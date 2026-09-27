@@ -970,7 +970,251 @@ description: Some("Investigate a recorded failure using earlier memories sharing
 
         // `mut` so the post-call block can annotate a successful result with any
         // Memory PRs or receipts it attaches to a successful result.
-        let mut result = match request.name.as_str() {
+        let tool_name = request.name.clone();
+        // Outer layer: protocol errors (unknown tool). Inner layer: the
+        // tool's own result, where `Err` becomes an is_error CallToolResult.
+        let mut result = match self.dispatch_tool(request).await {
+            Ok(result) => result,
+            Err(protocol_error) => return Err(protocol_error),
+        };
+
+        // ================================================================
+        // DASHBOARD EVENT EMISSION (v2.0)
+        // Emit real-time events to WebSocket clients after successful tool calls.
+        // ================================================================
+        if let Ok(ref mut content) = result {
+            // Agent Black Box: inspect the successful result and record the
+            // downstream memory events (retrieve/suppress/veto/dream) under the
+            // same run_id as the opening mcp.call, so /api/traces, /api/receipts
+            // and the trace:// resource are actually populated.
+            if trace_enabled() {
+                crate::trace_recorder::record_result(
+                    &self.storage,
+                    self.event_tx.as_ref(),
+                    &trace_run_id,
+                    &tool_name,
+                    content,
+                );
+                // Persist the receipt for this exact retrieval run, then attach
+                // its stable reference to the structured response. The Black Box
+                // can now answer "why did the agent do that?" from the same
+                // evidence the tool actually used, rather than reconstructing an
+                // explanation after the fact. Non-retrieval tools safely return
+                // None and keep their existing response shape.
+                if let Some(receipt) = crate::trace_recorder::build_and_save_receipt(
+                    &self.storage,
+                    &trace_run_id,
+                    &tool_name,
+                    content,
+                ) && let Some(obj) = content.as_object_mut()
+                {
+                    let receipt_id = receipt
+                        .get("receipt_id")
+                        .and_then(|value| value.as_str())
+                        .map(String::from);
+                    obj.entry("runId".to_string())
+                        .or_insert_with(|| serde_json::json!(trace_run_id));
+                    obj.insert("receiptId".to_string(), serde_json::json!(receipt_id));
+                    // A caller that asked for `detail_level: "brief"` wants the
+                    // smallest useful answer. The full receipt is persisted and
+                    // one `receipt` call away by id, so only the id ships.
+                    let brief = obj.get("detailLevel").and_then(|v| v.as_str()) == Some("brief");
+                    if !brief {
+                        obj.insert("receipt".to_string(), receipt);
+                    }
+                }
+
+                // Memory PR gate: classify the writes this tool just made under
+                // the active ReviewMode and, for risky ones, quarantine the new
+                // node and open a Memory PR. `gate_writes` no-ops for non-write
+                // tools, and `classify_write` auto-commits everything in Fast
+                // mode, so this is safe on every call.
+                //
+                // This closes the dead seam: the gate and its tests existed but
+                // it had no production caller, so `ReviewMode` was inert and
+                // nothing ever landed in `memory_prs` outside tests.
+                //
+                // Note this rides on `trace_enabled()` with the rest of the black
+                // box: a Memory PR is an auditable trace artifact and is reviewed
+                // through the same surfaces, so disabling tracing disables gating.
+                let mode = crate::trace_recorder::read_review_mode(&self.storage);
+                let opened = crate::trace_recorder::gate_writes(
+                    &self.storage,
+                    self.event_tx.as_ref(),
+                    &trace_run_id,
+                    &tool_name,
+                    content,
+                    mode,
+                );
+                if !opened.is_empty()
+                    && let Some(obj) = content.as_object_mut()
+                {
+                    // Tell the calling agent exactly what happened. A held write
+                    // is quarantined until the PR is decided; a destructive write
+                    // (or a failed suppression) is NOT held — the PR is an audit
+                    // record of something that already happened. Saying
+                    // "quarantined" for those would be false.
+                    let held = opened
+                        .iter()
+                        .filter(|o| o.get("held").and_then(|v| v.as_bool()) == Some(true))
+                        .count();
+                    let recorded = opened.len() - held;
+                    let mut parts = Vec::new();
+                    if held > 0 {
+                        parts.push(format!(
+                            "{held} write(s) quarantined until their Memory PR is decided"
+                        ));
+                    }
+                    if recorded > 0 {
+                        parts.push(format!(
+                            "{recorded} write(s) already applied but recorded for review \
+                             (destructive or unsuppressable — nothing is held)"
+                        ));
+                    }
+                    obj.insert("memoryPrs".to_string(), serde_json::json!(opened));
+                    obj.insert(
+                        "memoryPrNotice".to_string(),
+                        serde_json::json!(format!(
+                            "Review mode '{}': {}. Review in the dashboard under Memory PRs \
+                             or via GET /api/memory-prs.",
+                            mode.as_str(),
+                            parts.join("; ")
+                        )),
+                    );
+                }
+            }
+            // Reason mode budgets complete evidence groups before recording
+            // the retrieval receipt. Account for the actual attached metadata
+            // here; a caller-supplied trace ID may be arbitrarily long, so omit
+            // that optional echo if necessary (the receipt keeps correlation).
+            if let Some(budget) = content.get("tokenBudgetLimit").and_then(|v| v.as_u64()) {
+                content["budgetUnit"] = serde_json::json!("utf8_bytes_div_4_ceiling");
+                for _ in 0..3 {
+                    let bytes = content.to_string().len();
+                    content["tokensUsed"] = serde_json::json!(bytes.div_ceil(4));
+                }
+                if content.to_string().len() > budget as usize * 4 {
+                    if let Some(object) = content.as_object_mut() {
+                        object.remove("runId");
+                        object.insert("runIdOmitted".into(), serde_json::json!(true));
+                    }
+                    for _ in 0..3 {
+                        let bytes = content.to_string().len();
+                        content["tokensUsed"] = serde_json::json!(bytes.div_ceil(4));
+                    }
+                }
+            }
+            // Emit after receipt attachment and gating so the dashboard sees the
+            // same final evidence and review state returned to the calling agent.
+            self.emit_tool_event(&tool_name, &saved_args, content);
+        }
+
+        let response = match result {
+            Ok(content) => {
+                let call_result = CallToolResult {
+                    content: vec![crate::protocol::messages::ToolResultContent {
+                        content_type: "text".to_string(),
+                        text: serde_json::to_string_pretty(&content)
+                            .unwrap_or_else(|_| content.to_string()),
+                    }],
+                    structured_content: Some(content),
+                    is_error: Some(false),
+                };
+                serde_json::to_value(call_result)
+                    .map_err(|e| JsonRpcError::internal_error(&e.to_string()))
+            }
+            Err(e) => {
+                let error_content = serde_json::json!({ "error": e });
+                let call_result = CallToolResult {
+                    content: vec![crate::protocol::messages::ToolResultContent {
+                        content_type: "text".to_string(),
+                        text: error_content.to_string(),
+                    }],
+                    structured_content: Some(error_content),
+                    is_error: Some(true),
+                };
+                serde_json::to_value(call_result)
+                    .map_err(|e| JsonRpcError::internal_error(&e.to_string()))
+            }
+        };
+
+        // Inline consolidation trigger: uses ConsolidationScheduler instead of fixed count
+        let count = self.tool_call_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let should_consolidate = self
+            .cognitive
+            .try_lock()
+            .ok()
+            .map(|cog| cog.consolidation_scheduler.should_consolidate())
+            .unwrap_or(count.is_multiple_of(100)); // Fallback to count-based if lock unavailable
+
+        // The claim is what holds this to one worker at a time; the predicate
+        // above cannot, because it reads state it never changes.
+        let claim = if should_consolidate {
+            self.claim_consolidation()
+        } else {
+            None
+        };
+
+        if let Some(claim) = claim {
+            let storage_clone = Arc::clone(&self.storage);
+            let cognitive_clone = Arc::clone(&self.cognitive);
+            tokio::spawn(async move {
+                let _claim = claim;
+                // Expire labile reconsolidation windows
+                if let Ok(mut cog) = cognitive_clone.try_lock() {
+                    let _expired = cog.reconsolidation.reconsolidate_expired();
+                }
+                // Auto-close reconsolidation merge plans whose labile window
+                // expired without a verdict — no zombie plans.
+                match storage_clone.expire_stale_reconsolidation_plans() {
+                    Ok(closed) if !closed.is_empty() => {
+                        tracing::info!(
+                            count = closed.len(),
+                            "auto-closed expired reconsolidation merge plans"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "reconsolidation plan expiry sweep failed");
+                    }
+                    Ok(_) => {}
+                }
+
+                match storage_clone.run_consolidation() {
+                    Ok(result) => {
+                        tracing::info!(
+                            tool_calls = count,
+                            decay_applied = result.decay_applied,
+                            duplicates_merged = result.duplicates_merged,
+                            activations_computed = result.activations_computed,
+                            duration_ms = result.duration_ms,
+                            "Inline consolidation triggered (scheduler)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Inline consolidation failed: {}", e);
+                    }
+                }
+            });
+        }
+
+        response
+    }
+
+    /// Route a `tools/call` request to its tool implementation.
+    ///
+    /// Extracted verbatim from `handle_tools_call` (which keeps the trace
+    /// preamble and the post-call receipt/PR annotation) so the dispatch
+    /// table stays readable on its own.
+    ///
+    /// The outer `Result` is the protocol layer: only an unknown tool name
+    /// errors here, as a JSON-RPC `invalid_params`. The inner `Result` is the
+    /// tool layer: an `Err` is rendered by the caller as an `is_error`
+    /// `CallToolResult`, exactly as the inline dispatch did.
+    async fn dispatch_tool(
+        &self,
+        request: CallToolRequest,
+    ) -> Result<Result<serde_json::Value, String>, JsonRpcError> {
+        let result = match request.name.as_str() {
             // ================================================================
             // UNIFIED TOOLS (v1.1+) - Preferred API
             // ================================================================
@@ -1685,227 +1929,7 @@ description: Some("Investigate a recorded failure using earlier memories sharing
                 )));
             }
         };
-
-        // ================================================================
-        // DASHBOARD EVENT EMISSION (v2.0)
-        // Emit real-time events to WebSocket clients after successful tool calls.
-        // ================================================================
-        if let Ok(ref mut content) = result {
-            // Agent Black Box: inspect the successful result and record the
-            // downstream memory events (retrieve/suppress/veto/dream) under the
-            // same run_id as the opening mcp.call, so /api/traces, /api/receipts
-            // and the trace:// resource are actually populated.
-            if trace_enabled() {
-                crate::trace_recorder::record_result(
-                    &self.storage,
-                    self.event_tx.as_ref(),
-                    &trace_run_id,
-                    &request.name,
-                    content,
-                );
-                // Persist the receipt for this exact retrieval run, then attach
-                // its stable reference to the structured response. The Black Box
-                // can now answer "why did the agent do that?" from the same
-                // evidence the tool actually used, rather than reconstructing an
-                // explanation after the fact. Non-retrieval tools safely return
-                // None and keep their existing response shape.
-                if let Some(receipt) = crate::trace_recorder::build_and_save_receipt(
-                    &self.storage,
-                    &trace_run_id,
-                    &request.name,
-                    content,
-                ) && let Some(obj) = content.as_object_mut()
-                {
-                    let receipt_id = receipt
-                        .get("receipt_id")
-                        .and_then(|value| value.as_str())
-                        .map(String::from);
-                    obj.entry("runId".to_string())
-                        .or_insert_with(|| serde_json::json!(trace_run_id));
-                    obj.insert("receiptId".to_string(), serde_json::json!(receipt_id));
-                    // A caller that asked for `detail_level: "brief"` wants the
-                    // smallest useful answer. The full receipt is persisted and
-                    // one `receipt` call away by id, so only the id ships.
-                    let brief = obj.get("detailLevel").and_then(|v| v.as_str()) == Some("brief");
-                    if !brief {
-                        obj.insert("receipt".to_string(), receipt);
-                    }
-                }
-
-                // Memory PR gate: classify the writes this tool just made under
-                // the active ReviewMode and, for risky ones, quarantine the new
-                // node and open a Memory PR. `gate_writes` no-ops for non-write
-                // tools, and `classify_write` auto-commits everything in Fast
-                // mode, so this is safe on every call.
-                //
-                // This closes the dead seam: the gate and its tests existed but
-                // it had no production caller, so `ReviewMode` was inert and
-                // nothing ever landed in `memory_prs` outside tests.
-                //
-                // Note this rides on `trace_enabled()` with the rest of the black
-                // box: a Memory PR is an auditable trace artifact and is reviewed
-                // through the same surfaces, so disabling tracing disables gating.
-                let mode = crate::trace_recorder::read_review_mode(&self.storage);
-                let opened = crate::trace_recorder::gate_writes(
-                    &self.storage,
-                    self.event_tx.as_ref(),
-                    &trace_run_id,
-                    &request.name,
-                    content,
-                    mode,
-                );
-                if !opened.is_empty()
-                    && let Some(obj) = content.as_object_mut()
-                {
-                    // Tell the calling agent exactly what happened. A held write
-                    // is quarantined until the PR is decided; a destructive write
-                    // (or a failed suppression) is NOT held — the PR is an audit
-                    // record of something that already happened. Saying
-                    // "quarantined" for those would be false.
-                    let held = opened
-                        .iter()
-                        .filter(|o| o.get("held").and_then(|v| v.as_bool()) == Some(true))
-                        .count();
-                    let recorded = opened.len() - held;
-                    let mut parts = Vec::new();
-                    if held > 0 {
-                        parts.push(format!(
-                            "{held} write(s) quarantined until their Memory PR is decided"
-                        ));
-                    }
-                    if recorded > 0 {
-                        parts.push(format!(
-                            "{recorded} write(s) already applied but recorded for review \
-                             (destructive or unsuppressable — nothing is held)"
-                        ));
-                    }
-                    obj.insert("memoryPrs".to_string(), serde_json::json!(opened));
-                    obj.insert(
-                        "memoryPrNotice".to_string(),
-                        serde_json::json!(format!(
-                            "Review mode '{}': {}. Review in the dashboard under Memory PRs \
-                             or via GET /api/memory-prs.",
-                            mode.as_str(),
-                            parts.join("; ")
-                        )),
-                    );
-                }
-            }
-            // Reason mode budgets complete evidence groups before recording
-            // the retrieval receipt. Account for the actual attached metadata
-            // here; a caller-supplied trace ID may be arbitrarily long, so omit
-            // that optional echo if necessary (the receipt keeps correlation).
-            if let Some(budget) = content.get("tokenBudgetLimit").and_then(|v| v.as_u64()) {
-                content["budgetUnit"] = serde_json::json!("utf8_bytes_div_4_ceiling");
-                for _ in 0..3 {
-                    let bytes = content.to_string().len();
-                    content["tokensUsed"] = serde_json::json!(bytes.div_ceil(4));
-                }
-                if content.to_string().len() > budget as usize * 4 {
-                    if let Some(object) = content.as_object_mut() {
-                        object.remove("runId");
-                        object.insert("runIdOmitted".into(), serde_json::json!(true));
-                    }
-                    for _ in 0..3 {
-                        let bytes = content.to_string().len();
-                        content["tokensUsed"] = serde_json::json!(bytes.div_ceil(4));
-                    }
-                }
-            }
-            // Emit after receipt attachment and gating so the dashboard sees the
-            // same final evidence and review state returned to the calling agent.
-            self.emit_tool_event(&request.name, &saved_args, content);
-        }
-
-        let response = match result {
-            Ok(content) => {
-                let call_result = CallToolResult {
-                    content: vec![crate::protocol::messages::ToolResultContent {
-                        content_type: "text".to_string(),
-                        text: serde_json::to_string_pretty(&content)
-                            .unwrap_or_else(|_| content.to_string()),
-                    }],
-                    structured_content: Some(content),
-                    is_error: Some(false),
-                };
-                serde_json::to_value(call_result)
-                    .map_err(|e| JsonRpcError::internal_error(&e.to_string()))
-            }
-            Err(e) => {
-                let error_content = serde_json::json!({ "error": e });
-                let call_result = CallToolResult {
-                    content: vec![crate::protocol::messages::ToolResultContent {
-                        content_type: "text".to_string(),
-                        text: error_content.to_string(),
-                    }],
-                    structured_content: Some(error_content),
-                    is_error: Some(true),
-                };
-                serde_json::to_value(call_result)
-                    .map_err(|e| JsonRpcError::internal_error(&e.to_string()))
-            }
-        };
-
-        // Inline consolidation trigger: uses ConsolidationScheduler instead of fixed count
-        let count = self.tool_call_count.fetch_add(1, Ordering::Relaxed) + 1;
-        let should_consolidate = self
-            .cognitive
-            .try_lock()
-            .ok()
-            .map(|cog| cog.consolidation_scheduler.should_consolidate())
-            .unwrap_or(count.is_multiple_of(100)); // Fallback to count-based if lock unavailable
-
-        // The claim is what holds this to one worker at a time; the predicate
-        // above cannot, because it reads state it never changes.
-        let claim = if should_consolidate {
-            self.claim_consolidation()
-        } else {
-            None
-        };
-
-        if let Some(claim) = claim {
-            let storage_clone = Arc::clone(&self.storage);
-            let cognitive_clone = Arc::clone(&self.cognitive);
-            tokio::spawn(async move {
-                let _claim = claim;
-                // Expire labile reconsolidation windows
-                if let Ok(mut cog) = cognitive_clone.try_lock() {
-                    let _expired = cog.reconsolidation.reconsolidate_expired();
-                }
-                // Auto-close reconsolidation merge plans whose labile window
-                // expired without a verdict — no zombie plans.
-                match storage_clone.expire_stale_reconsolidation_plans() {
-                    Ok(closed) if !closed.is_empty() => {
-                        tracing::info!(
-                            count = closed.len(),
-                            "auto-closed expired reconsolidation merge plans"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "reconsolidation plan expiry sweep failed");
-                    }
-                    Ok(_) => {}
-                }
-
-                match storage_clone.run_consolidation() {
-                    Ok(result) => {
-                        tracing::info!(
-                            tool_calls = count,
-                            decay_applied = result.decay_applied,
-                            duplicates_merged = result.duplicates_merged,
-                            activations_computed = result.activations_computed,
-                            duration_ms = result.duration_ms,
-                            "Inline consolidation triggered (scheduler)"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("Inline consolidation failed: {}", e);
-                    }
-                }
-            });
-        }
-
-        response
+        Ok(result)
     }
 
     /// Handle resources/list request
