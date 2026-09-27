@@ -3940,6 +3940,8 @@ mod tests {
             ("maintain", serde_json::json!({"action": "consolidate"})),
             ("maintain", serde_json::json!({"action": "gc"})),
             ("maintain", serde_json::json!({"action": "backup"})),
+            // v2.3: the 4-phase DreamEngine surface, review-gated.
+            ("maintain", serde_json::json!({"action": "dream_compile"})),
         ];
         for (name, args) in dispatch_ok {
             let request = make_request(

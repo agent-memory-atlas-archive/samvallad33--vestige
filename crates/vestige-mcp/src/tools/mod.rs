@@ -55,6 +55,9 @@ pub mod merge;
 
 // v1.5: Cognitive tools
 pub mod dream;
+// v2.3: The 4-phase DreamEngine wired to durable state — review-gated
+// (every proposed change lands as a Memory PR; no autonomous memory writes).
+pub mod dream_compile;
 pub mod explore;
 pub mod predict;
 pub mod restore;

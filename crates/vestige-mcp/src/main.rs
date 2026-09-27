@@ -660,6 +660,40 @@ async fn serve() {
                     }
                 }
 
+                // v2.3: optional review-gated dream compile riding the same
+                // loop. Off by default (VESTIGE_DREAM_COMPILE_AUTOFIRE=1 to
+                // enable) because it files Memory PRs and an unattended store
+                // should not accumulate an unread review queue. Every change
+                // it produces is a reviewable PR — it never mutates a memory
+                // row — so enabling it is safe, just not silent.
+                if std::env::var("VESTIGE_DREAM_COMPILE_AUTOFIRE")
+                    .map(|v| {
+                        let v = v.trim();
+                        v.eq_ignore_ascii_case("1")
+                            || v.eq_ignore_ascii_case("true")
+                            || v.eq_ignore_ascii_case("on")
+                    })
+                    .unwrap_or(false)
+                {
+                    let config = vestige_core::DreamCompileConfig::default();
+                    match vestige_core::run_dream_compile(&storage_clone, &config) {
+                        Ok(report) if report.status == "compiled" => {
+                            info!(
+                                memories_replayed = report.memories_replayed,
+                                edges_strengthened = report.edges_strengthened,
+                                edges_downscaled = report.edges_downscaled,
+                                contradictions_found = report.contradictions_found,
+                                prs_filed = report.prs_filed.len(),
+                                "Auto dream compile complete (all changes held as review PRs)"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!("Auto dream compile failed: {}", e);
+                        }
+                    }
+                }
+
                 // Sleep until next check
                 tokio::time::sleep(std::time::Duration::from_secs(interval_hours * 3600)).await;
             }

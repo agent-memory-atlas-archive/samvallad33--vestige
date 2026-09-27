@@ -1,9 +1,9 @@
 //! Unified `maintain` Tool (v2.2 — Tool Consolidation)
 //!
-//! Folds the seven maintenance/lifecycle tools into one action-dispatched
+//! Folds the maintenance/lifecycle tools into one action-dispatched
 //! surface:
 //!
-//!   action = consolidate | dream | gc | importance_score | backup | export | restore
+//!   action = consolidate | dream | dream_compile | gc | importance_score | backup | export | restore
 //!
 //! This is a thin facade: each action forwards the *same* args envelope to the
 //! existing handler. None of the underlying arg structs use
@@ -12,7 +12,9 @@
 //! preserved because they live inside the callees:
 //!   - `gc` defaults `dry_run=true` (handler-internal),
 //!   - `restore` keeps path-confinement (handler-internal),
-//!   - `export` keeps its traversal guard (handler-internal).
+//!   - `export` keeps its traversal guard (handler-internal),
+//!   - `dream_compile` files everything as review-gated Memory PRs — it never
+//!     mutates a memory row (handler-internal).
 //!
 //! The `consolidate`/`dream` *Started* events and the
 //! `consolidate`/`dream`/`importance_score` *Completed* events are emitted by
@@ -28,9 +30,10 @@ use vestige_core::Storage;
 use crate::cognitive::CognitiveEngine;
 
 /// Discriminated-union schema for the unified `maintain` tool.
-const ACTIONS: [&str; 7] = [
+const ACTIONS: [&str; 8] = [
     "consolidate",
     "dream",
+    "dream_compile",
     "gc",
     "importance_score",
     "backup",
@@ -42,6 +45,7 @@ fn action_schema(action: &str) -> Option<Value> {
     Some(match action {
         "consolidate" => super::maintenance::consolidate_schema(),
         "dream" => super::dream::schema(),
+        "dream_compile" => super::dream_compile::schema(),
         "gc" => super::maintenance::gc_schema(),
         "importance_score" => super::importance::schema(),
         "backup" => super::maintenance::backup_schema(),
@@ -73,7 +77,7 @@ pub fn schema() -> Value {
         branches.push(branch);
     }
     properties.insert("action".into(), serde_json::json!({"type":"string", "enum":ACTIONS,
-        "description":"Store-wide maintenance: consolidate, dream, gc (preview by default), importance_score, backup, export, restore. Inspect the selected action's schema. Export uses since; start/end are unsupported."}));
+        "description":"Store-wide maintenance: consolidate, dream, dream_compile (run the 4-phase DreamEngine; every proposed memory change lands as a reviewable PR), gc (preview by default), importance_score, backup, export, restore. Inspect the selected action's schema. Export uses since; start/end are unsupported."}));
     // path has different meanings in export and restore; do not hide either.
     properties.get_mut("path").unwrap()["description"] = "[export] Confined filename inside exports/. [restore] JSON archive path, confined unless allowAnyPath=true for a trusted file.".into();
     serde_json::json!({"type":"object", "properties":properties, "required":["action"], "oneOf":branches})
@@ -91,7 +95,7 @@ pub async fn execute(
         .and_then(|a| a.get("action"))
         .and_then(|v| v.as_str())
         .ok_or(
-            "Missing 'action'. Use consolidate|dream|gc|importance_score|backup|export|restore.",
+            "Missing 'action'. Use consolidate|dream|dream_compile|gc|importance_score|backup|export|restore.",
         )?
         .to_string();
 
@@ -120,13 +124,14 @@ pub async fn execute(
     match action.as_str() {
         "consolidate" => super::maintenance::execute_consolidate(storage, args).await,
         "dream" => super::dream::execute(storage, cognitive, args).await,
+        "dream_compile" => super::dream_compile::execute(storage, args).await,
         "gc" => super::maintenance::execute_gc(storage, args).await,
         "importance_score" => super::importance::execute(storage, cognitive, args).await,
         "backup" => super::maintenance::execute_backup(storage, args).await,
         "export" => super::maintenance::execute_export(storage, args).await,
         "restore" => super::restore::execute(storage, args).await,
         other => Err(format!(
-            "Unknown maintain action '{other}'. Use consolidate|dream|gc|importance_score|backup|export|restore."
+            "Unknown maintain action '{other}'. Use consolidate|dream|dream_compile|gc|importance_score|backup|export|restore."
         )),
     }
 }
@@ -146,7 +151,8 @@ mod tests {
     fn test_schema_actions() {
         let s = schema();
         let actions = s["properties"]["action"]["enum"].as_array().unwrap();
-        assert_eq!(actions.len(), 7);
+        assert_eq!(actions.len(), 8);
+        assert!(actions.contains(&serde_json::json!("dream_compile")));
         assert_eq!(s["required"][0], "action");
         assert_eq!(
             s["properties"]["format"]["enum"],
@@ -251,5 +257,30 @@ mod tests {
         let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
         let args = Some(serde_json::json!({ "action": "consolidate" }));
         assert!(execute(&storage, &cognitive, args).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dream_compile_dispatches_and_needs_no_engine_lock() {
+        let storage = test_storage();
+        let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
+        // Empty store → clean insufficient_memories response, not an error.
+        let r = execute(
+            &storage,
+            &cognitive,
+            Some(serde_json::json!({ "action": "dream_compile" })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["status"], "insufficient_memories");
+        // Unknown-arg validation uses the per-action schema: min_similarity
+        // belongs to action='dream', not dream_compile.
+        let err = execute(
+            &storage,
+            &cognitive,
+            Some(serde_json::json!({ "action": "dream_compile", "min_similarity": 0.5 })),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("does not support"), "{err}");
     }
 }

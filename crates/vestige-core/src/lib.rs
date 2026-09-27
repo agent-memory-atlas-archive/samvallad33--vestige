@@ -305,8 +305,9 @@ pub use embedding::{
 // Consolidation (sleep-inspired memory processing)
 pub use consolidation::SleepConsolidation;
 pub use consolidation::{
-    CreativeConnection, CreativeConnectionType, DreamEngine, DreamInsight, DreamPhase,
-    FourPhaseDreamResult, PhaseResult, TriageCategory, TriagedMemory,
+    CreativeConnection, CreativeConnectionType, DreamCompileConfig, DreamCompilePhase,
+    DreamCompilePr, DreamCompileReport, DreamEngine, DreamInsight, DreamPhase,
+    FourPhaseDreamResult, PhaseResult, TriageCategory, TriagedMemory, run_dream_compile,
 };
 
 // Advanced features (bleeding edge 2026)

@@ -138,6 +138,12 @@ pub struct FourPhaseDreamResult {
     pub memories_downscaled: usize,
     pub emotional_processed: usize,
     pub replay_queue_size: usize,
+    /// The memory ids NREM1 selected for replay, in replay order. Downstream
+    /// consumers (e.g. dream_compile) need the actual queue, not just its
+    /// size, to walk and strengthen co-retrieval edges.
+    pub replay_queue: Vec<String>,
+    /// The memory ids NREM3 tagged for consolidation via synaptic tagging.
+    pub strengthened_ids: Vec<String>,
 }
 
 // ============================================================================
@@ -214,6 +220,8 @@ impl DreamEngine {
             memories_downscaled: downscaled_count,
             emotional_processed,
             phases,
+            replay_queue,
+            strengthened_ids,
         }
     }
 

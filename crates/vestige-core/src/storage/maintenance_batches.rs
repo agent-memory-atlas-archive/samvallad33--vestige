@@ -46,6 +46,43 @@ impl SqliteMemoryStore {
         Ok((nodes, more))
     }
 
+    /// Top memories by retention strength in a scope, for dream_compile input.
+    /// Namespace-specific and bounded like every other maintenance page;
+    /// suppressed and superseded memories never enter the dream.
+    pub fn dream_compile_candidates(
+        &self,
+        scope: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::KnowledgeNode>> {
+        if !(5..=500).contains(&limit) {
+            return Err(StorageError::Init(
+                "dream_compile memory_count must be 5..500".into(),
+            ));
+        }
+        let ids = {
+            let reader = self
+                .reader
+                .lock()
+                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+            reader.prepare(
+                "SELECT id FROM knowledge_nodes
+                 WHERE COALESCE(NULLIF(trim(scope),''),'user') = ?1
+                   AND COALESCE(suppression_count,0) = 0
+                   AND superseded_by IS NULL
+                 ORDER BY retention_strength DESC, id ASC LIMIT ?2",
+            )?
+            .query_map(params![scope, limit as i64], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut nodes = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(node) = self.get_node(&id)? {
+                nodes.push(node);
+            }
+        }
+        Ok(nodes)
+    }
+
     /// Clear only waking tags actually covered by the completed dream snapshot.
     pub fn clear_dream_page_tags(
         &self,
