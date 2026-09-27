@@ -185,10 +185,22 @@ struct SearchArgs {
     min_similarity: Option<f32>,
     /// #224: below this confidence (0..=1) recall abstains and returns the
     /// nearest matches instead of a weak answer. Default 0.35; 1 disables.
+    ///
+    /// The schema advertises this argument as `abstain_floor`; under the
+    /// struct-level `rename_all = "camelCase"` the effective wire name is
+    /// `abstainFloor`, so the advertised spelling needs the alias. Without
+    /// it, a client following the schema has its floor silently ignored and
+    /// recall never abstains.
+    #[serde(alias = "abstain_floor")]
     abstain_floor: Option<f64>,
     /// #252: include memories whose validity window has closed. Default
     /// false: supersession is enforced, superseded facts are withheld from
     /// current-time results rather than down-ranked.
+    ///
+    /// Alias for the same reason as `abstain_floor`: the schema advertises
+    /// `include_superseded`, and without the alias that spelling deserializes
+    /// as an unknown field and is silently dropped.
+    #[serde(alias = "include_superseded")]
     include_superseded: Option<bool>,
     #[serde(alias = "detail_level")]
     detail_level: Option<String>,
