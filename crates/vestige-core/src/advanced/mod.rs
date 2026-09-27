@@ -67,8 +67,8 @@ pub use importance::{ImportanceDecayConfig, ImportanceScore, ImportanceTracker, 
 pub use intent::{ActionType, DetectedIntent, IntentDetector, MaintenanceType, UserAction};
 pub use merge_supersede::{
     DEFAULT_MATCH_THRESHOLD, DEFAULT_POSSIBLE_THRESHOLD, MatchClass, MatchSignals, MergeCandidate,
-    MergeOperation, MergePlan, MergePolicy, PlanKind, compose_merged_content, compose_merged_tags,
-    score_pair,
+    MergeOperation, MergePlan, MergePolicy, PlanKind, ReconsolidationMeta, compose_merged_content,
+    compose_merged_tags, score_pair,
 };
 pub use prediction_error::{
     CandidateMemory, CreateReason, EvaluationIntent, GateDecision, GateStats, MergeStrategy,
@@ -76,9 +76,9 @@ pub use prediction_error::{
     cosine_similarity,
 };
 pub use reconsolidation::{
-    AccessContext, AccessTrigger, AppliedModification, ChangeSummary, LabileState, MemorySnapshot,
-    Modification, ReconsolidatedMemory, ReconsolidationManager, ReconsolidationStats,
-    RelationshipType, RetrievalRecord,
+    AccessContext, AccessTrigger, AppliedModification, ChangeSummary, LabileCandidate, LabileState,
+    MemorySnapshot, Modification, ReconsolidatedMemory, ReconsolidationManager,
+    ReconsolidationStats, RelationshipType, RetrievalRecord,
 };
 pub use retroactive_backfill::{
     BackfillCandidate, BackfillResult, BackfilledCause, FailureEvent, RetroactiveBackfill,

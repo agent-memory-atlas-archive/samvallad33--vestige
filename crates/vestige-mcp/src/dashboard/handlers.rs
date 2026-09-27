@@ -3105,7 +3105,7 @@ pub async fn plan_duplicates_merge(
         ));
     }
     let args = serde_json::json!({ "action": "plan_merge", "member_ids": body.member_ids });
-    crate::tools::dedup::execute_unified(&state.storage, Some(args))
+    crate::tools::dedup::execute_unified(&state.storage, None, Some(args))
         .await
         .map(Json)
         .map_err(dedup_tool_error)
@@ -3123,7 +3123,7 @@ pub async fn apply_duplicates_merge(
         "plan_id": body.plan_id,
         "confirm": body.confirm,
     });
-    crate::tools::dedup::execute_unified(&state.storage, Some(args))
+    crate::tools::dedup::execute_unified(&state.storage, None, Some(args))
         .await
         .map(Json)
         .map_err(dedup_tool_error)
@@ -4237,6 +4237,7 @@ mod tests {
         // The reflog the dashboard's undo path reads knows the operation.
         let log = crate::tools::dedup::execute_unified(
             &storage,
+            None,
             Some(serde_json::json!({ "action": "undo" })),
         )
             .await

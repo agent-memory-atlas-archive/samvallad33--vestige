@@ -388,7 +388,9 @@ pub use advanced::{
     ReasoningChain,
     ReconsolidatedMemory,
     // Reconsolidation (memories become modifiable on retrieval)
+    LabileCandidate,
     ReconsolidationManager,
+    ReconsolidationMeta,
     ReconsolidationStats,
     RelationshipType,
     RetrievalRecord,
@@ -620,6 +622,7 @@ pub mod prelude {
         GateDecision,
         ImportanceTracker,
         IntentDetector,
+        LabileCandidate,
         LabileState,
         MemoryChainBuilder,
         MemoryCompressor,

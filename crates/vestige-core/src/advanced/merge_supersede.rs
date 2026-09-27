@@ -230,6 +230,14 @@ pub enum PlanKind {
     Merge,
     /// Invalidate A in favour of B (bitemporal, audit-preserving).
     Supersede,
+    /// Reconsolidation verdict plan: a conflict or supersede arrived while the
+    /// target memory was inside its labile window (see
+    /// [`super::reconsolidation`]). The plan defers the rewrite until an
+    /// explicit verdict — approve (apply), reject (keep the memory), or
+    /// quarantine (suppress the memory) — mirroring Nader/Schafe/LeDoux
+    /// reconsolidation: material arriving during the window does not silently
+    /// overwrite the memory, it becomes a reviewable proposal.
+    Reconsolidation,
 }
 
 impl PlanKind {
@@ -237,8 +245,27 @@ impl PlanKind {
         match self {
             PlanKind::Merge => "merge",
             PlanKind::Supersede => "supersede",
+            PlanKind::Reconsolidation => "reconsolidation",
         }
     }
+}
+
+/// Reconsolidation-specific metadata carried by a [`PlanKind::Reconsolidation`]
+/// plan. `None` on merge/supersede plans.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconsolidationMeta {
+    /// The memory whose labile window was live when the conflict arrived.
+    pub target_memory_id: String,
+    /// Snapshot captured at `mark_labile` time — the pre-conflict state a
+    /// reviewer can compare against (and what `merge_undo` restores).
+    pub snapshot: super::reconsolidation::MemorySnapshot,
+    /// When the labile window closes. Verdicts after this instant are
+    /// refused and the plan auto-closes as `expired` — no zombie plans.
+    pub window_expires_at: chrono::DateTime<chrono::Utc>,
+    /// Which conflict path produced the plan: "supersede_deferred" (the write
+    /// path wanted to supersede the labile memory and was deferred) or
+    /// "contradiction" (the incoming content contradicts the labile memory).
+    pub trigger: String,
 }
 
 /// A previewable plan: exactly what *would* change, without changing anything.
@@ -274,6 +301,10 @@ pub struct MergePlan {
     pub signals: MatchSignals,
     /// Human-readable explanation of what this plan does.
     pub explanation: String,
+    /// Present only on `PlanKind::Reconsolidation` plans: the labile-window
+    /// target, its snapshot, and the verdict deadline.
+    #[serde(default)]
+    pub reconsolidation: Option<ReconsolidationMeta>,
 }
 
 // ============================================================================

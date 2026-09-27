@@ -11,6 +11,11 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+use crate::cognitive::CognitiveEngine;
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+use tokio::sync::Mutex;
+
 use vestige_core::Storage;
 #[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use vestige_core::cosine_similarity;
@@ -297,9 +302,9 @@ pub fn unified_schema() -> Value {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["scan", "plan_merge", "plan_supersede", "apply", "undo", "tag_rename", "tag_merge", "protect", "policy"],
+                "enum": ["scan", "plan_merge", "plan_supersede", "apply", "undo", "verdict", "tag_rename", "tag_merge", "protect", "policy"],
                 "default": "scan",
-                "description": "'scan' (default, read-only): duplicate clusters and merge candidates. 'plan_merge' / 'plan_supersede': preview a reversible plan. 'apply': run a plan_id. 'undo': reverse an operation_id, or list the reflog. 'tag_rename' / 'tag_merge': preview-token gated. 'protect': pin a memory. 'policy': thresholds."
+                "description": "'scan' (default, read-only): duplicate clusters, merge candidates, pending reconsolidation plans. 'plan_merge' / 'plan_supersede': preview a reversible plan. 'apply': run a plan_id. 'undo': reverse an operation_id, or list the reflog. 'verdict': approve|reject|quarantine a reconsolidation plan. 'tag_rename' / 'tag_merge': preview-token gated. 'protect': pin a memory. 'policy': thresholds."
             },
             "similarity_threshold": {
                 "type": "number",
@@ -322,7 +327,12 @@ pub fn unified_schema() -> Value {
             "survivor_id": { "type": "string", "description": "[plan_merge] Member to keep (default: highest retention)." },
             "old_id": { "type": "string", "description": "[plan_supersede] Memory being superseded (kept, marked invalid)." },
             "new_id": { "type": "string", "description": "[plan_supersede] Memory that supersedes it." },
-            "plan_id": { "type": "string", "description": "[apply] Plan id from plan_merge or plan_supersede." },
+            "plan_id": { "type": "string", "description": "[apply, verdict] Plan id from plan_merge, plan_supersede, or a reconsolidation plan surfaced by smart_ingest/scan." },
+            "verdict": {
+                "type": "string",
+                "enum": ["approve", "reject", "quarantine"],
+                "description": "[verdict] Reconsolidation verdict: approve applies the plan (old memory superseded, rollback via undo); reject discards it (memory stays); quarantine suppresses the memory (existing suppress path) and closes the plan."
+            },
             "confirm": { "type": "boolean", "default": false, "description": "[apply, tag_*] Explicit confirmation. Tag actions preview when false and need preview_token when true." },
             "operation_id": { "type": "string", "description": "[undo] Operation to reverse. Omit to list recent operations plus tagOperations." },
             "source_tag": { "type": "string", "description": "[tag_rename] Exact source tag to rename." },
@@ -342,7 +352,16 @@ pub fn unified_schema() -> Value {
 }
 
 /// Unified dispatcher for the `dedup` tool. Routes on `action` (default `scan`).
-pub async fn execute_unified(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
+///
+/// `cognitive` is used only by the `verdict` action: quarantine must close the
+/// in-memory labile window alongside the storage suppression, and the window
+/// lives in the cognitive engine. Callers without cognitive access pass
+/// `None`; the window then simply self-expires, which is always safe.
+pub async fn execute_unified(
+    storage: &Arc<Storage>,
+    cognitive: Option<&Arc<Mutex<CognitiveEngine>>>,
+    args: Option<Value>,
+) -> Result<Value, String> {
     let action = args
         .as_ref()
         .and_then(|a| a.get("action"))
@@ -357,24 +376,139 @@ pub async fn execute_unified(storage: &Arc<Storage>, args: Option<Value>) -> Res
             // Fellegi-Sunter merge candidates (merge module, name-dispatched).
             let candidates =
                 super::merge::execute(storage, "merge_candidates", args.clone()).await?;
+            // Pending reconsolidation verdicts — expired plans are swept by
+            // the listing itself, so only live windows are surfaced.
+            let reconsolidation_plans = reconsolidation_plan_entries(storage);
             Ok(serde_json::json!({
                 "action": "scan",
                 "duplicateClusters": clusters,
                 "mergeCandidates": candidates,
-                "nextStep": "Use action='plan_merge' (member_ids) or action='plan_supersede' (old_id,new_id) to preview a reversible plan, then action='apply' (plan_id)."
+                "reconsolidationPlans": reconsolidation_plans,
+                "nextStep": "Use action='plan_merge' (member_ids) or action='plan_supersede' (old_id,new_id) to preview a reversible plan, then action='apply' (plan_id). Reconsolidation plans take action='verdict' (verdict=approve|reject|quarantine)."
             }))
         }
         "plan_merge" => super::merge::execute(storage, "plan_merge", args).await,
         "plan_supersede" => super::merge::execute(storage, "plan_supersede", args).await,
         "apply" => super::merge::execute(storage, "apply_plan", args).await,
         "undo" => super::merge::execute(storage, "merge_undo", args).await,
+        "verdict" => execute_verdict(storage, cognitive, args),
         "tag_rename" => execute_tag_mutation(storage, args, false),
         "tag_merge" => execute_tag_mutation(storage, args, true),
         "protect" => super::merge::execute(storage, "protect", args).await,
         "policy" => super::merge::execute(storage, "merge_policy", args).await,
         other => Err(format!(
-            "Unknown dedup action '{other}'. Use scan|plan_merge|plan_supersede|apply|undo|tag_rename|tag_merge|protect|policy."
+            "Unknown dedup action '{other}'. Use scan|plan_merge|plan_supersede|apply|undo|verdict|tag_rename|tag_merge|protect|policy."
         )),
+    }
+}
+
+/// Pending reconsolidation plans shaped for the scan surface. Read-only; the
+/// storage listing runs the expiry sweep first so nothing stale is offered.
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+fn reconsolidation_plan_entries(storage: &Arc<Storage>) -> Vec<Value> {
+    match storage.list_reconsolidation_plans(20) {
+        Ok(plans) => plans
+            .into_iter()
+            .map(|(plan, status)| {
+                let meta = plan.reconsolidation.as_ref();
+                serde_json::json!({
+                    "planId": plan.id,
+                    "status": status,
+                    "targetMemoryId": meta.map(|m| m.target_memory_id.clone()),
+                    "trigger": meta.map(|m| m.trigger.clone()),
+                    "windowExpiresAt": meta.map(|m| m.window_expires_at.to_rfc3339()),
+                    "survivorId": plan.survivor_id,
+                    "explanation": plan.explanation,
+                    "nextStep": "decide with action='verdict' (verdict=approve|reject|quarantine, plan_id)"
+                })
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+fn reconsolidation_plan_entries(_storage: &Arc<Storage>) -> Vec<Value> {
+    Vec::new()
+}
+
+/// Apply an explicit reconsolidation verdict. Approve delegates to the
+/// existing apply path (reversible via undo); reject closes the plan leaving
+/// the memory untouched; quarantine suppresses the memory through the
+/// existing suppress path and closes the in-memory labile window.
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+fn obj(args: &Option<Value>) -> serde_json::Map<String, Value> {
+    args.as_ref()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+fn execute_verdict(
+    storage: &Arc<Storage>,
+    cognitive: Option<&Arc<Mutex<CognitiveEngine>>>,
+    args: Option<Value>,
+) -> Result<Value, String> {
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    {
+        let a = obj(&args);
+        let plan_id = a
+            .get("plan_id")
+            .and_then(|v| v.as_str())
+            .ok_or("plan_id is required for the verdict action")?;
+        let verdict = a
+            .get("verdict")
+            .and_then(|v| v.as_str())
+            .ok_or("verdict is required (approve | reject | quarantine)")?;
+        let reason = a.get("reason").and_then(|v| v.as_str());
+
+        // Capture the target before the verdict so quarantine can close the
+        // cognitive-side window afterwards.
+        let target_id = storage
+            .get_plan(plan_id)
+            .map_err(|e| e.to_string())?
+            .and_then(|plan| plan.reconsolidation.map(|meta| meta.target_memory_id));
+
+        let op = storage
+            .verdict_reconsolidation_plan(plan_id, verdict, reason)
+            .map_err(|e| e.to_string())?;
+
+        // Quarantine: the storage layer suppressed the memory; close the
+        // in-memory labile window so no further modification slips in while
+        // the memory is inhibited. Best-effort: the window also self-expires,
+        // and callers without cognitive access pass None.
+        if verdict == "quarantine"
+            && let Some(target) = target_id.as_deref()
+            && let Some(cognitive) = cognitive
+            && let Ok(mut cog) = cognitive.try_lock()
+        {
+            cog.reconsolidation.close_window(target);
+        }
+
+        Ok(serde_json::json!({
+            "action": "verdict",
+            "verdict": verdict,
+            "planId": plan_id,
+            "operationId": op.id,
+            "status": op.status,
+            "targetMemoryId": target_id,
+            "survivorId": op.survivor_id,
+            "reason": op.reason,
+            "reversible": verdict == "approve",
+            "nextStep": if verdict == "approve" {
+                format!("To reverse the approval, call merge_undo with operation_id='{}'.", op.id)
+            } else if verdict == "quarantine" {
+                "The target memory is suppressed (top-down inhibition). suppress with reverse=true within 24h un-suppresses it.".to_string()
+            } else {
+                "The plan was discarded and the target memory is unchanged.".to_string()
+            },
+            "note": "Reconsolidation verdicts are recorded in the merge_operations reflog. Expired plans cannot be verdicted; they auto-close with their labile window."
+        }))
+    }
+    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+    {
+        let _ = (storage, cognitive, args);
+        Err("Reconsolidation verdicts require embeddings and vector-search features.".into())
     }
 }
 
@@ -533,7 +667,11 @@ mod tests {
         let schema = unified_schema();
         assert_eq!(schema["type"], "object");
         let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
-        assert_eq!(actions.len(), 9);
+        assert_eq!(actions.len(), 10);
+        assert!(
+            actions.contains(&serde_json::json!("verdict")),
+            "the reconsolidation verdict action must be advertised"
+        );
         assert_eq!(schema["properties"]["action"]["default"], "scan");
     }
 
@@ -543,7 +681,7 @@ mod tests {
         let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
         let storage = Arc::new(storage);
         // Default action (scan) on empty storage must not error.
-        let result = execute_unified(&storage, None).await;
+        let result = execute_unified(&storage, None, None).await;
         assert!(result.is_ok());
     }
 
@@ -561,6 +699,7 @@ mod tests {
 
         let preview = execute_unified(
             &storage,
+            None,
             Some(serde_json::json!({
                 "action": "tag_rename",
                 "source_tag": "old",
@@ -579,6 +718,7 @@ mod tests {
 
         let missing_token = execute_unified(
             &storage,
+            None,
             Some(serde_json::json!({
                 "action": "tag_rename",
                 "source_tag": "old",
@@ -593,6 +733,7 @@ mod tests {
 
         let applied = execute_unified(
             &storage,
+            None,
             Some(serde_json::json!({
                 "action": "tag_rename",
                 "source_tag": "old",
@@ -616,6 +757,7 @@ mod tests {
 
         let undone = execute_unified(
             &storage,
+            None,
             Some(serde_json::json!({
                 "action": "undo",
                 "operation_id": applied["operationId"]
@@ -644,6 +786,7 @@ mod tests {
 
         let conflict = execute_unified(
             &storage,
+            None,
             Some(serde_json::json!({
                 "action": "tag_rename",
                 "source_tag": "old",
@@ -658,6 +801,7 @@ mod tests {
 
         let scoped_only = execute_unified(
             &storage,
+            None,
             Some(serde_json::json!({
                 "action": "tag_rename",
                 "source_tag": "old",
@@ -672,6 +816,7 @@ mod tests {
 
         let all_scopes_only = execute_unified(
             &storage,
+            None,
             Some(serde_json::json!({
                 "action": "tag_rename",
                 "source_tag": "old",
@@ -700,6 +845,7 @@ mod tests {
 
         let preview = execute_unified(
             &storage,
+            None,
             Some(serde_json::json!({
                 "action": "tag_rename",
                 "source_tag": overlong,
@@ -713,6 +859,7 @@ mod tests {
 
         let applied = execute_unified(
             &storage,
+            None,
             Some(serde_json::json!({
                 "action": "tag_rename",
                 "source_tag": overlong,
@@ -739,6 +886,7 @@ mod tests {
         let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
         let error = execute_unified(
             &storage,
+            None,
             Some(serde_json::json!({
                 "action": "tag_merge",
                 "source_tags": ["one"],

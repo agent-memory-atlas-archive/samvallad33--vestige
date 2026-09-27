@@ -356,6 +356,13 @@ pub struct SmartIngestResult {
     /// already superseded by a currently-valid fact starting later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_closed_until: Option<DateTime<Utc>>,
+    /// Set when the write path conflicted with a memory inside its labile
+    /// window and routed the conflict through a reconsolidation merge plan
+    /// instead of mutating immediately (`decision == "reconsolidation_pending"`
+    /// for a deferred supersede; a plain `"create"` for a contradiction that
+    /// was stored separately and linked to a verdict plan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconsolidation_plan_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -8449,3 +8449,281 @@ fn single_memory_retrievals_link_nothing() {
     store.record_batch_retrieval(&[ids[1].as_str()]).unwrap();
     assert!(narrative_edges(&store).is_empty());
 }
+
+// ========================================================================
+// RECONSOLIDATION LINKAGE — conflict vs a live labile window becomes a
+// reviewable merge plan with explicit verdicts (see
+// crate::advanced::reconsolidation for the neuroscience).
+// ========================================================================
+
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+fn reconsolidation_candidate(
+    storage: &Storage,
+    node_id: &str,
+    window_secs: i64,
+) -> crate::advanced::LabileCandidate {
+    let node = storage.get_node(node_id).unwrap().unwrap();
+    crate::advanced::LabileCandidate {
+        memory_id: node.id.clone(),
+        snapshot: crate::advanced::MemorySnapshot::capture(
+            node.content.clone(),
+            node.tags.clone(),
+            node.retention_strength,
+            node.storage_strength,
+            node.retrieval_strength,
+            vec![],
+        ),
+        window_expires_at: Utc::now() + Duration::seconds(window_secs),
+    }
+}
+
+/// Scenario 1: the write path detects a contradiction against a memory whose
+/// labile window is live → the conflict is routed through a reconsolidation
+/// merge plan that carries the mark_labile snapshot. Both memories exist; the
+/// target is untouched pending the verdict.
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[test]
+fn contradiction_during_live_window_creates_reconsolidation_plan_with_snapshot() {
+    let dir = tempdir().unwrap();
+    let storage = storage_with_marker_gate_runtime(&dir);
+    let old = storage
+        .ingest(IngestInput {
+            content: "alpha deploy policy is always use retries with backoff".to_string(),
+            node_type: "fact".to_string(),
+            tags: vec!["deploy".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+
+    let candidate = reconsolidation_candidate(&storage, &old.id, 300);
+    assert_eq!(candidate.snapshot.content, old.content);
+
+    let result = storage
+        .smart_ingest_in_scope_with_secret_policy_and_labile(
+            IngestInput {
+                content: "alpha deploy policy is never use retries with backoff".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["deploy".to_string()],
+                ..Default::default()
+            },
+            "user",
+            SecretPolicy::Reject,
+            std::slice::from_ref(&candidate),
+        )
+        .unwrap();
+
+    // The gate routed the contradiction to Create; the linkage attached a plan.
+    assert_eq!(result.decision, "create");
+    let plan_id = result
+        .reconsolidation_plan_id
+        .expect("a contradiction against a labile memory must create a reconsolidation plan");
+    let plan = storage.get_plan(&plan_id).unwrap().unwrap();
+    assert_eq!(plan.kind, crate::advanced::PlanKind::Reconsolidation);
+    let meta = plan.reconsolidation.as_ref().unwrap();
+    assert_eq!(meta.target_memory_id, old.id);
+    assert_eq!(meta.trigger, "contradiction");
+    // The plan references the snapshot taken at mark_labile time.
+    assert_eq!(meta.snapshot.content, old.content);
+    assert_eq!(meta.snapshot.tags, old.tags);
+    assert_eq!(meta.snapshot.retention_strength, old.retention_strength);
+    // Approve would supersede old in favour of the incoming memory.
+    assert_eq!(plan.invalidated_ids, vec![old.id.clone()]);
+    assert_eq!(plan.survivor_id, result.node.id);
+    // Review-first: a reconsolidation plan is never auto-apply class.
+    assert_eq!(plan.classification, MatchClass::Possible);
+    assert_eq!(
+        storage.plan_status(&plan_id).unwrap().as_deref(),
+        Some("pending")
+    );
+    // The labile target is untouched while the plan is pending.
+    let old_after = storage.get_node(&old.id).unwrap().unwrap();
+    assert!(old_after.is_currently_valid());
+    assert_eq!(storage.read_bitemporal(&old.id).unwrap().1, None);
+}
+
+/// Scenario 2: approve → the plan applies (bitemporal supersede of the labile
+/// target), and the existing merge_undo reflog reverses it.
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[test]
+fn approve_verdict_applies_the_plan_and_undo_reverses_it() {
+    let storage = create_test_storage();
+    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
+    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    let candidate = reconsolidation_candidate(&storage, &target, 300);
+
+    let plan = storage
+        .plan_reconsolidation(&target, &incoming, &candidate, "contradiction")
+        .unwrap();
+
+    let op = storage
+        .verdict_reconsolidation_plan(&plan.id, "approve", Some("verified the correction"))
+        .unwrap();
+
+    // The labile target was bitemporally invalidated, never deleted.
+    let (vu, sb) = storage.read_bitemporal(&target).unwrap();
+    assert!(vu.is_some(), "approve must stamp valid_until");
+    assert_eq!(sb.as_deref(), Some(incoming.as_str()));
+    let node = storage.get_node(&target).unwrap().unwrap();
+    assert!(!node.is_currently_valid());
+    assert_eq!(node.suppression_count, 0);
+    assert_eq!(storage.plan_status(&plan.id).unwrap().as_deref(), Some("applied"));
+
+    // Snapshot-based rollback through the existing undo path.
+    let undone = storage.merge_undo(&op.id).unwrap();
+    assert_eq!(undone.op_type, "undo");
+    let (vu2, sb2) = storage.read_bitemporal(&target).unwrap();
+    assert!(vu2.is_none() && sb2.is_none(), "undo restores the validity window");
+    assert!(storage.get_node(&target).unwrap().unwrap().is_currently_valid());
+}
+
+/// Scenario 3: reject → the plan is discarded and the target memory stays
+/// byte-identical to its mark_labile snapshot.
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[test]
+fn reject_verdict_leaves_the_memory_byte_identical_to_its_snapshot() {
+    let storage = create_test_storage();
+    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
+    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    let candidate = reconsolidation_candidate(&storage, &target, 300);
+    let plan = storage
+        .plan_reconsolidation(&target, &incoming, &candidate, "supersede_deferred")
+        .unwrap();
+
+    let before = storage.get_node(&target).unwrap().unwrap();
+    let op = storage
+        .verdict_reconsolidation_plan(&plan.id, "reject", Some("not a real conflict"))
+        .unwrap();
+    assert_eq!(op.status, "rejected");
+    assert_eq!(
+        storage.plan_status(&plan.id).unwrap().as_deref(),
+        Some("rejected")
+    );
+
+    let after = storage.get_node(&target).unwrap().unwrap();
+    // Snapshot equality: every field the snapshot captured is unchanged, and
+    // the memory gained no invalidation, no suppression, no content rewrite.
+    assert_eq!(after.content, candidate.snapshot.content);
+    assert_eq!(after.content, before.content);
+    assert_eq!(after.tags, candidate.snapshot.tags);
+    assert_eq!(after.retention_strength, candidate.snapshot.retention_strength);
+    assert_eq!(after.storage_strength, candidate.snapshot.storage_strength);
+    assert_eq!(after.retrieval_strength, candidate.snapshot.retrieval_strength);
+    let (vu, sb) = storage.read_bitemporal(&target).unwrap();
+    assert!(vu.is_none() && sb.is_none());
+    assert_eq!(after.suppression_count, 0);
+    assert!(after.is_currently_valid());
+}
+
+/// Scenario 4: quarantine → the target memory is suppressed through the
+/// existing top-down suppression path and the plan closes.
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[test]
+fn quarantine_verdict_suppresses_the_target_and_closes_the_plan() {
+    let storage = create_test_storage();
+    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
+    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    let candidate = reconsolidation_candidate(&storage, &target, 300);
+    let plan = storage
+        .plan_reconsolidation(&target, &incoming, &candidate, "contradiction")
+        .unwrap();
+
+    let op = storage
+        .verdict_reconsolidation_plan(&plan.id, "quarantine", Some("poisoned claim"))
+        .unwrap();
+
+    assert_eq!(op.status, "quarantined");
+    assert_eq!(
+        storage.plan_status(&plan.id).unwrap().as_deref(),
+        Some("quarantined")
+    );
+    let node = storage.get_node(&target).unwrap().unwrap();
+    assert!(
+        node.suppression_count > 0,
+        "quarantine must suppress the memory via the existing suppress path"
+    );
+    // The content is still there — suppression is inhibition, not deletion.
+    assert_eq!(node.content, "Fact A about caching");
+}
+
+/// Scenario 5: a reconsolidation plan whose labile window expires unacted is
+/// auto-closed (recorded), never applied, and never left pending as a zombie.
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[test]
+fn expired_window_auto_closes_the_plan() {
+    let storage = create_test_storage();
+    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
+    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    // One plan left to expire by the sweep, one fed straight to apply_plan.
+    let candidate = reconsolidation_candidate(&storage, &target, 1);
+    let plan_swept = storage
+        .plan_reconsolidation(&target, &incoming, &candidate, "contradiction")
+        .unwrap();
+    let plan_applied = storage
+        .plan_reconsolidation(&target, &incoming, &candidate, "contradiction")
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+
+    // The sweep auto-closes the stale plan and records it in the reflog.
+    let closed = storage.expire_stale_reconsolidation_plans().unwrap();
+    assert!(closed.contains(&plan_swept.id), "sweep must close the stale plan");
+    assert_eq!(
+        storage.plan_status(&plan_swept.id).unwrap().as_deref(),
+        Some("expired")
+    );
+    let ops = storage.list_merge_operations(10).unwrap();
+    assert!(
+        ops.iter().any(|op| op.plan_id.as_deref() == Some(plan_swept.id.as_str())
+            && op.op_type == "reconsolidation"
+            && op.status == "expired"),
+        "the auto-close must be recorded, got {ops:?}"
+    );
+
+    // apply_plan on a stale plan fails closed and auto-closes it too.
+    assert!(storage.apply_plan(&plan_applied.id, true).is_err());
+    assert_eq!(
+        storage.plan_status(&plan_applied.id).unwrap().as_deref(),
+        Some("expired")
+    );
+
+    // And a verdict on an expired plan is refused.
+    assert!(
+        storage
+            .verdict_reconsolidation_plan(&plan_swept.id, "approve", None)
+            .is_err()
+    );
+
+    // The target memory is untouched by any of it.
+    let (vu, sb) = storage.read_bitemporal(&target).unwrap();
+    assert!(vu.is_none() && sb.is_none());
+    // Listing never offers expired plans.
+    assert!(
+        storage
+            .list_reconsolidation_plans(20)
+            .unwrap()
+            .iter()
+            .all(|(plan, _)| plan.id != plan_swept.id && plan.id != plan_applied.id)
+    );
+}
+
+/// A pending reconsolidation plan is discoverable through the listing that
+/// backs the dedup scan surface.
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[test]
+fn pending_reconsolidation_plans_are_listed_for_the_verdict_surface() {
+    let storage = create_test_storage();
+    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
+    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    let candidate = reconsolidation_candidate(&storage, &target, 300);
+    let plan = storage
+        .plan_reconsolidation(&target, &incoming, &candidate, "supersede_deferred")
+        .unwrap();
+
+    let listed = storage.list_reconsolidation_plans(20).unwrap();
+    assert_eq!(listed.len(), 1);
+    let (listed_plan, status) = &listed[0];
+    assert_eq!(listed_plan.id, plan.id);
+    assert_eq!(status, "pending");
+    let meta = listed_plan.reconsolidation.as_ref().unwrap();
+    assert_eq!(meta.trigger, "supersede_deferred");
+    assert_eq!(meta.snapshot.content, "Fact A about caching");
+}

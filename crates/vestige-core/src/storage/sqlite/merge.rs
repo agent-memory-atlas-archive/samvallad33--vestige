@@ -484,6 +484,7 @@ impl SqliteMemoryStore {
                 },
                 member_ids.len() - 1
             ),
+            reconsolidation: None,
         };
 
         self.persist_plan(&plan)?;
@@ -541,6 +542,104 @@ impl SqliteMemoryStore {
             explanation: format!(
                 "Supersede {old_id} with {new_id}. {old_id} is kept and remains queryable for audit, but stamped valid_until=now and superseded_by={new_id} (invalidate, don't delete)."
             ),
+            reconsolidation: None,
+        };
+
+        self.persist_plan(&plan)?;
+        Ok(plan)
+    }
+
+    /// Build a previewable RECONSOLIDATION plan: a conflict or supersede
+    /// arrived while `target_id` was inside its labile window, so the rewrite
+    /// is deferred behind an explicit verdict instead of applying immediately.
+    ///
+    /// - **approve** → `apply_plan` invalidates the target bitemporally in
+    ///   favour of the incoming memory (snapshot-based rollback via
+    ///   `merge_undo`).
+    /// - **reject** → the plan is discarded; the target memory stays exactly
+    ///   as its `mark_labile` snapshot captured it.
+    /// - **quarantine** → the target is suppressed (top-down inhibition) and
+    ///   the plan closes.
+    ///
+    /// Classification is always `Possible`: a conflict with a live memory is
+    /// a review case by construction, never an auto-apply, regardless of
+    /// embedding score. See [`super::reconsolidation`] for the neuroscience.
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    pub fn plan_reconsolidation(
+        &self,
+        target_id: &str,
+        incoming_id: &str,
+        labile: &crate::advanced::reconsolidation::LabileCandidate,
+        trigger: &str,
+    ) -> Result<crate::advanced::MergePlan> {
+        use crate::advanced::{MatchClass, PlanKind, ReconsolidationMeta, score_pair};
+
+        if target_id == incoming_id {
+            return Err(StorageError::Init(
+                "reconsolidation members must be distinct".into(),
+            ));
+        }
+        if labile.memory_id != target_id {
+            return Err(StorageError::Init(
+                "labile candidate does not match the reconsolidation target".into(),
+            ));
+        }
+        if labile.window_expires_at <= Utc::now() {
+            return Err(StorageError::Init(
+                "labile window already expired; conflict is no longer routed through reconsolidation"
+                    .into(),
+            ));
+        }
+        let expected_state =
+            self.merge_state_snapshot(&[target_id.to_string(), incoming_id.to_string()])?;
+        let target = self
+            .get_node(target_id)?
+            .ok_or_else(|| StorageError::NotFound(target_id.to_string()))?;
+        let incoming = self
+            .get_node(incoming_id)?
+            .ok_or_else(|| StorageError::NotFound(incoming_id.to_string()))?;
+
+        if self.is_protected(target_id)? {
+            return Err(StorageError::Init(format!(
+                "Memory {target_id} is protected and cannot be superseded. Unprotect it first."
+            )));
+        }
+
+        let sim = self.pair_similarity(target_id, incoming_id)?;
+        let signals = score_pair(
+            sim,
+            &target.tags,
+            &incoming.tags,
+            &target.content,
+            &incoming.content,
+        );
+        // Review-first always: `Possible` forces confirm=true in apply_plan,
+        // whatever the configured match thresholds say.
+        let classification = MatchClass::Possible;
+
+        let plan = crate::advanced::MergePlan {
+            expected_state,
+            id: uuid::Uuid::new_v4().to_string(),
+            kind: PlanKind::Reconsolidation,
+            survivor_id: incoming.id.clone(),
+            member_ids: vec![target_id.to_string(), incoming_id.to_string()],
+            result_content: incoming.content.clone(),
+            result_tags: incoming.tags.clone(),
+            result_source: incoming.source.clone(),
+            invalidated_ids: vec![target_id.to_string()],
+            confidence: signals.combined_score,
+            classification,
+            signals,
+            explanation: format!(
+                "Reconsolidation ({trigger}): incoming memory {incoming_id} conflicts with {target_id} while its labile window is open. Approve supersedes {target_id} (kept for audit, rollback via merge_undo), reject keeps {target_id} unchanged, quarantine suppresses {target_id}. Window closes {}.",
+                labile.window_expires_at.to_rfc3339()
+            ),
+            reconsolidation: Some(ReconsolidationMeta {
+                target_memory_id: target_id.to_string(),
+                snapshot: labile.snapshot.clone(),
+                window_expires_at: labile.window_expires_at,
+                trigger: trigger.to_string(),
+            }),
         };
 
         self.persist_plan(&plan)?;
@@ -609,7 +708,8 @@ impl SqliteMemoryStore {
         }
     }
 
-    /// Plan status string (pending | applied | cancelled), if the plan exists.
+    /// Plan status string (pending | applied | cancelled | rejected |
+    /// quarantined | expired), if the plan exists.
     pub fn plan_status(&self, plan_id: &str) -> Result<Option<String>> {
         let reader = self
             .reader
@@ -623,6 +723,245 @@ impl SqliteMemoryStore {
             )
             .optional()?;
         Ok(status)
+    }
+
+    /// Record a non-mutating reconsolidation verdict row (reject / quarantine
+    /// marker / expiry) in `merge_operations` and set the plan status. These
+    /// ops carry an empty undo payload: `merge_undo` refuses anything that is
+    /// not `status='applied'`, which is correct — a rejection has nothing to
+    /// reverse, and suppression reversal goes through the suppression path's
+    /// own 24-hour labile undo, not the merge reflog.
+    fn record_reconsolidation_verdict_op(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        plan: &crate::advanced::MergePlan,
+        status: &str,
+        reason: &str,
+    ) -> Result<crate::advanced::MergeOperation> {
+        let op_id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let affected = vec![plan.survivor_id.clone()];
+        tx.execute(
+            "INSERT INTO merge_operations
+                (id, plan_id, op_type, status, created_at, reverted_at, reverts_op_id,
+                 survivor_id, affected_ids, confidence, signals, reason, undo_payload)
+             VALUES (?1, ?2, 'reconsolidation', ?3, ?4, NULL, NULL, ?5, ?6, ?7, NULL, ?8, '{}')",
+            params![
+                op_id,
+                plan.id,
+                status,
+                now.to_rfc3339(),
+                plan.survivor_id,
+                serde_json::to_string(&affected).unwrap_or_else(|_| "[]".into()),
+                plan.confidence as f64,
+                reason,
+            ],
+        )?;
+        tx.execute(
+            "UPDATE merge_plans SET status = ?1, applied_at = ?2 WHERE id = ?3",
+            params![status, now.to_rfc3339(), plan.id],
+        )?;
+        Ok(crate::advanced::MergeOperation {
+            id: op_id,
+            plan_id: Some(plan.id.clone()),
+            op_type: "reconsolidation".to_string(),
+            status: status.to_string(),
+            created_at: now.to_rfc3339(),
+            reverted_at: None,
+            reverts_op_id: None,
+            survivor_id: Some(plan.survivor_id.clone()),
+            affected_ids: affected,
+            confidence: Some(plan.confidence),
+            signals: None,
+            reason: Some(reason.to_string()),
+        })
+    }
+
+    /// Auto-close one expired reconsolidation plan (status `expired`) and
+    /// record the close. Used both by the opportunistic sweep and by the
+    /// apply-time guard, so an expired plan can never sit pending or be
+    /// applied after its labile window closed — no zombie plans.
+    pub fn expire_reconsolidation_plan(
+        &self,
+        plan: &crate::advanced::MergePlan,
+    ) -> Result<crate::advanced::MergeOperation> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        let tx = Self::begin_write_transaction(&writer, "expire_reconsolidation_plan")?;
+        let op = self.record_reconsolidation_verdict_op(
+            &tx,
+            plan,
+            "expired",
+            "Labile window expired without a verdict; reconsolidation plan auto-closed",
+        )?;
+        tx.commit()?;
+        Ok(op)
+    }
+
+    /// Close every pending reconsolidation plan whose labile window has
+    /// expired. Returns the closed plan ids. Called from the consolidation
+    /// cycle and before listing, so verdict surfaces never offer a stale
+    /// conflict.
+    pub fn expire_stale_reconsolidation_plans(&self) -> Result<Vec<String>> {
+        let stale = self.pending_expired_reconsolidation_plans()?;
+        let mut closed = Vec::with_capacity(stale.len());
+        for plan in stale {
+            self.expire_reconsolidation_plan(&plan)?;
+            closed.push(plan.id);
+        }
+        Ok(closed)
+    }
+
+    /// Load pending reconsolidation plans past their window.
+    fn pending_expired_reconsolidation_plans(&self) -> Result<Vec<crate::advanced::MergePlan>> {
+        let cutoff = Utc::now().to_rfc3339();
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT payload FROM merge_plans
+             WHERE kind = 'reconsolidation' AND status = 'pending' AND created_at < ?1",
+        )?;
+        let mut rows = stmt.query(params![cutoff])?;
+        let mut stale = Vec::new();
+        while let Some(row) = rows.next()? {
+            let payload: String = row.get(0)?;
+            if let Ok(plan) = serde_json::from_str::<crate::advanced::MergePlan>(&payload)
+                && let Some(meta) = &plan.reconsolidation
+                && meta.window_expires_at <= Utc::now()
+            {
+                stale.push(plan);
+            }
+        }
+        Ok(stale)
+    }
+
+    /// Pending reconsolidation plans with their verdict deadline, oldest
+    /// first. Runs the expiry sweep first, so a caller never sees a plan
+    /// whose window already closed.
+    pub fn list_reconsolidation_plans(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(crate::advanced::MergePlan, String)>> {
+        self.expire_stale_reconsolidation_plans()?;
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT payload, status FROM merge_plans
+             WHERE kind = 'reconsolidation' AND status = 'pending'
+             ORDER BY created_at ASC LIMIT ?1",
+        )?;
+        let mut rows = stmt.query(params![limit as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let payload: String = row.get(0)?;
+            let status: String = row.get(1)?;
+            if let Ok(plan) = serde_json::from_str::<crate::advanced::MergePlan>(&payload) {
+                out.push((plan, status));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Apply an explicit verdict to a reconsolidation plan.
+    ///
+    /// - `approve` → applies the plan (bitemporal invalidation of the labile
+    ///   target in favour of the incoming memory); reversible through
+    ///   `merge_undo`. `confirm` is implied: reaching the verdict IS the
+    ///   confirmation, and the plan's `Possible` classification would
+    ///   otherwise demand a redundant flag.
+    /// - `reject` → the plan is discarded (`rejected`); the target memory
+    ///   stays exactly as its `mark_labile` snapshot captured it.
+    /// - `quarantine` → the target memory is suppressed (top-down inhibition,
+    ///   `suppress_memory`) and the plan closes (`quarantined`).
+    ///
+    /// Expired plans are refused and auto-closed. Verdict on anything that is
+    /// not a pending reconsolidation plan is an error.
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    pub fn verdict_reconsolidation_plan(
+        &self,
+        plan_id: &str,
+        verdict: &str,
+        reason: Option<&str>,
+    ) -> Result<crate::advanced::MergeOperation> {
+        let plan = self
+            .get_plan(plan_id)?
+            .ok_or_else(|| StorageError::NotFound(format!("plan {plan_id}")))?;
+        if plan.kind != crate::advanced::PlanKind::Reconsolidation {
+            return Err(StorageError::Init(format!(
+                "plan {plan_id} is not a reconsolidation plan"
+            )));
+        }
+        match self.plan_status(plan_id)?.as_deref() {
+            Some("pending") => {}
+            other => {
+                return Err(StorageError::Init(format!(
+                    "plan {plan_id} is not pending (status: {})",
+                    other.unwrap_or("missing")
+                )));
+            }
+        }
+        if let Some(meta) = &plan.reconsolidation
+            && meta.window_expires_at <= Utc::now()
+        {
+            self.expire_reconsolidation_plan(&plan)?;
+            return Err(StorageError::Init(
+                "plan expired with its labile window and was auto-closed".to_string(),
+            ));
+        }
+        let note = reason.unwrap_or("no reason given");
+        match verdict {
+            "approve" => self.apply_plan(plan_id, true),
+            "reject" => {
+                let writer = self
+                    .writer
+                    .lock()
+                    .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+                let tx = Self::begin_write_transaction(&writer, "reject_reconsolidation_plan")?;
+                let op = self.record_reconsolidation_verdict_op(
+                    &tx,
+                    &plan,
+                    "rejected",
+                    &format!("Reconsolidation rejected; target memory unchanged ({note})"),
+                )?;
+                tx.commit()?;
+                Ok(op)
+            }
+            "quarantine" => {
+                let target = plan
+                    .reconsolidation
+                    .as_ref()
+                    .map(|meta| meta.target_memory_id.clone())
+                    .unwrap_or_else(|| plan.invalidated_ids[0].clone());
+                // Top-down suppression via the existing suppress path. This
+                // is a real inhibition (count, timestamp, before/after log),
+                // not a delete; the MCP layer closes the in-memory labile
+                // window alongside.
+                self.suppress_memory(&target)?;
+                let writer = self
+                    .writer
+                    .lock()
+                    .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+                let tx =
+                    Self::begin_write_transaction(&writer, "quarantine_reconsolidation_plan")?;
+                let op = self.record_reconsolidation_verdict_op(
+                    &tx,
+                    &plan,
+                    "quarantined",
+                    &format!("Reconsolidation quarantined; {target} suppressed ({note})"),
+                )?;
+                tx.commit()?;
+                Ok(op)
+            }
+            other => Err(StorageError::Init(format!(
+                "unknown verdict '{other}'; use approve | reject | quarantine"
+            ))),
+        }
     }
 
     /// Execute a previously-generated plan by id. Everything it does is recorded
@@ -647,6 +986,20 @@ impl SqliteMemoryStore {
         let plan = self
             .get_plan(plan_id)?
             .ok_or_else(|| StorageError::NotFound(format!("plan {plan_id}")))?;
+
+        // Reconsolidation plans are verdicts on a labile window: past the
+        // window they are auto-closed (recorded as `expired`) and refused —
+        // approving a stale conflict would rewrite a memory that already
+        // reconsolidated.
+        if plan.kind == PlanKind::Reconsolidation
+            && let Some(meta) = &plan.reconsolidation
+            && meta.window_expires_at <= Utc::now()
+        {
+            self.expire_reconsolidation_plan(&plan)?;
+            return Err(StorageError::Init(format!(
+                "plan {plan_id} expired with its labile window and was auto-closed"
+            )));
+        }
 
         match self.plan_status(plan_id)?.as_deref() {
             Some("applied") => {
@@ -824,6 +1177,24 @@ impl SqliteMemoryStore {
                         }]),
                     );
                 }
+                PlanKind::Reconsolidation => {
+                    // Same reversal shape as supersede: the approve verdict
+                    // bitemporally invalidates the labile target; the undo
+                    // payload restores its previous validity window. The
+                    // mark_labile snapshot travels in the plan payload for
+                    // reviewer diffing, while this payload is what makes the
+                    // apply reversible.
+                    let old_id = &plan.member_ids[0];
+                    let (vu, sb) = Self::read_bitemporal_in_transaction(&tx, old_id)?;
+                    undo.insert(
+                        "absorbed".into(),
+                        serde_json::json!([{
+                            "id": old_id,
+                            "prev_valid_until": vu,
+                            "prev_superseded_by": sb,
+                        }]),
+                    );
+                }
             }
 
             let affected: Vec<String> = {
@@ -894,6 +1265,12 @@ impl SqliteMemoryStore {
                     }
                 }
                 PlanKind::Supersede => {
+                    let old_id = &plan.member_ids[0];
+                    Self::invalidate_node_in_transaction(&tx, old_id, &plan.survivor_id, now)?;
+                }
+                PlanKind::Reconsolidation => {
+                    // Approve verdict: invalidate the labile target exactly as
+                    // a supersede would have — bitemporally, never deleted.
                     let old_id = &plan.member_ids[0];
                     Self::invalidate_node_in_transaction(&tx, old_id, &plan.survivor_id, now)?;
                 }
@@ -1020,7 +1397,7 @@ impl SqliteMemoryStore {
                     params![survivor_id],
                 )?;
                 regenerated = Some((survivor_id.to_string(), content.to_string()));
-            } else if kind != Some("supersede") {
+            } else if kind != Some("supersede") && kind != Some("reconsolidation") {
                 return Err(StorageError::Init("unsupported undo kind".into()));
             }
             let absorbed = undo

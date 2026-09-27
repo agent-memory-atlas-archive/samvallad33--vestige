@@ -1535,7 +1535,14 @@ description: Some("Investigate a recorded failure using earlier memories sharing
             // ================================================================
             // DEDUP / MERGE / SUPERSEDE — unified `dedup` tool (v2.2)
             // ================================================================
-            "dedup" => tools::dedup::execute_unified(&self.storage, request.arguments).await,
+            "dedup" => {
+                tools::dedup::execute_unified(
+                    &self.storage,
+                    Some(&self.cognitive),
+                    request.arguments,
+                )
+                .await
+            }
 
             // DEPRECATED (v2.2): folded into `dedup`. Kept as hidden back-compat
             // aliases (≥1 minor release) — they call the same underlying handlers
@@ -1863,6 +1870,20 @@ description: Some("Investigate a recorded failure using earlier memories sharing
                 // Expire labile reconsolidation windows
                 if let Ok(mut cog) = cognitive_clone.try_lock() {
                     let _expired = cog.reconsolidation.reconsolidate_expired();
+                }
+                // Auto-close reconsolidation merge plans whose labile window
+                // expired without a verdict — no zombie plans.
+                match storage_clone.expire_stale_reconsolidation_plans() {
+                    Ok(closed) if !closed.is_empty() => {
+                        tracing::info!(
+                            count = closed.len(),
+                            "auto-closed expired reconsolidation merge plans"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "reconsolidation plan expiry sweep failed");
+                    }
+                    Ok(_) => {}
                 }
 
                 match storage_clone.run_consolidation() {

@@ -49,14 +49,81 @@ use std::sync::{Arc, RwLock};
 // CONSTANTS
 // ============================================================================
 
-/// Default labile window duration (5 minutes)
-const DEFAULT_LABILE_WINDOW_SECS: i64 = 300;
+/// Default labile window duration (5 minutes).
+///
+/// Neuroscience rationale. Nader, Schafe and LeDoux (2000, Nature) showed that
+/// a retrieved memory re-enters a transient labile state and must be
+/// reconsolidated (protein-synthesis dependent in their rat fear-conditioning
+/// work) before it stabilizes again. Rodent windows are short; in humans the
+/// reconsolidation window is measured at roughly 10 minutes to 6 hours
+/// (Schwabe, Nader & Pruessner 2014; Hardt, Einarsson & Nader 2010 reviews).
+/// Vestige picks a conservative 5-minute default for an agent memory store —
+/// short enough that a conflict arriving after the window is treated as a new
+/// event instead of a rewrite, long enough to cover the immediate follow-up
+/// turns of a conversation where a correction typically lands.
+///
+/// Configurable: `ReconsolidationManager::new()` reads
+/// `VESTIGE_LABILE_WINDOW_SECS` (whole seconds), clamped to the literature-
+/// derived range below, so deployments that want a human-scale window can
+/// widen it without recompiling.
+pub const DEFAULT_LABILE_WINDOW_SECS: i64 = 300;
+
+/// Floor for the env-configured window (seconds). Below this the window is
+/// too short to act on before it closes.
+pub const MIN_LABILE_WINDOW_SECS: i64 = 10;
+
+/// Ceiling for the env-configured window (seconds = 6 hours), the upper end
+/// of the measured human reconsolidation window.
+pub const MAX_LABILE_WINDOW_SECS: i64 = 6 * 60 * 60;
+
+/// Read `VESTIGE_LABILE_WINDOW_SECS`, clamped to
+/// `[MIN_LABILE_WINDOW_SECS, MAX_LABILE_WINDOW_SECS]`. `None` when unset or
+/// unparseable — the default constant applies.
+pub fn labile_window_from_env() -> Option<Duration> {
+    labile_window_from_raw(std::env::var("VESTIGE_LABILE_WINDOW_SECS").ok().as_deref())
+}
+
+/// Pure parse for [`labile_window_from_env`], split out so the clamping
+/// rules are testable without process-global env mutation.
+pub fn labile_window_from_raw(raw: Option<&str>) -> Option<Duration> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed
+        .parse::<i64>()
+        .ok()
+        .map(|secs| Duration::seconds(secs.clamp(MIN_LABILE_WINDOW_SECS, MAX_LABILE_WINDOW_SECS)))
+}
 
 /// Maximum modifications per memory during labile window
 const MAX_MODIFICATIONS_PER_WINDOW: usize = 10;
 
 /// How long to keep retrieval history
 const RETRIEVAL_HISTORY_DAYS: i64 = 30;
+
+// ============================================================================
+// LABILE CANDIDATE — the cross-layer handoff for reconsolidation merge plans
+// ============================================================================
+
+/// A memory currently inside its labile window, handed from the retrieval
+/// side (which owns the [`ReconsolidationManager`]) to the write side
+/// (which decides supersede/conflict outcomes) so a conflict against labile
+/// state can be routed through a reviewable reconsolidation merge plan
+/// instead of mutating immediately.
+///
+/// `window_expires_at` travels with the candidate so the plan carries its own
+/// deadline: the plan's verdicts are only valid while the underlying window
+/// is live, and expired plans are auto-closed rather than left as zombies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabileCandidate {
+    /// The labile memory's id.
+    pub memory_id: String,
+    /// Snapshot captured when the memory was marked labile (mark_labile time).
+    pub snapshot: MemorySnapshot,
+    /// When the labile window closes (`accessed_at + labile_window`).
+    pub window_expires_at: DateTime<Utc>,
+}
 
 // ============================================================================
 // LABILE STATE
@@ -115,7 +182,7 @@ impl LabileState {
 }
 
 /// Snapshot of a memory's state before modification
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemorySnapshot {
     /// Memory content at time of access
     pub content: String,
@@ -422,11 +489,17 @@ impl Default for ReconsolidationManager {
 }
 
 impl ReconsolidationManager {
-    /// Create a new reconsolidation manager
+    /// Create a new reconsolidation manager.
+    ///
+    /// The labile window comes from `VESTIGE_LABILE_WINDOW_SECS` when set
+    /// (clamped to the literature-derived range; see
+    /// [`DEFAULT_LABILE_WINDOW_SECS`] for the rationale), else the 5-minute
+    /// default.
     pub fn new() -> Self {
         Self {
             labile_memories: HashMap::new(),
-            labile_window: Duration::seconds(DEFAULT_LABILE_WINDOW_SECS),
+            labile_window: labile_window_from_env()
+                .unwrap_or_else(|| Duration::seconds(DEFAULT_LABILE_WINDOW_SECS)),
             retrieval_history: Arc::new(RwLock::new(Vec::new())),
             stats: ReconsolidationStats::default(),
             enabled: true,
@@ -641,6 +714,39 @@ impl ReconsolidationManager {
             .filter(|(_, state)| state.is_within_window(self.labile_window))
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// Snapshot the full live-labile set as [`LabileCandidate`]s.
+    ///
+    /// This is what the write path consumes: the ingestion side has no access
+    /// to the manager, so the caller snapshots the live set per call and the
+    /// storage layer can route conflicts against these memories through
+    /// reconsolidation merge plans.
+    pub fn labile_candidates(&self) -> Vec<LabileCandidate> {
+        self.labile_memories
+            .iter()
+            .filter(|(_, state)| state.is_within_window(self.labile_window))
+            .map(|(id, state)| LabileCandidate {
+                memory_id: id.clone(),
+                snapshot: state.original_state.clone(),
+                window_expires_at: state.accessed_at + self.labile_window,
+            })
+            .collect()
+    }
+
+    /// The snapshot of a memory whose labile window is still live, if any.
+    pub fn labile_snapshot(&self, memory_id: &str) -> Option<MemorySnapshot> {
+        self.get_labile_state(memory_id)
+            .map(|state| state.original_state.clone())
+    }
+
+    /// Close the labile window for a memory without waiting for expiry.
+    ///
+    /// Used by the quarantine verdict: the memory is suppressed elsewhere and
+    /// its window must not stay open for further modification. Returns true
+    /// when a live window was actually closed.
+    pub fn close_window(&mut self, memory_id: &str) -> bool {
+        self.reconsolidate(memory_id).is_some()
     }
 
     /// Record a retrieval event
@@ -1048,5 +1154,69 @@ mod tests {
 
         let ids = manager.get_labile_memory_ids();
         assert_eq!(ids.len(), 3);
+    }
+
+    // ========================================================================
+    // RECONSOLIDATION LINKAGE — env-configured window + labile handoff
+    // ========================================================================
+
+    #[test]
+    fn labile_window_parse_clamps_to_the_literature_range() {
+        // Unset / blank / garbage fall back to the default.
+        assert!(labile_window_from_raw(None).is_none());
+        assert!(labile_window_from_raw(Some("")).is_none());
+        assert!(labile_window_from_raw(Some("   ")).is_none());
+        assert!(labile_window_from_raw(Some("abc")).is_none());
+
+        // A plain value passes through.
+        assert_eq!(
+            labile_window_from_raw(Some("600")),
+            Some(Duration::seconds(600))
+        );
+
+        // Below the 10s floor and above the 6h ceiling clamp into range.
+        assert_eq!(
+            labile_window_from_raw(Some("1")),
+            Some(Duration::seconds(MIN_LABILE_WINDOW_SECS))
+        );
+        assert_eq!(
+            labile_window_from_raw(Some("999999999")),
+            Some(Duration::seconds(MAX_LABILE_WINDOW_SECS))
+        );
+    }
+
+    #[test]
+    fn labile_candidates_carry_the_snapshot_and_the_deadline() {
+        let mut manager = ReconsolidationManager::with_window(60);
+        let snapshot = make_snapshot();
+        manager.mark_labile("mem-1", snapshot.clone());
+
+        let candidates = manager.labile_candidates();
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.memory_id, "mem-1");
+        assert_eq!(candidate.snapshot, snapshot);
+        // The deadline is capture time plus the configured window.
+        assert!(
+            candidate.window_expires_at > Utc::now(),
+            "a live window must expire in the future"
+        );
+        assert!((candidate.window_expires_at - Utc::now()) <= Duration::seconds(60));
+    }
+
+    #[test]
+    fn labile_snapshot_only_for_live_windows() {
+        let mut manager = ReconsolidationManager::new();
+        let snapshot = make_snapshot();
+        manager.mark_labile("mem-1", snapshot.clone());
+
+        assert_eq!(manager.labile_snapshot("mem-1"), Some(snapshot));
+        assert_eq!(manager.labile_snapshot("missing"), None);
+
+        // Closing the window removes the snapshot view and reports the close.
+        assert!(manager.close_window("mem-1"));
+        assert_eq!(manager.labile_snapshot("mem-1"), None);
+        // A second close finds nothing live.
+        assert!(!manager.close_window("mem-1"));
     }
 }

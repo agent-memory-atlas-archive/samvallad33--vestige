@@ -701,6 +701,7 @@ fn lean_response(value: &mut Value) {
         "mergePreview",
         "previousContent",
         "autoClosedUntil",
+        "reconsolidation",
     ] {
         if obj.get(key).is_some_and(Value::is_null) {
             obj.remove(key);
@@ -980,8 +981,14 @@ async fn execute_verbose(
 
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     {
+        // Reconsolidation handoff: snapshot the live labile set so a conflict
+        // or supersede against one of these memories is routed through a
+        // reconsolidation merge plan instead of mutating immediately.
+        let labile = current_labile_candidates(cognitive);
         let result = storage
-            .smart_ingest_in_scope_with_secret_policy(input, &scope, secret_policy)
+            .smart_ingest_in_scope_with_secret_policy_and_labile(
+                input, &scope, secret_policy, &labile,
+            )
             .map_err(|e| e.to_string())?;
         let node_id = result.node.id.clone();
         let node_content = result.node.content.clone();
@@ -1025,6 +1032,9 @@ async fn execute_verbose(
             "mergedFrom": result.merged_from,
             "mergePreview": merge_preview,
             "autoClosedUntil": result.auto_closed_until.map(|value| value.to_rfc3339()),
+            "reconsolidation": result.reconsolidation_plan_id.as_ref().map(|plan_id| {
+                reconsolidation_surface(plan_id, &result.decision)
+            }),
             "importanceScore": importance_composite,
             "synapticCapture": synaptic_capture,
             "reason": result.reason,
@@ -1037,6 +1047,7 @@ async fn execute_verbose(
                 "update" => "Updated existing memory - content was similar to an existing memory",
                 "reinforce" => "Reinforced existing memory - content was nearly identical",
                 "supersede" => "Superseded old memory - new content is an improvement/correction",
+                "reconsolidation_pending" => "Conflict with a memory inside its labile window - routed to a reconsolidation merge plan for review instead of overwriting",
                 "merge" => "Merged with related memories - content connects multiple topics",
                 "replace" => "Replaced existing memory content entirely",
                 "add_context" => "Added new content as context to existing memory",
@@ -1092,6 +1103,39 @@ async fn execute_verbose(
         attach_failure_hooks(&mut response, failure_hooks);
         Ok(response)
     }
+}
+
+/// Snapshot the live reconsolidation windows for the write-path handoff.
+///
+/// The retrieval side owns the `ReconsolidationManager`; the storage side
+/// never sees it, so the MCP layer carries the live set into each ingest call.
+/// If the cognitive engine lock is contended, an empty set is passed and the
+/// ingest behaves exactly as before — the handoff must never block a write.
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+fn current_labile_candidates(
+    cognitive: &Arc<Mutex<CognitiveEngine>>,
+) -> Vec<vestige_core::LabileCandidate> {
+    cognitive
+        .try_lock()
+        .map(|cog| cog.reconsolidation.labile_candidates())
+        .unwrap_or_default()
+}
+
+/// The reconsolidation verdict surface embedded in an ingest response: the
+/// plan id plus how to act on it through the existing `dedup` decision
+/// surface. Present only when a plan was created.
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+fn reconsolidation_surface(plan_id: &str, decision: &str) -> Value {
+    serde_json::json!({
+        "planId": plan_id,
+        "decision": decision,
+        "verdicts": {
+            "approve": "apply the plan (dedup action='verdict', verdict='approve', plan_id)",
+            "reject": "discard the plan; the target memory stays unchanged (verdict='reject')",
+            "quarantine": "suppress the target memory and close the plan (verdict='quarantine')"
+        },
+        "note": "The plan carries the memory snapshot taken when it was marked labile. Plans expire with the labile window if no verdict is given."
+    })
 }
 
 /// A kill switch read the way the other Vestige gates are: unset, empty or
@@ -1450,11 +1494,16 @@ async fn execute_batch(
 
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
         {
-            match storage.smart_ingest_excluding_in_scope_with_secret_policy(
+            // Reconsolidation handoff for the batch: one snapshot of the live
+            // labile set covers the whole batch (ingest does not open windows;
+            // only retrieval does).
+            let labile = current_labile_candidates(cognitive);
+            match storage.smart_ingest_excluding_in_scope_with_secret_policy_and_labile(
                 input,
                 &scope,
                 &batch_created_node_ids,
                 secret_policy,
+                &labile,
             ) {
                 Ok(result) => {
                     let node_id = result.node.id.clone();
@@ -1472,7 +1521,7 @@ async fn execute_batch(
                     };
 
                     match result.decision.as_str() {
-                        "create" | "supersede" | "merge" => {
+                        "create" | "supersede" | "merge" | "reconsolidation_pending" => {
                             created += 1;
                             batch_created_node_ids.push(node_id.clone());
                         }
@@ -1504,6 +1553,9 @@ async fn execute_batch(
                         "mergedFrom": result.merged_from,
                         "mergePreview": merge_preview,
                         "autoClosedUntil": result.auto_closed_until.map(|value| value.to_rfc3339()),
+                        "reconsolidation": result.reconsolidation_plan_id.as_ref().map(|plan_id| {
+                            reconsolidation_surface(plan_id, &result.decision)
+                        }),
                         "importanceScore": importance_composite,
                         "synapticCapture": synaptic_capture,
                         "reason": result.reason,

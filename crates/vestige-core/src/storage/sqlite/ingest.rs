@@ -23,6 +23,7 @@ impl SqliteMemoryStore {
             merged_from: None,
             merge_preview: None,
             auto_closed_until: None,
+            reconsolidation_plan_id: None,
         })
     }
 
@@ -402,6 +403,24 @@ impl SqliteMemoryStore {
         self.smart_ingest_excluding_in_scope_with_secret_policy(input, scope, &[], policy)
     }
 
+    /// Smart-ingest with a live-labile handoff: `labile` is the set of
+    /// memories currently inside their reconsolidation window, snapshotted by
+    /// the caller (the retrieval side owns the manager). A conflict or
+    /// supersede against one of these is routed through a reconsolidation
+    /// merge plan with explicit verdicts instead of mutating immediately.
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    pub fn smart_ingest_in_scope_with_secret_policy_and_labile(
+        &self,
+        input: IngestInput,
+        scope: &str,
+        policy: SecretPolicy,
+        labile: &[crate::advanced::reconsolidation::LabileCandidate],
+    ) -> Result<SmartIngestResult> {
+        self.smart_ingest_excluding_in_scope_with_secret_policy_and_labile(
+            input, scope, &[], policy, labile,
+        )
+    }
+
     /// Smart ingest with caller-provided candidate exclusions.
     ///
     /// Batch callers use this to keep two new items from the same caller-curated
@@ -449,6 +468,28 @@ impl SqliteMemoryStore {
         scope: &str,
         excluded_node_ids: &[String],
         policy: SecretPolicy,
+    ) -> Result<SmartIngestResult> {
+        self.smart_ingest_excluding_in_scope_with_secret_policy_and_labile(
+            input,
+            scope,
+            excluded_node_ids,
+            policy,
+            &[],
+        )
+    }
+
+    /// The labile-aware body of smart ingest. `labile` carries the live
+    /// reconsolidation windows (see
+    /// [`Self::smart_ingest_in_scope_with_secret_policy_and_labile`]); an
+    /// empty slice reproduces the classic behaviour exactly.
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    pub fn smart_ingest_excluding_in_scope_with_secret_policy_and_labile(
+        &self,
+        input: IngestInput,
+        scope: &str,
+        excluded_node_ids: &[String],
+        policy: SecretPolicy,
+        labile: &[crate::advanced::reconsolidation::LabileCandidate],
     ) -> Result<SmartIngestResult> {
         use crate::advanced::prediction_error::{
             CandidateMemory, GateDecision, PredictionErrorGate, UpdateType,
@@ -619,6 +660,54 @@ impl SqliteMemoryStore {
                         closes_at.to_rfc3339()
                     ));
                 }
+                // RECONSOLIDATION LINKAGE. A genuine contradiction against a
+                // memory that is currently inside its labile window is routed
+                // through a reviewable merge plan instead of being left as two
+                // silently duelling claims. The new memory is stored (nothing
+                // is dropped); the plan offers the resolution — approve
+                // supersedes the labile target, reject leaves both, quarantine
+                // suppresses the target. The plan carries the mark_labile
+                // snapshot so the reviewer sees the pre-conflict state.
+                // Nader/Schafe/LeDoux (2000): material arriving during the
+                // window does not have to erase the memory — it proposes an
+                // update to the reconsolidating trace.
+                let mut reconsolidation_plan_id: Option<String> = None;
+                for related in &related_memory_ids {
+                    let candidate = labile.iter().find(|c| {
+                        &c.memory_id == related && c.window_expires_at > Utc::now()
+                    });
+                    let Some(candidate) = candidate else {
+                        continue;
+                    };
+                    if !crate::advanced::appears_contradictory(
+                        &node.content,
+                        &candidate.snapshot.content,
+                        crate::advanced::SubjectIdentity::AlreadyEstablished,
+                    ) {
+                        continue;
+                    }
+                    match self.plan_reconsolidation(
+                        related,
+                        &node.id,
+                        candidate,
+                        "contradiction",
+                    ) {
+                        Ok(plan) => {
+                            reconsolidation_plan_id = Some(plan.id);
+                            reason.push_str(
+                                ". Target is labile: conflict routed to a reconsolidation merge plan for review",
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                related,
+                                "could not create the reconsolidation plan; both memories stay"
+                            );
+                        }
+                    }
+                    break;
+                }
                 Ok(SmartIngestResult {
                     decision: "create".to_string(),
                     node,
@@ -630,6 +719,7 @@ impl SqliteMemoryStore {
                     merged_from: None,
                     merge_preview: None,
                     auto_closed_until,
+                    reconsolidation_plan_id,
                 })
             }
             GateDecision::Update {
@@ -668,6 +758,7 @@ impl SqliteMemoryStore {
                             merged_from: None,
                             merge_preview: None,
                             auto_closed_until: None,
+                            reconsolidation_plan_id: None,
                         })
                     }
                     UpdateType::Merge | UpdateType::Append => {
@@ -713,6 +804,7 @@ impl SqliteMemoryStore {
                             merged_from: Some(target_id),
                             merge_preview: Some(merged_content),
                             auto_closed_until: None,
+                            reconsolidation_plan_id: None,
                         })
                     }
                     UpdateType::Replace => {
@@ -749,6 +841,7 @@ impl SqliteMemoryStore {
                             merged_from: Some(target_id),
                             merge_preview: Some(input.content),
                             auto_closed_until: None,
+                            reconsolidation_plan_id: None,
                         })
                     }
                     UpdateType::AddContext => {
@@ -788,6 +881,7 @@ impl SqliteMemoryStore {
                             merged_from: Some(target_id),
                             merge_preview: Some(merged_content),
                             auto_closed_until: None,
+                            reconsolidation_plan_id: None,
                         })
                     }
                 }
@@ -798,6 +892,44 @@ impl SqliteMemoryStore {
                 supersede_reason,
                 prediction_error,
             } => {
+                // RECONSOLIDATION LINKAGE. If the memory the gate wants to
+                // supersede is inside its labile window, the rewrite is
+                // DEFERRED behind an explicit verdict: the incoming memory is
+                // stored (nothing the caller said is dropped), but the old
+                // memory keeps its validity and strength until the
+                // reconsolidation plan is approved, rejected, or the target
+                // quarantined. Nader/Schafe/LeDoux (2000): a trace that is
+                // being reconsolidated is not overwritten by new material —
+                // the material competes for the trace and the outcome is
+                // decided after the window, not during it.
+                if let Some(candidate) = labile.iter().find(
+                    |c| c.memory_id == old_memory_id && c.window_expires_at > Utc::now(),
+                ) {
+                    let node = self.ingest_in_scope_with_secret_policy(input, scope, policy)?;
+                    let plan = self.plan_reconsolidation(
+                        &old_memory_id,
+                        &node.id,
+                        candidate,
+                        "supersede_deferred",
+                    )?;
+                    return Ok(SmartIngestResult {
+                        decision: "reconsolidation_pending".to_string(),
+                        node,
+                        superseded_id: Some(old_memory_id),
+                        similarity: Some(similarity),
+                        prediction_error: Some(prediction_error),
+                        reason: format!(
+                            "New memory supersedes old: {:?}. Old memory is labile: supersede deferred to reconsolidation plan {} for review",
+                            supersede_reason, plan.id
+                        ),
+                        previous_content: None,
+                        merged_from: None,
+                        merge_preview: None,
+                        auto_closed_until: None,
+                        reconsolidation_plan_id: Some(plan.id),
+                    });
+                }
+
                 // Close the old fact's world-time interval before demoting it.
                 // An explicitly dated replacement takes effect at its declared
                 // start; otherwise — including a prose-inferred "as of" date,
@@ -826,6 +958,7 @@ impl SqliteMemoryStore {
                     merged_from: None,
                     merge_preview: None,
                     auto_closed_until: None,
+                    reconsolidation_plan_id: None,
                 })
             }
             GateDecision::Merge {
@@ -851,6 +984,7 @@ impl SqliteMemoryStore {
                     merged_from: None,
                     merge_preview: None,
                     auto_closed_until: None,
+                    reconsolidation_plan_id: None,
                 })
             }
         }
