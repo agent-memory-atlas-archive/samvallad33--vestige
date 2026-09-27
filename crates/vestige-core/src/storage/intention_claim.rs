@@ -84,6 +84,7 @@ mod tests {
             snoozed_until: None,
             source_type: "user".into(),
             source_data: None,
+            scope: None,
         }
     }
 

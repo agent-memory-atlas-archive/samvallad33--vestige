@@ -1081,6 +1081,22 @@ pub struct IntentionRecord {
     pub snoozed_until: Option<DateTime<Utc>>,
     pub source_type: String,
     pub source_data: Option<String>,
+    /// Project namespace. `None` (legacy rows) resolves to the `user`
+    /// namespace; see `effective_scope`. Prospective surfacing in recall only
+    /// ever reads intentions whose effective scope equals the query scope.
+    pub scope: Option<String>,
+}
+
+impl IntentionRecord {
+    /// Normalized namespace for this intention: blank/None -> "user",
+    /// matching the `COALESCE(NULLIF(trim(scope), ''), 'user')` convention
+    /// used by the scoped knowledge-node queries.
+    pub fn effective_scope(&self) -> &str {
+        match self.scope.as_deref() {
+            Some(scope) if !scope.trim().is_empty() => scope.trim(),
+            _ => "user",
+        }
+    }
 }
 
 /// Insight data for persistence (matches the insights table schema)

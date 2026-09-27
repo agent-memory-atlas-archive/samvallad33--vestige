@@ -822,8 +822,8 @@ impl SqliteMemoryStore {
             "INSERT OR REPLACE INTO intentions (
                 id, content, trigger_type, trigger_data, priority, status,
                 created_at, deadline, fulfilled_at, reminder_count, last_reminded_at,
-                notes, tags, related_memories, snoozed_until, source_type, source_data
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                notes, tags, related_memories, snoozed_until, source_type, source_data, scope
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 intention.id,
                 intention.content,
@@ -842,6 +842,7 @@ impl SqliteMemoryStore {
                 intention.snoozed_until.map(|dt| dt.to_rfc3339()),
                 intention.source_type,
                 intention.source_data,
+                intention.scope,
             ],
         )?;
         Ok(())
@@ -871,6 +872,30 @@ impl SqliteMemoryStore {
         )?;
 
         let rows = stmt.query_map([], Self::row_to_intention)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Get active intentions in exactly one namespace. Legacy rows with a
+    /// NULL/blank scope resolve to `user` (V27 convention), so a scoped query
+    /// never sees another project's intentions and the `user` namespace keeps
+    /// seeing every pre-scope intention.
+    pub fn get_active_intentions_in_scope(&self, scope: &str) -> Result<Vec<IntentionRecord>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT * FROM intentions
+             WHERE status = 'active'
+               AND COALESCE(NULLIF(trim(scope), ''), 'user') = ?1
+             ORDER BY priority DESC, created_at ASC",
+        )?;
+
+        let rows = stmt.query_map(params![scope.trim()], Self::row_to_intention)?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row?);
@@ -992,6 +1017,7 @@ impl SqliteMemoryStore {
             snoozed_until: parse_opt_dt(row.get("snoozed_until").ok().flatten()),
             source_type: row.get("source_type").unwrap_or_else(|_| "api".to_string()),
             source_data: row.get("source_data").ok().flatten(),
+            scope: row.get("scope").ok().flatten(),
         })
     }
 

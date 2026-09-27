@@ -16,7 +16,7 @@ pub fn schema() -> Value {
         .expect("action enum")
         .push(json!("graph"));
     schema["properties"]["scope"] = json!({"type":"string","default":"user","maxLength":128,
-        "description":"[graph] Local intention namespace, not an authorization boundary."});
+        "description":"[set] Project namespace for the intention; recall resurfacing never crosses scopes. [graph] Local intention namespace, not an authorization boundary."});
     schema["properties"]["at"] = json!({"type":"string","format":"date-time",
         "description":"[graph] Explicit evaluation clock for reproducible fixtures; defaults to now."});
     schema["properties"]["command"] = vestige_core::intention_graph::schema();

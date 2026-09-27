@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 use crate::cognitive::CognitiveEngine;
 use vestige_core::{
     CompetitionCandidate, DEFAULT_MEMORY_SCOPE, EncodingContext, MemoryLifecycle, MemorySnapshot,
-    MemoryState, OutputConfig, Storage, TopicalContext,
+    MemoryState, OutputConfig, Storage, TopicalContext, UserAction,
 };
 
 /// Input schema for unified search tool
@@ -892,6 +892,7 @@ pub async fn execute(
         if let Some(warming) = super::warming::embedding_warming(storage) {
             response["warming"] = warming;
         }
+        attach_prospective(storage, &mut response, &args, &scope_filter);
         let response = super::lookup_packet::finish(
             response,
             args.token_budget,
@@ -1547,6 +1548,13 @@ pub async fn execute(
         // 7A. Record query for predictive memory
         let _ = cog.predictive_memory.record_query(&args.query, &[]);
 
+        // 7A-2. Feed the intent detector. A search is real behavioral signal;
+        // without this the detector's action history stays empty forever and
+        // every detect_intent() confidence gate downstream (smart_ingest,
+        // intention set) is dead code that never fires.
+        cog.intent_detector
+            .record_action(UserAction::search(&args.query));
+
         // 7B. Record each accessed memory for predictive/speculative models
         for result in &filtered_results {
             let _ = cog.predictive_memory.record_memory_access(
@@ -1726,6 +1734,7 @@ pub async fn execute(
     if let Some(warming) = super::warming::embedding_warming(storage) {
         response["warming"] = warming;
     }
+    attach_prospective(storage, &mut response, &args, &scope_filter);
     let response = super::lookup_packet::finish(
         response,
         args.token_budget,
@@ -1735,6 +1744,35 @@ pub async fn execute(
     );
     record_shown(storage, &response);
     Ok(response)
+}
+
+/// Prospective memory resurfacing: after the main results are composed,
+/// evaluate armed intentions whose trigger conditions match THIS query's
+/// cues and attach the top high-confidence matches as a distinct
+/// `prospective` section. Verdicts come from the same matcher `intention
+/// check` uses; delivery claims and cooldowns come from the same CAS, so a
+/// resurfaced intention cannot re-fire on every recall. Scope isolation is
+/// absolute: only the query's own namespace is read, `includeCrossScope`
+/// never lifts this.
+///
+/// Best-effort by design — an intentions storage error degrades to "no
+/// prospective section", never to a failed recall.
+fn attach_prospective(
+    storage: &Arc<Storage>,
+    response: &mut Value,
+    args: &SearchArgs,
+    scope_filter: &ScopeFilter,
+) {
+    let cue = super::intention_unified::ProspectiveCue {
+        query: args.query.clone(),
+        topics: args.context_topics.clone().unwrap_or_default(),
+        now: Utc::now(),
+    };
+    if let Some(prospective) =
+        super::intention_unified::surface_prospective(storage, &cue, &scope_filter.scope)
+    {
+        response["prospective"] = prospective;
+    }
 }
 
 fn record_shown(storage: &Storage, response: &Value) {
@@ -4011,6 +4049,153 @@ mod tag_case_tests {
         assert!(
             !tags_match_prefix(&stored, "unrelated"),
             "a genuine miss must still miss"
+        );
+    }
+}
+
+#[cfg(test)]
+mod prospective_resurfacing_tests {
+    use super::*;
+    use crate::cognitive::CognitiveEngine;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::Mutex;
+
+    async fn test_storage() -> (Arc<Storage>, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
+        (Arc::new(storage), dir)
+    }
+
+    fn test_cognitive() -> Arc<Mutex<CognitiveEngine>> {
+        Arc::new(Mutex::new(CognitiveEngine::new()))
+    }
+
+    async fn set_event_intention(storage: &Arc<Storage>, condition: &str) -> String {
+        let result = super::super::intention_unified::execute(
+            storage,
+            &test_cognitive(),
+            Some(serde_json::json!({
+                "action": "set",
+                "description": format!("Act on: {condition}"),
+                "trigger": { "type": "event", "condition": condition }
+            })),
+        )
+        .await
+        .unwrap();
+        result["intentionId"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn recall_resurfaces_a_fired_intention_exactly_once() {
+        let (storage, _dir) = test_storage().await;
+        let cognitive = test_cognitive();
+        let oc = OutputConfig::default();
+        let id = set_event_intention(&storage, "payments migration finished").await;
+
+        let response = execute(
+            &storage,
+            &cognitive,
+            &oc,
+            Some(serde_json::json!({ "query": "the payments migration finished today" })),
+        )
+        .await
+        .unwrap();
+        let items = response["prospective"]["intentions"]
+            .as_array()
+            .expect("matching cue must attach a prospective section");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], serde_json::json!(id));
+        assert_eq!(items[0]["cueType"], "event");
+        assert!(items[0]["why"].as_str().unwrap().contains("payments migration finished"));
+
+        // The section is additive: results/total stay the primary payload.
+        assert!(response["results"].is_array());
+        assert!(response["query"].is_string());
+
+        // Cooldown: the same recall immediately again must not resurface.
+        let repeat = execute(
+            &storage,
+            &cognitive,
+            &oc,
+            Some(serde_json::json!({ "query": "the payments migration finished today" })),
+        )
+        .await
+        .unwrap();
+        assert!(
+            repeat.get("prospective").is_none(),
+            "cooldown must suppress immediate resurfacing: {repeat:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_without_a_matching_cue_has_no_prospective_key() {
+        let (storage, _dir) = test_storage().await;
+        let oc = OutputConfig::default();
+        set_event_intention(&storage, "payments migration finished").await;
+
+        let response = execute(
+            &storage,
+            &test_cognitive(),
+            &oc,
+            Some(serde_json::json!({ "query": "best coffee grinders reviewed" })),
+        )
+        .await
+        .unwrap();
+        assert!(
+            response.get("prospective").is_none(),
+            "no-match recall must not grow a prospective key: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_scope_recall_cannot_leak_intentions() {
+        let (storage, _dir) = test_storage().await;
+        let oc = OutputConfig::default();
+        // Scoped intention.
+        super::super::intention_unified::execute(
+            &storage,
+            &test_cognitive(),
+            Some(serde_json::json!({
+                "action": "set",
+                "description": "Act on: payments migration finished",
+                "trigger": { "type": "event", "condition": "payments migration finished" },
+                "scope": "alpha"
+            })),
+        )
+        .await
+        .unwrap();
+
+        // Even includeCrossScope=true never lifts the intention scope wall.
+        let response = execute(
+            &storage,
+            &test_cognitive(),
+            &oc,
+            Some(serde_json::json!({
+                "query": "payments migration finished",
+                "scope": "beta",
+                "includeCrossScope": true
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(
+            response.get("prospective").is_none(),
+            "intentions must not leak across scopes: {response:?}"
+        );
+
+        // The owning scope surfaces it.
+        let own = execute(
+            &storage,
+            &test_cognitive(),
+            &oc,
+            Some(serde_json::json!({ "query": "payments migration finished", "scope": "alpha" })),
+        )
+        .await
+        .unwrap();
+        assert!(
+            own.get("prospective").is_some(),
+            "owning scope must resurface its intention"
         );
     }
 }

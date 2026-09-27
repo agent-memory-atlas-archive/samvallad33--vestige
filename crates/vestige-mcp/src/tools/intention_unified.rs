@@ -202,6 +202,11 @@ pub fn schema() -> Value {
                 "maximum": MAX_LIST_LIMIT,
                 "default": 20,
                 "description": "[list] Maximum number to return"
+            },
+            "scope": {
+                "type": "string",
+                "maxLength": 200,
+                "description": "[set] Project namespace for the intention (default 'user'). Prospective resurfacing in recall never crosses scopes."
             }
         },
         "required": ["action"]
@@ -271,6 +276,11 @@ struct UnifiedIntentionArgs {
     #[serde(alias = "filterStatus")]
     filter_status: Option<String>,
     limit: Option<i32>,
+    /// Project namespace. Applied by `set`; a blank value stores as the `user`
+    /// namespace. Prospective surfacing in recall only reads intentions whose
+    /// effective scope equals the query scope, so this is the isolation wall.
+    #[serde(alias = "scope")]
+    scope: Option<String>,
 }
 
 fn parse_rfc3339(value: &str, field: &str) -> Result<DateTime<Utc>, String> {
@@ -802,6 +812,15 @@ fn timestamp(value: &str, field: &str) -> Result<DateTime<Utc>, String> {
 }
 
 fn validate_inputs(args: &UnifiedIntentionArgs) -> Result<(), String> {
+    if let Some(scope) = args.scope.as_deref() {
+        let trimmed = scope.trim();
+        if trimmed.is_empty() || trimmed.len() > 200 || trimmed.chars().any(char::is_control) {
+            return Err(
+                "Invalid scope: expected a non-empty identifier of at most 200 visible characters"
+                    .to_string(),
+            );
+        }
+    }
     if args.limit.is_some_and(|limit| !(1..=200).contains(&limit)) {
         return Err("limit must be between 1 and 200".into());
     }
@@ -995,6 +1014,15 @@ async fn execute_set(
         .map(|value| parse_rfc3339(value, "deadline"))
         .transpose()?;
 
+    // Store the declared namespace verbatim (trimmed); blank -> NULL, which
+    // `effective_scope` resolves to `user` exactly like the scoped node reads.
+    let scope = args
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(str::to_string);
+
     let record = IntentionRecord {
         id: id.clone(),
         content: description.clone(),
@@ -1013,6 +1041,7 @@ async fn execute_set(
         snoozed_until: None,
         source_type: if nlp_parsed { "nlp" } else { "mcp" }.to_string(),
         source_data: None,
+        scope,
     };
 
     storage.save_intention(&record).map_err(|e| e.to_string())?;
@@ -1029,6 +1058,7 @@ async fn execute_set(
         "nextOccurrence": next_occurrence.map(|dt| dt.to_rfc3339()),
         "deadline": deadline.map(|dt| dt.to_rfc3339()),
         "nlpParsed": nlp_parsed,
+        "scope": record.effective_scope(),
     }))
 }
 
@@ -1427,6 +1457,394 @@ async fn execute_list(
         "intentions": items,
         "total": items.len(),
         "status": filter_status,
+    }))
+}
+
+// ============================================================================
+// PROSPECTIVE RESURFACING (shared by recall and session_start)
+// ============================================================================
+//
+// The `check` action is a polled surface: an agent that never calls it never
+// sees a fired intention. These helpers let retrieval paths (search_unified,
+// session_context) evaluate the SAME stored trigger semantics — the verdict
+// always comes from `IntentionTrigger::is_triggered_at`, never from a
+// reimplementation — and attach high-confidence matches to a response as a
+// distinct `prospective` section. Surfacing is a delivery: it claims the
+// occurrence through the same compare-and-swap and one-shot limits the check
+// action uses, so a reminder resurfaced in recall cannot spam on every query.
+
+/// Parse an intention's stored trigger into the canonical prospective form.
+/// `Ok(None)` for manual intentions (no trigger semantics — never resurface
+/// those: they would match every query and bury the real cues).
+pub(crate) fn stored_prospective_trigger(
+    intention: &IntentionRecord,
+) -> Result<Option<ProspectiveTrigger>, String> {
+    if intention.trigger_type == "manual" && intention.trigger_data.trim() == "{}" {
+        return Ok(None);
+    }
+    let mut spec: TriggerSpec = serde_json::from_str(&intention.trigger_data)
+        .map_err(|error| format!("Stored trigger JSON is invalid: {error}"))?;
+    let mut nodes = 0;
+    spec.normalize(intention.created_at, 1, &mut nodes)?;
+    spec.to_prospective(intention.created_at)
+        .map(Some)
+        .map_err(|error| format!("Stored trigger is not evaluable: {error}"))
+}
+
+/// The retrieval-side cues an intention can fire on: the query text (treated
+/// both as an observed event for event/activity triggers and as an active
+/// topic for context triggers), any explicit context topics, and the clock.
+pub(crate) struct ProspectiveCue {
+    pub query: String,
+    pub topics: Vec<String>,
+    pub now: DateTime<Utc>,
+}
+
+impl ProspectiveCue {
+    /// All strings a `TopicActive`/`InCodebase`/`FilePattern` containment
+    /// check may match against.
+    fn context_sources(&self) -> Vec<String> {
+        let mut sources = self.topics.clone();
+        sources.push(self.query.clone());
+        sources
+    }
+
+    fn context(&self, scope: &str) -> ProspectiveContext {
+        let mut context = ProspectiveContext::new();
+        context.timestamp = self.now;
+        // Scope names are project names in this system; an InCodebase
+        // trigger may legitimately fire on the namespace being queried.
+        context.project_name = Some(scope.to_string());
+        context.active_topics = self.context_sources();
+        context
+    }
+
+    fn events(&self) -> Vec<String> {
+        vec![self.query.clone()]
+    }
+}
+
+/// Minimum needle length for a text cue to count as evidence. A 2-3 character
+/// condition ("go", "run") is contained in half of all queries and would
+/// surface intentions on every recall — the opposite of high-confidence.
+const MIN_CUE_NEEDLE_CHARS: usize = 4;
+/// Text-cue confidence: 0.7 base + specificity up to 12 characters. The
+/// 0.75 high-confidence bar then requires needles of >= 4 characters.
+fn text_cue_confidence(needle: &str) -> Option<f64> {
+    let chars = needle.trim().chars().count();
+    if chars < MIN_CUE_NEEDLE_CHARS {
+        return None;
+    }
+    Some(0.7 + 0.3 * (chars as f64 / 12.0).min(1.0))
+}
+
+/// Best-effort citation: WHICH trigger condition fired and on WHAT cue text.
+/// The surface VERDICT is never taken from here — it comes from
+/// `is_triggered_at` — this only explains a verdict that already happened.
+/// Returns (cue_type, explanation, confidence).
+fn trigger_cue_evidence(
+    trigger: &ProspectiveTrigger,
+    cue: &ProspectiveCue,
+    scope: &str,
+) -> Option<(&'static str, String, f64)> {
+    match trigger {
+        ProspectiveTrigger::TimeBased { at } => {
+            if cue.now < *at {
+                return None;
+            }
+            Some((
+                "time",
+                format!("scheduled time reached ({})", at.format("%Y-%m-%d %H:%M UTC")),
+                1.0,
+            ))
+        }
+        ProspectiveTrigger::DurationBased { trigger_at, .. } => {
+            let at = trigger_at.filter(|at| cue.now >= *at)?;
+            Some((
+                "time",
+                format!("delay elapsed ({})", at.format("%Y-%m-%d %H:%M UTC")),
+                1.0,
+            ))
+        }
+        ProspectiveTrigger::EventBased { pattern, condition } => {
+            if !pattern.matches(&cue.query) {
+                return None;
+            }
+            let confidence = text_cue_confidence(condition)?;
+            Some(("event", format!("query matches event condition '{condition}'"), confidence))
+        }
+        ProspectiveTrigger::ActivityBased {
+            activity,
+            completion_pattern,
+        } => {
+            if !completion_pattern.matches(&cue.query) {
+                return None;
+            }
+            let confidence = text_cue_confidence(activity)?;
+            Some((
+                "activity",
+                format!("query indicates activity '{activity}' was completed"),
+                confidence,
+            ))
+        }
+        ProspectiveTrigger::ContextBased { context_match } => {
+            context_cue_evidence(context_match, cue, scope)
+        }
+        ProspectiveTrigger::Recurring {
+            base,
+            next_occurrence,
+            ..
+        } => {
+            let due = next_occurrence.map(|at| cue.now >= at).unwrap_or(false);
+            if !due {
+                return None;
+            }
+            let (_, inner, confidence) = trigger_cue_evidence(base, cue, scope)?;
+            Some(("recurring", format!("recurring schedule due; {inner}"), confidence))
+        }
+        ProspectiveTrigger::Compound { all_of, any_of } => {
+            let mut cues: Vec<(&'static str, String, f64)> = Vec::new();
+            for branch in all_of.iter().chain(any_of.iter()) {
+                if let Some(evidence) = trigger_cue_evidence(branch, cue, scope) {
+                    cues.push(evidence);
+                }
+            }
+            if cues.is_empty() {
+                return None;
+            }
+            let confidence = cues.iter().map(|(_, _, c)| *c).fold(f64::INFINITY, f64::min);
+            let explanation = cues
+                .into_iter()
+                .map(|(_, text, _)| text)
+                .collect::<Vec<_>>()
+                .join("; ");
+            Some(("compound", explanation, confidence))
+        }
+    }
+}
+
+fn context_cue_evidence(
+    pattern: &ContextPattern,
+    cue: &ProspectiveCue,
+    scope: &str,
+) -> Option<(&'static str, String, f64)> {
+    let project = cue.context(scope).project_name;
+    match pattern {
+        ContextPattern::InCodebase(name) => {
+            let matched = project
+                .as_ref()
+                .map(|project| project.to_lowercase().contains(&name.to_lowercase()))
+                .unwrap_or(false);
+            if !matched {
+                return None;
+            }
+            let confidence = text_cue_confidence(name)?;
+            Some(("context", format!("query scope matches codebase '{name}'"), confidence))
+        }
+        ContextPattern::FilePattern(file_pattern) => {
+            let matched = cue
+                .context_sources()
+                .iter()
+                .any(|source| source.to_lowercase().contains(&file_pattern.to_lowercase()));
+            if !matched {
+                return None;
+            }
+            let confidence = text_cue_confidence(file_pattern)?;
+            Some(("context", format!("query matches file pattern '{file_pattern}'"), confidence))
+        }
+        ContextPattern::TopicActive(topic) => {
+            let matched = cue
+                .context_sources()
+                .iter()
+                .any(|source| source.to_lowercase().contains(&topic.to_lowercase()));
+            if !matched {
+                return None;
+            }
+            let confidence = text_cue_confidence(topic)?;
+            Some(("context", format!("query mentions topic '{topic}'"), confidence))
+        }
+        // Recall cues carry no user mode; the verdict matcher can never fire
+        // this arm against a ProspectiveCue, so it never cites one either.
+        ContextPattern::UserMode(_) => None,
+        ContextPattern::Composite { all, any } => {
+            for branch in all.iter().chain(any.iter()) {
+                if let Some(evidence) = context_cue_evidence(branch, cue, scope) {
+                    return Some(evidence);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Recall-channel input transformation. In `intention check`, an event
+/// condition is matched EXACTLY against canonical event keys supplied by the
+/// caller ("build_finished"). A recall query is prose, not an event key —
+/// the whole query never equals "payments migration finished" — so on this
+/// channel an event condition fires when the query CONTAINS it. The verdict
+/// still comes from the canonical `is_triggered_at` matcher; only the stored
+/// pattern is widened (Exact -> Contains, one condition, same specificity
+/// confidence bar). Activity triggers already match with containment, and
+/// time/context/recurring/compound semantics are untouched.
+fn recall_channel_trigger(trigger: &ProspectiveTrigger) -> ProspectiveTrigger {
+    match trigger {
+        ProspectiveTrigger::EventBased { condition, .. } => ProspectiveTrigger::EventBased {
+            pattern: TriggerPattern::contains(condition.trim()),
+            condition: condition.clone(),
+        },
+        ProspectiveTrigger::Recurring {
+            base,
+            recurrence,
+            next_occurrence,
+        } => ProspectiveTrigger::Recurring {
+            base: Box::new(recall_channel_trigger(base)),
+            recurrence: recurrence.clone(),
+            next_occurrence: *next_occurrence,
+        },
+        ProspectiveTrigger::Compound { all_of, any_of } => ProspectiveTrigger::Compound {
+            all_of: all_of.iter().map(recall_channel_trigger).collect(),
+            any_of: any_of.iter().map(recall_channel_trigger).collect(),
+        },
+        other => other.clone(),
+    }
+}
+
+/// Evaluate the active intentions of exactly one scope against the recall
+/// cues and return the `prospective` response section, or `None` when nothing
+/// fired at high confidence.
+///
+/// Contract:
+/// - Scope isolation: reads `get_active_intentions_in_scope(scope)` only —
+///   even a cross-scope recall never resurfaces another scope's intentions.
+/// - Verdict authority: `IntentionTrigger::is_triggered_at` (the same matcher
+///   `intention action=check` uses) over the `recall_channel_trigger` view;
+///   the citation walk never flips a verdict.
+/// - High confidence only: text cues need a needle of >= 4 chars and score
+///   < 1.0 until specific; time/recurring cues score 1.0 when due.
+/// - Cooldown: surfacing claims the reminder through
+///   `commit_intention_check` — same MAX_ONE_SHOT_REMINDERS cap and
+///   MIN_ONE_SHOT_REMINDER_INTERVAL_MINUTES spacing as check, and recurring
+///   triggers re-arm instead of repeating. A lost CAS (concurrent check)
+///   drops the hit rather than double-delivering.
+pub(crate) fn surface_prospective(
+    storage: &Storage,
+    cue: &ProspectiveCue,
+    scope: &str,
+) -> Option<Value> {
+    const HIGH_CONFIDENCE: f64 = 0.75;
+    const MAX_SURFACED: usize = 3;
+
+    let intentions = storage.get_active_intentions_in_scope(scope).ok()?;
+    let context = cue.context(scope);
+    let events = cue.events();
+
+    let mut hits: Vec<(IntentionRecord, IntentionRecord, &'static str, String, f64)> = Vec::new();
+    for intention in intentions {
+        let Ok(Some(stored)) = stored_prospective_trigger(&intention) else {
+            continue;
+        };
+        let trigger = recall_channel_trigger(&stored);
+        if !trigger.is_triggered_at(&context, &events, cue.now) {
+            continue;
+        }
+        let Some((cue_type, explanation, confidence)) = trigger_cue_evidence(&trigger, cue, scope)
+        else {
+            continue;
+        };
+        if confidence < HIGH_CONFIDENCE {
+            continue;
+        }
+
+        // Deliverability: identical shape to execute_check — recurring
+        // triggers advance past the one-shot caps, everything else obeys
+        // them so an intention cannot resurface on every recall. The
+        // advanced trigger persisted back to storage is always derived from
+        // the UNTRANSFORMED stored trigger, so the recall channel can never
+        // silently rewrite an exact event pattern into a contains pattern.
+        let mut advanced = Some(trigger.clone());
+        let scheduled_recurrence = advanced
+            .as_mut()
+            .map(|value| value.re_arm_triggered(&context, &events, cue.now))
+            .unwrap_or(false);
+        let mut persisted_advanced = Some(stored.clone());
+        let _ = persisted_advanced
+            .as_mut()
+            .map(|value| value.re_arm_triggered(&context, &events, cue.now));
+        let within_one_shot_limits = intention.reminder_count < MAX_ONE_SHOT_REMINDERS
+            && intention
+                .last_reminded_at
+                .map(|last| cue.now - last >= Duration::minutes(MIN_ONE_SHOT_REMINDER_INTERVAL_MINUTES))
+                .unwrap_or(true);
+        if !(scheduled_recurrence || within_one_shot_limits) {
+            continue;
+        }
+
+        let mut claimed = intention.clone();
+        claimed.reminder_count = claimed.reminder_count.saturating_add(1);
+        claimed.last_reminded_at = Some(cue.now);
+        if scheduled_recurrence && let Some(value) = &persisted_advanced {
+            let spec = TriggerSpec::from_prospective(value);
+            claimed.trigger_type = spec
+                .trigger_type
+                .clone()
+                .unwrap_or_else(|| claimed.trigger_type.clone());
+            claimed.trigger_data = serde_json::to_string(&spec).ok()?;
+        }
+
+        // CAS claim: a concurrent check that delivered first makes this
+        // surface a no-op — that is the fire-once guarantee, not a failure.
+        if storage
+            .commit_intention_check(&[(intention.clone(), claimed.clone())])
+            .is_err()
+        {
+            tracing::debug!(
+                intention_id = %intention.id,
+                "prospective surfacing lost the claim race; skipping"
+            );
+            continue;
+        }
+        hits.push((intention, claimed, cue_type, explanation, confidence));
+    }
+
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort_by(|a, b| {
+        b.0.priority
+            .cmp(&a.0.priority)
+            .then(b.4.total_cmp(&a.4))
+            .then(a.0.created_at.cmp(&b.0.created_at))
+    });
+    hits.truncate(MAX_SURFACED);
+
+    let items: Vec<Value> = hits
+        .into_iter()
+        .map(|(original, claimed, cue_type, explanation, confidence)| {
+            let is_overdue = original
+                .deadline
+                .map(|deadline| deadline < cue.now)
+                .unwrap_or(false);
+            serde_json::json!({
+                "id": original.id,
+                "what": original.content,
+                "priority": match original.priority {
+                    1 => "low",
+                    3 => "high",
+                    4 => "critical",
+                    _ => "normal",
+                },
+                "cueType": cue_type,
+                "why": explanation,
+                "confidence": (confidence * 100.0).round() / 100.0,
+                "deadline": claimed.deadline.map(|dt| dt.to_rfc3339()),
+                "isOverdue": is_overdue,
+            })
+        })
+        .collect();
+
+    Some(serde_json::json!({
+        "intentions": items,
+        "notice": "Prospective memory: these intentions fired because this query matched their trigger cues. Handle them now, or complete/snooze them via intention(action=\"update\") to stop resurfacing.",
     }))
 }
 
@@ -2634,6 +3052,7 @@ mod tests {
                 snoozed_until: None,
                 source_type: "legacy".to_string(),
                 source_data: None,
+                scope: None,
             })
             .unwrap();
 
@@ -2769,5 +3188,163 @@ mod tests {
         )
         .await;
         assert!(too_many_topics.is_err());
+    }
+
+    // ========================================================================
+    // PROSPECTIVE RESURFACING TESTS
+    // ========================================================================
+
+    fn cue(query: &str) -> ProspectiveCue {
+        ProspectiveCue {
+            query: query.to_string(),
+            topics: Vec::new(),
+            now: Utc::now(),
+        }
+    }
+
+    async fn set_event_intention(storage: &Arc<Storage>, condition: &str, scope: Option<&str>) -> String {
+        let mut args = serde_json::json!({
+            "action": "set",
+            "description": format!("Act on: {condition}"),
+            "trigger": { "type": "event", "condition": condition }
+        });
+        if let Some(scope) = scope {
+            args["scope"] = serde_json::json!(scope);
+        }
+        let result = execute(storage, &test_cognitive(), Some(args))
+            .await
+            .unwrap();
+        result["intentionId"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_matching_cue_surfaces_and_claims_the_occurrence() {
+        let (storage, _dir) = test_storage().await;
+        let id = set_event_intention(&storage, "payments migration finished", None).await;
+
+        let section = surface_prospective(
+            &storage,
+            &cue("the payments migration finished this afternoon"),
+            "user",
+        )
+        .expect("matching query must surface the intention");
+        let items = section["intentions"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], serde_json::json!(id));
+        assert_eq!(items[0]["cueType"], "event");
+        assert!(
+            items[0]["why"].as_str().unwrap().contains("payments migration finished"),
+            "the citation must name the matched cue: {:?}",
+            items[0]["why"]
+        );
+        assert_eq!(items[0]["priority"], "normal");
+
+        // Surfacing is a delivery: the claim must be visible in storage.
+        let record = storage.get_intention(&id).unwrap().unwrap();
+        assert_eq!(record.reminder_count, 1);
+        assert!(record.last_reminded_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_query_surfaces_nothing() {
+        let (storage, _dir) = test_storage().await;
+        set_event_intention(&storage, "payments migration finished", None).await;
+
+        let section = surface_prospective(&storage, &cue("favorite hiking trails near oslo"), "user");
+        assert!(section.is_none(), "no-match must produce no section: {section:?}");
+    }
+
+    #[tokio::test]
+    async fn cooldown_suppresses_immediate_resurfacing() {
+        let (storage, _dir) = test_storage().await;
+        set_event_intention(&storage, "payments migration finished", None).await;
+
+        let first = surface_prospective(&storage, &cue("payments migration finished"), "user");
+        assert!(first.is_some());
+        let second = surface_prospective(&storage, &cue("payments migration finished"), "user");
+        assert!(
+            second.is_none(),
+            "the one-shot reminder interval must cool the intention down: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn intentions_never_leak_across_scopes() {
+        let (storage, _dir) = test_storage().await;
+        set_event_intention(&storage, "payments migration finished", Some("alpha")).await;
+
+        // Same query, wrong namespace: nothing.
+        let leaked = surface_prospective(&storage, &cue("payments migration finished"), "user");
+        assert!(leaked.is_none(), "cross-scope leak: {leaked:?}");
+        // Own namespace: surfaces.
+        let own = surface_prospective(&storage, &cue("payments migration finished"), "alpha");
+        assert!(own.is_some(), "own scope must surface: {own:?}");
+    }
+
+    #[tokio::test]
+    async fn surfacing_caps_at_three_intentions() {
+        let (storage, _dir) = test_storage().await;
+        for condition in [
+            "alpha review finished",
+            "beta review finished",
+            "gamma review finished",
+            "delta review finished",
+            "epsilon review finished",
+        ] {
+            set_event_intention(&storage, condition, None).await;
+        }
+        let section = surface_prospective(
+            &storage,
+            &cue("alpha review finished, beta review finished, gamma review finished, \
+                  delta review finished, epsilon review finished"),
+            "user",
+        )
+        .expect("matches exist");
+        let items = section["intentions"].as_array().unwrap();
+        assert_eq!(items.len(), 3, "never crowd out the actual results: {items:?}");
+    }
+
+    #[tokio::test]
+    async fn manual_and_too_generic_triggers_never_surface() {
+        let (storage, _dir) = test_storage().await;
+        // Manual intentions have no trigger semantics; resurfacing them on
+        // every query would bury real cues.
+        let manual = execute(
+            &storage,
+            &test_cognitive(),
+            Some(serde_json::json!({
+                "action": "set",
+                "description": "plain manual intention",
+                "scope": "user"
+            })),
+        )
+        .await
+        .unwrap();
+        let _ = manual;
+        // A 2-character needle matches half of all queries: not a cue.
+        set_event_intention(&storage, "go", None).await;
+
+        let section = surface_prospective(&storage, &cue("let's go over the plan"), "user");
+        assert!(
+            section.is_none(),
+            "manual + generic needles must not surface: {section:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_set_round_trips_the_namespace() {
+        let (storage, _dir) = test_storage().await;
+        let args = serde_json::json!({
+            "action": "set",
+            "description": "namespaced intention",
+            "scope": "  alpha  "
+        });
+        let result = execute(&storage, &test_cognitive(), Some(args)).await.unwrap();
+        assert_eq!(result["scope"], "alpha");
+        let id = result["intentionId"].as_str().unwrap().to_string();
+        let record = storage.get_intention(&id).unwrap().unwrap();
+        assert_eq!(record.effective_scope(), "alpha");
+        // And it is invisible to a user-scope surfacing scan.
+        assert!(surface_prospective(&storage, &cue("namespaced intention"), "user").is_none());
     }
 }

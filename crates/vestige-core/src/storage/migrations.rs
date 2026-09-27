@@ -184,6 +184,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "Versioned intention graphs and atomic deterministic command journal",
         up: MIGRATION_V36_UP,
     },
+    Migration {
+        version: 37,
+        description: "Intention scopes: project-namespaced intentions so prospective surfacing in recall never leaks across scopes",
+        up: MIGRATION_V37_UP,
+    },
 ];
 
 /// A database migration
@@ -2498,6 +2503,16 @@ CREATE TABLE IF NOT EXISTS intention_graph_journal (
     PRIMARY KEY(scope, seq)
 );
 UPDATE schema_version SET version = 36, applied_at = datetime('now');
+"#;
+
+/// V37: intentions become scope-aware. Legacy rows have NULL scope and resolve
+/// to the `user` namespace at read time (`COALESCE(NULLIF(trim(scope),''),'user')`),
+/// matching the knowledge_nodes convention from V27/V29, so every existing
+/// intention keeps surfacing exactly where it did before this column existed.
+const MIGRATION_V37_UP: &str = r#"
+ALTER TABLE intentions ADD COLUMN scope TEXT;
+CREATE INDEX IF NOT EXISTS idx_intentions_scope ON intentions(scope);
+UPDATE schema_version SET version = 37, applied_at = datetime('now');
 "#;
 
 #[cfg(test)]
