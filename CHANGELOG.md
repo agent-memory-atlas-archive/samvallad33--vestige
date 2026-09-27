@@ -105,6 +105,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a stalled connection previously blocked the tool call indefinitely.
   GitHub live-id enumeration gained the same hard page cap the Redmine
   connector already had.
+### Changed — dependency graph refreshed to the current registry state
+
+- Semver-compatible refresh across the lockfile (98 packages moved), plus
+  major bumps where the migration is proven: `sha2` 0.10 → 0.11 (digest
+  0.11 dropped `LowerHex` on the digest output, so hex encoding is now
+  explicit), `ed25519-dalek` 2 → 3, `argon2` 0.5 → 0.6, `chacha20poly1305`
+  0.10 → 0.11 (aead 0.6 replaces `generate_nonce(&mut OsRng)` with the
+  `Generate` trait on the nonce type; salt bytes now come from `getrandom`
+  0.4, which is also a new direct dependency — `rand_core` 0.10 dropped
+  `OsRng`), `git2` 0.20 → 0.21 (`Signature::name`/`shorthand` now return
+  `Result`), `criterion` 0.5 → 0.8 (benchmarks use `std::hint::black_box`
+  after criterion deprecated its own), `lru` 0.16 → 0.18, `base64` 0.22 →
+  0.23, `tower-http` 0.6 → 0.7, and `candle`/`tokenizers` unified onto the
+  single 0.11/0.23.2 copies fastembed 7.1 already used (one less duplicate
+  compile). Held intentionally: `fastembed` 7.1 + `ort` 2.0.0-rc.13 (the
+  pairing is load-bearing), `usearch` 2.26.2 (current), and the wasm family
+  (`wasm-bindgen` 0.2.128 exact-pinned by `js-sys`, unreachable from any
+  shipped target). The release profile was already at
+  `lto + codegen-units=1 + panic=abort + strip + opt-level=z`; nothing to
+  add there.
 
 ### Added — deterministic query rewriting before retrieval fusion
 
