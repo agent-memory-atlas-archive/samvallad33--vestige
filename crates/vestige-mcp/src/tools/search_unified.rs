@@ -718,6 +718,150 @@ fn partition_superseded(
 ///   7. Side effects: predictive memory recording + reconsolidation labile marking
 ///
 /// Retrieval is audit-only; callers explicitly promote memories that proved useful.
+/// Concrete (ID/tag/literal) lookup fast path, extracted verbatim from
+/// `execute` so the main hybrid pipeline stays readable. Runs a dedicated
+/// keyword/SQL pass, applies scope/source/validity post-filters, formats
+/// the response, and applies the shared output budget/packet finishing.
+#[allow(clippy::too_many_arguments)]
+async fn execute_concrete_lookup(
+    storage: &Arc<Storage>,
+    args: &SearchArgs,
+    output_config: &OutputConfig,
+    detail_level: &str,
+    retrieval_mode: &str,
+    limit: i32,
+    min_retention: f64,
+    source_filter: &SourceFilter,
+    scope_filter: &ScopeFilter,
+    valid_at: Option<chrono::DateTime<chrono::Utc>>,
+    packet_boundary: &Value,
+) -> Result<Value, String> {
+// When a tag_prefix OR a source filter is requested, fetch a larger
+// pool so the post-filter has enough headroom to still return ~limit
+// results after thinning. Cap at the same upper bound the underlying
+// SQL path uses elsewhere (100).
+let concrete_fetch_limit = if args.tag_prefix.is_some()
+    || source_filter.is_active()
+    || scope_filter.is_restrictive()
+{
+    (limit * 3).min(100)
+} else {
+    limit
+};
+let concrete_kept = storage
+    .concrete_search_filtered(
+        &args.query,
+        concrete_fetch_limit,
+        args.include_types.as_deref(),
+        args.exclude_types.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+
+// Apply post-filters before formatting the response. Retrieval
+// telemetry is recorded later, after the final budget selection.
+let concrete_verdict = abstention_decision(&concrete_kept, DEFAULT_ABSTAIN_FLOOR);
+let scoped = filter_results_to_scope(storage, concrete_kept, scope_filter)?;
+let (mut results, superseded_withheld) =
+    partition_superseded(scoped, valid_at, args.include_superseded.unwrap_or(false));
+results.sort_by(|a, b| {
+    b.combined_score
+        .partial_cmp(&a.combined_score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+});
+let filtered_results: Vec<&vestige_core::SearchResult> = results
+    .iter()
+    .filter(|r| match args.tag_prefix.as_deref() {
+        Some(prefix) => tags_match_prefix(&r.node.tags, prefix),
+        None => true,
+    })
+    .filter(|r| node_matches_source(&r.node, source_filter))
+    .filter(|r| valid_at.is_none_or(|at| r.node.is_valid_at(at)))
+    .take(limit as usize)
+    .collect();
+
+let mut formatted: Vec<Value> = filtered_results
+    .iter()
+    .filter(|r| r.node.retention_strength >= min_retention)
+    .map(|r| format_search_result(r, detail_level))
+    .collect();
+apply_output_masks(&mut formatted, output_config);
+
+let mut budget_expandable: Vec<String> = Vec::new();
+let mut budget_tokens_used: Option<usize> = None;
+if let Some(budget) = args.token_budget {
+    let budget = budget.clamp(100, 100000) as usize;
+    let budget_chars = budget * 4;
+    let mut used = 0;
+    let mut budgeted = Vec::new();
+
+    for result in &formatted {
+        let size = serde_json::to_string(result).unwrap_or_default().len();
+        if used + size > budget_chars {
+            if let Some(id) = result.get("id").and_then(|v| v.as_str()) {
+                budget_expandable.push(id.to_string());
+            }
+            continue;
+        }
+        used += size;
+        budgeted.push(result.clone());
+    }
+
+    budget_tokens_used = Some(used / 4);
+    formatted = budgeted;
+}
+
+    // Audit only memories that are actually present in the response, not
+    // candidates removed by retention or token-budget filtering.
+
+    // #224: concrete lookups carry confidence too, but never abstain —
+    // an exact-match path answering weakly is not the failure mode
+    // metamemory guards against.
+    let verdict = concrete_verdict;
+    let mut response = serde_json::json!({
+        "query": args.query.clone(),
+        "method": "concrete",
+        "retrievalMode": retrieval_mode,
+        "concrete": true,
+        "detailLevel": detail_level,
+        "profile": output_config.profile.as_str(),
+        "scope": scope_filter.scope,
+        "includeCrossScope": scope_filter.include_cross_scope,
+        "validAt": valid_at.map(|at| at.to_rfc3339()),
+        "total": formatted.len(),
+        "results": formatted,
+        "confidence": verdict.confidence,
+    });
+    if superseded_withheld > 0 {
+        response["supersededWithheld"] = serde_json::json!(superseded_withheld);
+    }
+
+    if formatted.is_empty() {
+        response["hint"] = serde_json::json!(
+            "No concrete matches found. Try concrete=false or a broader natural-language query."
+        );
+    }
+    if !budget_expandable.is_empty() {
+        response["expandable"] = serde_json::json!(budget_expandable);
+    }
+    if let Some(tokens) = budget_tokens_used {
+        response["tokenBudgetUsed"] = serde_json::json!(tokens);
+        response["tokenBudgetLimit"] = serde_json::json!(args.token_budget.unwrap());
+    }
+
+    if let Some(warming) = super::warming::embedding_warming(storage) {
+        response["warming"] = warming;
+    }
+    let response = super::lookup_packet::finish(
+        response,
+        args.token_budget,
+        args.context_packet == Some(true),
+        args.known_packet_id.as_deref(),
+        packet_boundary,
+    );
+    record_shown(storage, &response);
+    Ok(response)
+    }
+
 pub async fn execute(
     storage: &Arc<Storage>,
     cognitive: &Arc<Mutex<CognitiveEngine>>,
@@ -799,136 +943,20 @@ pub async fn execute(
         .concrete
         .unwrap_or_else(|| is_literal_query(&args.query));
     if concrete {
-        // When a tag_prefix OR a source filter is requested, fetch a larger
-        // pool so the post-filter has enough headroom to still return ~limit
-        // results after thinning. Cap at the same upper bound the underlying
-        // SQL path uses elsewhere (100).
-        let concrete_fetch_limit = if args.tag_prefix.is_some()
-            || source_filter.is_active()
-            || scope_filter.is_restrictive()
-        {
-            (limit * 3).min(100)
-        } else {
-            limit
-        };
-        let concrete_kept = storage
-            .concrete_search_filtered(
-                &args.query,
-                concrete_fetch_limit,
-                args.include_types.as_deref(),
-                args.exclude_types.as_deref(),
-            )
-            .map_err(|e| e.to_string())?;
-
-        // Apply post-filters before formatting the response. Retrieval
-        // telemetry is recorded later, after the final budget selection.
-        let concrete_verdict = abstention_decision(&concrete_kept, DEFAULT_ABSTAIN_FLOOR);
-        let scoped = filter_results_to_scope(storage, concrete_kept, &scope_filter)?;
-        let noncurrent_ok = partition_keeps_noncurrent(
-            args.include_superseded.unwrap_or(false),
-            source_filter.status == SourceStatus::Tombstoned,
-        );
-        let (mut results, superseded_withheld) =
-            partition_superseded(scoped, valid_at, noncurrent_ok);
-        results.sort_by(|a, b| {
-            b.combined_score
-                .partial_cmp(&a.combined_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let filtered_results: Vec<&vestige_core::SearchResult> = results
-            .iter()
-            .filter(|r| match args.tag_prefix.as_deref() {
-                Some(prefix) => tags_match_prefix(&r.node.tags, prefix),
-                None => true,
-            })
-            .filter(|r| node_matches_source(&r.node, &source_filter))
-            .filter(|r| valid_at.is_none_or(|at| r.node.is_valid_at(at)))
-            .take(limit as usize)
-            .collect();
-
-        let mut formatted: Vec<Value> = filtered_results
-            .iter()
-            .filter(|r| r.node.retention_strength >= min_retention)
-            .map(|r| format_search_result(r, detail_level))
-            .collect();
-        attach_code_evidence(&mut formatted, storage);
-        apply_output_masks(&mut formatted, output_config);
-
-        let mut budget_expandable: Vec<String> = Vec::new();
-        let mut budget_tokens_used: Option<usize> = None;
-        if let Some(budget) = args.token_budget {
-            let budget = budget.clamp(100, 100000) as usize;
-            let budget_chars = budget * 4;
-            let mut used = 0;
-            let mut budgeted = Vec::new();
-
-            for result in &formatted {
-                let size = serde_json::to_string(result).unwrap_or_default().len();
-                if used + size > budget_chars {
-                    if let Some(id) = result.get("id").and_then(|v| v.as_str()) {
-                        budget_expandable.push(id.to_string());
-                    }
-                    continue;
-                }
-                used += size;
-                budgeted.push(result.clone());
-            }
-
-            budget_tokens_used = Some(used / 4);
-            formatted = budgeted;
-        }
-
-        // Audit only memories that are actually present in the response, not
-        // candidates removed by retention or token-budget filtering.
-
-        // #224: concrete lookups carry confidence too, but never abstain —
-        // an exact-match path answering weakly is not the failure mode
-        // metamemory guards against.
-        let verdict = concrete_verdict;
-        let mut response = serde_json::json!({
-            "query": args.query,
-            "method": "concrete",
-            "retrievalMode": retrieval_mode,
-            "concrete": true,
-            "detailLevel": detail_level,
-            "profile": output_config.profile.as_str(),
-            "scope": scope_filter.scope,
-            "includeCrossScope": scope_filter.include_cross_scope,
-            "validAt": valid_at.map(|at| at.to_rfc3339()),
-            "total": formatted.len(),
-            "results": formatted,
-            "confidence": verdict.confidence,
-        });
-        if superseded_withheld > 0 {
-            response["supersededWithheld"] = serde_json::json!(superseded_withheld);
-        }
-
-        if formatted.is_empty() {
-            response["hint"] = serde_json::json!(
-                "No concrete matches found. Try concrete=false or a broader natural-language query."
-            );
-        }
-        if !budget_expandable.is_empty() {
-            response["expandable"] = serde_json::json!(budget_expandable);
-        }
-        if let Some(tokens) = budget_tokens_used {
-            response["tokenBudgetUsed"] = serde_json::json!(tokens);
-            response["tokenBudgetLimit"] = serde_json::json!(args.token_budget.unwrap());
-        }
-
-        if let Some(warming) = super::warming::embedding_warming(storage) {
-            response["warming"] = warming;
-        }
-        attach_prospective(storage, &mut response, &args, &scope_filter);
-        let response = super::lookup_packet::finish(
-            response,
-            args.token_budget,
-            args.context_packet == Some(true),
-            args.known_packet_id.as_deref(),
+        return execute_concrete_lookup(
+            storage,
+            &args,
+            output_config,
+            detail_level,
+            retrieval_mode,
+            limit,
+            min_retention,
+            &source_filter,
+            &scope_filter,
+            valid_at,
             &packet_boundary,
-        );
-        record_shown(storage, &response);
-        return Ok(response);
+        )
+        .await;
     }
 
     // Favor semantic search — research shows 0.3/0.7 outperforms equal weights

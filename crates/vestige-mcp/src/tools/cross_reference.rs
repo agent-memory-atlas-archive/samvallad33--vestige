@@ -885,6 +885,82 @@ pub(crate) fn validity_adjusted_score(combined_score: f32, currently_valid: bool
 // Main Execute — 8-Stage Pipeline
 // ============================================================================
 
+/// STAGE 1 of the deep-reference pipeline, extracted verbatim from
+/// `execute`: over-fetched hybrid retrieval, reason-filter thinning, and
+/// (vector-search builds) reranking.
+#[allow(clippy::too_many_arguments)]
+fn retrieve_and_rank_candidates(
+    storage: &Arc<Storage>,
+    cognitive: &Arc<Mutex<CognitiveEngine>>,
+    args: &DeepRefArgs,
+    depth: usize,
+    scope_filter: &ScopeFilter,
+    source_filter: &SourceFilter,
+    valid_at: Option<chrono::DateTime<chrono::Utc>>,
+    superseded_ids: &std::collections::HashSet<String>,
+) -> Result<Vec<vestige_core::SearchResult>, String> {
+// ====================================================================
+// STAGE 1: Broad Retrieval + Reranking
+// ====================================================================
+// Scope and source fields are post-filters because the core hybrid index is
+// not namespace-aware yet. Over-fetch within the storage ceiling so a busy
+// unrelated scope cannot trivially starve the requested namespace.
+let filters_can_thin = !scope_filter.include_cross_scope
+    || source_filter.is_active()
+    || args.tag_prefix.is_some()
+    || valid_at.is_some()
+    || args.min_retention.is_some()
+    || args.min_similarity.is_some();
+let fetch_limit = if filters_can_thin {
+    (depth.saturating_mul(4)).min(100)
+} else {
+    depth
+} as i32;
+let results = storage
+    .hybrid_search_filtered(
+        &args.query,
+        fetch_limit,
+        0.3,
+        0.7,
+        args.include_types.as_deref(),
+        args.exclude_types.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+
+let mut results =
+    results
+        .into_iter()
+        .try_fold(Vec::new(), |mut kept, result| -> Result<_, String> {
+            if node_matches_reason_filters(
+                storage,
+                &result.node,
+                result.semantic_score,
+                args,
+                scope_filter,
+                source_filter,
+                valid_at,
+                superseded_ids,
+            )? {
+                kept.push(result);
+            }
+            Ok(kept)
+        })?;
+results.truncate(depth);
+
+let mut ranked = results;
+#[cfg(feature = "vector-search")]
+if let Ok(mut cog) = cognitive.try_lock() {
+    let candidates: Vec<_> = ranked
+        .iter()
+        .map(|r| (r.clone(), r.node.content.clone()))
+        .collect();
+    if let Ok(reranked) = cog.reranker.rerank(&args.query, candidates, Some(depth)) {
+        ranked = reranked.into_iter().map(|rr| rr.item).collect();
+    }
+}
+        Ok(ranked)
+    }
+
 pub async fn execute(
     storage: &Arc<Storage>,
     cognitive: &Arc<Mutex<CognitiveEngine>>,
@@ -911,55 +987,20 @@ pub async fn execute(
     // ====================================================================
     let intent = classify_intent(&args.query);
 
-    // ====================================================================
-    // STAGE 1: Broad Retrieval + Reranking
-    // ====================================================================
-    // Scope and source fields are post-filters because the core hybrid index is
-    // not namespace-aware yet. Over-fetch within the storage ceiling so a busy
-    // unrelated scope cannot trivially starve the requested namespace.
-    let filters_can_thin = !scope_filter.include_cross_scope
-        || source_filter.is_active()
-        || args.tag_prefix.is_some()
-        || valid_at.is_some()
-        || args.min_retention.is_some()
-        || args.min_similarity.is_some();
-    let fetch_limit = if filters_can_thin {
-        (depth.saturating_mul(4)).min(100)
-    } else {
-        depth
-    } as i32;
-    let results = storage
-        .hybrid_search_filtered(
-            &args.query,
-            fetch_limit,
-            0.3,
-            0.7,
-            args.include_types.as_deref(),
-            args.exclude_types.as_deref(),
-        )
-        .map_err(|e| e.to_string())?;
+    let mut ranked = retrieve_and_rank_candidates(
+        storage,
+        cognitive,
+        &args,
+        depth,
+        &scope_filter,
+        &source_filter,
+        valid_at,
+        &superseded_ids,
+    )?;
 
-    let mut results =
-        results
-            .into_iter()
-            .try_fold(Vec::new(), |mut kept, result| -> Result<_, String> {
-                if node_matches_reason_filters(
-                    storage,
-                    &result.node,
-                    result.semantic_score,
-                    &args,
-                    &scope_filter,
-                    &source_filter,
-                    valid_at,
-                    &superseded_ids,
-                )? {
-                    kept.push(result);
-                }
-                Ok(kept)
-            })?;
-    results.truncate(depth);
-
-    if results.is_empty() {
+    // Reranking on an empty pool is a no-op, so checking emptiness after the
+    // helper is behavior-identical to the original inline ordering.
+    if ranked.is_empty() {
         let response = serde_json::json!({
             "query": args.query,
             "status": "no_memories",
@@ -975,17 +1016,6 @@ pub async fn execute(
         return Ok(enforce_reason_token_budget(response, args.token_budget));
     }
 
-    let mut ranked = results;
-    #[cfg(feature = "vector-search")]
-    if let Ok(mut cog) = cognitive.try_lock() {
-        let candidates: Vec<_> = ranked
-            .iter()
-            .map(|r| (r.clone(), r.node.content.clone()))
-            .collect();
-        if let Ok(reranked) = cog.reranker.rerank(&args.query, candidates, Some(depth)) {
-            ranked = reranked.into_iter().map(|rr| rr.item).collect();
-        }
-    }
 
     // ====================================================================
     // STAGE 2: Spreading Activation Expansion
