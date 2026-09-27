@@ -34,11 +34,11 @@ dynsyms=$(objdump -T "$BIN" 2>/dev/null || true)
 glibc_versions=$(printf '%s\n' "$dynsyms" \
   | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' \
   | sed 's/^GLIBC_//' \
-  | sort -uV)
+  | sort -uV || true)
 glibcxx_versions=$(printf '%s\n' "$dynsyms" \
   | grep -oE 'GLIBCXX_[0-9]+\.[0-9]+(\.[0-9]+)?' \
   | sed 's/^GLIBCXX_//' \
-  | sort -uV)
+  | sort -uV || true)
 
 failed=0
 

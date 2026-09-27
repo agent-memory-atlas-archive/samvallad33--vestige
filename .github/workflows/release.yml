@@ -310,18 +310,18 @@ jobs:
           }
           NODE
 
-      - name: Locate GCC-13 static libstdc++
-        run: echo "GXX13_LIBDIR=$(dirname "$(g++-13 -print-file-name=libstdc++.a)")" >> "$GITHUB_ENV"
-
       - name: Build
         env:
           CXX: g++-13
-          # ort-sys emits its libstdc++ link from ORT_CXX_STDLIB; 'static=stdc++'
-          # makes it a static-kind link so the shipped ELF embeds GCC-13's archive
-          # and records no libstdc++.so.6 NEEDED (floor: Debian 12 / Ubuntu 22.04).
-          # The -L must point at g++-13's archive: GCC-12's lacks _M_replace_cold.
+          # ort-sys emits its libstdc++ link from ORT_CXX_STDLIB/CXXSTDLIB;
+          # 'static=stdc++' makes it a static-kind link resolved from GCC-13's
+          # archive (-L native), so the shipped ELF records no libstdc++.so.6
+          # NEEDED and the dynamic GLIBCXX set is empty (floor: Debian 12 /
+          # Ubuntu 22.04). Verified in the docker build lab: objdump GLIBCXX
+          # refs = none, ceiling check passes, smoke passes on aarch64.
           ORT_CXX_STDLIB: static=stdc++
-          RUSTFLAGS: -C link-arg=-L${{ env.GXX13_LIBDIR }}
+          CXXSTDLIB: static=stdc++
+          RUSTFLAGS: -C link-arg=-static-libstdc++ -L native=/usr/lib/gcc/x86_64-linux-gnu/13
         run: cargo build --locked --package vestige-mcp --release --target x86_64-unknown-linux-gnu
 
       - name: Package
@@ -512,18 +512,18 @@ jobs:
           }
           NODE
 
-      - name: Locate GCC-13 static libstdc++
-        run: echo "GXX13_LIBDIR=$(dirname "$(g++-13 -print-file-name=libstdc++.a)")" >> "$GITHUB_ENV"
-
       - name: Build
         env:
           CXX: g++-13
-          # ort-sys emits its libstdc++ link from ORT_CXX_STDLIB; 'static=stdc++'
-          # makes it a static-kind link so the shipped ELF embeds GCC-13's archive
-          # and records no libstdc++.so.6 NEEDED (floor: Debian 12 / Ubuntu 22.04).
-          # The -L must point at g++-13's archive: GCC-12's lacks _M_replace_cold.
+          # ort-sys emits its libstdc++ link from ORT_CXX_STDLIB/CXXSTDLIB;
+          # 'static=stdc++' makes it a static-kind link resolved from GCC-13's
+          # archive (-L native), so the shipped ELF records no libstdc++.so.6
+          # NEEDED and the dynamic GLIBCXX set is empty (floor: Debian 12 /
+          # Ubuntu 22.04). Verified in the docker build lab: objdump GLIBCXX
+          # refs = none, ceiling check passes, smoke passes on aarch64.
           ORT_CXX_STDLIB: static=stdc++
-          RUSTFLAGS: -C link-arg=-L${{ env.GXX13_LIBDIR }}
+          CXXSTDLIB: static=stdc++
+          RUSTFLAGS: -C link-arg=-static-libstdc++ -L native=/usr/lib/gcc/aarch64-linux-gnu/13
         run: cargo build --locked --package vestige-mcp --release --target aarch64-unknown-linux-gnu
 
       - name: Package
