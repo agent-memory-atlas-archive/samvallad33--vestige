@@ -11,9 +11,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use crate::cognitive::CognitiveEngine;
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use tokio::sync::Mutex;
 
 use vestige_core::Storage;
@@ -443,7 +441,6 @@ fn obj(args: &Option<Value>) -> serde_json::Map<String, Value> {
         .unwrap_or_default()
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 fn execute_verdict(
     storage: &Arc<Storage>,
     cognitive: Option<&Arc<Mutex<CognitiveEngine>>>,
