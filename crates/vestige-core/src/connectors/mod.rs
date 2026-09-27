@@ -520,9 +520,11 @@ mod driver_tests {
     /// Scripted connector: each `fetch_updated` call consumes the next script
     /// entry (panics if exhausted — tests must script every call they expect).
     /// Every call's `(since, cursor)` arguments are recorded for assertions.
+    type CallLog = Mutex<Vec<(Option<DateTime<Utc>>, Option<String>)>>;
+
     struct MockConnector {
         script: Mutex<Vec<ConnectorResult<FetchPage>>>,
-        calls: Mutex<Vec<(Option<DateTime<Utc>>, Option<String>)>>,
+        calls: CallLog,
         call_count: AtomicUsize,
         live_ids: Option<Vec<String>>,
     }
@@ -784,16 +786,17 @@ mod driver_tests {
         assert_eq!(report.tombstoned, 1);
         assert!(report.reconciled);
 
-        let reader = store.reader.lock().unwrap();
-        let still_valid: i64 = reader
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_nodes WHERE source_system='mock' \
-                 AND valid_until IS NULL",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        drop(reader);
+        let still_valid: i64 = {
+            let reader = store.reader.lock().unwrap();
+            reader
+                .query_row(
+                    "SELECT COUNT(*) FROM knowledge_nodes WHERE source_system='mock' \
+                     AND valid_until IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
         assert_eq!(still_valid, 2, "1 and 3 stay valid; only 2 tombstoned");
 
         // Issue 2 reappears upstream → the next upsert un-tombstones it.
@@ -801,16 +804,17 @@ mod driver_tests {
             .with_live_ids(vec!["1".into(), "2".into(), "3".into()]);
         let report3 = run_sync(&store, &conn3, false, 10).await.unwrap();
         assert_eq!(report3.unchanged, 1, "same hash → Unchanged path");
-        let reader = store.reader.lock().unwrap();
-        let now_valid: i64 = reader
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_nodes WHERE source_system='mock' \
-                 AND valid_until IS NULL",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        drop(reader);
+        let now_valid: i64 = {
+            let reader = store.reader.lock().unwrap();
+            reader
+                .query_row(
+                    "SELECT COUNT(*) FROM knowledge_nodes WHERE source_system='mock' \
+                     AND valid_until IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
         assert_eq!(now_valid, 3, "reappearing record is un-tombstoned");
     }
 

@@ -737,8 +737,10 @@ mod http_tests {
         stop: Arc<AtomicBool>,
     }
 
+    type MockHandler = Arc<dyn Fn(&str, &str) -> Response + Send + Sync>;
+
     impl MockApi {
-        fn spawn(handler: Arc<dyn Fn(&str, &str) -> Response + Send + Sync>) -> Self {
+        fn spawn(handler: MockHandler) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let base_url = format!("http://127.0.0.1:{port}");
@@ -1055,29 +1057,29 @@ mod http_tests {
 
         // Every ingested memory is a good citizen: keyed envelope, citation
         // URL, event node type, structured tags.
-        let reader = store.reader.lock().unwrap();
-        let mut stmt = reader
-            .prepare(
-                "SELECT node_type, source_system, source_id, source_url, tags, content_hash \
-                 FROM knowledge_nodes WHERE source_system = 'github'",
-            )
-            .unwrap();
-        let rows: Vec<(String, String, String, String, String, String)> = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
+        let rows: Vec<(String, String, String, String, String, String)> = {
+            let reader = store.reader.lock().unwrap();
+            let mut stmt = reader
+                .prepare(
+                    "SELECT node_type, source_system, source_id, source_url, tags, content_hash \
+                     FROM knowledge_nodes WHERE source_system = 'github'",
+                )
+                .unwrap();
+            stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
             })
             .unwrap()
             .filter_map(Result::ok)
-            .collect();
-        drop(stmt);
-        drop(reader);
+                .collect()
+        };
         assert_eq!(
             rows.len(),
             report.created,
@@ -1104,8 +1106,8 @@ mod http_tests {
             "no warnings expected: {:?}",
             report2.warnings
         );
-        let reader = store.reader.lock().unwrap();
         let (total, distinct): (i64, i64) = {
+            let reader = store.reader.lock().unwrap();
             let mut stmt = reader
                 .prepare(
                     "SELECT COUNT(*), COUNT(DISTINCT source_id) FROM knowledge_nodes \
@@ -1114,7 +1116,6 @@ mod http_tests {
                 .unwrap();
             stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
         };
-        drop(reader);
         assert_eq!(
             total as usize,
             rows.len() + report2.created,
