@@ -24,7 +24,7 @@ pub fn schema() -> Value {
             "action": {
                 "type": "string",
                 "enum": ["remember_pattern", "remember_decision", "get_context", "verify", "reanchor"],
-                "description": "'remember_pattern' stores a code pattern, 'remember_decision' an architectural decision, 'get_context' returns both with a current-or-stale mark, 'verify' checks a bounded set of anchored memories, 'reanchor' explicitly replaces reviewed source anchors for memoryId"
+                "description": "Save, list, and re-check code knowledge. 'remember_pattern' stores a code pattern, 'remember_decision' an architectural decision, 'get_context' returns both with a current-or-stale mark, 'verify' checks a bounded set of anchored memories, 'reanchor' explicitly replaces reviewed source anchors for memoryId"
             },
             // remember_pattern fields
             "name": {
@@ -503,13 +503,25 @@ fn capture_and_record(storage: &Arc<Storage>, node_id: &str, args: &CodebaseArgs
     let verifiable = anchors.iter().filter(|a| a.is_verifiable()).count();
     let recorded = storage.record_code_anchors(&anchors);
 
-    serde_json::json!({
+    let mut result = serde_json::json!({
         "count": anchors.len(),
         "verifiable": verifiable,
         "items": items,
         "recorded": recorded.as_ref().map(|n| *n as i64).unwrap_or(0),
         "error": recorded.err().map(|e| e.to_string()),
-    })
+    });
+    // Teach the convention at exactly the failure point: a bare `files` entry
+    // anchors the path but hashes nothing, so the memory can never be checked.
+    // The compact wire schema drops this tool's field prose, making this
+    // response the one place a first-time caller reliably learns `path#symbol`.
+    if verifiable < anchors.len() {
+        result["note"] = serde_json::json!(format!(
+            "{} of {} anchors are not content-verifiable (path-only, symbol not found, or unreadable file). Re-save with `files: [\"src/x.py#symbol\"]` or an explicit `path:start-end` span so this memory can be checked against the code later.",
+            anchors.len() - verifiable,
+            anchors.len()
+        ));
+    }
+    result
 }
 
 /// Get codebase context (patterns and decisions)
@@ -1372,5 +1384,155 @@ pub fn load_config(path: &str) -> Config {
         let item = &value["patterns"]["items"][0];
         assert!(item.get("createdAt").is_none(), "lean must drop createdAt");
         assert!(item.get("content").is_some(), "content still present");
+    }
+
+    // =====================================================================
+    // THE WHOLE LOOP, END TO END
+    //
+    // remember (anchored to a real file) -> recall surfaces it -> the file
+    // changes -> verify flags it stale AND persists that verdict -> reanchor
+    // restores the evidence WITHOUT touching the memory or its FSRS state.
+    // =====================================================================
+
+    fn node_state(storage: &Arc<Storage>, id: &str) -> (String, String, f64, i32, i32) {
+        let node = storage.get_node(id).unwrap().expect("node exists");
+        (
+            node.id,
+            node.content,
+            node.retention_strength,
+            node.reps,
+            node.lapses,
+        )
+    }
+
+    /// Reanchor replaces reviewed source evidence and nothing else. The memory
+    /// keeps its content and FSRS state - evidence was wrong, not the memory.
+    #[tokio::test]
+    async fn reanchor_preserves_the_memory_and_its_fsrs_state() {
+        let (storage, _dir) = test_storage().await;
+        let cog = test_cognitive();
+        let repo = repo_with_source(SOURCE);
+        let saved = save_anchored(&storage, &cog, &repo, "Eager config read").await;
+        let id = saved["nodeId"].as_str().unwrap().to_string();
+
+        let before = node_state(&storage, &id);
+        rewrite_source(
+            &repo,
+            "pub fn load_config(path: &str) -> Config {\n    Config::from_env()\n}\n",
+        );
+
+        let rea = execute(
+            &storage,
+            &cog,
+            &OutputConfig::default(),
+            Some(serde_json::json!({
+                "action": "reanchor", "memoryId": id,
+                "repoPath": repo.path().to_str().unwrap(),
+                "files": ["src/state.rs#load_config"]
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rea["anchorsReplaced"], 1, "response: {rea}");
+        assert_eq!(rea["memoryContentChanged"], false);
+
+        let after = node_state(&storage, &id);
+        assert_eq!(before, after, "reanchor must not touch the memory row");
+
+        let ctx = get_context(&storage, &cog, &repo).await;
+        assert_eq!(ctx["patterns"]["items"][0]["anchorStatus"], "verified");
+    }
+
+    /// A stale verdict must outlive the sweep that produced it. The persisted
+    /// `last_status` is what recall's codeEvidence block reads; if verify never
+    /// writes it, the loop has no memory between sessions.
+    #[tokio::test]
+    async fn verify_action_persists_the_last_known_verdict() {
+        let (storage, _dir) = test_storage().await;
+        let cog = test_cognitive();
+        let repo = repo_with_source(SOURCE);
+        let saved = save_anchored(&storage, &cog, &repo, "Eager config read").await;
+        let id = saved["nodeId"].as_str().unwrap().to_string();
+
+        // Fresh check persists a fresh verdict.
+        super::code_context::verify_nodes(&storage, repo.path(), std::slice::from_ref(&id))
+            .unwrap();
+        let anchors = storage.code_anchors_for_node(&id).unwrap();
+        assert_eq!(anchors[0].last_status, Some(vestige_core::codebase::AnchorStatus::Verified));
+        assert!(anchors[0].last_verified_at.is_some());
+
+        // The code changes; the next check persists the accusation.
+        rewrite_source(
+            &repo,
+            "pub fn load_config(path: &str) -> Config {\n    Config::from_env()\n}\n",
+        );
+        super::code_context::verify_nodes(&storage, repo.path(), std::slice::from_ref(&id))
+            .unwrap();
+        let anchors = storage.code_anchors_for_node(&id).unwrap();
+        assert_eq!(anchors[0].last_status, Some(vestige_core::codebase::AnchorStatus::Drifted));
+
+        // Reanchor resets the evidence: a fresh capture has not been checked yet.
+        execute(
+            &storage,
+            &cog,
+            &OutputConfig::default(),
+            Some(serde_json::json!({
+                "action": "reanchor", "memoryId": id,
+                "repoPath": repo.path().to_str().unwrap(),
+                "files": ["src/state.rs#load_config"]
+            })),
+        )
+        .await
+        .unwrap();
+        let anchors = storage.code_anchors_for_node(&id).unwrap();
+        assert_eq!(anchors[0].last_status, None);
+        assert!(anchors[0].last_verified_at.is_none());
+    }
+
+    /// A bare `files` entry anchors the path but hashes nothing. The remember
+    /// response must teach `path#symbol` at exactly that failure point,
+    /// because the compact wire schema drops this tool's field prose.
+    #[tokio::test]
+    async fn remember_response_teaches_the_symbol_convention_when_unverifiable() {
+        let (storage, _dir) = test_storage().await;
+        let cog = test_cognitive();
+        let repo = repo_with_source(SOURCE);
+        let saved = execute(
+            &storage,
+            &cog,
+            &OutputConfig::default(),
+            Some(serde_json::json!({
+                "action": "remember_pattern",
+                "name": "Path only",
+                "description": "Anchored by bare path",
+                "files": ["src/state.rs"],
+                "repoPath": repo.path().to_str().unwrap(),
+                "codebase": "anchored"
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved["anchors"]["verifiable"], 0);
+        let note = saved["anchors"]["note"].as_str().unwrap();
+        assert!(note.contains("#symbol"), "note: {note}");
+        assert!(note.contains("not content-verifiable"));
+    }
+
+    /// The compact wire schema caps the action description at 50 chars; the
+    /// text must be shaped so truncation lands on the end of the first
+    /// sentence instead of mid-list (the enum alone used to carry the rest).
+    #[test]
+    fn compact_schema_truncates_the_action_description_on_a_sentence_boundary() {
+        let compact = crate::tools::compact::of(&schema());
+        let desc = compact["properties"]["action"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            desc.ends_with("code knowledge."),
+            "compact truncation must keep the whole first sentence, got: {desc}"
+        );
+        // The five actions themselves survive as the enum.
+        let actions = compact["properties"]["action"]["enum"].as_array().unwrap();
+        assert_eq!(actions.len(), 5);
     }
 }

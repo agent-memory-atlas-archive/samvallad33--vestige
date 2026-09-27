@@ -61,6 +61,7 @@ fn build_instructions() -> String {
          memory(action='demote') for wrong ones — do not ask permission, just act."
             .to_string()
     };
+    instructions.push_str("\nIn a codebase, save durable conventions and design decisions with codebase(action='remember_pattern'|'remember_decision', files=['path.rs#symbol']); anchored code memories self-check against the source and are flagged when the code drifts.");
     instructions.push_str("\nDiscover all available actions with memory_status(view='tools'); pass tool='<name>' for its exact schema. Choose calls that serve the task; no tool-call quota is required.");
     instructions
 }

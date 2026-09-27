@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — code memory closes the loop at retrieval time
+
+- A remembered pattern or decision always surfaced in `recall` (the
+  codebase tool stores through the normal ingest path — it was never a
+  silo), but it came back looking exactly like any other fact, with no
+  sign of the anchoring that makes it trustworthy. Recall results now
+  attach a compact `codeEvidence` block to code memories: anchor count,
+  verifiable count, and the last-known anchor status with its check time,
+  plus a `possiblyStale` flag when that status accuses the memory. The
+  block is database-only — live checking remains the explicit `codebase`
+  action `verify`.
+- Verification verdicts are now persisted (`last_status` /
+  `last_verified_at` were written by nothing but a unit test before), so
+  the last-known state of every anchor survives the process. Writes are
+  change-only, and `reanchor` resets them: a fresh capture has not been
+  checked yet.
+- The `remember_pattern`/`remember_decision` response teaches
+  `path#symbol` at exactly the failure point where anchors came back
+  path-only and unverifiable — the compact wire schema drops this tool's
+  field prose, so the response is the one place a first-time caller
+  reliably learns the convention. The action description is reshaped so
+  its 50-char compact truncation lands on the end of a sentence instead
+  of mid-list.
+- The server instructions name the code-memory workflow, so agents learn
+  that anchored code knowledge exists before they need it.
+
 ### Added — deterministic query rewriting before retrieval fusion
 
 - arXiv 2601.07711: agentic retrieval gains concentrate in intent

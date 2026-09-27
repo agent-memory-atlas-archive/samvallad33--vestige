@@ -2,7 +2,7 @@
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
-use vestige_core::codebase::{AnchorStatus, AnchorVerification, verify_anchor};
+use vestige_core::codebase::{AnchorStatus, AnchorVerification, CodeAnchor, verify_anchor};
 use vestige_core::{KnowledgeNode, Storage};
 
 pub(super) fn is_code_memory(node: &KnowledgeNode) -> bool {
@@ -131,6 +131,12 @@ fn worst_status(verifications: &[AnchorVerification]) -> AnchorStatus {
 
 /// Verify every anchor belonging to `node_ids` and return, per node, the rolled
 /// up status plus the individual verdicts.
+///
+/// Each fresh verdict is also persisted as the anchor's last-known state
+/// (`last_status` / `last_verified_at`). The retrieval path still re-verifies
+/// against the live tree on every read - the cached column is informational,
+/// feeding recall's `codeEvidence` hint between explicit checks. Writes are
+/// change-only so read paths do not churn the writer lock.
 pub(super) fn verify_nodes(
     storage: &Arc<Storage>,
     repo_root: &std::path::Path,
@@ -141,13 +147,46 @@ pub(super) fn verify_nodes(
         .code_anchors_for_nodes(node_ids)
         .map_err(|e| format!("Cannot read code anchors: {e}"))?;
     for (node_id, anchors) in by_node {
-        let verdicts: Vec<AnchorVerification> = anchors
-            .iter()
-            .map(|a| verify_anchor(a, repo_root))
-            .collect();
+        let mut verdicts: Vec<AnchorVerification> = Vec::with_capacity(anchors.len());
+        for anchor in &anchors {
+            let v = verify_anchor(anchor, repo_root);
+            if anchor.last_status != Some(v.status) || anchor.last_verified_at.is_none() {
+                let _ = storage.record_anchor_verification(&anchor.id, v.status, v.checked_at);
+            }
+            verdicts.push(v);
+        }
         out.insert(node_id, (worst_status(&verdicts), verdicts));
     }
     Ok(out)
+}
+
+/// Roll the *persisted* per-anchor statuses of one memory into a single
+/// last-known status. Staleness wins over freshness, mirroring
+/// [`worst_status`]; `None` means the memory has no anchors at all.
+pub(super) fn worst_persisted_status(anchors: &[CodeAnchor]) -> Option<AnchorStatus> {
+    if anchors.is_empty() {
+        return None;
+    }
+    let statuses: Vec<AnchorStatus> = anchors
+        .iter()
+        .filter_map(|a| a.last_status)
+        .collect();
+    if statuses.is_empty() {
+        return None;
+    }
+    if statuses.iter().any(|s| s == &AnchorStatus::Missing) {
+        Some(AnchorStatus::Missing)
+    } else if statuses.iter().any(|s| s == &AnchorStatus::Drifted) {
+        Some(AnchorStatus::Drifted)
+    } else if statuses.len() < anchors.len() {
+        // At least one anchor has never been checked: the honest roll-up is
+        // "we last looked and saw X, but not everything has been looked at".
+        Some(AnchorStatus::Unverifiable)
+    } else if statuses.iter().any(|s| s == &AnchorStatus::Moved) {
+        Some(AnchorStatus::Moved)
+    } else {
+        Some(AnchorStatus::Verified)
+    }
 }
 
 /// Annotate already-formatted memory items with their verification verdict.

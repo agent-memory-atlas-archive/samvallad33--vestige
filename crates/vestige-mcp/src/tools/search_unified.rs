@@ -825,6 +825,7 @@ pub async fn execute(
             .filter(|r| r.node.retention_strength >= min_retention)
             .map(|r| format_search_result(r, detail_level))
             .collect();
+        attach_code_evidence(&mut formatted, storage);
         apply_output_masks(&mut formatted, output_config);
 
         let mut budget_expandable: Vec<String> = Vec::new();
@@ -1601,6 +1602,7 @@ pub async fn execute(
         .iter()
         .map(|r| format_search_result(r, detail_level))
         .collect();
+    attach_code_evidence(&mut formatted, storage);
     apply_output_masks(&mut formatted, output_config);
 
     // ====================================================================
@@ -2375,6 +2377,71 @@ fn attach_source_record(value: &mut Value, node: &vestige_core::KnowledgeNode) {
     }
 }
 
+/// Attach a compact `codeEvidence` block to code memories in lookup results.
+///
+/// A remembered pattern or decision used to come back from `recall` looking
+/// exactly like any other fact - the one vantage point from which the
+/// remember → verify → reanchor loop was invisible, which is a large part of
+/// why the codebase tool went unused: the value of anchoring never showed up
+/// where the memory was actually consumed. This block is DB-only (no
+/// filesystem access - live checking stays the explicit `codebase` verify
+/// action) and reports the last-known anchor state so a possibly-stale code
+/// memory is visible at the moment it is served.
+fn attach_code_evidence(formatted: &mut [Value], storage: &Arc<Storage>) {
+    let ids: Vec<String> = formatted
+        .iter()
+        .filter(|v| {
+            let typed = v
+                .get("nodeType")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t == "pattern" || t == "decision");
+            let tagged = v.get("tags").and_then(Value::as_array).is_some_and(|tags| {
+                tags.iter()
+                    .filter_map(Value::as_str)
+                    .any(|t| t == "codebase" || t.starts_with("codebase:"))
+            });
+            typed && tagged
+        })
+        .filter_map(|v| v.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let Ok(by_node) = storage.code_anchors_for_nodes(&ids) else {
+        return;
+    };
+    for item in formatted.iter_mut() {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(anchors) = by_node.get(id) else {
+            continue;
+        };
+        let total = anchors.len();
+        let verifiable = anchors.iter().filter(|a| a.is_verifiable()).count();
+        let mut evidence = serde_json::json!({
+            "anchors": total,
+            "verifiableAnchors": verifiable,
+            "note": "last-known source-anchor state; live re-check with codebase action='verify'",
+        });
+        if let Some(status) = super::code_context::worst_persisted_status(anchors) {
+            evidence["lastStatus"] = Value::String(status.as_str().to_string());
+            evidence["lastVerifiedAt"] = anchors
+                .iter()
+                .filter_map(|a| a.last_verified_at)
+                .max()
+                .map(|dt| Value::String(dt.to_rfc3339()))
+                .unwrap_or(Value::Null);
+            if status.is_stale() {
+                evidence["possiblyStale"] = Value::Bool(true);
+            }
+        }
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert("codeEvidence".to_string(), evidence);
+        }
+    }
+}
+
 /// Format a KnowledgeNode based on the requested detail level.
 /// Reusable across search, timeline, and other tools.
 pub fn format_node(node: &vestige_core::KnowledgeNode, detail_level: &str) -> Value {
@@ -2464,6 +2531,128 @@ mod tests {
         };
         let node = storage.ingest(input).unwrap();
         node.id
+    }
+
+    // =====================================================================
+    // CODE MEMORIES ARE FIRST-CLASS RECALL CITIZENS
+    //
+    // The codebase tool stores through the normal ingest path, so a
+    // remembered pattern must surface in plain `recall` - not live in a silo
+    // only `codebase get_context` reads. And because it is anchored to
+    // source, the recall hit must carry its last-known anchor state, so a
+    // possibly-stale code memory is visible where the memory is consumed.
+    // =====================================================================
+
+    const RECALL_SOURCE: &str = "\
+pub fn load_config(path: &str) -> Config {
+    let raw = fs::read_to_string(path).unwrap();
+    parse(&raw)
+}
+";
+
+    async fn remember_anchored_pattern(storage: &Arc<Storage>, repo: &TempDir) -> String {
+        let input = IngestInput {
+            content: "# Code Pattern: Eager config read\n\nload_config reads the whole file eagerly; do not call it in a loop".to_string(),
+            node_type: "pattern".to_string(),
+            source: None,
+            sentiment_score: 0.0,
+            sentiment_magnitude: 0.0,
+            tags: vec!["pattern".into(), "codebase".into(), "codebase:audit".into()],
+            valid_from: None,
+            valid_until: None,
+            validity_inferred: false,
+            source_envelope: None,
+        };
+        let node = storage.ingest(input).unwrap();
+        let anchor = vestige_core::codebase::capture_anchor(
+            &node.id,
+            repo.path(),
+            &vestige_core::codebase::AnchorDraft::new("src/state.rs")
+                .with_symbol("load_config"),
+        );
+        assert!(anchor.is_verifiable(), "symbol anchor must capture a hash");
+        storage.record_code_anchors(&[anchor]).unwrap();
+        node.id
+    }
+
+    #[tokio::test]
+    async fn a_remembered_pattern_surfaces_in_recall_with_its_anchor_evidence() {
+        let (storage, _dir) = test_storage().await;
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/state.rs"), RECALL_SOURCE).unwrap();
+
+        let code_id = remember_anchored_pattern(&storage, &repo).await;
+        let fact_id = ingest_test_content(&storage, "An unrelated plain fact about the world").await;
+
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(serde_json::json!({
+                "query": "eager config read load_config",
+                "limit": 10
+            })),
+        )
+        .await
+        .unwrap();
+        let results = result["results"].as_array().unwrap();
+        let ids: Vec<&str> = results
+            .iter()
+            .filter_map(|r| r["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&code_id.as_str()),
+            "the pattern must surface in plain recall, got: {ids:?}"
+        );
+
+        let code_hit = results.iter().find(|r| r["id"] == code_id.as_str()).unwrap();
+        let evidence = &code_hit["codeEvidence"];
+        assert_eq!(evidence["anchors"], 1, "response: {code_hit}");
+        assert_eq!(evidence["verifiableAnchors"], 1);
+
+        // A plain fact carries no code-evidence block.
+        let fact_hit = results.iter().find(|r| r["id"] == fact_id.as_str());
+        if let Some(fact_hit) = fact_hit {
+            assert!(
+                fact_hit.get("codeEvidence").is_none(),
+                "non-code memories must keep their exact prior shape"
+            );
+        }
+
+        // The source changes; a verification pass persists the verdict, and
+        // recall now shows the memory as possibly stale.
+        std::fs::write(
+            repo.path().join("src/state.rs"),
+            "pub fn load_config(path: &str) -> Config {\n    Config::from_env()\n}\n",
+        )
+        .unwrap();
+        crate::tools::code_context::verify_nodes(
+            &storage,
+            repo.path(),
+            std::slice::from_ref(&code_id),
+        )
+        .unwrap();
+
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(serde_json::json!({
+                "query": "eager config read load_config",
+                "limit": 10
+            })),
+        )
+        .await
+        .unwrap();
+        let hit = result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == code_id.as_str())
+            .expect("pattern still surfaces after edit");
+        assert_eq!(hit["codeEvidence"]["lastStatus"], "drifted", "hit: {hit}");
+        assert_eq!(hit["codeEvidence"]["possiblyStale"], true);
     }
 
     #[tokio::test]
