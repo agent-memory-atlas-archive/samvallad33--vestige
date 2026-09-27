@@ -6,7 +6,48 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// MCP Protocol Version
+///
+/// The latest *legacy* revision: the last one that establishes a session with
+/// the `initialize` handshake. MCP 2026-07-28 (SEP-2575) removed the
+/// handshake entirely and moved version identity onto every request's `_meta`
+/// (`io.modelcontextprotocol/protocolVersion`), so it is not expressed by
+/// this constant but by [`MODERN_PROTOCOL_VERSION`].
 pub const MCP_VERSION: &str = "2025-11-25";
+
+/// The modern, stateless protocol revision (MCP 2026-07-28).
+///
+/// "Stateless core" concretely means: no `initialize`/`initialized`
+/// handshake, every request carries `io.modelcontextprotocol/protocolVersion`
+/// and `io.modelcontextprotocol/clientCapabilities` in its `_meta`, the
+/// server accepts or rejects each request independently, and nothing may be
+/// inferred from prior requests on the same connection. This server answers
+/// `initialize` for legacy clients (dual-era) and serves `_meta`-carrying
+/// requests statelessly.
+pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// Every protocol revision this server can serve, newest first.
+///
+/// Order matters: this slice lands verbatim in `server/discover`
+/// `supportedVersions` and in the `-32022` error `data.supported`, and the
+/// spec's own example lists the newest revision first.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    MODERN_PROTOCOL_VERSION,
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
+
+/// The revisions negotiable through the legacy `initialize` handshake.
+///
+/// `initialize` is a legacy-era method: a client that wants 2026-07-28 does
+/// not shake hands at all, it just sends requests carrying modern `_meta`.
+/// A client asking for the modern revision *through* `initialize` is
+/// speaking the wrong era, so the handshake falls back to the newest legacy
+/// revision rather than echoing a version we would then have to serve under
+/// handshake semantics we no longer have.
+pub const LEGACY_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// JSON-RPC version
 pub const JSONRPC_VERSION: &str = "2.0";
@@ -76,6 +117,13 @@ pub enum ErrorCode {
     RequestTimeout = -32001,
     ResourceNotFound = -32002,
     ServerNotInitialized = -32003,
+
+    // Reserved for the MCP specification (-32020 to -32099). Codes here are
+    // defined exclusively by the spec; implementations MUST NOT allocate new
+    // ones inside this sub-range.
+    /// MCP 2026-07-28: the request's `_meta` named a protocol version this
+    /// server does not serve. `data` carries `supported` + `requested`.
+    UnsupportedProtocolVersion = -32022,
 }
 
 impl From<ErrorCode> for i32 {
@@ -135,6 +183,24 @@ impl JsonRpcError {
             ErrorCode::ResourceNotFound,
             &format!("Resource not found: {}", uri),
         )
+    }
+
+    /// MCP 2026-07-28 `UnsupportedProtocolVersionError` (-32022).
+    ///
+    /// Emitted when a request's `_meta` names a protocol version this server
+    /// does not serve (unknown, or known-but-declined). `data.supported`
+    /// lists what we do serve so the client can retry with a mutually
+    /// supported revision without a second round trip.
+    pub fn unsupported_protocol_version(requested: &str) -> Self {
+        let mut error = Self::new(
+            ErrorCode::UnsupportedProtocolVersion,
+            "Unsupported protocol version",
+        );
+        error.data = Some(serde_json::json!({
+            "supported": SUPPORTED_PROTOCOL_VERSIONS,
+            "requested": requested,
+        }));
+        error
     }
 }
 

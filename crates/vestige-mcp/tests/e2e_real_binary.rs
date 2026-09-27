@@ -657,13 +657,15 @@ fn disable_review_gate(dir: &Path) {
 // 1. Protocol surface
 // ============================================================================
 
-/// `server/discover` must answer with no handshake at all, and must not claim a
-/// protocol revision the server does not implement.
+/// `server/discover` must answer with no handshake at all, and must advertise
+/// exactly the revisions the server serves — no more, no fewer.
 ///
 /// Catches: gating discovery behind `initialize` (which makes it useless, since
-/// its entire purpose is to precede the handshake), and advertising
-/// `2026-07-28` — a revision whose stateless core, `resultType` and MRTR are
-/// not implemented here. A false version claim fails conformance for real.
+/// its entire purpose is to precede the handshake), and advertising a revision
+/// the server does not implement — a false version claim fails conformance for
+/// real. Since #241 the server implements BOTH eras, so the modern revision
+/// must be named; a client that cannot speak it still negotiates down to
+/// `2025-11-25` through the handshake.
 #[test]
 fn discover_answers_before_any_handshake_and_does_not_overclaim() {
     let dir = data_dir();
@@ -697,15 +699,18 @@ fn discover_answers_before_any_handshake_and_does_not_overclaim() {
         .collect();
     assert!(
         versions.contains(&"2025-11-25".to_string()),
-        "discover must advertise the revision the server actually speaks: {versions:?}"
+        "discover must advertise the revision legacy clients negotiate down to: {versions:?}"
     );
     assert!(
-        !versions.contains(&"2026-07-28".to_string()),
-        "the server does not implement 2026-07-28 (stateless core / resultType / MRTR); \
-         advertising it would be a false conformance claim: {versions:?}"
+        versions.contains(&"2026-07-28".to_string()),
+        "#241: the server implements the 2026-07-28 stateless core, resultType \
+         and the receipt-card app, so it must advertise it: {versions:?}"
     );
-    // Every advertised revision must be one initialize will actually accept.
-    for version in &versions {
+    // Every LEGACY advertised revision must be one initialize will actually
+    // accept. The modern revision is deliberately absent from the handshake:
+    // a 2026-07-28 client never shakes hands at all, it sends per-request
+    // `_meta` and the server serves it statelessly.
+    for version in versions.iter().filter(|v| v.as_str() != "2026-07-28") {
         let mut probe = Server::spawn(dir.path());
         let negotiated = probe.result(
             "initialize",
@@ -803,9 +808,10 @@ fn warm_up_is_announced_as_mcp_logging_after_the_handshake() {
 }
 
 /// `resources/templates/list` belongs to the `resources` capability the server
-/// declares, so it must answer (with nothing to advertise) rather than
-/// method-not-found, and an unknown pagination cursor on any list method must be
-/// refused with `-32602` instead of being answered with page one.
+/// declares, so it must answer rather than method-not-found. Since #241 it
+/// advertises the MCP App receipt-card template (`ui://vestige/receipt/{id}`),
+/// and an unknown pagination cursor on any list method must be refused with
+/// `-32602` instead of being answered with page one.
 ///
 /// Catches: a client that believes it is paginating looping on page one forever,
 /// and a conformance suite that cannot verify the templates surface at all while
@@ -817,7 +823,19 @@ fn list_methods_reject_unknown_cursors_and_templates_list_is_empty() {
     server.handshake();
 
     let templates = server.result("resources/templates/list", None);
-    assert_eq!(templates["resourceTemplates"], json!([]));
+    let template_list = templates["resourceTemplates"].as_array().expect("array");
+    assert!(
+        template_list
+            .iter()
+            .any(|t| t["uriTemplate"] == json!("ui://vestige/receipt/{id}")),
+        "the receipt-card app template must be advertised: {template_list:?}"
+    );
+    assert!(
+        template_list
+            .iter()
+            .all(|t| t["mimeType"] == json!("text/html;profile=mcp-app")),
+        "every ui:// template carries the SEP-1865 app MIME type: {template_list:?}"
+    );
 
     for method in ["tools/list", "resources/list", "resources/templates/list"] {
         let error = server.error(method, Some(json!({ "cursor": "not-one-we-issued" })));

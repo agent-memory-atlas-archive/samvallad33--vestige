@@ -17,7 +17,10 @@ use crate::protocol::messages::{
     ListToolsResult, ReadResourceRequest, ReadResourceResult, ResourceDescription,
     ServerCapabilities, ServerInfo, ToolAnnotations, ToolDescription,
 };
-use crate::protocol::types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, MCP_VERSION};
+use crate::protocol::types::{
+    JsonRpcError, JsonRpcRequest, JsonRpcResponse, LEGACY_PROTOCOL_VERSIONS,
+    SUPPORTED_PROTOCOL_VERSIONS, MCP_VERSION,
+};
 use crate::resources;
 use crate::tools;
 use vestige_core::{OutputConfig, Storage, VestigeConfig};
@@ -67,7 +70,171 @@ fn build_instructions() -> String {
 }
 
 fn supported_protocol_versions() -> &'static [&'static str] {
-    &["2024-11-05", "2025-03-26", "2025-06-18", MCP_VERSION]
+    crate::protocol::types::SUPPORTED_PROTOCOL_VERSIONS
+}
+
+/// Which protocol era — and handshake requirement — a request speaks.
+///
+/// The 2026-07-28 revision removed the handshake and moved version identity
+/// onto every request (`_meta["io.modelcontextprotocol/protocolVersion"]`),
+/// so the era is a per-request property, not connection state:
+///
+/// * [`Era::Modern`] — the request declares the modern revision. Served
+///   statelessly: the `initialize` flag is ignored, the request must
+///   validate its own metadata, and every result gets the modern envelope
+///   (`resultType`, `_meta.serverInfo`).
+/// * [`Era::LegacyDeclared`] — the request declares a LEGACY revision through
+///   the modern `_meta` mechanism (a mixed client). Served statelessly — it
+///   declared its own revision, so no handshake gate — but with legacy result
+///   shape: a client on an older revision must not receive fields its
+///   revision does not define (`resultType` above all).
+/// * [`Era::LegacyHandshake`] — no declared version, or the request is
+///   `initialize` itself (a dual-era server selects legacy semantics from
+///   that method name per the 2026-07-28 versioning page). Requires the
+///   handshake, exactly as before this branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Era {
+    LegacyHandshake,
+    LegacyDeclared,
+    Modern,
+}
+
+/// The `_meta` key that carries the per-request protocol version.
+const META_PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+/// The `_meta` key that carries the client's capabilities per request.
+const META_CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+/// The result `_meta` key carrying server identity without connection state.
+const META_SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
+
+/// Classify an incoming request by protocol era (see [`Era`]).
+fn request_era(request: &JsonRpcRequest) -> Era {
+    // A dual-era server selects its behavior from how the client opens:
+    // `initialize` always selects legacy handshake semantics, even when the
+    // envelope happens to carry modern `_meta`.
+    if request.method == "initialize" {
+        return Era::LegacyHandshake;
+    }
+    let meta = request.params.as_ref().and_then(|p| p.get("_meta"));
+    let declared_version = meta.and_then(|m| m.get(META_PROTOCOL_VERSION_KEY));
+    match declared_version.and_then(|v| v.as_str()) {
+        None => {
+            // A `_meta` block carrying the reserved per-request keys without
+            // a version is still a modern attempt — a legacy client sends no
+            // `_meta` at all — and must fail modern validation with -32602
+            // ("missing required field"), not the legacy "server not
+            // initialized" gate.
+            if meta.is_some_and(|m| m.get(META_CLIENT_CAPABILITIES_KEY).is_some()) {
+                Era::Modern
+            } else {
+                Era::LegacyHandshake
+            }
+        }
+        Some(version) => {
+            if LEGACY_PROTOCOL_VERSIONS.contains(&version) {
+                // A known legacy revision declared per-request: serve that
+                // revision's shape, statelessly.
+                Era::LegacyDeclared
+            } else {
+                // The modern revision itself, or an unknown one —
+                // validate_modern_meta turns unknown into -32022 with the
+                // supported list.
+                Era::Modern
+            }
+        }
+    }
+}
+
+/// Validate the required per-request metadata of a modern (2026-07-28)
+/// request and return the requested protocol version.
+///
+/// Modern requests MUST carry `io.modelcontextprotocol/protocolVersion` and
+/// `io.modelcontextprotocol/clientCapabilities` in `_meta`; a request missing
+/// either is malformed and MUST be rejected with `-32602`. A version the
+/// server does not serve (unknown, or known-but-declined) MUST be rejected
+/// with `-32022` listing the versions it does support, so the client can
+/// retry with a mutually supported revision.
+fn validate_modern_meta(request: &JsonRpcRequest) -> Result<String, JsonRpcError> {
+    let meta = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("_meta"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let version = meta
+        .get(META_PROTOCOL_VERSION_KEY)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params(
+                "modern requests must carry a string \
+                 _meta['io.modelcontextprotocol/protocolVersion']",
+            )
+        })?;
+
+    if meta.get(META_CLIENT_CAPABILITIES_KEY).is_none() {
+        return Err(JsonRpcError::invalid_params(
+            "modern requests must carry \
+             _meta['io.modelcontextprotocol/clientCapabilities']",
+        ));
+    }
+
+    if !SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
+        return Err(JsonRpcError::unsupported_protocol_version(version));
+    }
+
+    Ok(version.to_string())
+}
+
+/// Make a successful result conform to the modern result envelope.
+///
+/// 2026-07-28 requires `resultType` on every result (`"complete"` for a
+/// finished request; this server never produces `"input_required"` because no
+/// tool needs a mid-call follow-up — see `dispatch_tool`) and recommends
+/// `io.modelcontextprotocol/serverInfo` in the result `_meta` so a client can
+/// identify the server without connection state. When the tool result carries
+/// a persisted retrieval receipt, the `_meta.ui.resourceUri` points at its
+/// rendered MCP App card, which is how Claude Desktop opens the receipt view
+/// inline (SEP-1865).
+fn decorate_modern_result(result: &mut serde_json::Value) {
+    // Read the receipt id before taking the mutable borrow below.
+    let receipt_id = result
+        .get("structuredContent")
+        .and_then(|sc| sc.get("receiptId"))
+        .and_then(|id| id.as_str())
+        .map(String::from);
+    let Some(object) = result.as_object_mut() else {
+        return;
+    };
+    object
+        .entry("resultType".to_string())
+        .or_insert_with(|| serde_json::json!("complete"));
+
+    let meta = object
+        .entry("_meta".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(meta_object) = meta.as_object_mut() {
+        meta_object
+            .entry(META_SERVER_INFO_KEY.to_string())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "name": "vestige",
+                    "version": env!("CARGO_PKG_VERSION"),
+                })
+            });
+        // Link the receipt card for any tool result that persisted one. The
+        // id comes from the structured payload the receipt attach step wrote;
+        // no additional lookup, no memory content added to the wire.
+        if let Some(receipt_id) = receipt_id {
+            meta_object
+                .entry("ui".to_string())
+                .or_insert_with(|| {
+                    serde_json::json!({
+                        "resourceUri":
+                            crate::resources::receipt_card::resource_uri(&receipt_id),
+                    })
+                });
+        }
+    }
 }
 
 /// Cache hint for `server/discover`. The payload is compile-time constant
@@ -257,7 +424,24 @@ impl McpServer {
             return None;
         }
 
-        // Check initialization for non-initialize requests.
+        // Classify the request by protocol era, and validate the per-request
+        // metadata a modern (2026-07-28) request must carry.
+        //
+        // The stateless core (SEP-2567/SEP-2575) means a modern request
+        // arrives with no handshake at all: it declares its own protocol
+        // version and client capabilities in `_meta`, and the server accepts
+        // or rejects it independently of anything that came before. So a
+        // modern request NEVER hits the `initialized` gate below — the gate
+        // exists to enforce the legacy handshake, and the spec forbids
+        // inferring context from prior requests on the same connection.
+        let era = request_era(&request);
+        if era == Era::Modern
+            && let Err(error) = validate_modern_meta(&request)
+        {
+            return Some(JsonRpcResponse::error(request.id, error));
+        }
+
+        // Check initialization for handshake-era requests.
         //
         // `server/discover` is deliberately exempt. Its entire purpose is to let
         // a client learn what this server speaks BEFORE committing to a protocol
@@ -266,7 +450,8 @@ impl McpServer {
         // stdio. Gating it behind the very handshake it exists to precede makes
         // it useless: a modern client probing this server would get
         // "Server not initialized" and have to guess.
-        if !self.initialized.load(Ordering::Acquire)
+        if era == Era::LegacyHandshake
+            && !self.initialized.load(Ordering::Acquire)
             && request.method != "initialize"
             && request.method != "notifications/initialized"
             && request.method != "server/discover"
@@ -281,18 +466,18 @@ impl McpServer {
             ));
         }
 
-        let result = match request.method.as_str() {
+        let mut result = match request.method.as_str() {
             "initialize" => self.handle_initialize(request.params).await,
             "notifications/initialized" => Err(JsonRpcError::invalid_request(
                 "notifications/initialized must be sent without an id",
             )),
-            "tools/list" => self.handle_tools_list(request.params.as_ref()).await,
+            "tools/list" => self.handle_tools_list(request.params.as_ref(), era).await,
             "tools/call" => self.handle_tools_call(request.params).await,
-            "resources/list" => self.handle_resources_list(request.params.as_ref()).await,
+            "resources/list" => self.handle_resources_list(request.params.as_ref(), era).await,
             "resources/templates/list" => {
-                self.handle_resources_templates_list(request.params.as_ref())
+                self.handle_resources_templates_list(request.params.as_ref(), era)
             }
-            "resources/read" => self.handle_resources_read(request.params).await,
+            "resources/read" => self.handle_resources_read(request.params, era).await,
             "server/discover" => self.handle_server_discover(),
             "ping" => Ok(serde_json::json!({})),
             // The server only emits info and warning messages about its own
@@ -320,6 +505,19 @@ impl McpServer {
             }
         };
 
+        // Modern result envelope: `resultType` on every result and
+        // `io.modelcontextprotocol/serverInfo` in the result `_meta` (both
+        // required or recommended by 2026-07-28; see
+        // `decorate_modern_result`). Legacy results are left byte-identical
+        // to before — unknown result fields are ignored by legacy clients,
+        // but there is no reason to grow the legacy wire at all when the
+        // distinction costs one `if`.
+        if era == Era::Modern
+            && let Ok(value) = result.as_mut()
+        {
+            decorate_modern_result(value);
+        }
+
         Some(match result {
             Ok(result) => JsonRpcResponse::success(request.id, result),
             Err(error) => JsonRpcResponse::error(request.id, error),
@@ -332,16 +530,21 @@ impl McpServer {
     /// MCP 2026-07-28 makes this mandatory: it removes the
     /// `initialize`/`notifications/initialized` handshake entirely and makes the
     /// protocol stateless, so a client needs some way to learn what a server
-    /// speaks before it commits to a revision. On stdio the spec explicitly
-    /// allows using this as a backward-compatibility probe, which is exactly how
-    /// a 2026-era client will meet this 2025-11-25 server.
+    /// speaks before it commits to a protocol revision. On stdio the spec
+    /// explicitly allows using this as a backward-compatibility probe, which is
+    /// exactly how a dual-era client decides between our modern path and the
+    /// legacy handshake.
     ///
-    /// Answering it truthfully costs nothing and is strictly better than the
-    /// alternative, which is a modern client getting `method_not_found` and
-    /// having to guess. It deliberately does NOT claim 2026-07-28 support: the
-    /// stateless core, `resultType`, and MRTR are not implemented yet, and
-    /// advertising a revision we do not serve would be a false claim that fails
-    /// conformance for real.
+    /// Since #241 the server serves BOTH eras, so `supportedVersions` names
+    /// 2026-07-28 first (the spec's own example orders newest first) followed
+    /// by the legacy revisions negotiable through `initialize`. The result
+    /// shape is the `DiscoverResult` schema (`resultType`, `supportedVersions`,
+    /// `capabilities`, `ttlMs`, `cacheScope` required; `instructions` optional;
+    /// server identity in `_meta` under `io.modelcontextprotocol/serverInfo`).
+    /// The first version of this handler invented its own field names
+    /// (`protocolVersions`, `serverInfo`); a conforming client could not read
+    /// them, concluded the server offered no revision at all, and tested the
+    /// newest one anyway (#175).
     ///
     /// Unlike `initialize`, this neither takes params nor mutates session state,
     /// so it is safe to call at any point, including before initialization.
@@ -393,8 +596,15 @@ impl McpServer {
             }
         };
 
+        // `initialize` is a legacy-era method: negotiation happens over the
+        // handshake revisions only. A client that wants the modern stateless
+        // revision does not shake hands at all — it sends requests carrying
+        // `_meta['io.modelcontextprotocol/protocolVersion']`. Echoing
+        // 2026-07-28 here would commit the session to handshake semantics the
+        // modern revision removed, so it is excluded from this list and the
+        // handshake falls back to the newest legacy revision.
         let negotiated_version =
-            if supported_protocol_versions().contains(&request.protocol_version.as_str()) {
+            if LEGACY_PROTOCOL_VERSIONS.contains(&request.protocol_version.as_str()) {
                 info!(
                     "Client requested supported protocol version {}, using it",
                     request.protocol_version
@@ -484,7 +694,15 @@ description: Some("Retrieve from memory. mode 'lookup' (default): fast hybrid ke
                         "query": {"type": "string"}
                     }
                 })),
-                ..Default::default()
+                // MCP Apps (SEP-1865): `recall` produces a persisted retrieval
+                // receipt, and the per-result `_meta.ui.resourceUri` that
+                // `decorate_modern_result` attaches points at this template
+                // filled with the concrete receipt id. Hosts that support the
+                // extension (Claude Desktop, Cursor) fetch
+                // `ui://vestige/receipt/{id}` and render the card inline.
+                meta: Some(serde_json::json!({
+                    "ui": { "resourceUri": "ui://vestige/receipt/{id}" }
+                })),
             },
             ToolDescription {
                 name: "receipt".to_string(),
@@ -786,6 +1004,7 @@ description: Some("Investigate a recorded failure using earlier memories sharing
     async fn handle_tools_list(
         &self,
         params: Option<&serde_json::Value>,
+        era: Era,
     ) -> Result<serde_json::Value, JsonRpcError> {
         reject_unknown_cursor(params)?;
 
@@ -861,10 +1080,13 @@ description: Some("Investigate a recorded failure using earlier memories sharing
         // vary with per-install configuration; a shared intermediary must not
         // serve one install's tool list to another.
         //
-        // Emitting these at 2025-11-25 is forward-compatible: unknown result
-        // fields are ignored by older clients, and the fields become required at
-        // 2026-07-28.
-        if let Some(object) = result.as_object_mut() {
+        // Emitting these at 2025-11-25 is forward-compatible for a client
+        // that negotiated through the handshake; but a client that DECLARED
+        // 2025-11-25 per-request gets strict old-revision shape (no
+        // newer-revision fields at all), so suppress them there.
+        if era != Era::LegacyDeclared
+            && let Some(object) = result.as_object_mut()
+        {
             object.insert("ttlMs".to_string(), serde_json::json!(3_600_000u64));
             object.insert("cacheScope".to_string(), serde_json::json!("private"));
         }
@@ -1387,7 +1609,12 @@ description: Some("Investigate a recorded failure using earlier memories sharing
                     .and_then(|v| v.as_str())
                     == Some("tools") =>
             {
-                let catalog = self.handle_tools_list(None).await?;
+                // This is tool RESULT content (data inside structuredContent),
+                // not a response envelope, so the strict
+                // no-newer-revision-fields rule for declared-legacy requests
+                // does not apply here; the catalog rides with the same hints
+                // it has always carried.
+                let catalog = self.handle_tools_list(None, Era::LegacyHandshake).await?;
                 tools::memory_status::tool_guide(&catalog, request.arguments.as_ref().unwrap())
             }
             "memory_status" => {
@@ -1936,6 +2163,7 @@ description: Some("Investigate a recorded failure using earlier memories sharing
     async fn handle_resources_list(
         &self,
         params: Option<&serde_json::Value>,
+        era: Era,
     ) -> Result<serde_json::Value, JsonRpcError> {
         reject_unknown_cursor(params)?;
 
@@ -2015,29 +2243,68 @@ description: Some("Investigate a recorded failure using earlier memories sharing
         ];
 
         let result = ListResourcesResult { resources };
-        serde_json::to_value(result).map_err(|e| JsonRpcError::internal_error(&e.to_string()))
+        let mut value =
+            serde_json::to_value(result).map_err(|e| JsonRpcError::internal_error(&e.to_string()))?;
+        // Cache hints (`CacheableResult`): the list of advertised resources is
+        // compile-time constant per binary, an hour is conservative;
+        // `private` because feature flags can differ per install. Suppressed
+        // for a client that declared a legacy revision per-request (no
+        // newer-revision fields); forward-compatible for everyone else.
+        if era != Era::LegacyDeclared
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert("ttlMs".to_string(), serde_json::json!(3_600_000u64));
+            object.insert("cacheScope".to_string(), serde_json::json!("private"));
+        }
+        Ok(value)
     }
 
     /// Handle resources/templates/list request.
     ///
-    /// Every Vestige resource is a fixed `memory://` URI, so there are no URI
-    /// templates to advertise. The answer is an empty list rather than
-    /// `-32601`: the method belongs to the `resources` capability we declare,
-    /// and a client discovering templates should learn "none" instead of
+    /// One URI template: the MCP App receipt card (`ui://vestige/receipt/{id}`,
+    /// SEP-1865). Every other Vestige resource is a fixed `memory://` URI.
+    /// The answer includes the template rather than `-32601`: the method
+    /// belongs to the `resources` capability we declare, and a client
+    /// discovering templates should learn what exists instead of
     /// "method not found". The conformance suite could not verify this surface
     /// while it errored (#175).
     fn handle_resources_templates_list(
         &self,
         params: Option<&serde_json::Value>,
+        era: Era,
     ) -> Result<serde_json::Value, JsonRpcError> {
         reject_unknown_cursor(params)?;
-        Ok(serde_json::json!({ "resourceTemplates": [] }))
+        // Cache hints (`CacheableResult`): the template list is compile-time
+        // constant per binary, an hour is conservative. `private` because a
+        // build's feature set can differ per install. Suppressed for a client
+        // that declared a legacy revision per-request.
+        let mut result = serde_json::json!({
+            "resourceTemplates": [
+                {
+                    "uriTemplate": resources::receipt_card::URI_TEMPLATE,
+                    "name": "Retrieval Receipt Card",
+                    "description": "MCP App rendering one retrieval receipt: retrieved ids, \
+                     suppressed entries with reasons, the activation path, and the trust floor. \
+                     Read with resources/read using the receipt id from a recall result. \
+                     Server-rendered HTML; no network, no memory content beyond the receipt.",
+                    "mimeType": resources::receipt_card::MIME_TYPE,
+                },
+            ]
+        });
+        if era != Era::LegacyDeclared
+            && let Some(object) = result.as_object_mut()
+        {
+            object.insert("ttlMs".to_string(), serde_json::json!(3_600_000u64));
+            object.insert("cacheScope".to_string(), serde_json::json!("private"));
+        }
+        Ok(result)
     }
 
     /// Handle resources/read request
     async fn handle_resources_read(
         &self,
         params: Option<serde_json::Value>,
+        era: Era,
     ) -> Result<serde_json::Value, JsonRpcError> {
         let request: ReadResourceRequest = match params {
             Some(p) => serde_json::from_value(p)
@@ -2050,7 +2317,13 @@ description: Some("Investigate a recorded failure using earlier memories sharing
         // OpenCode and other MCP clients may send "vestige/memory://recent"
         // but we register resources as "memory://recent"
         let normalized_uri = uri.strip_prefix("vestige/").unwrap_or(uri);
-        let content = if normalized_uri.starts_with("memory://") {
+        // The receipt card is the one non-JSON resource: an MCP App HTML
+        // document (`text/html;profile=mcp-app`, SEP-1865) rendered
+        // server-side from the persisted receipt.
+        let is_receipt_card = resources::receipt_card::parse_uri(normalized_uri).is_some();
+        let content = if is_receipt_card {
+            resources::receipt_card::read(&self.storage, normalized_uri).await
+        } else if normalized_uri.starts_with("memory://") {
             resources::memory::read(&self.storage, normalized_uri).await
         } else if normalized_uri.starts_with("codebase://") {
             resources::codebase::read(&self.storage, normalized_uri).await
@@ -2060,22 +2333,52 @@ description: Some("Investigate a recorded failure using earlier memories sharing
 
         match content {
             Ok(text) => {
+                let mime_type = if is_receipt_card {
+                    resources::receipt_card::MIME_TYPE.to_string()
+                } else {
+                    "application/json".to_string()
+                };
                 let result = ReadResourceResult {
                     contents: vec![crate::protocol::messages::ResourceContent {
                         uri: uri.clone(),
-                        mime_type: Some("application/json".to_string()),
+                        mime_type: Some(mime_type),
                         text: Some(text),
                         blob: None,
                     }],
                 };
-                serde_json::to_value(result)
-                    .map_err(|e| JsonRpcError::internal_error(&e.to_string()))
+                let mut value =
+                    serde_json::to_value(result).map_err(|e| JsonRpcError::internal_error(&e.to_string()))?;
+                // Cache hints (`CacheableResult`). Resource content is
+                // user-data backed and can change on any write, so the honest
+                // hint is one second and `private` — the field pair is
+                // required at 2026-07-28, and its value is advisory.
+                // Suppressed for a client that declared a legacy revision
+                // per-request (no newer-revision fields).
+                if era != Era::LegacyDeclared
+                    && let Some(object) = value.as_object_mut()
+                {
+                    object.insert("ttlMs".to_string(), serde_json::json!(1_000u64));
+                    object.insert("cacheScope".to_string(), serde_json::json!("private"));
+                }
+                Ok(value)
             }
             Err(e) => {
-                if e.to_ascii_lowercase().contains("unknown")
-                    || e.to_ascii_lowercase().contains("not found")
-                {
-                    Err(JsonRpcError::resource_not_found(uri))
+                let not_found = e.to_ascii_lowercase().contains("unknown")
+                    || e.to_ascii_lowercase().contains("not found");
+                if not_found {
+                    // 2026-07-28 retires `-32002` (resource not found):
+                    // implementations of the modern revision MUST NOT emit
+                    // it; the failure is expressed as `-32602` invalid
+                    // params instead. Legacy clients keep the historical
+                    // code they were built to match on.
+                    if era == Era::Modern {
+                        Err(JsonRpcError::invalid_params(&format!(
+                            "Resource not found: {}",
+                            uri
+                        )))
+                    } else {
+                        Err(JsonRpcError::resource_not_found(uri))
+                    }
                 } else {
                     Err(JsonRpcError::internal_error(&e))
                 }
@@ -2432,6 +2735,7 @@ description: Some("Investigate a recorded failure using earlier memories sharing
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::types::MODERN_PROTOCOL_VERSION;
     use tempfile::TempDir;
 
     /// Create a test storage instance with a temporary database
@@ -2525,6 +2829,372 @@ mod tests {
                 "version": "1.0.0"
             }
         })
+    }
+
+    /// A modern (2026-07-28) request: per-request `_meta` carries the
+    /// protocol version and client capabilities, and there is no handshake.
+    /// `method_params` must be an object (or null); `_meta` is inserted into
+    /// it alongside the caller's own fields.
+    fn modern_params(method_params: serde_json::Value) -> serde_json::Value {
+        let mut map = method_params
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        map.insert(
+            "_meta".to_string(),
+            serde_json::json!({
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientInfo": { "name": "modern", "version": "1.0" },
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }),
+        );
+        serde_json::Value::Object(map)
+    }
+
+    // ========================================================================
+    // MCP 2026-07-28: STATELESS CORE, VERSION NEGOTIATION, RESULT ENVELOPE
+    // ========================================================================
+
+    /// Done-when #241: `server/discover` lists both revisions. Modern first,
+    /// matching the spec's own ordering, with the legacy revisions a
+    /// handshake client can still negotiate.
+    #[tokio::test]
+    async fn discover_advertises_both_revisions_without_a_handshake() {
+        let (server, _dir) = test_server().await;
+        // Deliberately NOT initialized: discover must work pre-handshake.
+        let response = server
+            .handle_request(make_request("server/discover", None))
+            .await
+            .unwrap();
+        let result = response.result.expect("discover result");
+        assert_eq!(result["resultType"], "complete");
+        let versions = result["supportedVersions"].as_array().unwrap();
+        let versions: Vec<&str> = versions.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(versions.first(), Some(&MODERN_PROTOCOL_VERSION));
+        assert!(versions.contains(&MCP_VERSION), "legacy clients negotiate down to {MCP_VERSION}");
+        assert_eq!(result["capabilities"]["tools"], serde_json::json!({ "listChanged": false }));
+    }
+
+    /// A modern client never shakes hands. A `ping` with per-request `_meta`
+    /// must succeed on a never-initialized server and carry the modern
+    /// result envelope.
+    #[tokio::test]
+    async fn modern_ping_serves_statelessly_with_result_type() {
+        let (server, _dir) = test_server().await;
+        let response = server
+            .handle_request(make_request("ping", Some(modern_params(serde_json::json!({})))))
+            .await
+            .unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "vestige"
+        );
+    }
+
+    /// A modern tools/call works without any handshake and gets
+    /// `resultType: "complete"` — including an is_error tool result, which is
+    /// still a completed request at the protocol layer.
+    #[tokio::test]
+    async fn modern_tools_call_serves_statelessly_with_result_type() {
+        let (server, _dir) = test_server().await;
+        let response = server
+            .handle_request(make_request(
+                "tools/call",
+                Some(modern_params(serde_json::json!({
+                    "name": "memory_status",
+                    "arguments": { "view": "health" }
+                }))),
+            ))
+            .await
+            .unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["isError"], false);
+    }
+
+    /// A request that declares a LEGACY revision through `_meta` is served
+    /// statelessly (it declared its own revision) but keeps the legacy result
+    /// shape: a 2025-11-25 client must not receive newer-revision fields.
+    #[tokio::test]
+    async fn declared_legacy_revision_gets_legacy_shape_without_a_handshake() {
+        let (server, _dir) = test_server().await;
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MCP_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }
+        });
+        let response = server
+            .handle_request(make_request("ping", Some(params)))
+            .await
+            .unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert!(
+            result.get("resultType").is_none(),
+            "a 2025-11-25 request must not receive 2026-07-28 fields: {result}"
+        );
+    }
+
+    /// 2026-07-28 requires `io.modelcontextprotocol/clientCapabilities` on
+    /// every request. A modern request missing it is malformed (-32602), not
+    /// served with assumed-empty capabilities.
+    #[tokio::test]
+    async fn modern_request_without_client_capabilities_is_invalid_params() {
+        let (server, _dir) = test_server().await;
+        let response = server
+            .handle_request(make_request(
+                "ping",
+                Some(serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    }
+                })),
+            ))
+            .await
+            .unwrap();
+        let error = response.error.expect("must reject");
+        assert_eq!(error.code, -32602);
+    }
+
+    /// The same for the version key itself: a `_meta` block that claims the
+    /// modern era without a usable version string is malformed.
+    #[tokio::test]
+    async fn modern_request_without_version_is_invalid_params() {
+        let (server, _dir) = test_server().await;
+        let response = server
+            .handle_request(make_request(
+                "ping",
+                Some(serde_json::json!({
+                    "_meta": { "io.modelcontextprotocol/clientCapabilities": {} }
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.error.expect("must reject").code, -32602);
+    }
+
+    /// An unknown (or declined) version gets `UnsupportedProtocolVersionError`
+    /// with the versions the server does serve, so the client can retry
+    /// without a second discovery round trip.
+    #[tokio::test]
+    async fn modern_request_with_unknown_version_lists_supported() {
+        let (server, _dir) = test_server().await;
+        let response = server
+            .handle_request(make_request(
+                "ping",
+                Some(serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "1900-01-01",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    }
+                })),
+            ))
+            .await
+            .unwrap();
+        let error = response.error.expect("must reject");
+        assert_eq!(error.code, -32022, "spec-defined UnsupportedProtocolVersion");
+        let error_data = error.data.expect("-32022 carries data");
+        assert_eq!(error_data["requested"], "1900-01-01");
+        let supported = error_data["supported"].as_array().unwrap();
+        assert!(supported.contains(&serde_json::json!(MODERN_PROTOCOL_VERSION)));
+        assert!(supported.contains(&serde_json::json!(MCP_VERSION)));
+    }
+
+    /// Legacy results stay byte-compatible: no `resultType` on the wire for
+    /// handshake clients.
+    #[tokio::test]
+    async fn legacy_results_do_not_carry_result_type() {
+        let (server, _dir) = test_server().await;
+        server
+            .handle_request(make_request("initialize", Some(init_params())))
+            .await
+            .unwrap();
+        let response = server
+            .handle_request(make_request("tools/list", None))
+            .await
+            .unwrap();
+        let result = response.result.unwrap();
+        assert!(result.get("resultType").is_none(), "legacy envelope must not grow");
+        assert_eq!(result["ttlMs"], 3_600_000);
+    }
+
+    /// A dual-era server selects legacy semantics from the `initialize`
+    /// method itself. A client asking for the modern revision THROUGH the
+    /// handshake gets the newest handshake revision instead — the modern
+    /// revision has no handshake to negotiate with.
+    #[tokio::test]
+    async fn initialize_requesting_modern_revision_falls_back_to_legacy() {
+        let (server, _dir) = test_server().await;
+        let response = server
+            .handle_request(make_request(
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": { "name": "confused", "version": "1.0" }
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.result.unwrap()["protocolVersion"], MCP_VERSION);
+    }
+
+    /// The receipt-card UI template is advertised through
+    /// `resources/templates/list` with the SEP-1865 app MIME type.
+    #[tokio::test]
+    async fn receipt_card_template_is_advertised() {
+        let (server, _dir) = test_server().await;
+        server
+            .handle_request(make_request("initialize", Some(init_params())))
+            .await
+            .unwrap();
+        let response = server
+            .handle_request(make_request("resources/templates/list", None))
+            .await
+            .unwrap();
+        let templates = response.result.unwrap()["resourceTemplates"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let card = templates
+            .iter()
+            .find(|t| t["uriTemplate"] == "ui://vestige/receipt/{id}")
+            .expect("receipt card template advertised");
+        assert_eq!(card["mimeType"], "text/html;profile=mcp-app");
+    }
+
+    /// `resources/read` on a persisted receipt renders the app document with
+    /// the app MIME type. Modern not-found uses -32602 (the -32002 code is
+    /// retired at 2026-07-28); legacy keeps -32002.
+    #[tokio::test]
+    async fn receipt_card_read_renders_html_with_app_mime() {
+        let (storage, _dir) = test_storage().await;
+        let receipt = crate::trace_recorder::build_and_save_receipt(
+            &storage,
+            "run_test",
+            "recall",
+            &serde_json::json!({
+                "results": [
+                    { "id": "mem-1", "trustScore": 0.9 },
+                    { "id": "mem-2", "trustScore": 0.5 }
+                ]
+            }),
+        )
+        .expect("retrieval receipt built");
+        let receipt_id = receipt["receipt_id"].as_str().unwrap().to_string();
+        let uri = format!("ui://vestige/receipt/{receipt_id}");
+
+        // Both era servers MUST share the storage the receipt was saved to.
+        let make_server = |initialized: bool| {
+            let storage = Arc::clone(&storage);
+            async move {
+                let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
+                let server = McpServer::new(storage, cognitive);
+                if initialized {
+                    server
+                        .handle_request(make_request("initialize", Some(init_params())))
+                        .await
+                        .unwrap();
+                }
+                server
+            }
+        };
+
+        // Legacy era: handshake first, no modern _meta.
+        let legacy_server = make_server(true).await;
+        let legacy_result = legacy_server
+            .handle_request(
+                make_request("resources/read", Some(serde_json::json!({ "uri": uri }))),
+            )
+            .await
+            .unwrap()
+            .result
+            .expect("legacy read");
+        let content = &legacy_result["contents"][0];
+        assert_eq!(content["mimeType"], "text/html;profile=mcp-app");
+        assert!(content["text"].as_str().unwrap().contains(&receipt_id));
+
+        // Modern server, never initialized: works statelessly.
+        let modern_server = make_server(false).await;
+        let modern_response = modern_server
+            .handle_request(make_request(
+                "resources/read",
+                Some(modern_params(serde_json::json!({ "uri": uri }))),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            modern_response.error.is_none(),
+            "{:?}",
+            modern_response.error
+        );
+        assert_eq!(
+            modern_response.result.unwrap()["contents"][0]["mimeType"],
+            "text/html;profile=mcp-app"
+        );
+
+        // Unknown id: modern -32602, legacy -32002.
+        let modern_missing = modern_server
+            .handle_request(make_request(
+                "resources/read",
+                Some(modern_params(serde_json::json!({
+                    "uri": "ui://vestige/receipt/r_missing"
+                }))),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(modern_missing.error.expect("reject").code, -32602);
+        let legacy_missing = legacy_server
+            .handle_request(make_request(
+                "resources/read",
+                Some(serde_json::json!({ "uri": "ui://vestige/receipt/r_missing" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(legacy_missing.error.expect("reject").code, -32002);
+    }
+
+    /// The modern envelope links a tool result's persisted receipt to its
+    /// card: `structuredContent.receiptId` becomes `_meta.ui.resourceUri`.
+    #[test]
+    fn modern_envelope_links_receipt_card_from_tool_result() {
+        let mut result = serde_json::json!({
+            "content": [{ "type": "text", "text": "{}" }],
+            "structuredContent": { "receiptId": "r_2026_09_27_ab12cd_334455" },
+            "isError": false,
+        });
+        decorate_modern_result(&mut result);
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(
+            result["_meta"]["ui"]["resourceUri"],
+            "ui://vestige/receipt/r_2026_09_27_ab12cd_334455"
+        );
+
+        // A result without a receipt still gets the envelope, but no ui key.
+        let mut plain = serde_json::json!({});
+        decorate_modern_result(&mut plain);
+        assert_eq!(plain["resultType"], "complete");
+        assert!(plain["_meta"].get("ui").is_none());
+    }
+
+    /// The advertised `recall` tool carries the SEP-1865 `_meta.ui` pointer
+    /// so app-capable hosts can preload the card.
+    #[test]
+    fn recall_tool_advertises_receipt_card_ui() {
+        let recall = McpServer::tool_catalog()
+            .into_iter()
+            .find(|t| t.name == "recall")
+            .expect("recall in catalog");
+        let meta = recall.meta.expect("recall carries _meta");
+        assert_eq!(
+            meta["ui"]["resourceUri"],
+            "ui://vestige/receipt/{id}"
+        );
     }
 
     // ========================================================================
@@ -3115,13 +3785,13 @@ mod tests {
             .collect();
         assert!(versions.contains(&MCP_VERSION));
         assert!(
-            !versions.contains(&"2026-07-28"),
-            "never advertise a revision the server does not implement"
+            versions.contains(&MODERN_PROTOCOL_VERSION),
+            "#241: the server serves 2026-07-28 and must advertise it"
         );
         for version in versions {
             assert!(
-                supported_protocol_versions().contains(&version),
-                "every advertised revision must be one initialize accepts: {version}"
+                SUPPORTED_PROTOCOL_VERSIONS.contains(&version),
+                "every advertised revision is one this server serves: {version}"
             );
         }
     }
@@ -3169,8 +3839,12 @@ mod tests {
         }
     }
 
-    /// `resources/templates/list` answers with an empty list, not method-not-found:
+    /// `resources/templates/list` answers rather than method-not-found:
     /// the method belongs to the `resources` capability the server declares.
+    /// Since #241 it advertises the MCP App receipt-card template, so the
+    /// answer is a one-entry list — a client discovering templates learns
+    /// what exists instead of "method not found". The conformance suite
+    /// could not verify this surface while it errored (#175).
     #[tokio::test]
     async fn resources_templates_list_is_empty_not_method_not_found() {
         let (server, _dir) = test_server().await;
@@ -3183,9 +3857,15 @@ mod tests {
             .await
             .unwrap();
         assert!(response.error.is_none(), "{:?}", response.error);
-        assert_eq!(
-            response.result.unwrap()["resourceTemplates"],
-            serde_json::json!([])
+        let templates = response.result.unwrap()["resourceTemplates"]
+            .as_array()
+            .expect("resourceTemplates must be an array")
+            .clone();
+        assert!(
+            templates
+                .iter()
+                .any(|t| t["uriTemplate"] == "ui://vestige/receipt/{id}"),
+            "the receipt-card template is advertised: {templates:?}"
         );
     }
 
@@ -3459,7 +4139,10 @@ mod tests {
         server
             .handle_request(make_request("initialize", Some(init_params())))
             .await;
-        let catalog = server.handle_tools_list(None).await.unwrap();
+        let catalog = server
+            .handle_tools_list(None, Era::LegacyHandshake)
+            .await
+            .unwrap();
         let result = server
             .handle_tools_call(Some(serde_json::json!({
                 "name": "memory_status", "arguments": {"view": "tools"}
