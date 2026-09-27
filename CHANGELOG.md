@@ -32,7 +32,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of mid-list.
 - The server instructions name the code-memory workflow, so agents learn
   that anchored code knowledge exists before they need it.
-=======
 ### Changed — memory_status views: from counters to diagnostics
 
 - `health` now emits a structured `diagnostics` array alongside the
@@ -73,6 +72,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stdin loop starts (clean exit 0 verified manually), so the old
   deadline failed spuriously on cold starts. The behavior assertion is
   unchanged.
+### Fixed — source_sync hardening (connectors audit)
+
+- Rate-limit respect: GitHub *secondary* rate limits (403 carrying
+  `Retry-After` with nonzero `x-ratelimit-remaining`) were classified as a
+  generic "forbidden" and re-prompted immediate retries that deepened the
+  penalty. They now classify as `RateLimited`, and the sync driver backs off
+  once and retries the same page when the server's wait is at most 60s;
+  longer waits abort with the wait surfaced instead of blocking an MCP call
+  for an hour.
+- Resumable pagination: the incremental-sync checkpoint is persisted after
+  every completed page, not only at the end of a run. An interrupted
+  multi-page first sync (network drop, mid-sync shutdown) resumes from the
+  last good page instead of re-fetching the whole window.
+- Error messages name the exact failing call: every connector error now
+  carries `GET <url> -> <status>` plus the API's own `message` body and an
+  actionable hint for 401/403/404 (repo not found vs token without access
+  was previously indistinguishable from a bare "Not Found").
+- Stale tags on updated issues: `upsert_by_source` wrote content and the
+  envelope on upstream change but never `tags`, so a label or state change
+  left the original `state:open`-style tags on the node forever. Tags now
+  track every update, and the Unchanged path refreshes them too so tag
+  normalization changes converge on the next touch.
+- `recall` with `source_status=tombstoned` always returned empty: the
+  current-time validity partition withheld tombstoned nodes before the
+  source filter ran. The tombstone filter now counts as the audit opt-in.
+- One flaky comment-fetch response no longer aborts a whole GitHub sync
+  page: one retry, then the issue is skipped with a cursor clamp so the
+  next sync re-fetches exactly that issue (previously the entire run died
+  and later issues in the page were lost from it).
+- Both connectors set explicit connect (10s) and request (30s) timeouts;
+  a stalled connection previously blocked the tool call indefinitely.
+  GitHub live-id enumeration gained the same hard page cap the Redmine
+  connector already had.
 
 ### Added — deterministic query rewriting before retrieval fusion
 

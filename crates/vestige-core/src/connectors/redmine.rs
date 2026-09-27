@@ -153,6 +153,10 @@ impl RedmineConnector {
         }
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
+            // Bounded hangs: without explicit timeouts a stalled connection
+            // blocks the sync — and the MCP tool call — forever.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| ConnectorError::Transport(e.to_string()))?;
         let scope = config.project.clone();
@@ -173,7 +177,10 @@ impl RedmineConnector {
         }
     }
 
-    fn classify_status(resp: &reqwest::Response) -> Option<ConnectorError> {
+    /// Map a non-success response into a connector error that names the exact
+    /// failing call (`GET {url}`) plus the status, so a user seeing "source
+    /// error (403)" knows WHICH request was denied and why.
+    fn classify_status(resp: &reqwest::Response, url: &str) -> Option<ConnectorError> {
         let status = resp.status();
         if status.is_success() {
             return None;
@@ -201,7 +208,7 @@ impl RedmineConnector {
         };
         Some(ConnectorError::Source {
             status: status.as_u16(),
-            message,
+            message: format!("GET {url} -> {status}: {message}"),
         })
     }
 
@@ -214,14 +221,13 @@ impl RedmineConnector {
             .query(&[("include", "journals,relations")])
             .send()
             .await
-            .map_err(|e| ConnectorError::Transport(e.to_string()))?;
-        if let Some(err) = Self::classify_status(&resp) {
+            .map_err(|e| ConnectorError::Transport(format!("GET {url}: {e}")))?;
+        if let Some(err) = Self::classify_status(&resp, &url) {
             return Err(err);
         }
-        let wrapper: IssueWrapper = resp
-            .json()
-            .await
-            .map_err(|e| ConnectorError::Transport(e.to_string()))?;
+        let wrapper: IssueWrapper = resp.json().await.map_err(|e| {
+            ConnectorError::Transport(format!("GET {url}: decode failed: {e}"))
+        })?;
         Ok(wrapper.issue)
     }
 
@@ -454,14 +460,13 @@ impl Connector for RedmineConnector {
             .query(&params)
             .send()
             .await
-            .map_err(|e| ConnectorError::Transport(e.to_string()))?;
-        if let Some(err) = Self::classify_status(&resp) {
+            .map_err(|e| ConnectorError::Transport(format!("GET {url}: {e}")))?;
+        if let Some(err) = Self::classify_status(&resp, &url) {
             return Err(err);
         }
-        let page: IssueListResponse = resp
-            .json()
-            .await
-            .map_err(|e| ConnectorError::Transport(e.to_string()))?;
+        let page: IssueListResponse = resp.json().await.map_err(|e| {
+            ConnectorError::Transport(format!("GET {url}: decode failed: {e}"))
+        })?;
 
         // Per-issue detail fetch for journals (list endpoint omits them).
         //
@@ -495,6 +500,10 @@ impl Connector for RedmineConnector {
         Ok(FetchPage {
             records,
             next_cursor,
+            // The Redmine page aborts on a detail-fetch failure (a journal-less
+            // record would persist a wrong hash AND the offset cursor would
+            // advance past it), so nothing is ever soft-skipped here.
+            skipped: Vec::new(),
         })
     }
 
@@ -519,14 +528,13 @@ impl Connector for RedmineConnector {
                 ])
                 .send()
                 .await
-                .map_err(|e| ConnectorError::Transport(e.to_string()))?;
-            if let Some(err) = Self::classify_status(&resp) {
+                .map_err(|e| ConnectorError::Transport(format!("GET {url}: {e}")))?;
+            if let Some(err) = Self::classify_status(&resp, &url) {
                 return Err(err);
             }
-            let page: IssueListResponse = resp
-                .json()
-                .await
-                .map_err(|e| ConnectorError::Transport(e.to_string()))?;
+            let page: IssueListResponse = resp.json().await.map_err(|e| {
+                ConnectorError::Transport(format!("GET {url}: decode failed: {e}"))
+            })?;
             if page.issues.is_empty() {
                 break;
             }

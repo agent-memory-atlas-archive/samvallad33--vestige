@@ -345,7 +345,7 @@ mod query_rewrite_tests {
 
 #[cfg(test)]
 mod supersession_gate_tests {
-    use super::partition_superseded;
+    use super::{partition_keeps_noncurrent, partition_superseded};
     use vestige_core::memory::SearchResult;
     use vestige_core::KnowledgeNode;
 
@@ -382,6 +382,19 @@ mod supersession_gate_tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(withheld, 0);
         assert!((kept[0].combined_score - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tombstone_audit_source_filter_counts_as_audit_optin() {
+        // `source_status=tombstoned` asks for non-current records by
+        // definition; the currency partition must treat it as the audit
+        // opt-in or the connector tombstone view is unreachable.
+        assert!(partition_keeps_noncurrent(false, true));
+        assert!(partition_keeps_noncurrent(true, false));
+        assert!(
+            !partition_keeps_noncurrent(false, false),
+            "currency stays the default for ordinary queries"
+        );
     }
 
     #[test]
@@ -656,6 +669,15 @@ mod abstention_tests {
 /// entirely (counted in `supersededWithheld` for observability). Explicit
 /// `include_superseded=true` and as-of `validAt` queries still see them:
 /// audit is opt-in, currency is the default.
+///
+/// Opt-in also covers `source_status=tombstoned`: that filter asks for
+/// records that are not-current by definition, so the currency partition
+/// must not withhold exactly what the caller requested (it would make the
+/// connector tombstone-audit view unreachable through search).
+fn partition_keeps_noncurrent(include_superseded: bool, tombstone_audit: bool) -> bool {
+    include_superseded || tombstone_audit
+}
+
 fn partition_superseded(
     results: Vec<vestige_core::SearchResult>,
     valid_at: Option<DateTime<Utc>>,
@@ -802,8 +824,12 @@ pub async fn execute(
         // telemetry is recorded later, after the final budget selection.
         let concrete_verdict = abstention_decision(&concrete_kept, DEFAULT_ABSTAIN_FLOOR);
         let scoped = filter_results_to_scope(storage, concrete_kept, &scope_filter)?;
+        let noncurrent_ok = partition_keeps_noncurrent(
+            args.include_superseded.unwrap_or(false),
+            source_filter.status == SourceStatus::Tombstoned,
+        );
         let (mut results, superseded_withheld) =
-            partition_superseded(scoped, valid_at, args.include_superseded.unwrap_or(false));
+            partition_superseded(scoped, valid_at, noncurrent_ok);
         results.sort_by(|a, b| {
             b.combined_score
                 .partial_cmp(&a.combined_score)
@@ -1096,8 +1122,12 @@ pub async fn execute(
     // #252: enforcement, not labeling — closed validity windows are
     // withheld from current-time results (counted), unless explicitly
     // requested or the query is an as-of audit.
+    let noncurrent_ok = partition_keeps_noncurrent(
+        args.include_superseded.unwrap_or(false),
+        source_filter.status == SourceStatus::Tombstoned,
+    );
     let (kept_results, mut superseded_withheld) =
-        partition_superseded(filtered_results, valid_at, args.include_superseded.unwrap_or(false));
+        partition_superseded(filtered_results, valid_at, noncurrent_ok);
     let mut filtered_results = kept_results;
 
     // ====================================================================
@@ -1108,7 +1138,7 @@ pub async fn execute(
         let (mut kept_kp, extra_withheld) = partition_superseded(
             vec![keyword_priority.clone()],
             valid_at,
-            args.include_superseded.unwrap_or(false),
+            noncurrent_ok,
         );
         superseded_withheld += extra_withheld;
         let Some(kp) = kept_kp.pop() else { continue };

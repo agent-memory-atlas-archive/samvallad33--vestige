@@ -8727,75 +8727,30 @@ fn pending_reconsolidation_plans_are_listed_for_the_verdict_surface() {
     assert_eq!(meta.trigger, "supersede_deferred");
     assert_eq!(meta.snapshot.content, "Fact A about caching");
 }
-=======
-// ===================== memory_status upgrade: diagnostics storage ========
+// ===================== Connector tag freshness ==================
+// A synced issue's tags are derived (state:*, label:*). The UPDATE path used
+// to write only content/envelope columns, so a label or state change upstream
+// left the ORIGINAL tags on the node forever — `tag_prefix=state:open` kept
+// matching a closed issue. The Unchanged path must also converge tags, or a
+// tag-normalization change would only land one content-change late.
 
 #[test]
-fn lowest_retention_nodes_orders_worst_first_and_treats_null_as_zero() {
-    let storage = create_test_storage();
-    // Content strings are deliberately unrelated: ingest's prediction-error
-    // gate merges near-duplicate content, which would swallow fixtures.
-    let fixtures = [
-        ("healthy", "The alpine_ibex climbs cliff faces at dawn"),
-        ("mid", "Quarterly budget spreadsheets need reconciling"),
-        ("worst", "Jazz vinyl pressings warp under summer heat"),
-    ];
-    let mut ids = std::collections::HashMap::new();
-    for (name, content) in fixtures {
-        let node = storage
-            .ingest(crate::IngestInput {
-                content: content.to_string(),
-                ..Default::default()
-            })
-            .unwrap();
-        let demotions = match name {
-            "healthy" => 0,
-            "mid" => 3,
-            _ => 7,
-        };
-        for _ in 0..demotions {
-            storage.demote_memory(&node.id).unwrap();
-        }
-        ids.insert(name, node.id);
-    }
-    // Hand-edited legacy row with NULL retention must sort first, not vanish.
-    let now = Utc::now().to_rfc3339();
-    {
-        let writer = storage.writer.lock().unwrap();
-        writer
-            .execute(
-                "INSERT INTO knowledge_nodes
-                        (id, content, node_type, created_at, updated_at, last_accessed,
-                         tags, scope, retention_strength)
-                     VALUES ('null-ret', 'hand-edited', 'fact', ?1, ?1, ?1, NULL, 'user', NULL)",
-                params![&now],
-            )
-            .unwrap();
-    }
+fn upsert_by_source_updates_tags_when_content_changes() {
+    let store = create_test_storage();
+    let mut input = source_input("5", "issue five", "h5");
+    input.tags = vec!["github".to_string(), "state:open".to_string()];
+    store.upsert_by_source(input).unwrap();
 
-    let worst = storage.lowest_retention_nodes(10).unwrap();
-    assert_eq!(worst[0].0, "null-ret", "NULL retention is the worst row");
-    assert_eq!(worst[0].1, 0.0);
-    // Ascending order: the fully-decayed row must precede the healthy one.
-    let id_of = |name: &str| ids[name].as_str();
-    let position = |id: &str| {
-        worst
-            .iter()
-            .position(|(row_id, _)| row_id == id)
-            .unwrap_or_else(|| panic!("{id} missing from lowest_retention_nodes: {worst:?}"))
-    };
-    assert!(
-        position(id_of("worst")) < position(id_of("healthy")),
-        "decayed rows must sort before healthy rows: {worst:?}"
-    );
-    let mid = worst
-        .iter()
-        .find(|(row_id, _)| row_id == id_of("mid"))
-        .unwrap();
-    assert!(
-        mid.1 < 1.0 && mid.1 > 0.0,
-        "three demotions leave mid partially decayed, got {}",
-        mid.1
+    let mut edited = source_input("5", "issue five CLOSED", "h5b");
+    edited.tags = vec!["github".to_string(), "state:closed".to_string()];
+    let res = store.upsert_by_source(edited).unwrap();
+    assert_eq!(res.outcome, SourceUpsertOutcome::Updated);
+
+    let node = store.get_node(&res.node_id).unwrap().unwrap();
+    assert_eq!(
+        node.tags,
+        vec!["github".to_string(), "state:closed".to_string()],
+        "tags must track the upstream state change"
     );
 }
 

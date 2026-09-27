@@ -95,6 +95,14 @@ impl SqliteMemoryStore {
 
         let env_source_updated_at = env.source_updated_at.map(|dt| dt.to_rfc3339());
         let synced_at = now.to_rfc3339();
+        // Tags always track the normalized record. On the Update path this is
+        // a correctness fix: an issue whose labels/state changed upstream used
+        // to keep its ORIGINAL tags forever (state:open on a closed issue),
+        // silently corrupting tag-filtered retrieval. On the Unchanged path it
+        // is a cheap convergence: if tag normalization changes (e.g. new
+        // lowercase convention) but the content hash does not, tags still
+        // refresh instead of lagging one content-change behind.
+        let tags_json = serde_json::to_string(&input.tags).unwrap_or_else(|_| "[]".to_string());
 
         if unchanged {
             // Cheapest path: only advance liveness + the source cursor field.
@@ -110,9 +118,16 @@ impl SqliteMemoryStore {
                 "UPDATE knowledge_nodes \
                  SET synced_at = ?1, source_updated_at = COALESCE(?2, source_updated_at), \
                      source_url = COALESCE(?3, source_url), \
+                     tags = ?4, \
                      valid_until = NULL, superseded_by = NULL \
-                 WHERE id = ?4",
-                params![synced_at, env_source_updated_at, env.source_url, node_id],
+                 WHERE id = ?5",
+                params![
+                    synced_at,
+                    env_source_updated_at,
+                    env.source_url,
+                    tags_json,
+                    node_id
+                ],
             )?;
             return Ok(SourceUpsertResult {
                 outcome: SourceUpsertOutcome::Unchanged,
@@ -120,8 +135,8 @@ impl SqliteMemoryStore {
             });
         }
 
-        // Content changed upstream → update body + full envelope, clear any
-        // prior tombstone (`valid_until`), then regenerate the embedding.
+        // Content changed upstream → update body + full envelope + tags, clear
+        // any prior tombstone (`valid_until`), then regenerate the embedding.
         {
             let writer = self
                 .writer
@@ -133,8 +148,9 @@ impl SqliteMemoryStore {
                     content = ?1, updated_at = ?2, synced_at = ?3, \
                     content_hash = ?4, source_url = ?5, source_updated_at = ?6, \
                     source_project = ?7, source_type = ?8, source_author = ?9, \
+                    tags = ?10, \
                     valid_until = NULL, superseded_by = NULL \
-                 WHERE id = ?10",
+                 WHERE id = ?11",
                 params![
                     input.content,
                     now.to_rfc3339(),
@@ -145,6 +161,7 @@ impl SqliteMemoryStore {
                     env.source_project,
                     env.source_type,
                     env.source_author,
+                    tags_json,
                     node_id,
                 ],
             )?;
