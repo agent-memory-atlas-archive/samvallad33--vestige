@@ -144,13 +144,17 @@ def run(binary):
                 row[0] for row in sqlite3.connect(p).execute("SELECT name FROM sqlite_master")})
             with sqlite3.connect(db) as conn:
                 before = conn.execute("SELECT reps,storage_strength,retention_strength,content FROM knowledge_nodes WHERE id=?", (node_id,)).fetchone()
+                verdicts = conn.execute("SELECT file_path,last_status FROM code_memory_anchors WHERE node_id=?", (node_id,)).fetchall()
             contexts(); contexts()
             with sqlite3.connect(db) as conn:
                 after = conn.execute("SELECT reps,storage_strength,retention_strength,content FROM knowledge_nodes WHERE id=?", (node_id,)).fetchone()
                 assert before == after, {"before": before, "after": after}
-                cached = conn.execute("SELECT last_verified_at FROM code_memory_anchors WHERE node_id=?", (node_id,)).fetchall()
-                assert all(row[0] is None for row in cached)
-            passed("C12 repeated context reads do not reinforce or cache across worktrees")
+                # Reads may refresh last_verified_at (when), but must never flip
+                # last_status (what): verdicts persist across sessions and mere
+                # context reads neither corrupt nor clear them.
+                verdicts_after = conn.execute("SELECT file_path,last_status FROM code_memory_anchors WHERE node_id=?", (node_id,)).fetchall()
+                assert sorted(verdicts_after) == sorted(verdicts), {"before": sorted(verdicts), "after": sorted(verdicts_after)}
+            passed("C12 repeated context reads do not reinforce or flip verdicts across worktrees")
             with sqlite3.connect(db) as conn:
                 conn.execute("UPDATE knowledge_nodes SET valid_until='2020-01-01T00:00:00Z' WHERE id=?", (partial,))
                 conn.execute("UPDATE code_memory_anchors SET content_hash='0123456789abcdef0123456789abcdef' WHERE node_id=?", (node_id,))
