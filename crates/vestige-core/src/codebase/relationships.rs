@@ -122,9 +122,6 @@ pub struct GraphMetadata {
 struct CoEditSession {
     /// Files in this session
     files: HashSet<PathBuf>,
-    /// When the session started (for analytics/debugging)
-    #[allow(dead_code)]
-    started_at: DateTime<Utc>,
     /// When the session was last updated
     last_updated: DateTime<Utc>,
 }
@@ -216,8 +213,7 @@ impl RelationshipTracker {
                     self.finalize_session()?;
                     self.current_session = Some(CoEditSession {
                         files: files.iter().cloned().collect(),
-                        started_at: now,
-                        last_updated: now,
+                                                last_updated: now,
                     });
                 } else {
                     // Add files to current session
@@ -229,8 +225,7 @@ impl RelationshipTracker {
                 // Start new session
                 self.current_session = Some(CoEditSession {
                     files: files.iter().cloned().collect(),
-                    started_at: now,
-                    last_updated: now,
+                                        last_updated: now,
                 });
             }
         }

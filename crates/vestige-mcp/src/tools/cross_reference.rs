@@ -528,10 +528,8 @@ enum Relation {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct RelationAssessment {
     relation: Relation,
-    confidence: f64,
     reasoning: String,
 }
 
@@ -551,7 +549,6 @@ fn assess_relation(
     if topic_sim < 0.15 {
         return RelationAssessment {
             relation: Relation::Irrelevant,
-            confidence: 1.0 - topic_sim as f64,
             reasoning: format!("Different topics (similarity {:.2})", topic_sim),
         };
     }
@@ -584,7 +581,6 @@ fn assess_relation(
     if topic_sim > 0.4 && time_delta_days > 0 && trust_gain > 0.05 && !has_correction {
         return RelationAssessment {
             relation: Relation::Supersedes,
-            confidence: topic_sim as f64 * (0.5 + trust_gain.min(0.5)),
             reasoning: format!(
                 "{} supersedes {} (newer by {}d, trust +{:.0}%)",
                 newer,
@@ -604,7 +600,6 @@ fn assess_relation(
     if has_correction && topic_sim > 0.55 {
         return RelationAssessment {
             relation: Relation::Contradicts,
-            confidence: topic_sim as f64 * 0.8,
             reasoning: format!(
                 "Contradiction detected (similarity {:.2}, correction signals present)",
                 topic_sim
@@ -616,7 +611,6 @@ fn assess_relation(
     if topic_sim > 0.3 {
         return RelationAssessment {
             relation: Relation::Supports,
-            confidence: topic_sim as f64,
             reasoning: format!(
                 "Topically aligned (similarity {:.2}), consistent stance",
                 topic_sim
@@ -626,7 +620,6 @@ fn assess_relation(
 
     RelationAssessment {
         relation: Relation::Irrelevant,
-        confidence: 0.3,
         reasoning: "Weak relationship".to_string(),
     }
 }
@@ -863,15 +856,11 @@ pub(crate) fn topic_overlap(a: &str, b: &str) -> f32 {
 // Scored Memory (used across pipeline stages)
 // ============================================================================
 
-#[allow(dead_code)]
 struct ScoredMemory {
     id: String,
     content: String,
-    tags: Vec<String>,
     trust: f64,
     updated_at: chrono::DateTime<Utc>,
-    created_at: chrono::DateTime<Utc>,
-    retention: f64,
     combined_score: f32,
     valid_until: Option<chrono::DateTime<Utc>>,
     currently_valid: bool,
@@ -1064,11 +1053,8 @@ pub async fn execute(
             ScoredMemory {
                 id: r.node.id.clone(),
                 content: r.node.content.clone(),
-                tags: r.node.tags.clone(),
                 trust,
                 updated_at: r.node.updated_at,
-                created_at: r.node.created_at,
-                retention: r.node.retention_strength,
                 combined_score: validity_adjusted_score(r.combined_score, valid_for_ranking),
                 valid_until: r.node.valid_until,
                 currently_valid,
@@ -1959,11 +1945,8 @@ mod tests {
         super::ScoredMemory {
             id: id.to_string(),
             content: content.to_string(),
-            tags: vec![],
             trust,
             updated_at: when,
-            created_at: when,
-            retention: 0.9,
             combined_score: 0.8,
             valid_until: None,
             currently_valid: true,
@@ -2008,7 +1991,6 @@ mod tests {
             0.55,
             super::RelationAssessment {
                 relation: super::Relation::Contradicts,
-                confidence: 0.6,
                 reasoning: "Same topic, opposite claims".to_string(),
             },
         )];

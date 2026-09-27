@@ -564,8 +564,6 @@ pub use search::{
     HybridSearchConfig,
     // Hybrid search
     HybridSearcher,
-    // Keyword search
-    KeywordSearcher,
     RerankedResult,
     // GOD TIER 2026: Reranking
     Reranker,

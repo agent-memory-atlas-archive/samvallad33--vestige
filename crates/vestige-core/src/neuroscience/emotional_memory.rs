@@ -120,10 +120,6 @@ impl std::fmt::Display for EmotionCategory {
 #[derive(Debug, Clone)]
 struct EmotionalRecord {
     memory_id: String,
-    #[allow(dead_code)]
-    valence: f64,
-    #[allow(dead_code)]
-    arousal: f64,
     encoded_at: DateTime<Utc>,
 }
 
@@ -328,11 +324,13 @@ impl EmotionalMemory {
     ///
     /// Call this after ingesting a memory so that subsequent high-emotion
     /// events can retroactively boost temporally adjacent memories.
-    pub fn record_encoding(&mut self, memory_id: &str, valence: f64, arousal: f64) {
+    ///
+    /// `valence` and `arousal` are accepted to keep the capture-trail API
+    /// stable; tag-and-capture keys off the trigger's arousal and temporal
+    /// proximity alone, so the per-record values are not stored.
+    pub fn record_encoding(&mut self, memory_id: &str, _valence: f64, _arousal: f64) {
         self.recent_records.push(EmotionalRecord {
             memory_id: memory_id.to_string(),
-            valence,
-            arousal,
             encoded_at: Utc::now(),
         });
 

@@ -1647,9 +1647,6 @@ impl Session {
 struct FocusDetector {
     /// Baseline for "normal" inter-access time (seconds)
     baseline_inter_access: f64,
-    /// Baseline for session depth (for future depth-weighted focus scoring)
-    #[allow(dead_code)]
-    baseline_session_depth: f64,
 }
 
 impl Default for FocusDetector {
@@ -1662,7 +1659,6 @@ impl FocusDetector {
     fn new() -> Self {
         Self {
             baseline_inter_access: 60.0, // 1 minute
-            baseline_session_depth: 5.0,
         }
     }
 

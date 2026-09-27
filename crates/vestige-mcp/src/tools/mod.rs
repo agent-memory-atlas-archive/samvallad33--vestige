@@ -87,23 +87,16 @@ pub mod backfill;
 
 // Internal/backwards-compat tools still dispatched by server.rs for specific
 // tool names. Each module below has live callers via string dispatch in
-// `server.rs` (match arms on request.name). The #[allow(dead_code)]
-// suppresses warnings for the per-module schema/struct items that aren't
-// yet consumed.
+// `server.rs` (match arms on request.name).
 //
 // The nine legacy siblings here pre-v2.0.8 (checkpoint, codebase, consolidate,
 // ingest, intentions, knowledge, recall, search, stats) were removed in the
 // post-v2.0.8 dead-code sweep — all nine had zero callers after the
 // unification work landed `*_unified` + `maintenance::*` replacements.
-#[allow(dead_code)]
 pub mod context;
-#[allow(dead_code)]
 pub mod feedback;
-#[allow(dead_code)]
 pub mod memory_states;
-#[allow(dead_code)]
 pub mod review;
-#[allow(dead_code)]
 pub mod tagging;
 
 /// Evidence-aware intention command adapter.

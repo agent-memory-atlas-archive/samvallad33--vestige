@@ -12,7 +12,7 @@
 //! 5. Weak/old memories are pruned
 //! 6. New connections between memories are discovered
 
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use vestige_core::{
     advanced::dreams::{
         ActivityTracker, ConnectionGraph, ConnectionReason, ConsolidationScheduler, DreamConfig,
@@ -34,37 +34,6 @@ fn make_dream_memory(id: &str, content: &str, tags: Vec<&str>) -> DreamMemory {
         tags: tags.into_iter().map(String::from).collect(),
         created_at: Utc::now(),
         access_count: 1,
-    }
-}
-
-/// Create a memory with specific age
-#[allow(dead_code)]
-fn make_aged_memory(id: &str, content: &str, tags: Vec<&str>, hours_ago: i64) -> DreamMemory {
-    DreamMemory {
-        id: id.to_string(),
-        content: content.to_string(),
-        embedding: None,
-        tags: tags.into_iter().map(String::from).collect(),
-        created_at: Utc::now() - Duration::hours(hours_ago),
-        access_count: 1,
-    }
-}
-
-/// Create a memory with access count
-#[allow(dead_code)]
-fn make_accessed_memory(
-    id: &str,
-    content: &str,
-    tags: Vec<&str>,
-    access_count: u32,
-) -> DreamMemory {
-    DreamMemory {
-        id: id.to_string(),
-        content: content.to_string(),
-        embedding: None,
-        tags: tags.into_iter().map(String::from).collect(),
-        created_at: Utc::now() - Duration::hours(24),
-        access_count,
     }
 }
 

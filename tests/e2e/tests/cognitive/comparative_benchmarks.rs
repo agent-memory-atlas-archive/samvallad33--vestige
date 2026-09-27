@@ -51,16 +51,11 @@ impl Default for SM2State {
     }
 }
 
-/// SM-2 grade (0-5)
+/// SM-2 grade (0-5). This benchmark drives SM-2 at the "correct with
+/// hesitation" grade (4) only; the other scale points are never constructed.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 enum SM2Grade {
-    CompleteBlackout = 0,
-    Incorrect = 1,
-    IncorrectRemembered = 2,
-    CorrectDifficult = 3,
     CorrectHesitation = 4,
-    Perfect = 5,
 }
 
 impl SM2Grade {
@@ -141,14 +136,12 @@ impl Default for FSRS6State {
     }
 }
 
-/// FSRS-6 grade (1-4)
+/// FSRS-6 grade (1-4). This benchmark constructs only `Good` and `Hard`;
+/// the lapse-side grades are never driven through `fsrs6_review`.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 enum FSRS6Grade {
-    Again = 1,
     Hard = 2,
     Good = 3,
-    Easy = 4,
 }
 
 /// FSRS-6 forgetting factor
@@ -185,25 +178,9 @@ fn fsrs6_review(state: &FSRS6State, grade: FSRS6Grade, elapsed_days: f64) -> FSR
     let r = fsrs6_retrievability(state.stability, elapsed_days, w20);
 
     let new_stability = match grade {
-        FSRS6Grade::Again => {
-            // Lapse formula
-            w[11]
-                * state.difficulty.powf(-w[12])
-                * ((state.stability + 1.0).powf(w[13]) - 1.0)
-                * (w[14] * (1.0 - r)).exp()
-        }
-        _ => {
-            // Recall formula
-            let hard_penalty = if matches!(grade, FSRS6Grade::Hard) {
-                w[15]
-            } else {
-                1.0
-            };
-            let easy_bonus = if matches!(grade, FSRS6Grade::Easy) {
-                w[16]
-            } else {
-                1.0
-            };
+        FSRS6Grade::Hard => {
+            // Recall formula with the hard penalty
+            let hard_penalty = w[15];
 
             state.stability
                 * (w[8].exp()
@@ -211,7 +188,15 @@ fn fsrs6_review(state: &FSRS6State, grade: FSRS6Grade, elapsed_days: f64) -> FSR
                     * state.stability.powf(-w[9])
                     * ((w[10] * (1.0 - r)).exp() - 1.0)
                     * hard_penalty
-                    * easy_bonus
+                    + 1.0)
+        }
+        FSRS6Grade::Good => {
+            // Recall formula
+            state.stability
+                * (w[8].exp()
+                    * (11.0 - state.difficulty)
+                    * state.stability.powf(-w[9])
+                    * ((w[10] * (1.0 - r)).exp() - 1.0)
                     + 1.0)
         }
     };
@@ -268,16 +253,6 @@ fn leitner_review(state: &LeitnerState, correct: bool) -> LeitnerState {
     } else {
         LeitnerState { box_number: 1 }
     }
-}
-
-// ============================================================================
-// FIXED INTERVAL SYSTEM (For Comparison)
-// ============================================================================
-
-/// Fixed interval - always reviews at same interval
-#[allow(dead_code)]
-fn fixed_interval_schedule(_correct: bool) -> i32 {
-    7 // Always 7 days
 }
 
 // ============================================================================

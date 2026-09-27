@@ -270,7 +270,6 @@ struct UnifiedIntentionArgs {
     // CHECK parameters
     context: Option<ContextSpec>,
     #[serde(alias = "includeSnoozed")]
-    #[allow(dead_code)]
     include_snoozed: Option<bool>,
     // LIST parameters
     #[serde(alias = "filterStatus")]

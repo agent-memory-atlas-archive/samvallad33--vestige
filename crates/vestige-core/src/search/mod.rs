@@ -2,14 +2,13 @@
 //!
 //! Provides high-performance search capabilities:
 //! - Vector search using HNSW (USearch)
-//! - Keyword search using BM25/FTS5
+//! - Keyword search using BM25/FTS5 (sanitization in `crate::fts`)
 //! - Hybrid search with RRF fusion
 //! - Temporal-aware search
 //! - Reranking for precision (GOD TIER 2026)
 
 mod hybrid;
 pub mod hyde;
-mod keyword;
 mod reranker;
 mod temporal;
 mod vector;
@@ -19,7 +18,10 @@ pub use vector::{
     VectorSearchError,
 };
 
-pub use keyword::{KeywordSearcher, sanitize_fts5_query};
+// Re-exported so `vestige_core::search::sanitize_fts5_query` keeps resolving
+// (benches and downstream code use this path); the implementation lives in
+// the always-available `crate::fts`.
+pub use crate::fts::sanitize_fts5_query;
 
 pub use hybrid::{HybridSearchConfig, HybridSearcher, linear_combination, reciprocal_rank_fusion};
 

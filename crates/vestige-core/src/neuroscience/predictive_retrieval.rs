@@ -71,10 +71,6 @@ const INTEREST_LEARNING_RATE: f64 = 0.1;
 /// Decay factor for interest weights (per day)
 const INTEREST_DECAY_RATE: f64 = 0.98;
 
-/// Decay factor for prediction outcomes (for exponential smoothing)
-#[allow(dead_code)] // Reserved for future prediction accuracy tracking
-const PREDICTION_OUTCOME_DECAY: f64 = 0.9;
-
 /// Time window for session context (minutes)
 const SESSION_WINDOW_MINUTES: i64 = 60;
 

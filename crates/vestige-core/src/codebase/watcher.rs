@@ -154,20 +154,15 @@ impl Default for WatcherConfig {
 struct EditSession {
     /// Files modified in this session
     files: HashSet<PathBuf>,
-    /// When the session started (for analytics/debugging)
-    #[allow(dead_code)]
-    started_at: DateTime<Utc>,
     /// When the last edit occurred
     last_edit_at: DateTime<Utc>,
 }
 
 impl EditSession {
     fn new() -> Self {
-        let now = Utc::now();
         Self {
             files: HashSet::new(),
-            started_at: now,
-            last_edit_at: now,
+            last_edit_at: Utc::now(),
         }
     }
 
