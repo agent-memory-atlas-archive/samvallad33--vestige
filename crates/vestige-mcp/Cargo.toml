@@ -77,7 +77,7 @@ tokio = { version = "1", features = ["full", "io-std"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 unicode-normalization = "0.1"
 
 # Date/Time
@@ -88,7 +88,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Derives the public half of an operator-provisioned receipt signing seed
 # before it is allowed to sign against the separately registered key record.
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 
 # Constant-time comparison for auth tokens (prevents timing side-channels)
 subtle = "2"
@@ -114,7 +114,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # Dashboard (v2.0) - HTTP server + WebSocket + embedded SvelteKit
 axum = { version = "0.8", default-features = false, features = ["json", "query", "tokio", "http1", "ws"] }
 tower = { version = "0.5", features = ["limit"] }
-tower-http = { version = "0.6", features = ["cors", "set-header"] }
+tower-http = { version = "0.7", features = ["cors", "set-header"] }
 futures-util = "0.3"
 open = "5"
 

@@ -889,7 +889,11 @@ impl VerifiedLocalArtifact {
             }
             hasher.update(&buffer[..read]);
         }
-        let actual = format!("{:x}", hasher.finalize());
+        let actual = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         if actual != self.artifact.digest {
             return Err(EmbeddingProfileError::ArtifactVerificationFailed {
                 artifact: self.artifact.artifact.clone(),

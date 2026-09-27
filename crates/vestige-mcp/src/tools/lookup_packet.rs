@@ -152,7 +152,10 @@ pub(crate) fn finish(
     if packet && response["evidenceIncomplete"] == false {
         let payload = json!({"version":1, "boundary":boundary, "results":response["results"],
                              "dissent":response.get("contradictionProtected")});
-        let id = format!("{:x}", Sha256::digest(payload.to_string().as_bytes()));
+        let id = Sha256::digest(payload.to_string().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         response["packetId"] = json!(id);
         response["notModified"] = json!(known == Some(id.as_str()));
         if known == Some(id.as_str()) {

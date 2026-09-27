@@ -838,10 +838,15 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
         .flat_map(|value| value.to_le_bytes())
         .collect()
 }
+// sha2 0.11 (digest 0.11) dropped `LowerHex` on the digest output, so hex
+// encoding is done explicitly here instead of via `format!("{:x}", ...)`.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
-    format!("{:x}", h.finalize())
+    hex_encode(&h.finalize())
 }
 fn corpus_hash(nodes: &[crate::memory::KnowledgeNode]) -> String {
     let mut h = Sha256::new();
@@ -851,7 +856,7 @@ fn corpus_hash(nodes: &[crate::memory::KnowledgeNode]) -> String {
         h.update(node.content.as_bytes());
         h.update([0]);
     }
-    format!("{:x}", h.finalize())
+    hex_encode(&h.finalize())
 }
 fn destination_vector_hash(
     storage: &Storage,
@@ -873,7 +878,7 @@ fn destination_vector_hash(
         h.update(&vector.embedding);
         h.update([0]);
     }
-    Ok(format!("{:x}", h.finalize()))
+    Ok(hex_encode(&h.finalize()))
 }
 
 struct SidecarReceipt {
@@ -957,7 +962,7 @@ fn build_and_verify_sidecar(
     hash.update(fs::read(&final_mappings)?);
     Ok(SidecarReceipt {
         relative_path: format!("embedding-profiles/{}/hnsw/index.usearch", profile),
-        integrity_hash: format!("{:x}", hash.finalize()),
+        integrity_hash: hex_encode(&hash.finalize()),
     })
 }
 

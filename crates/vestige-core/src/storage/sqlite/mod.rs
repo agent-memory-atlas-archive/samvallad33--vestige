@@ -1463,7 +1463,10 @@ impl SqliteMemoryStore {
                 .optional()?.ok_or_else(|| StorageError::NotFound(id.clone()))?;
             state.insert(
                 id.clone(),
-                format!("{:x}", Sha256::digest(payload.as_bytes())),
+                Sha256::digest(payload.as_bytes())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
             );
         }
         Ok(state)

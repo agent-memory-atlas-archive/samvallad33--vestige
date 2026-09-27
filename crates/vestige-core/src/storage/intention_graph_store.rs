@@ -18,7 +18,10 @@ const MAX_COMMAND_BYTES: usize = 128 * 1024;
 const MAX_JOURNAL_ENTRIES: i64 = 20_000;
 
 fn digest(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 fn validate_scope(scope: &str) -> Result<(), String> {

@@ -7986,7 +7986,10 @@ fn storage_with_marker_gate_runtime(dir: &tempfile::TempDir) -> Storage {
     std::fs::write(dir.path().join("runner.bin"), artifact_bytes).unwrap();
     let artifact = ModelArtifactHash::sha256(
         "runner.bin",
-        format!("{:x}", Sha256::digest(artifact_bytes)),
+        Sha256::digest(artifact_bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
     );
     let profile = EmbeddingProfile {
         profile_id: EmbeddingProfileId::new("marker-gate-test-2d").unwrap(),

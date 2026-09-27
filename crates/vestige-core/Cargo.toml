@@ -110,8 +110,8 @@ cudnn = ["cuda", "candle-core/cudnn"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_json_canonicalizer = "0.3"
-base64 = "0.22"
-ed25519-dalek = "2"
+base64 = "0.23"
+ed25519-dalek = "3"
 
 # Date/Time with full timezone support
 chrono = { version = "0.4", features = ["serde"] }
@@ -137,7 +137,7 @@ tracing = "0.1"
 
 # Git integration for codebase memory (feature `codebase-git`, default on)
 # vendored-openssl: Compile OpenSSL from source for cross-compilation support
-git2 = { version = "0.20", features = ["vendored-openssl"], optional = true }
+git2 = { version = "0.21", features = ["vendored-openssl"], optional = true }
 
 # File watching for codebase memory
 notify = "8"
@@ -148,9 +148,9 @@ notify = "8"
 # nomic-embed-text-v1.5: 768 dimensions, 8192 token context, Matryoshka support
 # fastembed v5 provides Nomic v2 MoE and Qwen3 feature-gated model loaders.
 fastembed = { version = "7.1", default-features = false, features = ["hf-hub-native-tls", "image-models"], optional = true }
-candle-core = { version = "0.10.2", optional = true }
-candle-nn = { version = "0.10.2", optional = true }
-tokenizers = { version = "0.22.2", default-features = false, features = ["onig"], optional = true }
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"], optional = true }
 
 # ============================================================================
 # OPTIONAL: Vector Search (USearch - HNSW, 20x faster than FAISS)
@@ -169,10 +169,10 @@ tokenizers = { version = "0.22.2", default-features = false, features = ["onig"]
 usearch = { version = "2.26.2", default-features = false, optional = true }
 
 # LRU cache for query embeddings
-lru = "0.16"
+lru = "0.18"
 trait-variant = "0.1"
 blake3 = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # ============================================================================
 # OPTIONAL: External-source connectors (#57)
@@ -188,12 +188,14 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # XChaCha20-Poly1305 AEAD + Argon2id passphrase KDF. The archive is encrypted on
 # the client before upload, so the hosted service only ever stores ciphertext.
 # Behind the `cloud-sync` feature — the default local-first build links neither.
-chacha20poly1305 = { version = "0.10", optional = true }
-argon2 = { version = "0.5", optional = true }
+chacha20poly1305 = { version = "0.11", optional = true }
+argon2 = { version = "0.6", optional = true }
+# System CSPRNG for salt/nonce material (rand_core 0.10 dropped OsRng).
+getrandom = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "search_bench"

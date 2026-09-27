@@ -2464,7 +2464,7 @@ fn stable_digest<T: Serialize>(value: &T) -> Result<String, String> {
         .map_err(|error| format!("failed to serialize deterministic digest input: {error}"))?;
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 fn requirement_signature(requirement: &Requirement) -> Result<String, String> {

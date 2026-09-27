@@ -3,7 +3,10 @@
 //! Benchmarks for core search operations using Criterion.
 //! Run with: cargo bench -p vestige-core
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+// criterion 0.8 deprecates its own `black_box`; std's is the supported one.
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion};
 use vestige_core::embeddings::cosine_similarity;
 use vestige_core::search::hyde::{centroid_embedding, classify_intent, expand_query};
 use vestige_core::search::{linear_combination, reciprocal_rank_fusion, sanitize_fts5_query};

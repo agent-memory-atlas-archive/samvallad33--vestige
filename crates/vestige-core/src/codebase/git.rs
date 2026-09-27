@@ -133,7 +133,7 @@ impl GitAnalyzer {
                     Ok(head
                         .shorthand()
                         .map(|s| s.to_string())
-                        .unwrap_or_else(|| "unknown".to_string()))
+                        .unwrap_or_else(|_| "unknown".to_string()))
                 } else {
                     // Detached HEAD
                     Ok(head
@@ -592,7 +592,7 @@ impl GitAnalyzer {
                 .unwrap_or_else(Utc::now),
             issue_link,
             severity,
-            discovered_by: commit.author().name().map(|s| s.to_string()),
+            discovered_by: commit.author().name().ok().map(|s| s.to_string()),
             prevention_notes: None,
             tags: vec!["auto-detected".to_string()],
         };

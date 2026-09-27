@@ -17,9 +17,8 @@
 //! the synced data is unrecoverable. We cannot reset it — we never have it.
 
 use argon2::Argon2;
-use chacha20poly1305::aead::rand_core::RngCore;
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
-use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::aead::{Aead, Generate, KeyInit};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
 use super::sqlite::{Result, StorageError};
 
@@ -46,11 +45,14 @@ fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; KEY_LEN]> {
 /// same archive yields different ciphertext (no deterministic leakage).
 pub fn encrypt(passphrase: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
     let mut salt = [0u8; SALT_LEN];
-    OsRng.fill_bytes(&mut salt);
+    getrandom::fill(&mut salt)
+        .map_err(|e| StorageError::Init(format!("system RNG unavailable: {e}")))?;
 
     let key_bytes = derive_key(passphrase.as_bytes(), &salt)?;
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let cipher = XChaCha20Poly1305::new(&key_bytes.into());
+    // aead 0.6 replaced `AeadCore::generate_nonce(&mut OsRng)` with the
+    // `Generate` trait on the nonce type itself (system RNG, 192-bit XChaCha nonce).
+    let nonce = XNonce::generate();
 
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
@@ -95,13 +97,19 @@ pub fn decrypt(passphrase: &str, envelope: &[u8]) -> Result<Vec<u8>> {
     let nonce_start = salt_start + SALT_LEN;
     let ct_start = nonce_start + NONCE_LEN;
     let salt = &envelope[salt_start..nonce_start];
-    let nonce = XNonce::from_slice(&envelope[nonce_start..ct_start]);
+    // hybrid-array deprecated `Array::from_slice` in favor of TryFrom; the
+    // length is already guaranteed to NONCE_LEN by the header arithmetic above.
+    let nonce = XNonce::try_from(&envelope[nonce_start..ct_start]).map_err(|_| {
+        StorageError::Init(
+            "cloud archive is too short to contain a valid XChaCha nonce".to_string(),
+        )
+    })?;
     let ciphertext = &envelope[ct_start..];
 
     let key_bytes = derive_key(passphrase.as_bytes(), salt)?;
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+    let cipher = XChaCha20Poly1305::new(&key_bytes.into());
 
-    cipher.decrypt(nonce, ciphertext).map_err(|_| {
+    cipher.decrypt(&nonce, ciphertext).map_err(|_| {
         StorageError::Init(
             "cloud decryption failed: wrong VESTIGE_CLOUD_ENCRYPTION_KEY or corrupted data"
                 .to_string(),
