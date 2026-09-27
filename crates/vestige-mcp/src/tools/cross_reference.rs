@@ -891,7 +891,9 @@ pub(crate) fn validity_adjusted_score(combined_score: f32, currently_valid: bool
 #[allow(clippy::too_many_arguments)]
 fn retrieve_and_rank_candidates(
     storage: &Arc<Storage>,
-    cognitive: &Arc<Mutex<CognitiveEngine>>,
+    // Only read by the vector-search-only reranker below; the underscore
+    // keeps the no-embeddings build warning-free.
+    _cognitive: &Arc<Mutex<CognitiveEngine>>,
     args: &DeepRefArgs,
     depth: usize,
     scope_filter: &ScopeFilter,
@@ -947,9 +949,12 @@ let mut results =
         })?;
 results.truncate(depth);
 
-let mut ranked = results;
 #[cfg(feature = "vector-search")]
-if let Ok(mut cog) = cognitive.try_lock() {
+let mut ranked = results;
+#[cfg(not(feature = "vector-search"))]
+let ranked = results;
+#[cfg(feature = "vector-search")]
+if let Ok(mut cog) = _cognitive.try_lock() {
     let candidates: Vec<_> = ranked
         .iter()
         .map(|r| (r.clone(), r.node.content.clone()))
