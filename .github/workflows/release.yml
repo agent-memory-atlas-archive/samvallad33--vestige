@@ -229,7 +229,7 @@ jobs:
       # dynamic symbol table only).
       - name: Install GCC 13 (ONNX 1.28 libstdc++ requirements)
         run: |
-          bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends software-properties-common"
+          bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends software-properties-common gnupg"
           bash -lc "add-apt-repository -y ppa:ubuntu-toolchain-r/test && apt-get update"
           bash -lc "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g++-13"
 
@@ -426,7 +426,7 @@ jobs:
       # dynamic symbol table only).
       - name: Install GCC 13 (ONNX 1.28 libstdc++ requirements)
         run: |
-          bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends software-properties-common"
+          bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends software-properties-common gnupg"
           bash -lc "add-apt-repository -y ppa:ubuntu-toolchain-r/test && apt-get update"
           bash -lc "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g++-13"
 

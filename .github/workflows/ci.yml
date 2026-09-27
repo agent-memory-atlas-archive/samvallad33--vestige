@@ -365,7 +365,7 @@ jobs:
     steps:
       - name: Install build dependencies
         run: |
-          bash -lc "apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config cmake python3 perl xz-utils unzip binutils libssl-dev software-properties-common"
+          bash -lc "apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config cmake python3 perl xz-utils unzip binutils libssl-dev software-properties-common gnupg"
           bash -lc "add-apt-repository -y ppa:ubuntu-toolchain-r/test && apt-get update"
           bash -lc "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g++-13"
 
@@ -473,7 +473,7 @@ jobs:
     steps:
       - name: Install build dependencies
         run: |
-          bash -lc "apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config cmake python3 perl xz-utils unzip binutils libssl-dev software-properties-common"
+          bash -lc "apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config cmake python3 perl xz-utils unzip binutils libssl-dev software-properties-common gnupg"
           bash -lc "add-apt-repository -y ppa:ubuntu-toolchain-r/test && apt-get update"
           bash -lc "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g++-13"
 
