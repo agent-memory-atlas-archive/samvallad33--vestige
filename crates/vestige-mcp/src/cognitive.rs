@@ -42,6 +42,18 @@ use vestige_core::{
 #[cfg(feature = "vector-search")]
 use vestige_core::{Reranker, RerankerConfig};
 
+/// Number of cognitive modules held by [`CognitiveEngine`] in this build.
+/// These are in-process Rust structs with no runtime failure channel, so the
+/// health view reports this as the compiled-in module count, not a runtime
+/// probe. The previous hardcode said 28 while the struct actually holds 27
+/// base fields plus 2 search modules — exactly the drift this constant now
+/// prevents. When you add a module field, update the matching arm here and
+/// `cognitive_module_count_is_maintained`.
+#[cfg(feature = "vector-search")]
+pub const COGNITIVE_MODULE_COUNT: usize = 16 + 11 + 2;
+#[cfg(not(feature = "vector-search"))]
+pub const COGNITIVE_MODULE_COUNT: usize = 16 + 11;
+
 /// Stateful cognitive engine holding all neuroscience modules.
 ///
 /// Lives on McpServer as `Arc<Mutex<CognitiveEngine>>` and is passed
@@ -190,6 +202,17 @@ mod tests {
     use chrono::Utc;
     use tempfile::TempDir;
     use vestige_core::{ConnectionRecord, IngestInput};
+
+    /// The health view reports `modulesActive` from `COGNITIVE_MODULE_COUNT`.
+    /// Rust cannot reflect over struct fields, so this test pins the counting
+    /// convention: 16 neuroscience + 11 advanced + 2 cfg-gated search modules.
+    /// If a module field is added to `CognitiveEngine`, update the constant
+    /// arms and this expression together.
+    #[test]
+    fn cognitive_module_count_is_maintained() {
+        let expected = 16 + 11 + if cfg!(feature = "vector-search") { 2 } else { 0 };
+        assert_eq!(COGNITIVE_MODULE_COUNT, expected);
+    }
 
     fn create_test_storage() -> (Storage, TempDir) {
         let dir = TempDir::new().unwrap();

@@ -32,6 +32,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of mid-list.
 - The server instructions name the code-memory workflow, so agents learn
   that anchored code knowledge exists before they need it.
+=======
+### Changed — memory_status views: from counters to diagnostics
+
+- `health` now emits a structured `diagnostics` array alongside the
+  legacy string `warnings`. Each entry names a detected problem (decay,
+  review backlog, embedding coverage/model mismatch, consolidation
+  staleness, declining retention trend), carries a count, up to 10
+  example memory IDs, and a `nextAction` referencing an existing tool —
+  the panel an agent can act on, not just read. `stateDistribution` is
+  computed in SQL over every row instead of a 500-row insertion-ordered
+  sample; `sampled` keeps its key and now equals the whole store
+  (`basis: "full"`). `modulesActive` comes from a maintained constant —
+  the old hardcode said 28 while the struct holds 27 base modules (+2
+  search), the exact drift the constant prevents. Duplicate
+  `embeddingsCompiledIn` key removed from the response.
+- `stats` gains `recommendedActions`: every non-zero hygiene problem
+  (expired, superseded, low retention, untagged, malformed tag rows,
+  never accessed) pairs its count with bounded example memory IDs and a
+  concrete action against an advertised tool.
+- `changelog` closes the audit gap: merge, supersede, undo, tag_rename
+  and tag_merge operations from the `merge_operations` reflog now appear
+  as `merge_operation` events; they were previously visible only through
+  the stats view's bounded tag window.
+- `retention` distribution buckets out-of-range values explicitly:
+  NULL retention lands in `unknown`, negatives in `below0`, above 1.0 in
+  `above100%`. Previously NULL and >1.0 rows inflated `80-100%`, so a
+  store with unreadable retention could read as fully healthy. In-range
+  bucketing is unchanged.
+- `timeline` now returns explicit `returned` and `truncated` fields;
+  `totalMemories` was (and is) the bounded returned count, and the new
+  fields stop it being mistaken for the range's full population.
+- New storage helpers behind the diagnostics: `lowest_retention_nodes`,
+  `due_for_review_node_ids`, `state_distribution` (all bounded reads).
+- Sized-store performance guard: new test file builds a 1000-memory
+  store, budgets every view, and asserts the stats view scales without
+  quadratic behavior (4x store, sub-25x time).
+- Test calibration: the stdio shutdown test's deadline moved 10s → 30s.
+  A fresh data dir pays ~19s of first-run embedding warm-up before the
+  stdin loop starts (clean exit 0 verified manually), so the old
+  deadline failed spuriously on cold starts. The behavior assertion is
+  unchanged.
 
 ### Added — deterministic query rewriting before retrieval fusion
 

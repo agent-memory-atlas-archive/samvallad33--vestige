@@ -23,7 +23,12 @@ fn stdio_server_exits_cleanly_when_stderr_is_already_closed() {
         .spawn()
         .expect("start vestige-mcp with stderr closed");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // 30s, not 10s: a fresh VESTIGE_DATA_DIR pays first-run embedding-runtime
+    // warm-up before the stdin loop is even reached (measured ~18.7s cold on
+    // an arm64 dev machine, exit code 0). The behavior assertion is unchanged
+    // — clean exit on closed stderr + stdin EOF — the deadline just has to be
+    // longer than legitimate cold start or the test fails spuriously.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().expect("poll vestige-mcp") {
             assert!(

@@ -8727,3 +8727,192 @@ fn pending_reconsolidation_plans_are_listed_for_the_verdict_surface() {
     assert_eq!(meta.trigger, "supersede_deferred");
     assert_eq!(meta.snapshot.content, "Fact A about caching");
 }
+=======
+// ===================== memory_status upgrade: diagnostics storage ========
+
+#[test]
+fn lowest_retention_nodes_orders_worst_first_and_treats_null_as_zero() {
+    let storage = create_test_storage();
+    // Content strings are deliberately unrelated: ingest's prediction-error
+    // gate merges near-duplicate content, which would swallow fixtures.
+    let fixtures = [
+        ("healthy", "The alpine_ibex climbs cliff faces at dawn"),
+        ("mid", "Quarterly budget spreadsheets need reconciling"),
+        ("worst", "Jazz vinyl pressings warp under summer heat"),
+    ];
+    let mut ids = std::collections::HashMap::new();
+    for (name, content) in fixtures {
+        let node = storage
+            .ingest(crate::IngestInput {
+                content: content.to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let demotions = match name {
+            "healthy" => 0,
+            "mid" => 3,
+            _ => 7,
+        };
+        for _ in 0..demotions {
+            storage.demote_memory(&node.id).unwrap();
+        }
+        ids.insert(name, node.id);
+    }
+    // Hand-edited legacy row with NULL retention must sort first, not vanish.
+    let now = Utc::now().to_rfc3339();
+    {
+        let writer = storage.writer.lock().unwrap();
+        writer
+            .execute(
+                "INSERT INTO knowledge_nodes
+                        (id, content, node_type, created_at, updated_at, last_accessed,
+                         tags, scope, retention_strength)
+                     VALUES ('null-ret', 'hand-edited', 'fact', ?1, ?1, ?1, NULL, 'user', NULL)",
+                params![&now],
+            )
+            .unwrap();
+    }
+
+    let worst = storage.lowest_retention_nodes(10).unwrap();
+    assert_eq!(worst[0].0, "null-ret", "NULL retention is the worst row");
+    assert_eq!(worst[0].1, 0.0);
+    // Ascending order: the fully-decayed row must precede the healthy one.
+    let id_of = |name: &str| ids[name].as_str();
+    let position = |id: &str| {
+        worst
+            .iter()
+            .position(|(row_id, _)| row_id == id)
+            .unwrap_or_else(|| panic!("{id} missing from lowest_retention_nodes: {worst:?}"))
+    };
+    assert!(
+        position(id_of("worst")) < position(id_of("healthy")),
+        "decayed rows must sort before healthy rows: {worst:?}"
+    );
+    let mid = worst
+        .iter()
+        .find(|(row_id, _)| row_id == id_of("mid"))
+        .unwrap();
+    assert!(
+        mid.1 < 1.0 && mid.1 > 0.0,
+        "three demotions leave mid partially decayed, got {}",
+        mid.1
+    );
+}
+
+#[test]
+fn due_for_review_node_ids_returns_only_past_due_rows() {
+    let storage = create_test_storage();
+    let node = storage
+        .ingest(crate::IngestInput {
+            content: "review fixture scheduling".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    // Future-dated review: not due, must not appear.
+    let future = (Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+    {
+        let writer = storage.writer.lock().unwrap();
+        writer
+            .execute(
+                "UPDATE knowledge_nodes SET next_review = ?1 WHERE id = ?2",
+                params![&future, &node.id],
+            )
+            .unwrap();
+    }
+    assert!(
+        storage.due_for_review_node_ids(10).unwrap().is_empty(),
+        "a future next_review must not be reported as due"
+    );
+    // Backdate next_review into the past: now it is due.
+    let past = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+    {
+        let writer = storage.writer.lock().unwrap();
+        writer
+            .execute(
+                "UPDATE knowledge_nodes SET next_review = ?1 WHERE id = ?2",
+                params![&past, &node.id],
+            )
+            .unwrap();
+    }
+    let due = storage.due_for_review_node_ids(10).unwrap();
+    assert_eq!(due, vec![node.id]);
+    // The limit is honored.
+    assert_eq!(storage.due_for_review_node_ids(0).unwrap().len(), 0);
+}
+
+#[test]
+fn state_distribution_covers_every_row_with_sql_thresholds() {
+    let storage = create_test_storage();
+    // Fresh rows: full strengths -> active.
+    for index in 0..3 {
+        storage
+            .ingest(crate::IngestInput {
+                content: format!("active fixture {index}"),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    // NULL retention rows must count as decayed (0), not silently healthy:
+    // accessibility = 0.5*0 + 0.3*1 + 0.2*1 = 0.5 -> dormant.
+    let now = Utc::now().to_rfc3339();
+    {
+        let writer = storage.writer.lock().unwrap();
+        writer
+            .execute(
+                "INSERT INTO knowledge_nodes
+                        (id, content, node_type, created_at, updated_at, last_accessed,
+                         tags, scope, retention_strength)
+                     VALUES ('null-ret', 'hand-edited', 'fact', ?1, ?1, ?1, NULL, 'user', NULL)",
+                params![&now],
+            )
+            .unwrap();
+    }
+    let (active, dormant, silent, unavailable) = storage.state_distribution().unwrap();
+    assert_eq!(active, 3, "fresh rows are fully accessible");
+    assert_eq!(dormant, 1, "NULL retention lands dormant, not active");
+    assert_eq!(silent + unavailable, 0);
+    // Every row is accounted for exactly once.
+    assert_eq!(active + dormant + silent + unavailable, 4);
+}
+
+#[test]
+fn retention_distribution_reports_out_of_range_values_explicitly() {
+    let storage = create_test_storage();
+    let now = Utc::now().to_rfc3339();
+    {
+        let writer = storage.writer.lock().unwrap();
+        for (id, retention) in [
+            ("null-row", None::<f64>),
+            ("negative-row", Some(-0.5)),
+            ("above-row", Some(1.5)),
+            ("normal-row", Some(0.5)),
+        ] {
+            writer
+                .execute(
+                    "INSERT INTO knowledge_nodes
+                            (id, content, node_type, created_at, updated_at, last_accessed,
+                             tags, scope, retention_strength)
+                         VALUES (?1, 'bucket fixture', 'fact', ?2, ?2, ?2, NULL, 'user', ?3)",
+                    rusqlite::params![id, &now, retention],
+                )
+                .unwrap();
+        }
+    }
+    let distribution = storage.get_retention_distribution().unwrap();
+    let bucket_of = |name: &str| {
+        distribution
+            .iter()
+            .find(|(bucket, _)| bucket == name)
+            .map(|(_, count)| *count)
+            .unwrap_or(0)
+    };
+    assert_eq!(bucket_of("unknown"), 1, "NULL retention gets its own bucket");
+    assert_eq!(bucket_of("below0"), 1);
+    assert_eq!(bucket_of("above100%"), 1);
+    assert_eq!(bucket_of("40-60%"), 1);
+    assert_eq!(
+        bucket_of("80-100%") + bucket_of("0-20%") + bucket_of("20-40%") + bucket_of("60-80%"),
+        0,
+        "out-of-range rows must no longer inflate the in-range buckets"
+    );
+}

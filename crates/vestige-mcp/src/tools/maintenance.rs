@@ -206,6 +206,146 @@ pub async fn execute_system_status(
         );
     }
 
+    // === Automation trigger timestamps (read early: the stale-consolidation
+    // diagnostic below consumes last_consolidation) ===
+    let last_consolidation = storage.get_last_consolidation().ok().flatten();
+    let last_dream = storage.get_last_dream().ok().flatten();
+    let saves_since_last_dream = match &last_dream {
+        Some(dt) => storage.count_memories_since(*dt).unwrap_or(0),
+        None => stats.total_nodes,
+    };
+    let last_backup = storage.last_backup_timestamp();
+
+    // === Structured diagnostics (upgrade/memory-status) ===
+    // Warnings above stay byte-compatible strings for audit scripts. The
+    // diagnostics array is the machine-readable panel: each entry names a
+    // detected problem, the affected count, up to 10 example entity IDs, and
+    // a concrete next action referencing an existing tool. Reads are
+    // failure-tolerant: a diagnostic source failing must never fail health.
+    const DIAGNOSTIC_ID_LIMIT: usize = 10;
+    let mut diagnostics: Vec<Value> = Vec::new();
+
+    // Decay risk: memories below the retention floor, with the worst IDs.
+    let below_30 = storage.count_memories_below_retention(0.3).unwrap_or(0);
+    let worst = storage.lowest_retention_nodes(DIAGNOSTIC_ID_LIMIT).unwrap_or_default();
+    if below_30 > 0 {
+        let severity = if stats.total_nodes > 0 && below_30 * 2 >= stats.total_nodes {
+            "critical"
+        } else {
+            "warning"
+        };
+        diagnostics.push(serde_json::json!({
+            "code": "low_retention",
+            "severity": severity,
+            "detail": format!(
+                "{below_30} memories below 30% retention; worst listed first by id"
+            ),
+            "count": below_30,
+            "memoryIds": worst.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            "memoryIdsTruncated": below_30 > DIAGNOSTIC_ID_LIMIT as i64,
+            "nextAction": { "tool": "maintain", "args": { "action": "consolidate" } },
+        }));
+    }
+
+    // Review backlog: due memories with example IDs.
+    let due_ids = storage
+        .due_for_review_node_ids(DIAGNOSTIC_ID_LIMIT)
+        .unwrap_or_default();
+    if stats.nodes_due_for_review > 10 {
+        diagnostics.push(serde_json::json!({
+            "code": "due_for_review",
+            "severity": "warning",
+            "detail": format!(
+                "{} memories are past their next_review timestamp; oldest due listed first",
+                stats.nodes_due_for_review
+            ),
+            "count": stats.nodes_due_for_review,
+            "memoryIds": due_ids,
+            "memoryIdsTruncated": stats.nodes_due_for_review > DIAGNOSTIC_ID_LIMIT as i64,
+            "nextAction": { "tool": "maintain", "args": { "action": "consolidate" } },
+        }));
+    }
+
+    // Embedding gaps: only meaningful in builds that can generate embeddings.
+    if embeddings_compiled_in && stats.total_nodes > 0 {
+        let missing = stats.total_nodes - stats.nodes_with_active_embeddings;
+        if stats.nodes_with_active_embeddings == 0 {
+            diagnostics.push(serde_json::json!({
+                "code": "embedding_coverage_gap",
+                "severity": "critical",
+                "detail": "No memory has an active-model embedding; semantic recall is blind",
+                "count": missing,
+                "nextAction": {
+                    "tool": "maintain",
+                    "args": { "action": "consolidate", "phase": "embeddings" }
+                },
+            }));
+        } else if embedding_coverage < 50.0 && stats.total_nodes > 10 {
+            diagnostics.push(serde_json::json!({
+                "code": "embedding_coverage_gap",
+                "severity": "warning",
+                "detail": format!(
+                    "Embedding coverage is {embedding_coverage:.1}% ({} of {} memories)",
+                    stats.nodes_with_active_embeddings, stats.total_nodes
+                ),
+                "count": missing,
+                "nextAction": {
+                    "tool": "maintain",
+                    "args": { "action": "consolidate", "phase": "embeddings" }
+                },
+            }));
+        }
+        if stats.nodes_with_mismatched_embeddings > 0 {
+            diagnostics.push(serde_json::json!({
+                "code": "embedding_model_mismatch",
+                "severity": "warning",
+                "detail": format!(
+                    "{} memories hold embeddings from a model other than the active profile",
+                    stats.nodes_with_mismatched_embeddings
+                ),
+                "count": stats.nodes_with_mismatched_embeddings,
+                "nextAction": { "tool": "maintain", "args": { "action": "consolidate" } },
+            }));
+        }
+    }
+
+    // Consolidation staleness: never run, or older than 7 days.
+    match last_consolidation {
+        Some(ts) => {
+            let age_days = (Utc::now() - ts).num_days();
+            if age_days > 7 {
+                diagnostics.push(serde_json::json!({
+                    "code": "stale_consolidation",
+                    "severity": "info",
+                    "detail": format!(
+                        "Last consolidation ran {age_days} days ago; FSRS decay scores go stale between runs"
+                    ),
+                    "nextAction": { "tool": "maintain", "args": { "action": "consolidate" } },
+                }));
+            }
+        }
+        None => {
+            if stats.total_nodes > 0 {
+                diagnostics.push(serde_json::json!({
+                    "code": "stale_consolidation",
+                    "severity": "info",
+                    "detail": "Consolidation has never run on this store",
+                    "nextAction": { "tool": "maintain", "args": { "action": "consolidate" } },
+                }));
+            }
+        }
+    }
+
+    // Retention trajectory from the consolidation snapshots.
+    if storage.get_retention_trend().unwrap_or_default() == "declining" {
+        diagnostics.push(serde_json::json!({
+            "code": "retention_trend_declining",
+            "severity": "warning",
+            "detail": "Average retention is declining across recent consolidation snapshots",
+            "nextAction": { "tool": "memory_status", "args": { "view": "retention" } },
+        }));
+    }
+
     let mut recommendations = Vec::new();
     if status == "critical" {
         recommendations
@@ -225,35 +365,26 @@ pub async fn execute_system_status(
     }
 
     // === State distribution ===
-    let nodes = storage.get_all_nodes(500, 0).map_err(|e| e.to_string())?;
-    let total = nodes.len();
-    let (active, dormant, silent, unavailable) = if total > 0 {
-        let mut a = 0usize;
-        let mut d = 0usize;
-        let mut s = 0usize;
-        let mut u = 0usize;
-        for node in &nodes {
-            let accessibility = node.retention_strength * 0.5
-                + node.retrieval_strength * 0.3
-                + node.storage_strength * 0.2;
-            if accessibility >= 0.7 {
-                a += 1;
-            } else if accessibility >= 0.4 {
-                d += 1;
-            } else if accessibility >= 0.1 {
-                s += 1;
-            } else {
-                u += 1;
-            }
-        }
-        (a, d, s, u)
-    } else {
-        (0, 0, 0, 0)
-    };
+    // Computed in SQL over EVERY stored row (upgrade/memory-status). The old
+    // version blended strengths over only the first 500 rows in insertion
+    // order, so on a large store the "distribution" silently described the
+    // oldest slice of the data. Thresholds and the blend
+    // (0.5*retention + 0.3*retrieval + 0.2*storage) are unchanged.
+    let (active, dormant, silent, unavailable) =
+        storage.state_distribution().map_err(|e| e.to_string())?;
+    let total = active + dormant + silent + unavailable;
 
     // === FSRS Preview ===
+    // Representative = newest memory (get_all_nodes is created_at DESC),
+    // labeled as such so the preview is not mistaken for a store-wide
+    // projection. One row, not 500.
     let scheduler = FSRSScheduler::default();
-    let fsrs_preview = if let Some(representative) = nodes.first() {
+    let representative = storage
+        .get_all_nodes(1, 0)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .next();
+    let fsrs_preview = if let Some(representative) = representative {
         let mut state = scheduler.new_card();
         state.difficulty = representative.difficulty;
         state.stability = representative.stability;
@@ -264,6 +395,7 @@ pub async fn execute_system_status(
         let preview = scheduler.preview_reviews(&state, elapsed);
         Some(serde_json::json!({
             "representativeMemoryId": representative.id,
+            "representativeBasis": "newest memory",
             "elapsedDays": format!("{:.1}", elapsed),
             "intervalIfGood": preview.good.interval,
             "intervalIfEasy": preview.easy.interval,
@@ -282,7 +414,10 @@ pub async fn execute_system_status(
         Some(serde_json::json!({
             "activationNetworkSize": activation_count,
             "predictionAccuracy": format!("{:.2}", prediction_accuracy),
-            "modulesActive": 28,
+            // Compiled-in module count (single source: COGNITIVE_MODULE_COUNT).
+            // Cognitive modules are in-process structs with no failure
+            // channel; this is a build fact, not a runtime probe.
+            "modulesActive": crate::cognitive::COGNITIVE_MODULE_COUNT,
             "schedulerStats": {
                 "totalEvents": scheduler_stats.total_events,
                 "eventsPerMinute": scheduler_stats.events_per_minute,
@@ -295,19 +430,15 @@ pub async fn execute_system_status(
     };
 
     // === Automation triggers (for conditional dream/backup/gc at session start) ===
-    let last_consolidation = storage.get_last_consolidation().ok().flatten();
-    let last_dream = storage.get_last_dream().ok().flatten();
-    let saves_since_last_dream = match &last_dream {
-        Some(dt) => storage.count_memories_since(*dt).unwrap_or(0),
-        None => stats.total_nodes,
-    };
-    let last_backup = storage.last_backup_timestamp();
+    // Reads happen early in this function (the stale-consolidation diagnostic
+    // consumes last_consolidation); only response assembly happens here.
 
     let mut response = serde_json::json!({
         "tool": "system_status",
         // Health
         "status": status,
         "warnings": warnings,
+        "diagnostics": diagnostics,
         "recommendations": recommendations,
         "embeddingReady": embedding_ready,
         "embeddingsCompiledIn": embeddings_compiled_in,
@@ -321,18 +452,22 @@ pub async fn execute_system_status(
         "withActiveEmbeddings": stats.nodes_with_active_embeddings,
         "mismatchedEmbeddings": stats.nodes_with_mismatched_embeddings,
         "embeddingCoverage": format!("{:.1}%", embedding_coverage),
-        "embeddingsCompiledIn": embeddings_compiled_in,
+        // (embeddingsCompiledIn was serialized twice here; the duplicate
+        //  literal above this block is the one that survived serde_json's
+        //  last-key-wins behavior. Kept once.)
         "embeddingModel": stats.embedding_model,
         "activeEmbeddingModel": stats.active_embedding_model,
         "oldestMemory": stats.oldest_memory.map(|dt| dt.to_rfc3339()),
         "newestMemory": stats.newest_memory.map(|dt| dt.to_rfc3339()),
-        // Distribution
+        // Distribution — full-population SQL aggregate; `sampled` keeps its
+        // key for compatibility but now equals the whole store.
         "stateDistribution": {
             "active": active,
             "dormant": dormant,
             "silent": silent,
             "unavailable": unavailable,
             "sampled": total,
+            "basis": "full",
         },
         // FSRS
         "fsrsPreview": fsrs_preview,
@@ -796,7 +931,11 @@ mod tests {
         let result = execute_system_status(&storage, &test_cognitive(), None).await;
         let value = result.unwrap();
         assert!(value["cognitiveHealth"].is_object());
-        assert_eq!(value["cognitiveHealth"]["modulesActive"], 28);
+        assert_eq!(
+            value["cognitiveHealth"]["modulesActive"],
+            crate::cognitive::COGNITIVE_MODULE_COUNT,
+            "modulesActive must come from the maintained constant, not a literal"
+        );
     }
 
     #[tokio::test]
@@ -846,6 +985,98 @@ mod tests {
         // No dream ever → savesSinceLastDream == totalMemories
         assert_eq!(triggers["savesSinceLastDream"], 3);
         assert!(triggers["lastDreamTimestamp"].is_null());
+    }
+
+    // ========================================================================
+    // STRUCTURED DIAGNOSTICS TESTS (upgrade/memory-status)
+    // ========================================================================
+
+    /// An empty store must not invent problems: no decay, review, embedding
+    /// or staleness diagnostics may fire.
+    #[tokio::test]
+    async fn test_system_status_empty_store_has_no_diagnostic_noise() {
+        let (storage, _dir) = test_storage().await;
+        let value = execute_system_status(&storage, &test_cognitive(), None)
+            .await
+            .unwrap();
+        let diagnostics = value["diagnostics"].as_array().unwrap();
+        assert!(
+            diagnostics.is_empty(),
+            "empty store must produce no diagnostics, got {diagnostics:?}"
+        );
+    }
+
+    /// Health must DETECT a real problem, not just print counts: repeatedly
+    /// demoting a memory drives its retention below the 0.3 floor via the
+    /// public API, and the low_retention diagnostic must name that memory's
+    /// id and a concrete next action. Consolidation has never run either, so
+    /// the staleness diagnostic must fire as well.
+    #[tokio::test]
+    async fn test_system_status_diagnostics_name_decayed_memory_ids() {
+        let (storage, _dir) = test_storage().await;
+        let node = storage
+            .ingest(vestige_core::IngestInput {
+                content: "Memory that will be driven into decay".to_string(),
+                node_type: "fact".to_string(),
+                source: None,
+                sentiment_score: 0.0,
+                sentiment_magnitude: 0.0,
+                tags: vec![],
+                valid_from: None,
+                valid_until: None,
+                validity_inferred: false,
+                source_envelope: None,
+            })
+            .unwrap();
+        // 7 demotions at -0.15 retention each bottom out at the 0.05 floor.
+        for _ in 0..7 {
+            storage.demote_memory(&node.id).unwrap();
+        }
+
+        let value = execute_system_status(&storage, &test_cognitive(), None)
+            .await
+            .unwrap();
+        let diagnostics = value["diagnostics"].as_array().unwrap();
+
+        let low = diagnostics
+            .iter()
+            .find(|d| d["code"] == "low_retention")
+            .unwrap_or_else(|| panic!("low_retention diagnostic missing: {diagnostics:?}"));
+        assert_eq!(low["count"].as_i64().unwrap(), 1);
+        assert_eq!(
+            low["memoryIds"].as_array().unwrap(),
+            &vec![serde_json::json!(node.id)],
+            "diagnostic must name the decayed memory"
+        );
+        assert!(low["memoryIdsTruncated"] == false);
+        assert_eq!(low["nextAction"]["tool"], "maintain");
+        assert_eq!(low["nextAction"]["args"]["action"], "consolidate");
+        assert!(
+            low["severity"] == "critical" || low["severity"] == "warning",
+            "severity must be a known level, got {low:?}"
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d["code"] == "stale_consolidation"),
+            "a store that never consolidated must report staleness"
+        );
+
+        // Full-population state distribution: sampled now equals the store.
+        assert_eq!(value["stateDistribution"]["basis"], "full");
+        assert_eq!(
+            value["stateDistribution"]["sampled"],
+            value["totalMemories"]
+        );
+        let distributed: i64 = ["active", "dormant", "silent", "unavailable"]
+            .iter()
+            .map(|k| value["stateDistribution"][k].as_i64().unwrap())
+            .sum();
+        assert_eq!(
+            distributed, 1,
+            "state distribution must account for every memory"
+        );
     }
 
     // ========================================================================

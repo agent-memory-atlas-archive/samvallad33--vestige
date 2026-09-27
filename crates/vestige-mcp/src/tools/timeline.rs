@@ -181,7 +181,12 @@ pub async fn execute(
         },
         "detailLevel": detail_level,
         "profile": output_config.profile.as_str(),
+        // `totalMemories` is the RETURNED count (bounded by limit), kept for
+        // compatibility. `returned`/`truncated` make the bound explicit so
+        // callers do not mistake it for the range's full population.
         "totalMemories": total,
+        "returned": total,
+        "truncated": total >= limit as usize,
         "days": days,
         "timeline": timeline,
     }))

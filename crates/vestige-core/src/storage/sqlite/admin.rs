@@ -970,6 +970,89 @@ impl SqliteMemoryStore {
         })
     }
 
+    /// Bounded list of the lowest-retention memories: `(id, retention_strength)`
+    /// ascending, ties broken by id. Feeds the health view's decay diagnostics,
+    /// where the agent needs entity IDs, not just an average. NULL retention
+    /// (hand-edited legacy rows) sorts first and is reported at 0.0 so it lands
+    /// on the decay-risk list instead of silently reading as healthy.
+    pub fn lowest_retention_nodes(&self, limit: usize) -> Result<Vec<(String, f64)>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT id, COALESCE(retention_strength, 0.0)
+             FROM knowledge_nodes
+             ORDER BY COALESCE(retention_strength, 0.0) ASC, id ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Bounded list of memory IDs due for review (`next_review <= now`),
+    /// oldest review first. Feeds the health view's review diagnostics.
+    pub fn due_for_review_node_ids(&self, limit: usize) -> Result<Vec<String>> {
+        let now = Utc::now().to_rfc3339();
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT id FROM knowledge_nodes
+             WHERE next_review IS NOT NULL AND next_review <= ?1
+             ORDER BY next_review ASC, id ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![now, limit as i64], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Memory-state distribution over EVERY stored row, computed in SQL from
+    /// the same accessibility blend the health view previously applied to a
+    /// 500-row insertion-ordered sample:
+    /// `0.5*retention + 0.3*retrieval + 0.2*storage`.
+    /// Returns `(active, dormant, silent, unavailable)` with the thresholds
+    /// 0.7 / 0.4 / 0.1. NULL strength columns count as 0 (decay risk), not 1.
+    pub fn state_distribution(&self) -> Result<(i64, i64, i64, i64)> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT
+                SUM(CASE WHEN a >= 0.7 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN a >= 0.4 AND a < 0.7 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN a >= 0.1 AND a < 0.4 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN a < 0.1 THEN 1 ELSE 0 END)
+             FROM (
+                SELECT 0.5 * COALESCE(retention_strength, 0.0)
+                     + 0.3 * COALESCE(retrieval_strength, 0.0)
+                     + 0.2 * COALESCE(storage_strength, 0.0) AS a
+                FROM knowledge_nodes
+             )",
+        )?;
+        let (active, dormant, silent, unavailable): (i64, i64, i64, i64) = stmt.query_row([], |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            ))
+        })?;
+        Ok((active, dormant, silent, unavailable))
+    }
+
     /// Introspect the live SQLite schema: schema version + per-table row/column
     /// shape + embedding-coverage convenience fields.
     ///

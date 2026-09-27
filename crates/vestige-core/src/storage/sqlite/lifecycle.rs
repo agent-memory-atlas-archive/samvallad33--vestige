@@ -2117,7 +2117,13 @@ impl SqliteMemoryStore {
         Ok(avg)
     }
 
-    /// Get retention distribution in buckets (0-20%, 20-40%, 40-60%, 60-80%, 80-100%)
+    /// Get retention distribution in buckets (0-20%, 20-40%, 40-60%, 60-80%, 80-100%).
+    ///
+    /// Out-of-range values get their own buckets instead of silently inflating
+    /// the edges: NULL (hand-edited legacy rows) → `unknown`, negative →
+    /// `below0`, above 1.0 → `above100%`. Previously NULL and >1.0 rows both
+    /// landed in `80-100%`, making a store with unreadable retention read as
+    /// fully healthy. In-range bucketing is unchanged for compatibility.
     pub fn get_retention_distribution(&self) -> Result<Vec<(String, i64)>> {
         let reader = self
             .reader
@@ -2126,11 +2132,14 @@ impl SqliteMemoryStore {
         let mut stmt = reader.prepare(
             "SELECT
                 CASE
+                    WHEN retention_strength IS NULL THEN 'unknown'
+                    WHEN retention_strength < 0 THEN 'below0'
                     WHEN retention_strength < 0.2 THEN '0-20%'
                     WHEN retention_strength < 0.4 THEN '20-40%'
                     WHEN retention_strength < 0.6 THEN '40-60%'
                     WHEN retention_strength < 0.8 THEN '60-80%'
-                    ELSE '80-100%'
+                    WHEN retention_strength <= 1.0 THEN '80-100%'
+                    ELSE 'above100%'
                 END as bucket,
                 COUNT(*) as count
             FROM knowledge_nodes

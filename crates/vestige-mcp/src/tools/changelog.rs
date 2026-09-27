@@ -2,7 +2,14 @@
 //!
 //! View audit trail of memory changes.
 //! Per-memory mode: state transitions for a single memory.
-//! System-wide mode: consolidations + recent state transitions.
+//! System-wide mode: consolidations + dreams + state transitions + the
+//! reversible memory reflog (merge / supersede / undo / tag_rename /
+//! tag_merge operations from `merge_operations`).
+//!
+//! Gap closed (upgrade/memory-status): merge, supersede, undo and tag
+//! mutations were previously visible only through the stats view's tag
+//! window, so a changelog consumer auditing "what happened to this store"
+//! missed every content-mutating and tag-mutating operation.
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -177,6 +184,12 @@ fn execute_system_wide(
     // Get dream history (Bug #9 fix — dreams were invisible to audit trail)
     let dreams = storage.get_dream_history(fetch_limit).unwrap_or_default();
 
+    // Reversible memory reflog (upgrade/memory-status): merges, supersedes,
+    // undos and tag mutations were previously invisible to this audit trail.
+    let operations = storage
+        .list_merge_operations(fetch_limit.max(0) as usize)
+        .unwrap_or_default();
+
     // Build unified event list
     let mut events: Vec<(DateTime<Utc>, Value)> = Vec::new();
 
@@ -221,6 +234,33 @@ fn execute_system_wide(
                 "memoriesReplayed": d.memories_replayed,
                 "connectionFound": d.connections_found,
                 "insightsGenerated": d.insights_generated,
+            }),
+        ));
+    }
+
+    // Merge/supersede/undo/tag operations from the memory reflog. created_at
+    // is an RFC3339 string on the record; rows with unparseable timestamps
+    // are skipped rather than pinning the whole view to epoch or now.
+    for op in &operations {
+        let Ok(ts) = DateTime::parse_from_rfc3339(&op.created_at).map(|dt| dt.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        let affected_preview: Vec<&str> =
+            op.affected_ids.iter().take(5).map(String::as_str).collect();
+        events.push((
+            ts,
+            serde_json::json!({
+                "type": "merge_operation",
+                "timestamp": ts.to_rfc3339(),
+                "operationId": op.id,
+                "opType": op.op_type,
+                "status": op.status,
+                "survivorId": op.survivor_id,
+                "affectedCount": op.affected_ids.len(),
+                "affectedIdsPreview": affected_preview,
+                "revertedAt": op.reverted_at,
+                "reason": op.reason,
             }),
         ));
     }
@@ -411,5 +451,50 @@ mod tests {
         let value = result.unwrap();
         assert_eq!(value["filter"]["start"], "2026-04-19T00:00:00+00:00");
         assert!(value["filter"]["end"].is_null());
+    }
+
+    /// Gap-closed regression (upgrade/memory-status): a tag mutation must
+    /// appear in the system-wide changelog as a merge_operation event. Before
+    /// this fix, tag/merge/supersede operations were invisible here — they
+    /// lived only in the stats view's bounded tag window.
+    #[tokio::test]
+    async fn test_changelog_includes_tag_mutations() {
+        let (storage, _dir) = test_storage().await;
+        storage
+            .ingest_in_scope(
+                vestige_core::IngestInput {
+                    content: "Tag mutation changelog fixture".into(),
+                    tags: vec!["old-tag".into()],
+                    ..Default::default()
+                },
+                "user",
+            )
+            .expect("seed memory");
+
+        let sources = vec!["old-tag".to_string()];
+        let preview = storage
+            .preview_tag_mutation(&sources, "new-tag", Some("user"))
+            .expect("preview");
+        storage
+            .apply_tag_mutation(
+                &sources,
+                "new-tag",
+                Some("user"),
+                preview["previewToken"].as_str().expect("token"),
+                "tag_rename",
+                "changelog coverage test",
+            )
+            .expect("apply rename");
+
+        let value = execute(&storage, None).await.unwrap();
+        let events = value["events"].as_array().unwrap();
+        let tag_event = events
+            .iter()
+            .find(|e| e["type"] == "merge_operation" && e["opType"] == "tag_rename")
+            .unwrap_or_else(|| panic!("tag mutation missing from changelog: {events:?}"));
+        assert_eq!(tag_event["status"], "applied");
+        assert_eq!(tag_event["affectedCount"], 1);
+        assert_eq!(tag_event["reason"], "changelog coverage test");
+        assert_eq!(tag_event["affectedIdsPreview"].as_array().unwrap().len(), 1);
     }
 }

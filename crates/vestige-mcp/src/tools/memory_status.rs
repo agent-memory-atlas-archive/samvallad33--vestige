@@ -108,7 +108,7 @@ pub fn schema() -> Value {
                 "type": "string",
                 "enum": ["health", "retention", "timeline", "changelog", "stats", "tools"],
                 "default": "health",
-                "description": "'tools': current tool/action inventory, or one full schema with tool. 'health' (default): system health, stats, decay preview, warnings, recommendations. 'retention': average, distribution, trend. 'timeline': memories by date. 'changelog': state-change audit trail. 'stats': hygiene counts by type, tag, age, retention, and lifecycle, with bounded detail lists and recent tag operations."
+                "description": "'tools': current tool/action inventory, or one full schema with tool. 'health' (default): system health, stats, decay preview, warnings, structured diagnostics (with entity IDs and next actions), recommendations. 'retention': average, distribution, trend. 'timeline': memories by date, bounded by limit (returned/truncated are explicit). 'changelog': audit trail of consolidations, dreams, state transitions, and merge/supersede/undo/tag operations. 'stats': hygiene counts by type, tag, age, retention, and lifecycle, bounded detail lists, recommended actions with example IDs, and recent tag operations."
             },
             "tool": {
                 "type": "string",
@@ -173,7 +173,7 @@ pub async fn execute(
         "changelog" => super::changelog::execute(storage, args).await,
         "stats" => super::hygiene_stats::execute(storage, args).await,
         other => Err(format!(
-            "Unknown memory_status view '{other}'. Use health|retention|timeline|changelog|stats."
+            "Unknown memory_status view '{other}'. Use health|retention|timeline|changelog|stats|tools."
         )),
     }
 }

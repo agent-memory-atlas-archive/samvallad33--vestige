@@ -195,6 +195,12 @@ fn build_response(
     let mut expired = 0usize;
     let mut invalid_temporal_bounds = 0usize;
     let mut superseded = 0usize;
+    // Example entity IDs for the recommended actions below. Counts say how
+    // many; these say WHICH, so an agent can act without re-scanning.
+    const ACTION_ID_LIMIT: usize = 5;
+    let mut expired_ids: Vec<&str> = Vec::new();
+    let mut superseded_ids: Vec<&str> = Vec::new();
+    let mut low_retention_ids: Vec<&str> = Vec::new();
 
     for node in &nodes {
         *type_counts.entry(node.node_type.clone()).or_default() += 1;
@@ -228,6 +234,9 @@ fn build_response(
         *retention_counts
             .get_mut(retention_bucket)
             .expect("fixed retention bucket") += 1;
+        if node.retention_strength <= 0.2 && low_retention_ids.len() < ACTION_ID_LIMIT {
+            low_retention_ids.push(node.id.as_str());
+        }
 
         if node
             .valid_from
@@ -238,6 +247,9 @@ fn build_response(
         }
         if node.valid_until.is_some_and(|until| until < now) {
             expired += 1;
+            if expired_ids.len() < ACTION_ID_LIMIT {
+                expired_ids.push(node.id.as_str());
+            }
         } else if node.valid_from.is_some_and(|from| from > now) {
             not_yet_valid += 1;
         } else {
@@ -245,6 +257,9 @@ fn build_response(
         }
         if node.superseded {
             superseded += 1;
+            if superseded_ids.len() < ACTION_ID_LIMIT {
+                superseded_ids.push(node.id.as_str());
+            }
         }
     }
 
@@ -321,6 +336,77 @@ fn build_response(
         })
         .collect();
 
+    // Actionable recommendations (upgrade/memory-status): every entry pairs a
+    // hygiene count with the entity IDs to act on and a concrete next action
+    // against an existing advertised tool. Only non-zero problems appear.
+    let mut recommended_actions: Vec<Value> = Vec::new();
+    {
+        let mut push_action = |code: &str, count: usize, detail: &str, tool: &str, args: Value| {
+            recommended_actions.push(json!({
+                "code": code,
+                "count": count,
+                "detail": detail,
+                "tool": tool,
+                "args": args,
+            }));
+        };
+        if expired > 0 {
+            push_action(
+                "expired_memories",
+                expired,
+                "Memories past their valid_until date remain stored; review and purge the ones with no audit value. Examples listed in memoryIds.",
+                "purge",
+                json!({ "exampleMemoryIds": expired_ids }),
+            );
+        }
+        if superseded > 0 {
+            push_action(
+                "superseded_rows",
+                superseded,
+                "Superseded rows are kept intentionally for audit and undo; purge individual ids only when their history no longer matters. Examples listed in memoryIds.",
+                "purge",
+                json!({ "exampleMemoryIds": superseded_ids }),
+            );
+        }
+        let low_retention = retention_counts["0-20%"] + retention_counts["below0"];
+        if low_retention > 0 {
+            push_action(
+                "low_retention",
+                low_retention,
+                "Memories at or below 20% retention are decay candidates; run consolidation to replay and strengthen the ones still needed, or GC the rest. Examples listed in memoryIds.",
+                "maintain",
+                json!({ "action": "consolidate", "exampleMemoryIds": low_retention_ids }),
+            );
+        }
+        if untagged > 0 {
+            push_action(
+                "untagged_memories",
+                untagged,
+                "Untagged memories are invisible to tag filters; tag new memories at ingest, and use dedup tag actions to consolidate tag vocabulary.",
+                "smart_ingest",
+                json!({ "hint": "pass tags on future ingests; dedup tag_rename/tag_merge for existing vocabulary" }),
+            );
+        }
+        if snapshot.malformed_tag_rows > 0 {
+            push_action(
+                "malformed_tag_rows",
+                snapshot.malformed_tag_rows,
+                "Rows with unparseable tags JSON are treated as untagged; inspect the listed ids and re-save them to repair the column.",
+                "memory",
+                json!({ "hint": "memory get the listed ids, then re-save with valid tags" }),
+            );
+        }
+        if never_accessed_total > 0 {
+            push_action(
+                "never_accessed",
+                never_accessed_total,
+                "Memories created inside the access-log window with zero retrievals; if they were predicted to matter, verify content and suppress or demote the dead weight. Examples in neverAccessed.memories.",
+                "suppress",
+                json!({ "hint": "review first; suppress is compounding and out of retrieval" }),
+            );
+        }
+    }
+
     json!({
         "success": true,
         "view": "stats",
@@ -390,6 +476,10 @@ fn build_response(
             "limit": limit,
             "truncated": total > largest_items.len(),
             "memories": largest_items,
+        },
+        "recommendedActions": {
+            "note": "Only non-zero problems appear. memoryIds are bounded examples, not the full set; the matching count field is authoritative.",
+            "actions": recommended_actions,
         },
         "recentTagOperations": {
             "source": "merge_operations memory reflog",
@@ -1021,6 +1111,80 @@ mod tests {
         assert_eq!(retention_bucket(0.6), ">40-60%");
         assert_eq!(retention_bucket(0.8), ">60-80%");
         assert_eq!(retention_bucket(1.0), ">80-100%");
+    }
+
+    /// Counts must be actionable: every non-zero hygiene problem appears in
+    /// recommendedActions with a bounded set of example entity IDs and a tool
+    /// that actually exists. A clean store yields no actions.
+    #[test]
+    fn recommended_actions_pair_counts_with_example_ids_and_tools() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 19, 12, 0, 0).unwrap();
+        let mut expired_node = summary("exp-1", "fact", now - Duration::days(2), 0.9, &[], 10);
+        expired_node.valid_until = Some(now - Duration::seconds(1));
+        let mut superseded_node =
+            summary("sup-1", "fact", now - Duration::days(2), 0.9, &[], 10);
+        superseded_node.superseded = true;
+        let decayed = summary("low-1", "fact", now - Duration::days(2), 0.1, &[], 10);
+        let mut never = summary("nav-1", "fact", now - Duration::days(2), 0.9, &[], 10);
+        never.never_accessed = true;
+        let clean = summary("clean", "fact", now - Duration::days(2), 0.9, &["ok"], 10);
+
+        let response = build_response(
+            snapshot_of(vec![
+                expired_node,
+                superseded_node,
+                decayed,
+                never,
+                clean,
+            ]),
+            Some("user"),
+            50,
+            now,
+            empty_audit(),
+        );
+
+        let actions = response["recommendedActions"]["actions"]
+            .as_array()
+            .expect("actions array");
+        let find = |code: &str| {
+            actions
+                .iter()
+                .find(|a| a["code"] == code)
+                .unwrap_or_else(|| panic!("{code} action missing: {actions:?}"))
+        };
+        assert_eq!(find("expired_memories")["count"], 1);
+        assert_eq!(
+            find("expired_memories")["args"]["exampleMemoryIds"],
+            json!(["exp-1"])
+        );
+        assert_eq!(find("superseded_rows")["args"]["exampleMemoryIds"], json!(["sup-1"]));
+        assert_eq!(find("low_retention")["count"], 1);
+        assert_eq!(find("low_retention")["args"]["exampleMemoryIds"], json!(["low-1"]));
+        assert_eq!(find("low_retention")["tool"], "maintain");
+        assert_eq!(find("never_accessed")["count"], 1);
+        // Every action names a tool that exists on the advertised catalog.
+        for action in actions {
+            assert!(
+                crate::tools::compact::full_schema(action["tool"].as_str().unwrap()).is_some(),
+                "recommendedActions must reference an advertised tool: {action:?}"
+            );
+        }
+
+        // A clean store recommends nothing.
+        let clean_response = build_response(
+            snapshot_of(vec![summary("solo", "fact", now - Duration::days(1), 0.9, &["ok"], 10)]),
+            Some("user"),
+            50,
+            now,
+            empty_audit(),
+        );
+        assert!(
+            clean_response["recommendedActions"]["actions"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "a healthy store must produce no recommended actions"
+        );
     }
 
     #[test]
