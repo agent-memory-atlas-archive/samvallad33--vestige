@@ -2653,8 +2653,11 @@ CREATE TABLE IF NOT EXISTS purge_tombstones (
 
 CREATE INDEX IF NOT EXISTS idx_purge_tombstones_purged_at
     ON purge_tombstones(purged_at);
-=======
-/// V39: walk receipts for backfill re-execution.
+
+UPDATE schema_version SET version = 39, applied_at = datetime('now');
+"#;
+
+/// V40: walk receipts for backfill re-execution.
 ///
 /// A "walk receipt" freezes the exact parameter envelope of a Retroactive
 /// Salience Backfill run together with the blake3 digest of its canonical
