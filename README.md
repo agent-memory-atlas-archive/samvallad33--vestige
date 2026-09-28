@@ -38,7 +38,7 @@ Prefer Homebrew?
 brew install samvallad33/tap/vestige
 ```
 
-`eget samvallad33/vestige` installs those same GitHub Release archives. Intel Mac builds are linked against a system ONNX Runtime: `brew install onnxruntime` before the first run, and set `ORT_DYLIB_PATH` to that library. That tarball includes `INSTALL-INTEL-MAC.md`.
+`eget samvallad33/vestige` installs those same GitHub Release archives. Do not install this version with npm. Intel Mac builds are linked against a system ONNX Runtime: `brew install onnxruntime` before the first run, and set `ORT_DYLIB_PATH` to that library. That tarball includes `INSTALL-INTEL-MAC.md`.
 
 Connect the MCP server. The client command is `vestige-mcp`:
 
