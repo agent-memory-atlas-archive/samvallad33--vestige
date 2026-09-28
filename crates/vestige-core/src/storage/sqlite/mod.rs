@@ -18,13 +18,6 @@ use std::sync::Mutex;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
-use crate::embedding::{
-    ActiveEmbeddingProfile, BuiltinEmbeddingProfile, EmbeddingMigrationState, EmbeddingProfileId,
-    EmbeddingProfileManifest, EmbeddingProfileState, ProfileMigrationCheckpoint,
-    VerificationStatus,
-};
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
-use crate::embedding::{EmbeddingRuntimeBackend, ProfiledEmbedder};
 use crate::fsrs::{
     DEFAULT_DECAY, FSRSScheduler, FSRSState, LearningState, MAX_STABILITY, Rating,
     retrievability_with_decay,
@@ -34,26 +27,14 @@ use crate::memory::{
     ConsolidationResult, IngestInput, KnowledgeNode, MatchType, MemoryStats, RecallInput,
     SearchMode, SearchResult,
 };
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
-use crate::memory::{EmbeddingResult, SimilarityResult};
 use crate::security::{SecretFinding, SecretPolicy, scan_secrets};
 use crate::storage::portable::{
     PORTABLE_ARCHIVE_FORMAT, PortableArchive, PortableImportMode, PortableImportReport,
     PortableTable, PortableValue, encode_hex,
 };
 
-#[cfg(all(test, feature = "embeddings"))]
-use crate::embeddings::EMBEDDING_DIMENSIONS;
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
-use crate::embeddings::Embedding;
-#[cfg(feature = "embeddings")]
-use crate::embeddings::EmbeddingService;
 
-#[cfg(feature = "vector-search")]
-use crate::search::{VectorIndex, VectorIndexConfig, reciprocal_rank_fusion};
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
-use crate::search::hyde;
 
 // ============================================================================
 // ERROR TYPES
@@ -997,76 +978,6 @@ impl SqliteMemoryStore {
             .map_err(Into::into)
     }
 
-    /// Repair a bounded page of dirty/missing active-profile embeddings.
-    /// The cursor is a scan position, not a frozen snapshot; restart from None
-    /// after a sweep to discover new or failed rows preceding it.
-    pub fn maintain_embedding_batch(
-        &self,
-        limit: usize,
-        after: Option<&str>,
-        dry_run: bool,
-    ) -> Result<serde_json::Value> {
-        if !(1..=100).contains(&limit) {
-            return Err(StorageError::Init(
-                "embedding batch limit must be 1..100".into(),
-            ));
-        }
-        if after.is_some_and(|id| uuid::Uuid::parse_str(id).is_err()) {
-            return Err(StorageError::Init(
-                "embedding cursor must be a memory UUID".into(),
-            ));
-        }
-        let started = std::time::Instant::now();
-        let ids: Vec<String> = {
-            let reader = self
-                .reader
-                .lock()
-                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
-            let profile = Self::active_profile_id_from_conn(&reader)?
-                .unwrap_or_else(|| LEGACY_EMBEDDING_PROFILE_ID.into());
-            let mut statement = reader.prepare("SELECT id FROM knowledge_nodes n
-                WHERE id > ?1 AND COALESCE(suppression_count, 0) = 0
-                AND (COALESCE(has_embedding, 0) = 0 OR NOT EXISTS (
-                    SELECT 1 FROM embedding_profile_vectors v WHERE v.node_id = n.id AND v.profile_id = ?2))
-                ORDER BY id LIMIT ?3")?;
-            statement
-                .query_map(
-                    params![after.unwrap_or(""), profile, (limit + 1) as i64],
-                    |row| row.get(0),
-                )?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        let has_more = ids.len() > limit;
-        let selected = &ids[..ids.len().min(limit)];
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        let runtime_ready = self.active_embedding_runtime_ready()?;
-        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
-        let runtime_ready = false;
-        let blocked = !dry_run && !runtime_ready && !selected.is_empty();
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        let result = if dry_run || blocked {
-            EmbeddingResult::default()
-        } else {
-            self.generate_embeddings(Some(selected), false)?
-        };
-        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
-        let result = crate::memory::EmbeddingResult::default();
-        let cursor = if blocked {
-            after.map(str::to_string)
-        } else {
-            selected.last().cloned()
-        };
-        Ok(serde_json::json!({
-            "phase": "embeddings", "dryRun": dry_run, "batchSize": limit,
-            "selected": selected.len(), "successful": result.successful, "failed": result.failed,
-            "skipped": result.skipped, "runtimeReady": runtime_ready,
-            "status": if blocked { "runtime_unavailable" } else if dry_run { "preview" } else { "processed" },
-            "hasMore": has_more || blocked, "nextCursor": cursor,
-            "durationMs": started.elapsed().as_millis(),
-            "checkpoint": "committed embedding rows; restart cursor after a sweep to retry failures or discover earlier inserts",
-            "bound": "at most batchSize selected memories; no hard inference deadline"
-        }))
-    }
 }
 
 // ============================================================================
@@ -2742,7 +2653,6 @@ mod v3_regression_tests;
 mod admin;
 mod actors;
 mod connectors;
-mod embeddings;
 mod ingest;
 mod lifecycle;
 mod merge;

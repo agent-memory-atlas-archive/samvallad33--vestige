@@ -87,7 +87,6 @@ pub mod config;
 pub mod connectors;
 pub mod consolidation;
 /// Durable profile contracts for local embedding vector spaces.
-pub mod embedding;
 pub mod fsrs;
 pub mod fts;
 pub mod memory;
@@ -291,18 +290,6 @@ pub use storage::{
 // Embedding profile contracts are feature-independent so profile discovery,
 // storage metadata, and explicit install workflows remain available in a
 // lightweight build without an inference runtime.
-pub use embedding::{
-    ActiveEmbeddingProfile, BuiltinEmbeddingProfile, ChunkingStrategy,
-    EMBEDDING_PROFILE_MANIFEST_SCHEMA_VERSION, EmbeddingDevice, EmbeddingEvaluationSummary,
-    EmbeddingLifecycleError, EmbeddingLifecycleEvaluationReceipt,
-    EmbeddingLifecycleMigrationReceipt, EmbeddingMigrationState, EmbeddingNormalization,
-    EmbeddingProfile, EmbeddingProfileError, EmbeddingProfileFailure, EmbeddingProfileId,
-    EmbeddingProfileLifecycle, EmbeddingProfileManifest, EmbeddingProfileState,
-    EmbeddingRuntimeBackend, EmbeddingRuntimeMetadata, EmbeddingVerification, EncodingTemplate,
-    ModelArtifactHash, ProfileMigrationCheckpoint, ProfileRuntimeRegistry, ProfiledEmbedder,
-    VerificationStatus, VerifiedLocalArtifact, builtin_embedding_profile_by_id,
-    builtin_embedding_profiles,
-};
 
 // Consolidation (sleep-inspired memory processing)
 pub use consolidation::SleepConsolidation;

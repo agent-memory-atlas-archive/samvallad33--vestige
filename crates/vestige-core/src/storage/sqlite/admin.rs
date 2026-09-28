@@ -806,14 +806,6 @@ impl SqliteMemoryStore {
     /// Return the profile-scoped HNSW sidecar location. The profile ID is
     /// validated before being placed in a path, preventing traversal through a
     /// manifest or CLI argument.
-    pub fn embedding_profile_index_dir(&self, profile_id: &EmbeddingProfileId) -> Result<PathBuf> {
-        EmbeddingProfileId::new(profile_id.as_str().to_string())
-            .map_err(|error| StorageError::InvalidEmbeddingProfile(error.to_string()))?;
-        Ok(self
-            .sidecar_dir("embedding-profiles")
-            .join(profile_id.as_str())
-            .join("hnsw"))
-    }
 
     /// Get memory statistics
     pub fn get_stats(&self) -> Result<MemoryStats> {
