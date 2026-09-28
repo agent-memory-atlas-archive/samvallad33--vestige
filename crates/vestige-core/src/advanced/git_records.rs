@@ -22,9 +22,16 @@ pub struct GitCommit {
     pub time: DateTime<Utc>,
     pub subject: String,
     pub files: Vec<String>,
+    /// Files the diff contained beyond [`MAX_FILES`] (recorded as a count, not
+    /// names, so the content can say "+N more" instead of truncating silently).
+    pub extra_files: usize,
     /// Symbols from diff hunk headers, path-qualified (`<file>/<symbol>`) so
     /// they pass the entity shape test; a bare lowercase `fn_name` would not.
     pub symbols: Vec<String>,
+}
+
+fn is_full_sha(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 const RECORD_SEP: char = '\u{1e}';
@@ -47,7 +54,9 @@ pub fn parse_git_log(raw: &str) -> Vec<GitCommit> {
         };
         let mut fields = head.split(UNIT_SEP);
         let sha = fields.next().unwrap_or("").trim().to_string();
-        if sha.is_empty() {
+        // A full 40-hex sha or nothing: subjects are not sanitized for \x1e/\x1f,
+        // so a control char in a message can fabricate a phantom record header.
+        if !is_full_sha(&sha) {
             continue;
         }
         let time = fields
@@ -59,38 +68,57 @@ pub fn parse_git_log(raw: &str) -> Vec<GitCommit> {
         let subject = fields.next().unwrap_or("").trim().to_string();
 
         let mut files: Vec<String> = Vec::new();
+        let mut extra_files = 0usize;
+        // once the cap is hit, further hunks belong to files we never recorded;
+        // attaching their symbols to files.last() would fabricate join keys
+        let mut files_capped = false;
         let mut symbols: BTreeSet<String> = BTreeSet::new();
         for line in body.lines() {
             if let Some(rest) = line.strip_prefix("diff --git a/") {
-                if let Some((_, b)) = rest.split_once(" b/") {
-                    push_bounded(&mut files, b.trim(), MAX_FILES);
+                match rest.split_once(" b/") {
+                    // git C-quotes exotic paths; the +++ line below re-captures them
+                    Some((_, b)) if !b.contains('"') => push_file(&mut files, b.trim(), &mut extra_files, &mut files_capped),
+                    _ => {}
                 }
-            } else if line.starts_with("@@") {
-                if let Some(ctx) = line.split("@@").nth(2) {
-                    if let Some(sym) = leading_identifier(ctx) {
-                        if let Some(file) = files.last() {
-                            if symbols.len() < MAX_SYMBOLS {
+            } else if let Some(rest) = line.strip_prefix("+++ b/") {
+                let b = rest.trim().trim_matches('"');
+                if !b.is_empty() && b != "/dev/null" {
+                    push_file(&mut files, b, &mut extra_files, &mut files_capped);
+                }
+            } else if line.starts_with("@@")
+                && let Some(ctx) = line.split("@@").nth(2)
+                    && let Some(sym) = leading_identifier(ctx)
+                        && let Some(file) = files.last().filter(|_| !files_capped)
+                            && symbols.len() < MAX_SYMBOLS {
                                 symbols.insert(format!("{file}/{sym}"));
                             }
-                        }
-                    }
-                }
-            }
         }
         out.push(GitCommit {
             sha,
             time,
             subject,
             files,
+            extra_files,
             symbols: symbols.into_iter().collect(),
         });
     }
     out
 }
 
-fn push_bounded(v: &mut Vec<String>, item: &str, cap: usize) {
-    if !item.is_empty() && v.len() < cap && !v.iter().any(|x| x == item) {
-        v.push(item.to_string());
+fn push_file(
+    files: &mut Vec<String>,
+    path: &str,
+    extra_files: &mut usize,
+    files_capped: &mut bool,
+) {
+    if path.is_empty() || files.iter().any(|x| x == path) {
+        return;
+    }
+    if files.len() < MAX_FILES {
+        files.push(path.to_string());
+    } else {
+        *files_capped = true;
+        *extra_files += 1;
     }
 }
 
@@ -101,7 +129,9 @@ fn leading_identifier(ctx: &str) -> Option<String> {
     const KEYWORDS: &[&str] = &[
         "fn", "def", "function", "func", "method", "class", "struct", "impl",
         "public", "private", "protected", "static", "async", "const", "let",
-        "var", "extern", "unsafe",
+        "var", "extern", "unsafe", "pub", "export", "return", "type",
+        "interface", "enum", "trait", "virtual", "template", "override",
+        "final",
     ];
     let mut ident = String::new();
     for raw in ctx.split_whitespace() {
@@ -130,6 +160,9 @@ pub fn record_content(c: &GitCommit) -> String {
     if !c.files.is_empty() {
         s.push_str("\nfiles: ");
         s.push_str(&c.files.join(", "));
+        if c.extra_files > 0 {
+            s.push_str(&format!(" (+{} more)", c.extra_files));
+        }
     }
     // Only multi-segment module paths pass the shape test; single-segment dirs
     // ("src") are already covered by the file entities beneath them.
@@ -194,12 +227,12 @@ fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// Tags embedding one of `versions` ("v1.42.1", "release-1.42.1"). Returns the
 /// matching tag names, sorted ascending by version.
-pub fn match_version_tags<'a>(tags: &[&'a str], versions: &[String]) -> Vec<String> {
+pub fn match_version_tags(tags: &[&str], versions: &[String]) -> Vec<String> {
     let mut matched: Vec<String> = tags
         .iter()
         .filter(|t| {
             versions.iter().any(|v| {
-                t.rsplit(|c: char| c == 'v' || c == '-' || c == '_')
+                t.rsplit(['v', '-', '_'])
                     .any(|seg| extract_versions(seg).iter().any(|ev| ev == v))
             })
         })
@@ -276,6 +309,66 @@ diff --git a/README.md b/README.md
         for want in ["events/local.py", "src/store.rs", "events/local.py/write_event"] {
             assert!(ents.iter().any(|e| e == want), "missing {want} in {ents:?}");
         }
+    }
+
+    #[test]
+    fn phantom_records_from_control_chars_are_skipped() {
+        // a subject containing \x1e fabricates a second record header whose
+        // "sha" is prose: only full 40-hex shas become records
+        let raw = "\u{1e}1111111111111111111111111111111111111111\u{1f}2026-09-01T12:00:00+00:00\u{1f}subject with\u{1e}embedded split\u{1f}2026-09-01T00:00:00+00:00\u{1f}junk";
+        let commits = parse_git_log(raw);
+        assert_eq!(commits.len(), 1, "phantom header must not become a record");
+        assert_eq!(commits[0].sha, "1111111111111111111111111111111111111111");
+    }
+
+    #[test]
+    fn file_cap_counts_extras_and_stops_symbol_attribution() {
+        let mut raw = String::from(
+            "\u{1e}2222222222222222222222222222222222222222\u{1f}2026-09-01T12:00:00+00:00\u{1f}big move\n",
+        );
+        for i in 0..52 {
+            raw.push_str(&format!("diff --git a/src/f{i}.rs b/src/f{i}.rs\n"));
+            raw.push_str(&format!("@@ -1,2 +1,3 @@ fn handler_{i}(x: u8)\n"));
+        }
+        let commits = parse_git_log(&raw);
+        assert_eq!(commits[0].files.len(), MAX_FILES);
+        assert_eq!(commits[0].extra_files, 2);
+        // hunks past the cap must NOT attach their symbols to file #50
+        assert!(
+            !commits[0].symbols.iter().any(|s| s.contains("handler_50")),
+            "symbol past the file cap must not be attributed to the last recorded file"
+        );
+        assert!(commits[0].symbols.iter().any(|s| s.contains("handler_0")));
+        let content = record_content(&commits[0]);
+        assert!(content.contains("(+2 more)"), "truncation must be visible: {content}");
+    }
+
+    #[test]
+    fn quoted_paths_fall_back_to_plusplus_line() {
+        // git C-quotes exotic paths in the diff --git header; the +++ line
+        // re-captures the file (quotes stripped)
+        let raw = "\u{1e}3333333333333333333333333333333333333333\u{1f}2026-09-01T12:00:00+00:00\u{1f}odd path\n"
+            .to_string()
+            + "diff --git \"a/spa ce\" \"b/spa ce\"\n"
+            + "index 111..222 100644\n"
+            + "--- a/\"spa ce\"\n"
+            + "+++ b/\"spa ce\"\n"
+            + "@@ -1,2 +1,3 @@ fn main()\n";
+        let commits = parse_git_log(&raw);
+        assert_eq!(commits[0].files, vec!["spa ce"], "files: {:?}", commits[0].files);
+        assert!(commits[0].symbols.contains(&"spa ce/main".to_string()));
+    }
+
+    #[test]
+    fn modifier_keywords_are_not_symbols() {
+        assert_eq!(
+            leading_identifier("pub fn write_event(self, x: u8)"),
+            Some("write_event".into())
+        );
+        assert_eq!(leading_identifier("pub struct Config {"), Some("Config".into()));
+        assert_eq!(leading_identifier("export function save()"), Some("save".into()));
+        assert_eq!(leading_identifier("return None;"), None);
+        assert_eq!(leading_identifier("trait Store {"), Some("Store".into()));
     }
 
     #[test]

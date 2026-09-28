@@ -3294,6 +3294,18 @@ fn run_ingest(
     if content.trim().is_empty() {
         anyhow::bail!("Content cannot be empty");
     }
+    // Parse/validate BEFORE any storage write: a bad timestamp must not leave a
+    // node behind with the wrong created_at and no key to retry with.
+    let created_at_ts = created_at
+        .map(|ts| {
+            chrono::DateTime::parse_from_rfc3339(&ts)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .map_err(|e| anyhow::anyhow!("--created-at wants RFC 3339: {e}"))
+        })
+        .transpose()?;
+    if ago_days.is_some() && created_at_ts.is_some() {
+        anyhow::bail!("--ago-days and --created-at are mutually exclusive");
+    }
 
     let tag_list: Vec<String> = tags
         .as_deref()
@@ -3359,10 +3371,7 @@ fn run_ingest(
                 })?;
             storage.set_created_at(&result.node.id, when)?;
         }
-        if let Some(ts) = &created_at {
-            let when = chrono::DateTime::parse_from_rfc3339(ts)
-                .map_err(|e| anyhow::anyhow!("--created-at wants RFC 3339: {e}"))?
-                .with_timezone(&chrono::Utc);
+        if let Some(when) = created_at_ts {
             storage.set_created_at(&result.node.id, when)?;
         }
         println!("{}", "=== Vestige Ingest ===".cyan().bold());
@@ -3409,10 +3418,7 @@ fn run_ingest(
                 })?;
             storage.set_created_at(&node.id, when)?;
         }
-        if let Some(ts) = &created_at {
-            let when = chrono::DateTime::parse_from_rfc3339(ts)
-                .map_err(|e| anyhow::anyhow!("--created-at wants RFC 3339: {e}"))?
-                .with_timezone(&chrono::Utc);
+        if let Some(when) = created_at_ts {
             storage.set_created_at(&node.id, when)?;
         }
         println!("{}", "=== Vestige Ingest ===".cyan().bold());
@@ -3813,6 +3819,33 @@ fn run_backfill(
     Ok(())
 }
 
+/// Normalized remote identity for a repo: `git config remote.origin.url`
+/// stripped of protocol and `.git` (`https://github.com/a/b.git`,
+/// `git@github.com:a/b` -> `github.com/a/b`). None when no remote is set.
+fn git_repo_identity(path: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if url.is_empty() {
+        return None;
+    }
+    let stripped = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("git@")
+        .trim_start_matches("ssh://")
+        .trim_end_matches(".git")
+        .replace(':', "/");
+    Some(stripped)
+}
+
 /// Ingest git commits as memory records. Each commit becomes one event whose
 /// content carries the files, module dirs and hunk-header symbols — the
 /// query-time entity extractor turns those into the causal join keys. Records
@@ -3825,10 +3858,18 @@ fn run_ingest_git(
     max_commits: usize,
     json: bool,
 ) -> anyhow::Result<()> {
-    let repo_name = path
+    let repo_display = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
+    // Identity = remote URL (normalized), not the directory basename: two
+    // clones named "vestige" in different paths would otherwise share one
+    // source-key namespace and project tag.
+    let repo_name = git_repo_identity(&path).unwrap_or_else(|| {
+        path.canonicalize()
+            .map(|p| p.display().to_string())
+            .unwrap_or(repo_display.clone())
+    });
     let mut git_args = vec![
         "log".to_string(),
         "-p".to_string(),
@@ -3903,7 +3944,8 @@ fn run_ingest_git(
         println!(
             "{}",
             serde_json::json!({
-                "repo": repo_name,
+                "repo": repo_display,
+                "repo_identity": repo_name,
                 "commits_seen": commits.len(),
                 "created": created,
                 "updated": updated,
@@ -3913,7 +3955,8 @@ fn run_ingest_git(
     } else {
         println!("{}", "=== Vestige Ingest Git ===".cyan().bold());
         println!();
-        println!("{}: {}", "Repo".white().bold(), repo_name);
+        println!("{}: {}", "Repo".white().bold(), repo_display);
+        println!("{}: {}", "Identity".white().bold(), repo_name);
         println!("{}: {}", "Commits seen".white().bold(), commits.len());
         println!("{}: {}", "Created".white().bold(), created);
         println!("{}: {}", "Updated".white().bold(), updated);

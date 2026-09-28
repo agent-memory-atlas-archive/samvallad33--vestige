@@ -109,27 +109,48 @@ type VersionRange = (String, String, std::collections::HashSet<String>);
 
 /// Map "broke in X, worked in Y" to the commit set between the two tags.
 /// Explicit tags win; otherwise semver tokens in the failure text are matched
-/// against the repo's tags (lowest = worked in, highest = broke in). Any git
-/// failure resolves to "no range" — the reach then uses the lookback window.
+/// against the repo's tags (lowest = worked in, highest = broke in).
+///
+/// Explicit tags that fail to resolve (typo, shallow clone without the tag) or
+/// resolve to an EMPTY range (worked/broke swapped) are ERRORS: silently
+/// dropping a range the caller explicitly asked for would widen the candidate
+/// set without a hint. Auto-detected ranges degrade silently to no-range.
 fn resolve_version_range(
     repo: &str,
     worked_in: Option<&str>,
     broke_in: Option<&str>,
     failure_text: &str,
-) -> Option<VersionRange> {
+) -> Result<Option<VersionRange>, String> {
+    let explicit = worked_in.is_some() && broke_in.is_some();
     let (worked, broke) = match (worked_in, broke_in) {
         (Some(w), Some(b)) => (w.to_string(), b.to_string()),
         _ => {
-            let tags = git_lines(repo, &["tag", "--list"])?;
+            let Some(tags) = git_lines(repo, &["tag", "--list"]) else {
+                return Ok(None);
+            };
             let versions = git_records::extract_versions(failure_text);
             let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
             let matched = git_records::match_version_tags(&tag_refs, &versions);
-            let (w, b) = git_records::version_range(&matched)?;
+            let Some((w, b)) = git_records::version_range(&matched) else {
+                return Ok(None);
+            };
             (w, b)
         }
     };
-    let shas = git_lines(repo, &["rev-list", &format!("{worked}..{broke}")])?;
-    Some((worked, broke, git_records::parse_rev_list(&shas.join("\n"))))
+    let Some(shas) = git_lines(repo, &["rev-list", &format!("{worked}..{broke}")]) else {
+        if explicit {
+            return Err(format!(
+                "could not resolve the version range {worked}..{broke} in {repo} (tag missing or not fetched?)"
+            ));
+        }
+        return Ok(None);
+    };
+    if shas.is_empty() && explicit {
+        return Err(format!(
+            "version range {worked}..{broke} is empty — broke_in must come after worked_in"
+        ));
+    }
+    Ok(Some((worked, broke, git_records::parse_rev_list(&shas.join("\n")))))
 }
 
 fn git_lines(repo: &str, git_args: &[&str]) -> Option<Vec<String>> {
@@ -266,14 +287,49 @@ fn build_candidates(
 }
 
 /// One-line answer to "why not X?" for a memory id or commit sha prefix.
+///
+/// The rule is DERIVED from the candidate itself rather than read from
+/// `result.rejected`: the rejected list is truncated to the strongest few, so a
+/// truncated rejection would otherwise be mislabeled "ranked below the top 3".
+/// Caller-side exclusions (version range) are answered from `excluded`.
 fn explain_why_not(
     target: &str,
     failure: &FailureEvent,
     result: &BackfillResult,
     candidates: &[BackfillCandidate],
+    excluded: &[ExcludedCandidate],
+    lookback_days: i64,
     contents: &std::collections::HashMap<String, String>,
 ) -> Value {
     let lowered = target.trim().to_lowercase();
+    let is_hexish = lowered.chars().all(|c| c.is_ascii_hexdigit());
+    if lowered.len() < 7 && is_hexish && !lowered.is_empty() {
+        return json!({
+            "target": target,
+            "verdict": "ambiguous",
+            "detail": "sha prefix too short; use at least 7 characters or the memory id",
+        });
+    }
+    // caller-excluded records (e.g. outside the version range) are not in the
+    // candidate pool; resolve them first so their reason is not lost
+    if let Some(ex) = excluded
+        .iter()
+        .find(|ex| ex.candidate.id.to_lowercase() == lowered)
+        .or_else(|| {
+            excluded.iter().find(|ex| {
+                contents
+                    .get(&ex.candidate.id)
+                    .and_then(|c| commit_sha(c))
+                    .is_some_and(|sha| sha.starts_with(&lowered))
+            })
+        })
+    {
+        return json!({
+            "target": target,
+            "verdict": "rejected",
+            "detail": ex.reason,
+        });
+    }
     let id = candidates
         .iter()
         .map(|c| &c.id)
@@ -291,7 +347,7 @@ fn explain_why_not(
         return json!({
             "target": target,
             "verdict": "not a candidate",
-            "detail": "not in this scope, suppressed, or shares no time window with the failure",
+            "detail": "not in this scope, suppressed, or outside the scanned window entirely",
         });
     };
     if let Some((rank, cause)) = result
@@ -306,27 +362,36 @@ fn explain_why_not(
             "detail": format!("cause candidate #{}: {}", rank + 1, cause.reason),
         });
     }
-    if let Some(r) = result.rejected.iter().find(|r| r.memory_id == id) {
+    // derive the rule from the candidate, not the (truncated) rejected list
+    if let Some(c) = candidates.iter().find(|c| c.id == id) {
+        let shared = c
+            .entities
+            .iter()
+            .filter(|e| failure.entities.contains(e))
+            .count();
+        let rule = if c.age_days_before_failure <= 0.0 {
+            "record is newer than the failure".to_string()
+        } else if c.age_days_before_failure > lookback_days as f64 {
+            format!("outside the {lookback_days}d lookback window")
+        } else if shared == 0 {
+            "shares no entity with the failure".to_string()
+        } else {
+            format!(
+                "ranked below the top {}: scored lower than the surfaced causes (shares {shared} entit{} with the failure)",
+                result.causes.len().max(1),
+                if shared == 1 { "y" } else { "ies" }
+            )
+        };
         return json!({
             "target": target,
             "verdict": "rejected",
-            "detail": r.reason,
+            "detail": rule,
         });
     }
-    let shared = candidates
-        .iter()
-        .find(|c| c.id == id)
-        .map(|c| {
-            c.entities
-                .iter()
-                .filter(|e| failure.entities.contains(e))
-                .count()
-        })
-        .unwrap_or(0);
     json!({
         "target": target,
-        "verdict": "ranked below the top 3",
-        "detail": format!("in the scan but scored below the surfaced causes (shares {shared} entit{} with the failure)", if shared == 1 {"y"} else {"ies"}),
+        "verdict": "not a candidate",
+        "detail": "not in this scope, suppressed, or outside the scanned window entirely",
     })
 }
 
@@ -411,7 +476,7 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
             args.worked_in.as_deref(),
             args.broke_in.as_deref(),
             &failure_node.content,
-        ),
+        )?,
         None => None,
     };
     let embedding_of = |id: &str| storage.get_node_embedding(id).ok().flatten();
@@ -442,6 +507,13 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
             "triggered": false,
             "reason": "the event was not salient (not a detected failure and manual=false). Pass manual=true to force.",
             "failure_id": failure.id,
+            // answer the why-not question even here: there is no ranking to
+            // interrogate until the reach actually runs
+            "why_not": args.why_not.as_deref().map(|t| json!({
+                "target": t,
+                "verdict": "not triggered",
+                "detail": "the event was not salient, so no candidate was ranked or excluded; pass manual=true to force the reach",
+            })),
         }));
     }
 
@@ -511,10 +583,9 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
     }
 
     // why-not-X: one line per named suspect
-    let why_not = args
-        .why_not
-        .as_deref()
-        .map(|t| explain_why_not(t, &failure, &result, &candidates, &contents));
+    let why_not = args.why_not.as_deref().map(|t| {
+        explain_why_not(t, &failure, &result, &candidates, &excluded, lookback, &contents)
+    });
 
     // gap suggestion: name the concrete missing record kind
     let gap_value = result.gap.clone().map(|gap| {
@@ -807,6 +878,7 @@ mod tests {
             subject: "fix local write".into(),
             files: vec!["events/local.py".into()],
             symbols: vec![],
+                extra_files: 0,
         })
     }
 
@@ -875,6 +947,87 @@ mod tests {
         assert_eq!(excluded[0].reason, "outside version range 1.41.0..1.42.1");
     }
 
+    fn temp_git_repo() -> tempfile::TempDir {
+        use std::process::Command;
+        let dir = tempfile::TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "one"]);
+        git(&["tag", "v1.41.0"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "two"]);
+        git(&["tag", "v1.42.1"]);
+        dir
+    }
+
+    #[test]
+    fn explicit_range_failures_are_errors_not_silent_fallbacks() {
+        let dir = temp_git_repo();
+        let repo = dir.path().display().to_string();
+        // typo'd tag: explicit range must error instead of silently widening
+        let err = resolve_version_range(&repo, Some("v9.9.9"), Some("v1.42.1"), "").unwrap_err();
+        assert!(err.contains("could not resolve"), "{err}");
+        // swapped order resolves to an empty range: also an error
+        let err = resolve_version_range(&repo, Some("v1.42.1"), Some("v1.41.0"), "").unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+        // the valid explicit range resolves
+        let ok = resolve_version_range(&repo, Some("v1.41.0"), Some("v1.42.1"), "")
+            .unwrap()
+            .expect("range");
+        assert_eq!(ok.0, "v1.41.0");
+        assert_eq!(ok.1, "v1.42.1");
+        assert_eq!(ok.2.len(), 1);
+        // auto-detection with no versions in the text degrades silently
+        assert!(resolve_version_range(&repo, None, None, "no versions here")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn why_not_answers_for_range_excluded_commits_and_short_prefixes() {
+        let (failure, failure_created) = failure_event();
+        let good = "4444444444444444444444444444444444444444";
+        let all = vec![
+            node("fail", "crash in events/local.py", &[], 0),
+            node("c1", &commit_record_content(good), &[git_records::COMMIT_TAG], 5),
+        ];
+        let (candidates, excluded, _) = build_candidates(
+            &failure,
+            failure_created,
+            None,
+            &|_| None,
+            &all,
+            &Default::default(),
+            None,
+        );
+        let result = RetroactiveBackfill::new().run_trail(&failure, &candidates, &excluded);
+        let contents: std::collections::HashMap<String, String> =
+            all.iter().map(|n| (n.id.clone(), n.content.clone())).collect();
+
+        // a range-excluded commit answers from the excluded list, not "not a candidate"
+        let excluded_c = vec![ExcludedCandidate {
+            candidate: candidates[0].clone(),
+            reason: "outside version range 1.41.0..1.42.1".into(),
+        }];
+        let out = explain_why_not(
+            "4444444", &failure, &result, &[], &excluded_c, 30, &contents,
+        );
+        assert_eq!(out["verdict"], "rejected");
+        assert_eq!(out["detail"], "outside version range 1.41.0..1.42.1");
+
+        // hex prefixes shorter than 7 chars are refused, not guessed
+        let out = explain_why_not("444", &failure, &result, &candidates, &[], 30, &contents);
+        assert_eq!(out["verdict"], "ambiguous");
+    }
+
     #[test]
     fn why_not_answers_for_every_disposition() {
         let (failure, failure_created) = failure_event();
@@ -894,11 +1047,15 @@ mod tests {
             all.iter().map(|n| (n.id.clone(), n.content.clone())).collect();
 
         // a rejected record gets its rule
-        let out = explain_why_not("later", &failure, &result, &candidates, &contents);
+        let out = explain_why_not(
+            "later", &failure, &result, &candidates, &[], 30, &contents,
+        );
         assert_eq!(out["verdict"], "rejected");
         assert_eq!(out["detail"], "record is newer than the failure");
         // an unknown id says so
-        let out = explain_why_not("nope", &failure, &result, &candidates, &contents);
+        let out = explain_why_not(
+            "nope", &failure, &result, &candidates, &[], 30, &contents,
+        );
         assert_eq!(out["verdict"], "not a candidate");
         // a commit sha prefix resolves to its record
         let sha = "9999998888777766665555444433332222221111";
@@ -918,7 +1075,9 @@ mod tests {
         let result2 = RetroactiveBackfill::new().run_trail(&failure, &candidates2, &[]);
         let contents2: std::collections::HashMap<String, String> =
             all2.iter().map(|n| (n.id.clone(), n.content.clone())).collect();
-        let out = explain_why_not("9999998", &failure, &result2, &candidates2, &contents2);
+        let out = explain_why_not(
+            "9999998", &failure, &result2, &candidates2, &[], 30, &contents2,
+        );
         assert_eq!(out["verdict"], "surfaced", "{out}");
     }
 }

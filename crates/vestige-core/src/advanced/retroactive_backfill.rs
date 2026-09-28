@@ -20,8 +20,12 @@
 //!   in time. The biological directionality earns its keep, it is not decorative.
 //! - Linking flows along the **overlap ensemble** — memories that share entities
 //!   (same file, env var, service, symbol). That shared-entity edge is the join
-//!   key the backward scan follows; semantic similarity is deliberately NOT the
-//!   ranking signal (that is the whole point — RAG already covers similarity).
+//!   key the backward scan follows; semantic similarity is deliberately NOT a
+//!   ranking signal IN EITHER DIRECTION (that is the whole point — RAG already
+//!   covers similarity, and an inverted-similarity bonus would still make the
+//!   ranking a function of the embedding space, i.e. vector search with the
+//!   sign flipped). Similarity appears in the OUTPUT only, as the reported
+//!   similarity_rank proving the cause is not what a vector search surfaces.
 //!
 //! Honesty note for callers: this is scoped to *failure → backward causal
 //! backfill*, not a universal "all salience flows backward" law. The Cai paper
@@ -63,7 +67,11 @@ pub const FAILURE_MARKERS: &[&str] = &[
     "oom", "502", "503", "504", "rejected", "denied", "flaky",
     // real-incident vocabulary (CauseBench found these missing — postmortems often
     // describe failures without the classic crash words above)
-    "pinned", "saturated", "saturation", "stalled", "exhausted", "exhaustion",
+    // NOTE: bare "pinned" was removed — dependency pinning ("pinned rails to
+    // 5.2") is classic quiet-CAUSE vocabulary; flagging such notes as failures
+    // excludes them from the backward reach, the same failure mode that got
+    // bare "500" removed above.
+    "saturated", "saturation", "stalled", "exhausted", "exhaustion",
     "overload", "overloaded", "backlog", "fell behind", "lag", "lagging",
     "unavailable", "down", "dropped", "reset", "refused", "stampede",
     "thrashing", "starved", "starvation", "expired", "expiry", "overflow",
@@ -398,20 +406,30 @@ impl RetroactiveBackfill {
         let failure_entities: HashSet<&str> =
             failure.entities.iter().map(|s| s.as_str()).collect();
 
-        // Inverse document frequency over the scanned pool: an entity that
+        // Inverse document frequency over the IN-WINDOW pool: an entity that
         // nearly every record carries (issue-template paths, the product's own
         // package name) is boilerplate, not a clue. Replaces the raw shared
         // count, which let two boilerplate matches outrank one real one.
-        let n = candidates.len();
+        // In-window only: post-failure records are excluded from the reach, so
+        // they must not inflate df either — a hot file churned on both sides of
+        // the failure would otherwise deflate the very cause being ranked.
+        let in_window: Vec<&BackfillCandidate> = candidates
+            .iter()
+            .filter(|c| {
+                c.age_days_before_failure > 0.0
+                    && c.age_days_before_failure <= self.lookback_days as f64
+            })
+            .collect();
+        let n = in_window.len();
         let mut df: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-        for c in candidates {
+        for c in &in_window {
             for e in &c.entities {
                 *df.entry(e.as_str()).or_default() += 1;
             }
         }
         let idf = |e: &str| -> f64 {
             let d = df.get(e).copied().unwrap_or(1).max(1) as f64;
-            (1.0 + n as f64 / d).ln()
+            (1.0 + (n as f64) / d).ln()
         };
 
         // similarity ranking (only to PROVE the cause ranks low on similarity)
@@ -584,32 +602,23 @@ impl RetroactiveBackfill {
         }
     }
 
-    /// Score a candidate cause. More shared entities = stronger causal join.
-    /// Recency among the past matters a little (a change yesterday is a more
-    /// likely cause than one a month ago) but is deliberately a *weak* term so
-    /// genuinely old causes still surface — the opposite of recency-only ranking.
-    /// LOW similarity is rewarded slightly: a cause that is dissimilar to the
-    /// failure is exactly the one RAG cannot find, so it is the most valuable
-    /// to backfill.
+    /// Score a candidate cause. Purely STRUCTURAL: IDF-weighted shared entities
+    /// (boilerplate names count for almost nothing, rare identifiers a lot), a
+    /// weak recency term, and the change-record bonus. Embedding similarity is
+    /// NOT an input — not to pull lookalikes in, and not to push them away: a
+    /// dissimilarity bonus would make this vector search with the sign flipped.
     fn score(
         &self,
         c: &BackfillCandidate,
         shared: &[String],
         idf: &impl Fn(&str) -> f64,
     ) -> f64 {
-        // dominant signal, per-entity weighted: boilerplate names count for
-        // almost nothing, rare identifiers count for a lot
         let entity_term: f64 = shared.iter().map(|e| idf(e)).sum();
         // gentle recency-in-the-past: 1.0 at the failure, fading with age
         let recency_term =
             0.3 * (1.0 / (1.0 + c.age_days_before_failure / self.lookback_days as f64));
-        // dissimilarity bonus: the less similar, the more "RAG would miss it"
-        let dissim_term = c
-            .similarity_to_failure
-            .map(|s| 0.5 * (1.0 - s as f64).max(0.0))
-            .unwrap_or(0.0);
         let change_term = if c.is_change_record { CHANGE_RECORD_BONUS } else { 0.0 };
-        entity_term + recency_term + dissim_term + change_term
+        entity_term + recency_term + change_term
     }
 }
 
@@ -969,6 +978,127 @@ mod tests {
             &[make("report", false, 1.0), make("change", true, 8.0)],
         );
         assert_eq!(result.causes[0].memory_id, "change");
+    }
+
+    #[test]
+    fn idf_ignores_post_failure_records() {
+        // Post-failure records are excluded from the reach, so they must not
+        // inflate an entity's document frequency either: a hot file churned on
+        // BOTH sides of the failure would deflate the in-window cause's rare
+        // clue. Under the pre-fix df (whole pool), the boilerplate pair won.
+        let failure = FailureEvent {
+            id: "fail".into(),
+            content: "crash T1 T2 RARE_X".into(),
+            entities: vec!["T1".into(), "T2".into(), "RARE_X".into()],
+            tags: vec![],
+            prediction_error: 0.9,
+            manual: false,
+        };
+        let mut candidates = Vec::new();
+        // five in-window template records carrying T1/T2 (the boilerplate pair
+        // IS common in-window — that's why it must lose)
+        for i in 0..5 {
+            candidates.push(BackfillCandidate {
+                id: format!("template-{i}"),
+                content: "template noise".into(),
+                entities: vec!["T1".into(), "T2".into()],
+                age_days_before_failure: 1.0,
+                stability: 4.0,
+                similarity_to_failure: None,
+                via_supersession_of: None,
+                is_change_record: false,
+            });
+        }
+        // in-window cause: the rare identifier, itself a change record
+        candidates.push(BackfillCandidate {
+            id: "cause".into(),
+            content: "commit flipping RARE_X".into(),
+            entities: vec!["RARE_X".into()],
+            age_days_before_failure: 1.0,
+            stability: 4.0,
+            similarity_to_failure: None,
+            via_supersession_of: None,
+            is_change_record: true,
+        });
+        // eight POST-failure records all carrying RARE_X: under whole-pool df,
+        // df(RARE_X)=9 made the rare clue look common and the template pair won
+        for i in 0..8 {
+            candidates.push(BackfillCandidate {
+                id: format!("future-{i}"),
+                content: "post-failure churn".into(),
+                entities: vec!["RARE_X".into()],
+                age_days_before_failure: -(i as f64 + 1.0),
+                stability: 4.0,
+                similarity_to_failure: None,
+                via_supersession_of: None,
+                is_change_record: false,
+            });
+        }
+        let result = RetroactiveBackfill::new().run(&failure, &candidates);
+        assert_eq!(
+            result.causes[0].memory_id, "cause",
+            "future churn must not deflate the in-window rare clue"
+        );
+    }
+
+    #[test]
+    fn ranking_is_invariant_to_embedding_similarity() {
+        // Backfill must NOT be vector search with the sign flipped: identical
+        // structural evidence must produce identical ranking regardless of the
+        // candidates' embedding similarity to the failure.
+        let failure = FailureEvent {
+            id: "fail".into(),
+            content: "crash in local.py".into(),
+            entities: vec!["local.py".into()],
+            tags: vec![],
+            prediction_error: 0.9,
+            manual: false,
+        };
+        let make = |id: &str, sim: Option<f32>| BackfillCandidate {
+            id: id.into(),
+            content: "touched local.py".into(),
+            entities: vec!["local.py".into()],
+            age_days_before_failure: 5.0,
+            stability: 4.0,
+            similarity_to_failure: sim,
+            via_supersession_of: None,
+            is_change_record: false,
+        };
+        // run A: no embeddings; run B: wildly different similarities.
+        // Top-3 membership and order must be identical.
+        let pool_a = vec![make("a", None), make("b", None), make("c", None)];
+        let pool_b = vec![make("a", Some(0.99)), make("b", Some(0.01)), make("c", Some(0.5))];
+        let ra = RetroactiveBackfill::new().run(&failure, &pool_a);
+        let rb = RetroactiveBackfill::new().run(&failure, &pool_b);
+        let ids_a: Vec<&str> = ra.causes.iter().map(|c| c.memory_id.as_str()).collect();
+        let ids_b: Vec<&str> = rb.causes.iter().map(|c| c.memory_id.as_str()).collect();
+        assert_eq!(ids_a, ids_b, "similarity must not reorder structurally-equal candidates");
+        // and a near-identical lookalike cannot outrank the structural cause
+        // even at similarity 1.0
+        let pool_c = vec![
+            make("lookalike", Some(1.0)),
+            BackfillCandidate {
+                id: "cause".into(),
+                content: "commit touching local.py".into(),
+                entities: vec!["local.py".into(), "RARE_KEY".into()],
+                age_days_before_failure: 5.0,
+                stability: 4.0,
+                similarity_to_failure: Some(0.0),
+                via_supersession_of: None,
+                is_change_record: true,
+            },
+        ];
+        let rc = RetroactiveBackfill::new().run(&failure, &pool_c);
+        assert_eq!(rc.causes[0].memory_id, "cause");
+    }
+
+    #[test]
+    fn dependency_pinning_is_not_a_failure_marker() {
+        // "pinned" was removed from FAILURE_MARKERS: pinning a dependency is
+        // quiet-CAUSE vocabulary and must stay reachable by the backward reach.
+        assert!(!looks_like_failure("pinned rails to 5.2 for the tz workaround", &[]));
+        // real incident vocabulary still detected
+        assert!(looks_like_failure("connection pool saturated at 100%", &[]));
     }
 
     #[test]

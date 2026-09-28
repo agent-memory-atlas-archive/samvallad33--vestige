@@ -97,12 +97,23 @@ def run_entry(entry, repos, stores, vestige):
 
 
 def clone_repo(entry, repos, repo_slug, issue_date):
+    # One clone per repo, windowed to the OLDEST entry that uses it: caching by
+    # repo name alone let a newer entry's narrow --shallow-since truncate the
+    # history an older same-repo entry needed (run-2 bug: three entries measured
+    # against missing history). The needed-since file records the clone's floor.
     clone = repos / repo_slug
-    since = (issue_date - timedelta(days=WINDOW_DAYS + SHALLOW_MARGIN_DAYS)).strftime("%Y-%m-%d")
+    needed = (issue_date - timedelta(days=WINDOW_DAYS + SHALLOW_MARGIN_DAYS)).strftime("%Y-%m-%d")
+    floor_file = clone / ".eval-shallow-floor"
+    if floor_file.exists():
+        floor = floor_file.read_text().strip()
+        if needed < floor:
+            # this entry needs older history than the cached clone has
+            subprocess.run(["rm", "-rf", str(clone)], check=True)
     if not (clone / ".git").exists():
-        must(["git", "clone", "--shallow-since=" + since, "--single-branch",
+        must(["git", "clone", "--shallow-since=" + needed, "--single-branch",
               f"https://github.com/{entry['repo']}", str(clone)],
              what="git clone")
+        (clone / ".eval-shallow-floor").write_text(needed)
     return clone
 
 
