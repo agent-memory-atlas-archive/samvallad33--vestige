@@ -867,6 +867,9 @@ mod tests {
             symbols: vec![],
             extra_files: 0,
             mentions: vec![],
+            hunks: vec![],
+            extra_hunks: 0,
+            imports: vec![],
         })
     }
 

@@ -2,9 +2,10 @@
 //!
 //! Turn `git log -p` output into memory records so Backfill can join a failure
 //! to the change that caused it, not only to another description of it. Each
-//! commit becomes one record tagged `git-commit`; its files, modules and
-//! hunk-header symbols ride in the content, so the query-time entity extractor
-//! picks them up as join keys with no schema change.
+//! commit becomes one record tagged `git-commit`; its files, modules, hunk
+//! spans (new-side line ranges, the anchors blame needs) and import edges ride
+//! in the content alongside the hunk-header symbols, so the query-time entity
+//! extractor picks them up as join keys with no schema change.
 
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
@@ -14,6 +15,20 @@ use std::collections::BTreeSet;
 pub const COMMIT_TAG: &str = "git-commit";
 /// `source_system` key for the idempotent source upsert.
 pub const SOURCE_SYSTEM: &str = "git";
+
+/// One `@@ -a[,b] +c[,d] @@` hunk span on the new side — where the changed
+/// lines live in the post-commit file, so blame can anchor onto it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HunkSpan {
+    /// File the hunk belongs to (the b/ side name, like `files`).
+    pub file: String,
+    /// New-side start line (`+c`).
+    pub start: u32,
+    /// New-side line count (`,d`); an omitted count means a single line.
+    pub len: u32,
+    /// Symbol from the hunk-header trailing context, when one parses.
+    pub symbol: Option<String>,
+}
 
 /// One parsed commit.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +47,17 @@ pub struct GitCommit {
     /// names, code identifiers appearing IN the diff body) — the causal link
     /// usually lives here in plain text, not in the headers.
     pub mentions: Vec<String>,
+    /// Hunk spans (new-side line ranges) per file, bounded by [`MAX_HUNKS`].
+    pub hunks: Vec<HunkSpan>,
+    /// Hunks beyond [`MAX_HUNKS`] (recorded as a count, not spans, so the
+    /// content can say "+N more" instead of truncating silently).
+    pub extra_hunks: usize,
+    /// Import edges harvested from changed lines, sorted by (file, target):
+    /// (file in this commit, target path, resolved). A resolved target is the
+    /// repo-relative path that exactly matched this commit's files or their
+    /// module dirs; an unresolved target keeps the module path as written —
+    /// never a guess.
+    pub imports: Vec<(String, String, bool)>,
 }
 
 fn is_full_sha(s: &str) -> bool {
@@ -45,6 +71,24 @@ const MAX_SYMBOLS: usize = 40;
 /// Changed lines harvested per commit for mention entities.
 const MAX_DIFF_LINES: usize = 400;
 const MAX_MENTIONS: usize = 40;
+/// Hunk spans kept per commit; overflow is counted in `extra_hunks`.
+const MAX_HUNKS: usize = 200;
+/// Upper bound for the comma-joined span list on the `hunks:` content line.
+const MAX_HUNK_LINE: usize = 400;
+/// Import edges kept per commit.
+const MAX_IMPORTS: usize = 40;
+
+/// Syntax family of a captured import statement — decides how the written
+/// target maps onto candidate repo-relative paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ImportKind {
+    /// `use a::b::Item;` — `::`-separated; a `crate` root maps to `src/`.
+    Rust,
+    /// `import x.y.z` / `from x.y import z` — `.`-separated module path.
+    Dotted,
+    /// `#include "p"` / `#include <p>` — path used verbatim.
+    Include,
+}
 
 /// Parse `git log -p --unified=0 --no-color --pretty=format:%x1e%H%x1f%aI%x1f%s`.
 /// Files come from `diff --git a/X b/Y` lines (the b/ side wins, so renames
@@ -81,6 +125,11 @@ pub fn parse_git_log(raw: &str) -> Vec<GitCommit> {
         let mut files_capped = false;
         let mut symbols: BTreeSet<String> = BTreeSet::new();
         let mut diff_body = String::new();
+        let mut hunks: Vec<HunkSpan> = Vec::new();
+        let mut extra_hunks = 0usize;
+        // (file, written target, syntax) — resolution is deferred until the
+        // whole commit is scanned and the file list is complete
+        let mut raw_imports: BTreeSet<(String, String, ImportKind)> = BTreeSet::new();
         for line in body.lines() {
             if let Some(rest) = line.strip_prefix("diff --git a/") {
                 match rest.split_once(" b/") {
@@ -93,18 +142,47 @@ pub fn parse_git_log(raw: &str) -> Vec<GitCommit> {
                 if !b.is_empty() && b != "/dev/null" {
                     push_file(&mut files, b, &mut extra_files, &mut files_capped);
                 }
-            } else if line.starts_with("@@")
-                && let Some(ctx) = line.split("@@").nth(2)
-                    && let Some(sym) = leading_identifier(ctx)
-                        && let Some(file) = files.last().filter(|_| !files_capped)
-                            && symbols.len() < MAX_SYMBOLS {
-                                symbols.insert(format!("{file}/{sym}"));
-                            }
-            else if (line.starts_with('+') || line.starts_with('-'))
-                && diff_body.len() < MAX_DIFF_LINES {
-                    diff_body.push_str(line.trim_start_matches(['+', '-']));
+            } else if line.starts_with("@@") {
+                let mut parts = line.split("@@");
+                parts.next();
+                let ranges = parts.next().unwrap_or("");
+                let ctx = parts.next().unwrap_or("");
+                let sym = leading_identifier(ctx);
+                if let Some(file) = files.last().filter(|_| !files_capped) {
+                    if let Some(sym) = sym.as_ref()
+                        && symbols.len() < MAX_SYMBOLS
+                    {
+                        symbols.insert(format!("{file}/{sym}"));
+                    }
+                    // blame anchors: the +c[,d] side is where the new lines live
+                    if let Some((start, len)) = parse_new_side(ranges) {
+                        if hunks.len() < MAX_HUNKS {
+                            hunks.push(HunkSpan {
+                                file: file.clone(),
+                                start,
+                                len,
+                                symbol: sym.clone(),
+                            });
+                        } else {
+                            extra_hunks += 1;
+                        }
+                    }
+                }
+            } else if line.starts_with('+') || line.starts_with('-') {
+                let text = line.trim_start_matches(['+', '-']);
+                if diff_body.len() < MAX_DIFF_LINES {
+                    diff_body.push_str(text);
                     diff_body.push('\n');
                 }
+                // import edges ride the same changed lines; capture continues
+                // after the mention body is full (bounded independently)
+                if raw_imports.len() < MAX_IMPORTS
+                    && let Some(file) = files.last().filter(|_| !files_capped)
+                    && let Some((target, kind)) = import_target(text)
+                {
+                    raw_imports.insert((file.clone(), target, kind));
+                }
+            }
         }
 
         // harvest identifier-shaped names from the changed lines, bounded
@@ -117,6 +195,20 @@ pub fn parse_git_log(raw: &str) -> Vec<GitCommit> {
             })
             .take(MAX_MENTIONS)
             .collect();
+
+        // resolve import edges against this commit's own file list — exact
+        // module-segment matching only; anything else stays unresolved
+        let mut imports: Vec<(String, String, bool)> = Vec::new();
+        for (file, target, kind) in raw_imports {
+            if imports.len() >= MAX_IMPORTS {
+                break;
+            }
+            let resolved = resolve_import(&target, kind, &files);
+            imports.push(match resolved {
+                Some(path) => (file, path, true),
+                None => (file, target, false),
+            });
+        }
         out.push(GitCommit {
             sha,
             time,
@@ -125,6 +217,9 @@ pub fn parse_git_log(raw: &str) -> Vec<GitCommit> {
             extra_files,
             symbols: symbols.into_iter().collect(),
             mentions,
+            hunks,
+            extra_hunks,
+            imports,
         });
     }
     out
@@ -145,6 +240,156 @@ fn push_file(
         *files_capped = true;
         *extra_files += 1;
     }
+}
+
+/// New side of an `@@` header's range list: the `+c[,d]` token, parsed as
+/// (start, len). An omitted `,d` means a single-line hunk (len 1). A missing
+/// or malformed `+` token yields `None` and the hunk is skipped.
+fn parse_new_side(ranges: &str) -> Option<(u32, u32)> {
+    let plus = ranges.split_whitespace().find(|t| t.starts_with('+'))?;
+    let mut it = plus.strip_prefix('+')?.splitn(2, ',');
+    let start = it.next()?.parse().ok()?;
+    let len = match it.next() {
+        Some(l) => l.parse().ok()?,
+        None => 1,
+    };
+    Some((start, len))
+}
+
+/// If `text` (a changed diff line with its +/- markers stripped) is an
+/// import/use statement, return its written target and syntax family.
+/// Exact prefixes only: `use <path>::...`, `import x.y.z` (multi-segment, so
+/// stdlib noise like `import os` is not an edge), `from x.y import z`, and
+/// `#include "p"` / `#include <p>`.
+fn import_target(text: &str) -> Option<(String, ImportKind)> {
+    let t = text.trim();
+    if let Some(rest) = t.strip_prefix("use ") {
+        // `use a::b::{c, d};` / `use a::b as c;` — keep the path before the
+        // group brace, the alias, or the semicolon
+        let path = rest
+            .split(['{', ';'])
+            .next()
+            .unwrap_or_default()
+            .split(" as ")
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches(':')
+            .trim();
+        return rust_like(path).then(|| (path.to_string(), ImportKind::Rust));
+    }
+    if let Some(rest) = t.strip_prefix("from ") {
+        let (module, _) = rest.split_once(" import ")?;
+        let module = module.trim();
+        return dotted_like(module).then(|| (module.to_string(), ImportKind::Dotted));
+    }
+    if let Some(rest) = t.strip_prefix("import ") {
+        let path = rest
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .split(" as ")
+            .next()
+            .unwrap_or_default()
+            .trim();
+        let stripped = path.trim_start_matches('.');
+        return (dotted_like(path) && stripped.contains('.'))
+            .then(|| (path.to_string(), ImportKind::Dotted));
+    }
+    if let Some(rest) = t.strip_prefix("#include") {
+        let r = rest.trim();
+        let inner = r
+            .strip_prefix('<')
+            .and_then(|x| x.strip_suffix('>'))
+            .or_else(|| r.strip_prefix('"').and_then(|x| x.strip_suffix('"')))?;
+        return (!inner.is_empty()).then(|| (inner.to_string(), ImportKind::Include));
+    }
+    None
+}
+
+/// A `::`-separated path of identifier segments (`crate::store::Store`).
+fn rust_like(path: &str) -> bool {
+    let p = path.trim();
+    !p.is_empty()
+        && p.split("::")
+            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_'))
+}
+
+/// A `.`-separated module path (`x.y.z`, `.relative.mod` allowed).
+fn dotted_like(path: &str) -> bool {
+    let stripped = path.trim().trim_start_matches('.');
+    !stripped.is_empty()
+        && stripped
+            .split('.')
+            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_'))
+}
+
+/// Resolve a written import target to a repo-relative path using ONLY the
+/// same commit's file list: exact string/module-segment matching, no fuzzy
+/// matching, no guessing. File candidates win over module-dir candidates and
+/// the longest (most specific) module path is tried first.
+fn resolve_import(target: &str, kind: ImportKind, files: &[String]) -> Option<String> {
+    let mut file_cands: Vec<String> = Vec::new();
+    let mut dir_cands: Vec<String> = Vec::new();
+    match kind {
+        ImportKind::Rust => {
+            let mut segs: Vec<&str> = target.split("::").collect();
+            // `crate` is the crate root and roots at src/; `self`/`super` and
+            // external crates have no deterministic repo mapping and stay
+            // unresolved unless their segments happen to match exactly
+            if segs.first() == Some(&"crate") {
+                segs[0] = "src";
+            }
+            let joined = segs.join("/");
+            if segs.len() >= 2 {
+                // `a::b::Item` — Item is an item in module a::b (the common
+                // reading of a CamelCase tail) or a module itself
+                let module = segs[..segs.len() - 1].join("/");
+                if module == "src" {
+                    // item re-exported from the crate root
+                    file_cands.push("src/lib.rs".into());
+                    file_cands.push("src/main.rs".into());
+                } else {
+                    file_cands.push(format!("{module}.rs"));
+                    file_cands.push(format!("{module}/mod.rs"));
+                    dir_cands.push(module);
+                }
+                file_cands.push(format!("{joined}.rs"));
+                file_cands.push(format!("{joined}/mod.rs"));
+                dir_cands.push(joined);
+            } else {
+                file_cands.push(format!("{joined}.rs"));
+            }
+        }
+        ImportKind::Dotted => {
+            // python-style: x/y/z.py before x/y.py before x.py, each with an
+            // __init__.py variant; bare prefixes act as module dirs
+            let segs: Vec<&str> = target.trim_start_matches('.').split('.').collect();
+            for n in (1..=segs.len()).rev() {
+                let p = segs[..n].join("/");
+                file_cands.push(format!("{p}.py"));
+                file_cands.push(format!("{p}/__init__.py"));
+                dir_cands.push(p);
+            }
+        }
+        ImportKind::Include => file_cands.push(target.to_string()),
+    }
+    // pass 1: exact file hit
+    for cand in &file_cands {
+        if let Some(f) = files.iter().find(|f| *f == cand) {
+            return Some(f.clone());
+        }
+    }
+    // pass 2: a module dir of a committed file
+    for cand in &dir_cands {
+        if files
+            .iter()
+            .any(|f| f.rsplit_once('/').is_some_and(|(d, _)| d == cand))
+        {
+            return Some(cand.clone());
+        }
+    }
+    None
 }
 
 /// Leading identifier of a hunk-header context, skipping language keywords:
@@ -218,6 +463,41 @@ pub fn record_content(c: &GitCommit) -> String {
     if !c.mentions.is_empty() {
         s.push_str("\nmentions: ");
         s.push_str(&c.mentions.join(", "));
+    }
+    if !c.hunks.is_empty() {
+        s.push_str("\nhunks: ");
+        let items: Vec<String> = c
+            .hunks
+            .iter()
+            .map(|h| format!("{}:{}+{}", h.file, h.start, h.len))
+            .collect();
+        // keep the joined list bounded (~400 chars); dropped spans are counted
+        // together with extra_hunks so truncation stays visible
+        let mut shown = items.len();
+        while shown > 1 && items[..shown].join(", ").len() > MAX_HUNK_LINE {
+            shown -= 1;
+        }
+        s.push_str(&items[..shown].join(", "));
+        let hidden = c.hunks.len() - shown + c.extra_hunks;
+        if hidden > 0 {
+            s.push_str(&format!(" (+{hidden} more)"));
+        }
+    }
+    if !c.imports.is_empty() {
+        s.push_str("\nimports: ");
+        let pairs: Vec<String> = c
+            .imports
+            .iter()
+            .map(|(file, target, resolved)| {
+                if *resolved {
+                    format!("{file}->{target}")
+                } else {
+                    // unresolved stays unresolved AND visible
+                    format!("{file}->?{target}")
+                }
+            })
+            .collect();
+        s.push_str(&pairs.join(", "));
     }
     s
 }
@@ -315,10 +595,27 @@ index 111..222 100644
 --- a/events/local.py
 +++ b/events/local.py
 @@ -10,7 +10,8 @@ def write_event(self, payload):
++from events import local
++import ghost.module.nothere
      return out
 diff --git a/src/store.rs b/src/store.rs
 @@ -40,6 +40,7 @@ impl LocalFileStore {
      ok
+diff --git a/src/app.rs b/src/app.rs
+index 333..444 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -1,3 +1,6 @@ struct App
++use crate::store::Store;
++use serde_magic::Wizard;
+     fn main()
+diff --git a/src/wrap.c b/src/wrap.c
+@@ -2,1 +2,3 @@
++#include \"src/legacy.h\"
++#include <stdint.h>
+diff --git a/src/legacy.h b/src/legacy.h
+@@ -0,0 +1,1 @@
++int legacy(void);
 \u{1e}fff000111222333444555666777888999aaaabbb\u{1f}2026-09-02T08:30:00+00:00\u{1f}docs: readme
 diff --git a/README.md b/README.md
 @@ -1,3 +1,4 @@ 
@@ -331,13 +628,87 @@ diff --git a/README.md b/README.md
         assert_eq!(commits.len(), 2);
         let c = &commits[0];
         assert_eq!(c.sha, "abc123def4567890abc123def4567890abc12345");
-        assert_eq!(c.files, vec!["events/local.py", "src/store.rs"]);
+        assert_eq!(
+            c.files,
+            vec![
+                "events/local.py",
+                "src/store.rs",
+                "src/app.rs",
+                "src/wrap.c",
+                "src/legacy.h"
+            ]
+        );
         assert!(c.symbols.contains(&"events/local.py/write_event".to_string()));
         assert!(c.symbols.contains(&"src/store.rs/LocalFileStore".to_string()));
         assert_eq!(c.time.to_rfc3339(), "2026-09-01T12:00:00+00:00");
         // the docs commit touches files but has no parseable symbol context
         assert_eq!(commits[1].files, vec!["README.md"]);
         assert!(commits[1].symbols.is_empty());
+    }
+
+    #[test]
+    fn hunk_spans_carry_new_side_numbers_and_camel_symbols() {
+        let commits = parse_git_log(FIXTURE);
+        let c = &commits[0];
+        // one span per @@ header, attributed to the file being diffed
+        assert_eq!(c.hunks.len(), 5);
+        assert_eq!(
+            c.hunks[0],
+            HunkSpan {
+                file: "events/local.py".into(),
+                start: 10,
+                len: 8,
+                symbol: Some("write_event".into())
+            }
+        );
+        assert_eq!(
+            c.hunks[1],
+            HunkSpan {
+                file: "src/store.rs".into(),
+                start: 40,
+                len: 7,
+                symbol: Some("LocalFileStore".into()) // camel-case header symbol
+            }
+        );
+        // new-file hunk: -0,0 +1,1, no context symbol
+        assert_eq!(
+            c.hunks[4],
+            HunkSpan {
+                file: "src/legacy.h".into(),
+                start: 1,
+                len: 1,
+                symbol: None
+            }
+        );
+        // second commit keeps its own span
+        assert_eq!(
+            commits[1].hunks,
+            vec![HunkSpan {
+                file: "README.md".into(),
+                start: 1,
+                len: 4,
+                symbol: None
+            }]
+        );
+    }
+
+    #[test]
+    fn hunk_len_omitted_means_one_line() {
+        let raw = "\u{1e}5555555555555555555555555555555555555555\u{1f}2026-09-01T12:00:00+00:00\u{1f}solo\n"
+            .to_string()
+            + "diff --git a/src/solo.rs b/src/solo.rs\n"
+            + "@@ -5 +9 @@ fn solo()\n"
+            + "+only line";
+        let commits = parse_git_log(&raw);
+        assert_eq!(
+            commits[0].hunks,
+            vec![HunkSpan {
+                file: "src/solo.rs".into(),
+                start: 9,
+                len: 1,
+                symbol: Some("solo".into())
+            }]
+        );
     }
 
     #[test]
@@ -348,6 +719,105 @@ diff --git a/README.md b/README.md
         for want in ["events/local.py", "src/store.rs", "events/local.py/write_event"] {
             assert!(ents.iter().any(|e| e == want), "missing {want} in {ents:?}");
         }
+        // hunk spans and import edges are part of the record content
+        assert!(
+            content.contains("\nhunks: events/local.py:10+8, src/store.rs:40+7, src/app.rs:1+6, src/wrap.c:2+3, src/legacy.h:1+1"),
+            "hunks line wrong: {content}"
+        );
+        assert!(
+            content.contains("\nimports: events/local.py->events, events/local.py->?ghost.module.nothere, src/app.rs->src/store.rs, src/app.rs->?serde_magic::Wizard, src/wrap.c->src/legacy.h, src/wrap.c->?stdint.h"),
+            "imports line wrong: {content}"
+        );
+    }
+
+    #[test]
+    fn import_edges_resolve_against_the_same_commit() {
+        let commits = parse_git_log(FIXTURE);
+        let imports = &commits[0].imports;
+        // `use crate::store::Store;` maps onto src/store.rs in the same commit
+        assert!(
+            imports
+                .iter()
+                .any(|(f, t, r)| f == "src/app.rs" && t == "src/store.rs" && *r),
+            "crate::store::Store must resolve to src/store.rs: {imports:?}"
+        );
+        // quoted #include resolves verbatim; <> include has no repo mapping
+        assert!(imports.iter().any(|(f, t, r)| f == "src/wrap.c" && t == "src/legacy.h" && *r));
+        assert!(imports.iter().any(|(f, t, r)| f == "src/wrap.c" && t == "stdint.h" && !*r));
+        // `from events import local` maps onto the module dir of events/local.py
+        assert!(imports.iter().any(|(f, t, r)| f == "events/local.py" && t == "events" && *r));
+        // an external crate and a missing module stay unresolved and visible
+        assert!(
+            imports
+                .iter()
+                .any(|(f, t, r)| f == "src/app.rs" && t == "serde_magic::Wizard" && !*r),
+            "unresolvable rust import missing: {imports:?}"
+        );
+        assert!(
+            imports
+                .iter()
+                .any(|(f, t, r)| f == "events/local.py" && t == "ghost.module.nothere" && !*r),
+            "unresolvable python import missing: {imports:?}"
+        );
+        // the second commit has no import-bearing changed lines
+        assert!(commits[1].imports.is_empty());
+    }
+
+    #[test]
+    fn import_edges_are_deduped_and_capped() {
+        let mut raw = String::from(
+            "\u{1e}6666666666666666666666666666666666666666\u{1f}2026-09-01T12:00:00+00:00\u{1f}wire up\n",
+        );
+        raw.push_str("diff --git a/src/app.rs b/src/app.rs\n@@ -1,2 +1,3 @@\n");
+        for i in 0..45 {
+            raw.push_str(&format!("+use ext_crate_{i}::Thing;\n"));
+        }
+        // the same statement twice is one edge
+        raw.push_str("+use ext_crate_0::Thing;\n");
+        let commits = parse_git_log(&raw);
+        assert_eq!(commits[0].imports.len(), MAX_IMPORTS, "cap at 40");
+        assert!(commits[0].imports.iter().all(|(_, _, r)| !*r));
+        assert_eq!(
+            commits[0]
+                .imports
+                .iter()
+                .filter(|(f, _, _)| f == "src/app.rs")
+                .count(),
+            MAX_IMPORTS
+        );
+    }
+
+    #[test]
+    fn hunk_caps_overflow_and_bound_the_content_line() {
+        let mut raw = String::from(
+            "\u{1e}7777777777777777777777777777777777777777\u{1f}2026-09-01T12:00:00+00:00\u{1f}spans\n",
+        );
+        raw.push_str("diff --git a/src/big.rs b/src/big.rs\n");
+        for i in 0..250 {
+            raw.push_str(&format!("@@ -{i},1 +{i},2 @@ fn site_{i}()\n"));
+        }
+        let commits = parse_git_log(&raw);
+        assert_eq!(commits[0].hunks.len(), MAX_HUNKS);
+        assert_eq!(commits[0].extra_hunks, 50);
+        let content = record_content(&commits[0]);
+        let hunk_line = content
+            .lines()
+            .find(|l| l.starts_with("hunks: "))
+            .expect("hunks line present");
+        assert!(
+            hunk_line.len() <= MAX_HUNK_LINE + 24,
+            "line must stay ~bounded: {} chars",
+            hunk_line.len()
+        );
+        // every span is accounted for: shown + hidden == 250
+        let shown = hunk_line.matches(".rs:").count();
+        let hidden: usize = hunk_line
+            .split("(+")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("visible (+N more) counter");
+        assert_eq!(shown + hidden, 250, "shown {shown} + hidden {hidden} != 250");
     }
 
     #[test]
@@ -378,6 +848,11 @@ diff --git a/README.md b/README.md
             "symbol past the file cap must not be attributed to the last recorded file"
         );
         assert!(commits[0].symbols.iter().any(|s| s.contains("handler_0")));
+        // hunks past the file cap must not be attributed to file #50 either:
+        // 52 file blocks, but only the 50 recorded files keep their spans
+        assert_eq!(commits[0].hunks.len(), MAX_FILES);
+        assert!(commits[0].hunks.iter().all(|h| h.file != "src/f50.rs" && h.file != "src/f51.rs"));
+        assert_eq!(commits[0].extra_hunks, 0, "dropped-for-attribution is not span overflow");
         let content = record_content(&commits[0]);
         assert!(content.contains("(+2 more)"), "truncation must be visible: {content}");
     }
