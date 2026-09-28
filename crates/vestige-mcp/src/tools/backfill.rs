@@ -11,7 +11,6 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use vestige_core::advanced::git_records;
-use vestige_core::advanced::prediction_error::cosine_similarity;
 use vestige_core::advanced::retroactive_backfill::{
     self, BackfillCandidate, BackfillResult, ExcludedCandidate, FailureEvent, RetroactiveBackfill,
 };
@@ -190,8 +189,6 @@ fn commit_sha(content: &str) -> Option<String> {
 fn build_candidates(
     failure: &FailureEvent,
     failure_created: chrono::DateTime<Utc>,
-    failure_embedding: Option<&Vec<f32>>,
-    embedding_of: &dyn Fn(&str) -> Option<Vec<f32>>,
     all: &[KnowledgeNode],
     supersession: &std::collections::HashMap<String, String>,
     range: Option<&VersionRange>,
@@ -234,10 +231,6 @@ fn build_candidates(
                 }
             }
         }
-        let sim = match (failure_embedding, embedding_of(&current.id)) {
-            (Some(f), Some(c)) if f.len() == c.len() => Some(cosine_similarity(f, &c)),
-            _ => None,
-        };
         let is_commit = current
             .tags
             .iter()
@@ -249,7 +242,6 @@ fn build_candidates(
             entities,
             age_days_before_failure: age,
             stability: current.stability,
-            similarity_to_failure: sim,
             via_supersession_of: if current.id != origin.id {
                 Some(origin.id.clone())
             } else {
@@ -440,7 +432,6 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
     };
 
     let failure_entities = extract_entities(&failure_node);
-    let failure_embedding = storage.get_node_embedding(&failure_node.id).ok().flatten();
 
     // surprise/prediction-error proxy: a failure-marked memory is treated as
     // high-salience; otherwise fall back to a neutral value (manual can force).
@@ -479,12 +470,9 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
         )?,
         None => None,
     };
-    let embedding_of = |id: &str| storage.get_node_embedding(id).ok().flatten();
     let (candidates, excluded, commit_records) = build_candidates(
         &failure,
         failure_node.created_at,
-        failure_embedding.as_ref(),
-        &embedding_of,
         &all,
         &supersession,
         range.as_ref(),
@@ -571,7 +559,6 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
             "content_preview": content_preview,
             "shared_entities": cause.shared_entities,
             "age_days_before_failure": (cause.age_days * 10.0).round() / 10.0,
-            "similarity_rank": cause.similarity_rank,
             "backfill_score": (cause.score * 100.0).round() / 100.0,
             "promoted": did_promote,
             "eligible_for_promotion": eligible_for_promotion,
@@ -878,7 +865,8 @@ mod tests {
             subject: "fix local write".into(),
             files: vec!["events/local.py".into()],
             symbols: vec![],
-                extra_files: 0,
+            extra_files: 0,
+            mentions: vec![],
         })
     }
 
@@ -898,8 +886,6 @@ mod tests {
         let (candidates, excluded, _) = build_candidates(
             &failure,
             failure_created,
-            None,
-            &|_| None,
             &all,
             &supersession,
             None,
@@ -931,8 +917,6 @@ mod tests {
         let (candidates, excluded, commit_records) = build_candidates(
             &failure,
             failure_created,
-            None,
-            &|_| None,
             &all,
             &Default::default(),
             Some(&range),
@@ -1002,8 +986,6 @@ mod tests {
         let (candidates, excluded, _) = build_candidates(
             &failure,
             failure_created,
-            None,
-            &|_| None,
             &all,
             &Default::default(),
             None,
@@ -1036,8 +1018,6 @@ mod tests {
         let (candidates, _excluded, _) = build_candidates(
             &failure,
             failure_created,
-            None,
-            &|_| None,
             &all,
             &Default::default(),
             None,
@@ -1066,8 +1046,6 @@ mod tests {
         let (candidates2, _, _) = build_candidates(
             &failure,
             failure_created,
-            None,
-            &|_| None,
             &all2,
             &Default::default(),
             None,

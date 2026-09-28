@@ -105,9 +105,6 @@ pub struct BackfillCandidate {
     pub age_days_before_failure: f64,
     /// Current FSRS stability (we promote by boosting this).
     pub stability: f64,
-    /// Optional cosine similarity to the failure, ONLY used to demonstrate that
-    /// the cause ranks LOW on similarity (the thing RAG misses). Not a ranker.
-    pub similarity_to_failure: Option<f32>,
     /// Set when this candidate stands in for an older record that was
     /// bitemporally superseded: the trail follows the supersession link to the
     /// current belief, dated by the superseded record (the fact's origin).
@@ -148,36 +145,131 @@ pub struct FailureEvent {
 /// this same test (record entities are decided at write time, extracted at
 /// query time — both sides must agree).
 pub fn is_identifier_shaped(tok: &str) -> bool {
-    if tok.len() < 3 {
-        return false;
+    identifier_tier(tok).is_some()
+}
+
+/// How much a shared name of this shape is worth as causal evidence. Tiers,
+/// not booleans: a shared file path is strong evidence, a shared English word
+/// is almost none (rarity weighting via IDF does the rest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentifierTier {
+    /// Dotted/slashed paths and file names: `events/local.py`, `pyvenv.cfg`.
+    Path,
+    /// Code-shaped names: UPPER_SNAKE env vars, lower_snake identifiers,
+    /// camelCase normalized to snake_case: `API_TIMEOUT`, `is_abort_error`.
+    Code,
+    /// Bare semver-ish versions: `0.8.5`, `1.42`.
+    Version,
+    /// Bare English words >= 4 chars (`purge`). Cheapest tier: admitted so a
+    /// named suspect is never invisible, but rarity weighting plus the 0.3
+    /// multiplier keeps vocabulary from out-ranking real anchors.
+    Word,
+}
+
+impl IdentifierTier {
+    pub fn weight(self) -> f64 {
+        match self {
+            IdentifierTier::Path => 1.0,
+            IdentifierTier::Code => 0.9,
+            IdentifierTier::Version => 0.6,
+            IdentifierTier::Word => 0.3,
+        }
     }
-    // UPPER_SNAKE env var. The underscore is REQUIRED: the previous check
-    // accepted any all-caps run of >=3 chars, so ordinary emphasis -- VERIFIED,
-    // BUG, FALSE, CRITICAL, SHIPPED, DANGEROUS -- was harvested as an "env var".
-    // Memory text written in a house style that shouts for emphasis therefore
-    // filled the entity pool with vocabulary, and since the causal score is a
-    // raw count of shared entities, three such junk matches outranked one
-    // genuine rare identifier.
+}
+
+/// True for `X.Y` / `X.Y.Z` with <=3 digit groups per segment.
+fn is_version_token(tok: &str) -> bool {
+    let segs: Vec<&str> = tok.split('.').collect();
+    segs.len() >= 2
+        && segs.len() <= 3
+        && segs
+            .iter()
+            .all(|g| !g.is_empty() && g.len() <= 3 && g.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// camelCase / PascalCase with a real case transition, ascii-alphabetic only.
+fn is_camel_token(tok: &str) -> bool {
+    tok.chars().all(|c| c.is_ascii_alphabetic())
+        && tok.chars().any(|c| c.is_ascii_lowercase())
+        && tok.chars().any(|c| c.is_ascii_uppercase())
+        && tok
+            .chars()
+            .zip(tok.chars().skip(1))
+            .any(|(a, b)| a.is_ascii_lowercase() && b.is_ascii_uppercase())
+}
+
+/// camelCase -> snake_case so `isAbortError` joins `is_abort_error`.
+fn camel_to_snake(tok: &str) -> String {
+    let mut out = String::with_capacity(tok.len() + 4);
+    for (i, c) in tok.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+pub fn identifier_tier(tok: &str) -> Option<IdentifierTier> {
+    if tok.len() < 3 {
+        return None;
+    }
+    if !tok.contains('/') && is_version_token(tok) {
+        return Some(IdentifierTier::Version);
+    }
+    if tok.contains('/') || tok.contains('.') {
+        let segs: Vec<&str> = tok.split(['/', '.']).filter(|x| !x.is_empty()).collect();
+        let is_path = segs.len() >= 2
+            && segs.iter().any(|x| x.len() >= 3)
+            && tok.chars().any(|c| c.is_ascii_alphabetic());
+        return if is_path { Some(IdentifierTier::Path) } else { None };
+    }
+    // UPPER_SNAKE env var: underscore REQUIRED so emphasis (VERIFIED, SHIPPED)
+    // is not harvested as an env var.
     let is_env = tok.contains('_')
         && tok
             .chars()
             .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
         && tok.chars().any(|c| c.is_ascii_uppercase());
+    if is_env {
+        return Some(IdentifierTier::Code);
+    }
+    let is_snake = tok.contains('_')
+        && tok
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+        && tok.chars().any(|c| c.is_ascii_lowercase());
+    if is_snake {
+        return Some(IdentifierTier::Code);
+    }
+    if is_camel_token(tok) {
+        return Some(IdentifierTier::Code);
+    }
+    if tok.chars().all(|c| c.is_ascii_alphabetic()) && tok.len() >= 4 {
+        return Some(IdentifierTier::Word);
+    }
+    None
+}
 
-    // Path or dotted/slashed identifier. Requires a segment on BOTH sides of the
-    // separator and at least one multi-character segment, so ordinary prose
-    // abbreviations ("e.g.", "i.e.", "U.S.", "v2.3.0" trailing dots) no longer
-    // qualify as causal join keys.
-    let is_path = if tok.contains('/') || tok.contains('.') {
-        let segs: Vec<&str> = tok.split(['/', '.']).filter(|x| !x.is_empty()).collect();
-        segs.len() >= 2
-            && segs.iter().any(|x| x.len() >= 3)
-            && tok.chars().any(|c| c.is_ascii_alphabetic())
-    } else {
-        false
-    };
-
-    is_env || is_path
+/// Tier of an already-normalized (lowercased, snake) entity string.
+pub fn normalized_tier(entity: &str) -> IdentifierTier {
+    if entity.contains('/') {
+        return IdentifierTier::Path;
+    }
+    if is_version_token(entity) {
+        return IdentifierTier::Version;
+    }
+    if entity.contains('.') {
+        return IdentifierTier::Path;
+    }
+    if entity.contains('_') {
+        return IdentifierTier::Code;
+    }
+    IdentifierTier::Word
 }
 
 pub fn extract_entities(content: &str, tags: &[String]) -> Vec<String> {
@@ -193,14 +285,14 @@ pub fn extract_entities(content: &str, tags: &[String]) -> Vec<String> {
         .iter()
         .map(|t| t.trim())
         .filter(|t| is_identifier_shaped(t))
-        .map(|t| t.to_lowercase())
+        .map(|t| if is_camel_token(t) { camel_to_snake(t) } else { t.to_lowercase() })
         .collect();
     for raw in content.split(|c: char| {
         !(c.is_alphanumeric() || c == '_' || c == '.' || c == '/' || c == '-')
     }) {
         let tok = raw.trim_matches(|c: char| c == '.' || c == '/' || c == '-');
         if is_identifier_shaped(tok) {
-            set.insert(tok.to_lowercase());
+            set.insert(if is_camel_token(tok) { camel_to_snake(tok) } else { tok.to_lowercase() });
         }
     }
     set.into_iter().collect()
@@ -283,10 +375,6 @@ pub struct BackfilledCause {
     pub score: f64,
     /// New stability after promotion (= old * factor, capped).
     pub promoted_stability: f64,
-    /// Its similarity rank position among candidates by similarity (1 = most
-    /// similar). A high number here is the proof: the cause is NOT what a
-    /// similarity search would have surfaced.
-    pub similarity_rank: Option<usize>,
     /// Whether the surfaced cause is itself a change record (a commit).
     #[serde(default)]
     pub is_change_record: bool,
@@ -427,20 +515,14 @@ impl RetroactiveBackfill {
                 *df.entry(e.as_str()).or_default() += 1;
             }
         }
+        // probabilistic IDF * shape tier: a name every in-window record
+        // carries weighs ~0, a rare one weighs ln((1+n)/2); a shared file path
+        // is worth ~3x a shared English word before rarity is even considered.
         let idf = |e: &str| -> f64 {
-            let d = df.get(e).copied().unwrap_or(1).max(1) as f64;
-            (1.0 + (n as f64) / d).ln()
+            let d = df.get(e).copied().unwrap_or(0) as f64;
+            ((1.0 + n as f64) / (1.0 + d)).ln().max(0.0) * normalized_tier(e).weight()
         };
 
-        // similarity ranking (only to PROVE the cause ranks low on similarity)
-        let mut by_sim: Vec<(&str, f32)> = candidates
-            .iter()
-            .filter_map(|c| c.similarity_to_failure.map(|s| (c.id.as_str(), s)))
-            .collect();
-        by_sim.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let sim_rank = |id: &str| -> Option<usize> {
-            by_sim.iter().position(|(cid, _)| *cid == id).map(|p| p + 1)
-        };
 
         let mut rejected: Vec<RejectedCandidate> = Vec::new();
         let note_supersession =
@@ -491,17 +573,15 @@ impl RetroactiveBackfill {
                 }
                 let score = self.score(c, &shared, &idf);
                 let promoted = (c.stability * PROMOTION_STABILITY_FACTOR).min(c.stability + 365.0);
-                let rank = sim_rank(&c.id);
                 let reason = note_supersession(
                     c,
                     format!(
                         "Reached back {:.1}d to a quiet memory sharing {} entit{} ({}) with the failure; \
-                         its similarity rank was {} among the scanned candidates. Shared entities support an association, not proof of cause.",
+                         Shared entities support an association, not proof of cause.",
                         c.age_days_before_failure,
                         shared_n,
                         if shared_n == 1 { "y" } else { "ies" },
                         shared.join(", "),
-                        rank.map(|r| format!("#{r}")).unwrap_or_else(|| "untracked".into()),
                     ),
                 );
                 Some(BackfilledCause {
@@ -510,7 +590,6 @@ impl RetroactiveBackfill {
                     age_days: c.age_days_before_failure,
                     score,
                     promoted_stability: promoted,
-                    similarity_rank: rank,
                     is_change_record: c.is_change_record,
                     reason,
                 })
@@ -655,7 +734,6 @@ mod tests {
                 entities: vec!["API_TIMEOUT".into(), "deploy-env".into()],
                 age_days_before_failure: 3.0,
                 stability: 5.0,
-                similarity_to_failure: Some(0.11), // dissimilar — RAG would miss it
                 via_supersession_of: None,
             is_change_record: false,
             },
@@ -667,7 +745,6 @@ mod tests {
                 entities: vec!["billing-service".into()],
                 age_days_before_failure: 20.0,
                 stability: 3.0,
-                similarity_to_failure: Some(0.82), // similar — RAG WOULD surface this
                 via_supersession_of: None,
             is_change_record: false,
             },
@@ -678,7 +755,6 @@ mod tests {
                 entities: vec!["API_TIMEOUT".into()],
                 age_days_before_failure: -1.0,
                 stability: 2.0,
-                similarity_to_failure: Some(0.4),
                 via_supersession_of: None,
             is_change_record: false,
             },
@@ -693,10 +769,10 @@ mod tests {
         // the promoted memory is the real cause, not the similar distractor
         assert_eq!(top.memory_id, "cause-mon", "must promote the causal env-var note");
         assert!(top.shared_entities.contains(&"API_TIMEOUT".to_string()));
-        // and it is provably NOT what similarity search would have surfaced:
+        // the similar distractor must not be surfaced at all: it shares no anchor
         assert!(
-            top.similarity_rank.unwrap() > 1,
-            "the cause must rank below the similar distractor on similarity (that's the point)"
+            !result.causes.iter().any(|c| c.memory_id == "noise-similar"),
+            "a lookalike with no shared anchor must never be a cause"
         );
         // backward-only: the future memory is never promoted
         assert!(
@@ -739,14 +815,30 @@ mod tests {
         ] {
             assert!(ents.iter().any(|e| e == want), "missing entity {want:?}: {ents:?}");
         }
-        // Emphasis words, prose abbreviations and broad topical tags do NOT
-        // become causal join keys.
-        for junk in ["verified", "bug", "false", "dangerous", "negative", "vestige", "e.g"] {
+        // Bare words >= 4 chars ARE now join keys (Word tier, 0.3x weight +
+        // rarity-weighted): a named suspect like `purge` must never be
+        // invisible. The noise guard moved from extraction into scoring —
+        // two word-tier matches cannot out-rank one code/path anchor
+        // (pinned by boilerplate_matches_lose_to_the_rare_one).
+        for word in ["verified", "dangerous", "negative", "vestige"] {
+            assert!(
+                ents.iter().any(|e| e == word),
+                "bare word {word:?} must extract at Word tier: {ents:?}"
+            );
+            assert_eq!(normalized_tier(word), IdentifierTier::Word);
+        }
+        // short words and prose abbreviations still never extract
+        for junk in ["bug", "false", "e.g"] {
             assert!(
                 !ents.iter().any(|e| e == junk),
-                "vocabulary {junk:?} must not be an entity: {ents:?}"
+                "{junk:?} must not be an entity: {ents:?}"
             );
         }
+        // code shapes land at the stronger tiers
+        assert_eq!(normalized_tier("pyvenv.cfg"), IdentifierTier::Path);
+        assert_eq!(normalized_tier("is_abort_error"), IdentifierTier::Code);
+        assert_eq!(normalized_tier("api_timeout"), IdentifierTier::Code);
+        assert_eq!(normalized_tier("0.8.5"), IdentifierTier::Version);
     }
 
     #[test]
@@ -780,7 +872,6 @@ mod tests {
             entities: vec!["checkout".into()],
             age_days_before_failure: 2.0,
             stability: 4.0,
-            similarity_to_failure: Some(0.3),
                 via_supersession_of: None,
             is_change_record: false,
         }];
@@ -799,7 +890,6 @@ mod tests {
             entities: vec!["README".into()],
             age_days_before_failure: 1.0,
             stability: 4.0,
-            similarity_to_failure: Some(0.05),
                 via_supersession_of: None,
             is_change_record: false,
         }];
@@ -834,7 +924,6 @@ mod tests {
                 entities: vec!["events/local.py".into()],
                 age_days_before_failure: -2.0,
                 stability: 4.0,
-                similarity_to_failure: None,
                 via_supersession_of: None,
             is_change_record: false,
             },
@@ -845,7 +934,6 @@ mod tests {
                 entities: vec!["events/local.py".into()],
                 age_days_before_failure: 90.0,
                 stability: 4.0,
-                similarity_to_failure: None,
                 via_supersession_of: None,
             is_change_record: false,
             },
@@ -856,7 +944,6 @@ mod tests {
                 entities: vec!["README".into()],
                 age_days_before_failure: 1.0,
                 stability: 4.0,
-                similarity_to_failure: None,
                 via_supersession_of: None,
             is_change_record: false,
             },
@@ -886,7 +973,6 @@ mod tests {
             entities: vec!["deploy-env".into()],
             age_days_before_failure: 2.0,
             stability: 4.0,
-            similarity_to_failure: None,
             via_supersession_of: None,
             is_change_record: false,
         }];
@@ -919,7 +1005,6 @@ mod tests {
                 entities: vec!["T1".into(), "T2".into(), "T3".into()],
                 age_days_before_failure: 1.0,
                 stability: 4.0,
-                similarity_to_failure: None,
                 via_supersession_of: None,
                 is_change_record: false,
             });
@@ -934,7 +1019,6 @@ mod tests {
             entities: vec!["RARE_SETTING".into()],
             age_days_before_failure: 1.0,
             stability: 4.0,
-            similarity_to_failure: None,
             via_supersession_of: None,
             is_change_record: true,
         });
@@ -961,7 +1045,6 @@ mod tests {
             entities: vec!["local.py".into()],
             age_days_before_failure: age,
             stability: 4.0,
-            similarity_to_failure: None,
             via_supersession_of: None,
             is_change_record: change,
         };
@@ -1004,7 +1087,6 @@ mod tests {
                 entities: vec!["T1".into(), "T2".into()],
                 age_days_before_failure: 1.0,
                 stability: 4.0,
-                similarity_to_failure: None,
                 via_supersession_of: None,
                 is_change_record: false,
             });
@@ -1016,7 +1098,6 @@ mod tests {
             entities: vec!["RARE_X".into()],
             age_days_before_failure: 1.0,
             stability: 4.0,
-            similarity_to_failure: None,
             via_supersession_of: None,
             is_change_record: true,
         });
@@ -1029,7 +1110,6 @@ mod tests {
                 entities: vec!["RARE_X".into()],
                 age_days_before_failure: -(i as f64 + 1.0),
                 stability: 4.0,
-                similarity_to_failure: None,
                 via_supersession_of: None,
                 is_change_record: false,
             });
@@ -1042,10 +1122,9 @@ mod tests {
     }
 
     #[test]
-    fn ranking_is_invariant_to_embedding_similarity() {
-        // Backfill must NOT be vector search with the sign flipped: identical
-        // structural evidence must produce identical ranking regardless of the
-        // candidates' embedding similarity to the failure.
+    fn ranking_is_purely_structural_no_similarity_anywhere() {
+        // The similarity field is DELETED from the candidate type: the engine
+        // physically cannot consult embeddings, in any direction.
         let failure = FailureEvent {
             id: "fail".into(),
             content: "crash in local.py".into(),
@@ -1054,36 +1133,28 @@ mod tests {
             prediction_error: 0.9,
             manual: false,
         };
-        let make = |id: &str, sim: Option<f32>| BackfillCandidate {
+        let make = |id: &str| BackfillCandidate {
             id: id.into(),
             content: "touched local.py".into(),
             entities: vec!["local.py".into()],
             age_days_before_failure: 5.0,
             stability: 4.0,
-            similarity_to_failure: sim,
             via_supersession_of: None,
             is_change_record: false,
         };
-        // run A: no embeddings; run B: wildly different similarities.
-        // Top-3 membership and order must be identical.
-        let pool_a = vec![make("a", None), make("b", None), make("c", None)];
-        let pool_b = vec![make("a", Some(0.99)), make("b", Some(0.01)), make("c", Some(0.5))];
-        let ra = RetroactiveBackfill::new().run(&failure, &pool_a);
-        let rb = RetroactiveBackfill::new().run(&failure, &pool_b);
-        let ids_a: Vec<&str> = ra.causes.iter().map(|c| c.memory_id.as_str()).collect();
-        let ids_b: Vec<&str> = rb.causes.iter().map(|c| c.memory_id.as_str()).collect();
-        assert_eq!(ids_a, ids_b, "similarity must not reorder structurally-equal candidates");
-        // and a near-identical lookalike cannot outrank the structural cause
-        // even at similarity 1.0
+        let pool = vec![make("a"), make("b"), make("c")];
+        let r = RetroactiveBackfill::new().run(&failure, &pool);
+        let ids: Vec<&str> = r.causes.iter().map(|c| c.memory_id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        // a candidate with the rarer anchor set outranks equal-count boilerplate
         let pool_c = vec![
-            make("lookalike", Some(1.0)),
+            make("lookalike"),
             BackfillCandidate {
                 id: "cause".into(),
                 content: "commit touching local.py".into(),
                 entities: vec!["local.py".into(), "RARE_KEY".into()],
                 age_days_before_failure: 5.0,
                 stability: 4.0,
-                similarity_to_failure: Some(0.0),
                 via_supersession_of: None,
                 is_change_record: true,
             },
@@ -1109,7 +1180,6 @@ mod tests {
             entities: vec!["events/local.py".into()],
             age_days_before_failure: 2.0,
             stability: 4.0,
-            similarity_to_failure: None,
             via_supersession_of: None,
             is_change_record: false,
         };

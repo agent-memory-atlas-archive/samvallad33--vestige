@@ -1353,7 +1353,6 @@ impl SqliteMemoryStore {
                                 entities: rb::extract_entities(&c.content, &c.tags),
                                 age_days_before_failure: age,
                                 stability: c.stability,
-                                similarity_to_failure: None,
                                 via_supersession_of: None,
                                     is_change_record: false,
                             })

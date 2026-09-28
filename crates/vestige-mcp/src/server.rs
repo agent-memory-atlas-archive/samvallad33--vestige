@@ -1543,19 +1543,11 @@ description: Some("Investigate a recorded failure using earlier memories sharing
                 .await
             }
             "receipt" => tools::receipt::execute(&self.storage, request.arguments).await,
-            // DEPRECATED (v2.2): folded into `recall` (mode='lookup'). Hidden alias.
-            "search" => {
-                warn!(
-                    "Tool 'search' is deprecated in v2.2. Use 'recall' (mode='lookup', the default)."
-                );
-                tools::search_unified::execute(
-                    &self.storage,
-                    &self.cognitive,
-                    &self.output_config,
-                    request.arguments,
-                )
-                .await
-            }
+            // REMOVED (2026-09-28): vector search is not the product.
+            // Keyword + structural retrieval lives in `recall`.
+            "search" => Err(
+                "tool 'search' is removed: vector search is not part of Vestige; use 'recall' (keyword + structural retrieval)".to_string(),
+            ),
             "memory" => {
                 tools::memory_unified::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
@@ -1739,17 +1731,9 @@ description: Some("Investigate a recorded failure using earlier memories sharing
             // ('recall' itself is now the unified retrieval tool, handled above.)
             // ================================================================
             "semantic_search" | "hybrid_search" => {
-                warn!(
-                    "Tool '{}' is deprecated. Use 'recall' (mode='lookup') instead.",
-                    request.name
-                );
-                tools::search_unified::execute(
-                    &self.storage,
-                    &self.cognitive,
-                    &self.output_config,
-                    request.arguments,
+                Err(
+                    "tool 'semantic_search'/'hybrid_search' is removed: vector search is not part of Vestige; use 'recall' (keyword + structural retrieval)".to_string(),
                 )
-                .await
             }
 
             // ================================================================

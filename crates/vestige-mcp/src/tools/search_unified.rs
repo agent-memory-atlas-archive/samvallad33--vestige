@@ -972,8 +972,11 @@ pub async fn execute(
     }
 
     // Favor semantic search — research shows 0.3/0.7 outperforms equal weights
-    let keyword_weight = 0.3_f32;
-    let semantic_weight = 0.7_f32;
+    // Vector retrieval is REMOVED from the product: keyword-only ranking.
+    // (Structural signals — FSRS trust, spreading activation, supersession —
+    // still apply downstream; embeddings no longer touch retrieval order.)
+    let keyword_weight = 1.0_f32;
+    let semantic_weight = 0.0_f32;
 
     // ====================================================================
     // STAGE R: Query rewriting (Wave-S, arXiv 2601.07711)
@@ -1249,32 +1252,11 @@ pub async fn execute(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Rerank the remaining candidates when the vector-search search stack is enabled.
-        #[cfg(feature = "vector-search")]
-        let reranked_results: Vec<vestige_core::SearchResult> = if rerank_candidates.is_empty() {
-            Vec::new()
-        } else if let Ok(mut cog) = cognitive.try_lock() {
-            if let Ok(reranked) =
-                cog.reranker
-                    .rerank(&args.query, rerank_candidates, Some(limit_usize))
-            {
-                reranked.into_iter().map(|rr| rr.item).collect()
-            } else {
-                // Reranker failed — fall back to original order for non-bypass candidates
-                filtered_results
-                    .iter()
-                    .filter(|r| r.keyword_score.unwrap_or(0.0) < keyword_bypass_threshold)
-                    .cloned()
-                    .collect()
-            }
-        } else {
-            // Couldn't acquire cognitive lock — use original order
-            filtered_results
-                .iter()
-                .filter(|r| r.keyword_score.unwrap_or(0.0) < keyword_bypass_threshold)
-                .cloned()
-                .collect()
-        };
+        // Vector rerank REMOVED: candidates keep their keyword order.
+        let reranked_results: Vec<vestige_core::SearchResult> = rerank_candidates
+            .into_iter()
+            .map(|(result, _)| result)
+            .collect();
         #[cfg(not(feature = "vector-search"))]
         let reranked_results: Vec<vestige_core::SearchResult> = rerank_candidates
             .into_iter()

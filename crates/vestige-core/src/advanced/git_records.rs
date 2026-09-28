@@ -28,6 +28,10 @@ pub struct GitCommit {
     /// Symbols from diff hunk headers, path-qualified (`<file>/<symbol>`) so
     /// they pass the entity shape test; a bare lowercase `fn_name` would not.
     pub symbols: Vec<String>,
+    /// Names harvested from the changed lines themselves (config keys, file
+    /// names, code identifiers appearing IN the diff body) — the causal link
+    /// usually lives here in plain text, not in the headers.
+    pub mentions: Vec<String>,
 }
 
 fn is_full_sha(s: &str) -> bool {
@@ -38,6 +42,9 @@ const RECORD_SEP: char = '\u{1e}';
 const UNIT_SEP: char = '\u{1f}';
 const MAX_FILES: usize = 50;
 const MAX_SYMBOLS: usize = 40;
+/// Changed lines harvested per commit for mention entities.
+const MAX_DIFF_LINES: usize = 400;
+const MAX_MENTIONS: usize = 40;
 
 /// Parse `git log -p --unified=0 --no-color --pretty=format:%x1e%H%x1f%aI%x1f%s`.
 /// Files come from `diff --git a/X b/Y` lines (the b/ side wins, so renames
@@ -73,6 +80,7 @@ pub fn parse_git_log(raw: &str) -> Vec<GitCommit> {
         // attaching their symbols to files.last() would fabricate join keys
         let mut files_capped = false;
         let mut symbols: BTreeSet<String> = BTreeSet::new();
+        let mut diff_body = String::new();
         for line in body.lines() {
             if let Some(rest) = line.strip_prefix("diff --git a/") {
                 match rest.split_once(" b/") {
@@ -92,7 +100,23 @@ pub fn parse_git_log(raw: &str) -> Vec<GitCommit> {
                             && symbols.len() < MAX_SYMBOLS {
                                 symbols.insert(format!("{file}/{sym}"));
                             }
+            else if (line.starts_with('+') || line.starts_with('-'))
+                && diff_body.len() < MAX_DIFF_LINES {
+                    diff_body.push_str(line.trim_start_matches(['+', '-']));
+                    diff_body.push('\n');
+                }
         }
+
+        // harvest identifier-shaped names from the changed lines, bounded
+        let mentions: Vec<String> = super::retroactive_backfill::extract_entities(&diff_body, &[])
+            .into_iter()
+            .filter(|m| {
+                !files.iter().any(|f| f == m)
+                    && !symbols.iter().any(|s| s == m)
+                    && !m.starts_with("commit")
+            })
+            .take(MAX_MENTIONS)
+            .collect();
         out.push(GitCommit {
             sha,
             time,
@@ -100,6 +124,7 @@ pub fn parse_git_log(raw: &str) -> Vec<GitCommit> {
             files,
             extra_files,
             symbols: symbols.into_iter().collect(),
+            mentions,
         });
     }
     out
@@ -189,6 +214,10 @@ pub fn record_content(c: &GitCommit) -> String {
     if !c.symbols.is_empty() {
         s.push_str("\nsymbols: ");
         s.push_str(&c.symbols.join(", "));
+    }
+    if !c.mentions.is_empty() {
+        s.push_str("\nmentions: ");
+        s.push_str(&c.mentions.join(", "));
     }
     s
 }
