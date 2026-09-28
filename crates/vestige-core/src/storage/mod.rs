@@ -18,6 +18,7 @@ mod replay_store;
 mod sqlite;
 mod synaptic_store;
 mod trace_store;
+mod walk_receipts;
 pub mod unlearning;
 mod unlearning_store;
 
@@ -72,6 +73,10 @@ pub use synaptic_store::{
 };
 pub use trace_store::{
     AgentRunSummary, PendingMemoryMutationDecision, PendingMemoryMutationEffect,
+};
+pub use walk_receipts::{
+    CoverageSnapshot, StoredWalkReceipt, WalkReceiptHandle, WALK_RECEIPT_SCHEMA_V1,
+    canonical_walk_json,
 };
 pub use unlearning::{
     AntiResurrectionCommitments, ArtifactKind, ArtifactRef, CheckStatus, Commitment, CommitmentKey,
