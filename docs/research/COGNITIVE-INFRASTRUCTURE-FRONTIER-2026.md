@@ -307,7 +307,7 @@ The remaining 30 findings from the codebase mapping. Each is either fully wired 
 
 **Neuroscience-Inspired Memory Mechanisms (fully wired, listed for completeness)**
 
-15. **Active Forgetting (top-down inhibitory control).** Fully wired: `ActiveForgettingSystem` is called from `suppress.rs`, `search_unified.rs` (score adjustment), and `dashboard/handlers.rs` (2 sites). The `suppress` MCP tool is one of the 16 advertised tools, and the dashboard has a dedicated `ForgettingIndicator.svelte` plus `forgetting-plan.ts` and `rescue-plan.ts` in the Observatory layer.
+15. **Active Forgetting (top-down inhibitory control).** Fully wired: `ActiveForgettingSystem` is called from `suppress.rs`, `search_unified.rs` (score adjustment), and `dashboard/handlers.rs` (2 sites). The `suppress` MCP tool is one of the 13 top-level v2.3 tools, and the dashboard has a dedicated `ForgettingIndicator.svelte` plus `forgetting-plan.ts` and `rescue-plan.ts` in the Observatory layer.
 
 16. **Context-Dependent Memory (Encoding Specificity Principle, live implementation).** `cognitive.rs:55` holds `context_matcher: ContextMatcher` on `CognitiveEngine`. `search_unified.rs:614-645` builds an `EncodingContext` from the query, computes a context-score boost, and produces temporal/topical/session hints included in the response (`search_unified.rs:860-861`). Backs the top-level `recall` tool.
 
@@ -319,7 +319,7 @@ The remaining 30 findings from the codebase mapping. Each is either fully wired 
 
 20. **Predictive Memory Retrieval (Friston Free Energy / Active Inference).** `record_query`/`record_memory_access` called from `autopilot.rs` and `search_unified.rs` on every `recall`. `predict.rs`/`session_context.rs` call the read methods; the `predict` action is folded into the unified `graph` tool and separately exposed to the dashboard via `api.ts:118`, consumed by the importance page.
 
-21. **Prospective Memory (Einstein & McDaniel intentions).** `check_triggers()` polled every 60s by a background task in `autopilot.rs`. The `intention` MCP tool is one of the 16 advertised tools, backed by `intention_unified.rs`, with a dedicated `routes/(app)/intentions/+page.svelte`. Note: persistence for intention CRUD actually goes through `Storage::get_active_intentions()`, a separate storage-layer implementation, rather than `ProspectiveMemory`'s own in-memory store, so the in-memory struct is used mainly for live context-monitoring.
+21. **Prospective Memory (Einstein & McDaniel intentions).** `check_triggers()` polled every 60s by a background task in `autopilot.rs`. The `intention` MCP tool is one of the 13 top-level v2.3 tools, backed by `intention_unified.rs`, with a dedicated `routes/(app)/intentions/+page.svelte`. Note: persistence for intention CRUD actually goes through `Storage::get_active_intentions()`, a separate storage-layer implementation, rather than `ProspectiveMemory`'s own in-memory store, so the in-memory struct is used mainly for live context-monitoring.
 
 22. **Spreading Activation (Collins & Loftus semantic network).** Used pervasively: `.add_edge()` in `cognitive.rs` and `dream.rs`, `.activate()` in `autopilot.rs`, `cross_reference.rs`, and `search_unified.rs`. Dashboard has a dedicated `ActivationNetwork.svelte` plus `activation-helpers.ts`.
 

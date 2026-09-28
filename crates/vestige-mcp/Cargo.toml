@@ -66,7 +66,7 @@ path = "src/bin/cli.rs"
 # Only `bundled-sqlite` is always on. `embeddings` and `vector-search` are
 # toggled via vestige-mcp's own feature flags below so `--no-default-features`
 # actually works (previously hardcoded here, which silently defeated the flag).
-vestige-core = { version = "3.1.0", path = "../vestige-core", default-features = false, features = ["bundled-sqlite"] }
+vestige-core = { version = "3.0.0", path = "../vestige-core", default-features = false, features = ["bundled-sqlite"] }
 
 # ============================================================================
 # MCP Server Dependencies

@@ -175,11 +175,11 @@ This is not on anyone's radar and it should be. ort's own docs: *"All x86-64 bin
 
 Cheap now: a documented CPU floor in README + release notes, and ideally a startup capability check that fails loudly with an actionable message. The structural fix is Tier 2 #1.
 
-### 6. Add `outputSchema` to the 16 advertised tools (small, real spec gap at the *current* revision)
+### 6. Add `outputSchema` to the 14 advertised tools (small, real spec gap at the *current* revision)
 
 Vestige emits `structuredContent` (server.rs:644, 659, 1461, 1474) while declaring no `outputSchema` in `tools/list` (handle_tools_list, server.rs:367+). Spec: *"Clients SHOULD validate structured results against this schema."* No client can validate, no client gets type info, the LLM gets no parsing guidance. This is a gap at 2025-11-25, not a 2026-07-28 requirement.
 
-Sharp edge: once `outputSchema` is declared, servers **MUST** return conforming structured results. The error paths at server.rs:659/1474 also set `structured_content`, so the schema must admit the error shape. Start with `recall` and `smart_ingest`, not all 16 at once.
+Sharp edge: once `outputSchema` is declared, servers **MUST** return conforming structured results. The error paths at server.rs:659/1474 also set `structured_content`, so the schema must admit the error shape. Start with `recall` and `smart_ingest`, not all 14 at once.
 
 ### 7. Run the official MCP conformance suite (small, converts a claim into a number)
 

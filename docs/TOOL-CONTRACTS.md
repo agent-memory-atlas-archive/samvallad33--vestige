@@ -1,6 +1,6 @@
 # Tool contracts and progressive discovery
 
-Vestige advertises sixteen MCP tools. Most are action multiplexers: `recall`
+Vestige advertises fourteen MCP tools. Most are action multiplexers: `recall`
 uses `mode`, `memory_status` uses `view`, and tools such as `memory` and `dedup`
 use `action`. An agent should choose the action needed for its current task.
 There is no requirement to call every tool during every session.

@@ -1,6 +1,6 @@
 # External-Source Connectors
 
-> Status: **v3.1.0** — GitHub Issues + Redmine reference connectors, plus
+> Status: **v3.0.0** — GitHub Issues + Redmine reference connectors, plus
 > source-aware investigation filters on `recall`. Tracking issue:
 > [#57](https://github.com/samvallad33/vestige/issues/57).
 
