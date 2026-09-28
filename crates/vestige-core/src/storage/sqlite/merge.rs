@@ -326,6 +326,25 @@ impl SqliteMemoryStore {
         Ok(set)
     }
 
+    /// (superseded_id, superseding_id) pairs, so a trail can follow the link
+    /// to the current belief instead of stopping at the invalidated record.
+    pub fn supersession_pairs(&self) -> Result<Vec<(String, String)>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader
+            .prepare("SELECT id, superseded_by FROM knowledge_nodes WHERE superseded_by IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// IDs of protected (pinned) nodes.
     pub fn protected_node_ids(&self) -> Result<std::collections::HashSet<String>> {
         let reader = self

@@ -25,7 +25,8 @@ use chrono::{NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand};
 use colored::Colorize;
 use vestige_core::{
-    IngestInput, PortableImportMode, SecretConfidence, SecretPolicy, Storage, scan_secrets,
+    IngestInput, PortableImportMode, SecretConfidence, SecretPolicy, SourceEnvelope,
+    SourceUpsertOutcome, Storage, scan_secrets,
 };
 
 /// Vestige - Cognitive Memory System CLI
@@ -331,10 +332,35 @@ enum Commands {
         /// Backdate this memory N days in the past (for demos / seeding history)
         #[arg(long)]
         ago_days: Option<i64>,
+        /// Exact creation time (RFC 3339) — the true origin time of an
+        /// external record (an issue, a commit) so the backward reach is exact.
+        #[arg(long)]
+        created_at: Option<String>,
         /// Deliberately allow a detected credential to be stored. Prefer a
         /// secret-manager reference; this disables the default safety guard.
         #[arg(long)]
         allow_secrets: bool,
+    },
+
+    /// Ingest git commits as memory records: files, modules and hunk-header
+    /// symbols become the entities the backfill joins on. Idempotent per commit.
+    IngestGit {
+        /// Path to the git repository
+        path: PathBuf,
+        /// Only commits on/after this date (RFC 3339 or YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+        /// Only commits before this date (RFC 3339 or YYYY-MM-DD) — bound the
+        /// window above the failure date so post-cause commits don't eat the
+        /// max-commits budget
+        #[arg(long)]
+        until: Option<String>,
+        /// Stop after this many commits (newest first)
+        #[arg(long, default_value = "2000")]
+        max_commits: usize,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
     },
 
     /// Read-only audit for credential-shaped values already in the local store.
@@ -374,6 +400,20 @@ enum Commands {
         /// benchmarks). Suppresses the human-formatted output.
         #[arg(long)]
         json: bool,
+        /// Git repository backing this scope's commit records; enables
+        /// version-range mapping from the failure text ("broke in X, worked in Y").
+        #[arg(long)]
+        git_repo: Option<PathBuf>,
+        /// Last-known-good tag for the version range (with --git-repo)
+        #[arg(long)]
+        worked_in: Option<String>,
+        /// First-bad tag for the version range (with --git-repo)
+        #[arg(long)]
+        broke_in: Option<String>,
+        /// Memory id (or commit sha prefix): report the exact rule that
+        /// excluded it, or its rank among the surfaced causes
+        #[arg(long)]
+        why_not: Option<String>,
     },
 
     /// Recall + reason across memories (deep_reference): hybrid search, FSRS-6 trust,
@@ -513,8 +553,16 @@ fn main() -> anyhow::Result<()> {
             node_type,
             source,
             ago_days,
+            created_at,
             allow_secrets,
-        } => run_ingest(content, tags, node_type, source, ago_days, allow_secrets),
+        } => run_ingest(content, tags, node_type, source, ago_days, created_at, allow_secrets),
+        Commands::IngestGit {
+            path,
+            since,
+            until,
+            max_commits,
+            json,
+        } => run_ingest_git(path, since, until, max_commits, json),
         Commands::ScanSecrets {
             include_suspected,
             json,
@@ -527,6 +575,10 @@ fn main() -> anyhow::Result<()> {
             no_promote,
             contrast,
             json,
+            git_repo,
+            worked_in,
+            broke_in,
+            why_not,
         } => run_backfill(
             failure_id,
             manual,
@@ -534,6 +586,10 @@ fn main() -> anyhow::Result<()> {
             !no_promote,
             contrast,
             json,
+            git_repo,
+            worked_in,
+            broke_in,
+            why_not,
         ),
         Commands::Recall {
             query,
@@ -3232,10 +3288,23 @@ fn run_ingest(
     node_type: String,
     source: Option<String>,
     ago_days: Option<i64>,
+    created_at: Option<String>,
     allow_secrets: bool,
 ) -> anyhow::Result<()> {
     if content.trim().is_empty() {
         anyhow::bail!("Content cannot be empty");
+    }
+    // Parse/validate BEFORE any storage write: a bad timestamp must not leave a
+    // node behind with the wrong created_at and no key to retry with.
+    let created_at_ts = created_at
+        .map(|ts| {
+            chrono::DateTime::parse_from_rfc3339(&ts)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .map_err(|e| anyhow::anyhow!("--created-at wants RFC 3339: {e}"))
+        })
+        .transpose()?;
+    if ago_days.is_some() && created_at_ts.is_some() {
+        anyhow::bail!("--ago-days and --created-at are mutually exclusive");
     }
 
     let tag_list: Vec<String> = tags
@@ -3302,6 +3371,9 @@ fn run_ingest(
                 })?;
             storage.set_created_at(&result.node.id, when)?;
         }
+        if let Some(when) = created_at_ts {
+            storage.set_created_at(&result.node.id, when)?;
+        }
         println!("{}", "=== Vestige Ingest ===".cyan().bold());
         println!();
         println!("{}: {}", "Decision".white().bold(), result.decision.green());
@@ -3344,6 +3416,9 @@ fn run_ingest(
                 .ok_or_else(|| {
                     anyhow::anyhow!("--ago-days value {days} is out of the supported range")
                 })?;
+            storage.set_created_at(&node.id, when)?;
+        }
+        if let Some(when) = created_at_ts {
             storage.set_created_at(&node.id, when)?;
         }
         println!("{}", "=== Vestige Ingest ===".cyan().bold());
@@ -3477,6 +3552,7 @@ fn run_scan_secrets(
 }
 
 /// Run Retroactive Salience Backfill from the CLI (the demo's payoff command).
+#[allow(clippy::too_many_arguments)]
 fn run_backfill(
     failure_id: Option<String>,
     manual: bool,
@@ -3484,6 +3560,10 @@ fn run_backfill(
     promote: bool,
     contrast: bool,
     json: bool,
+    git_repo: Option<PathBuf>,
+    worked_in: Option<String>,
+    broke_in: Option<String>,
+    why_not: Option<String>,
 ) -> anyhow::Result<()> {
     let storage = std::sync::Arc::new(open_storage()?);
     #[cfg(feature = "embeddings")]
@@ -3621,6 +3701,10 @@ fn run_backfill(
         "manual": manual,
         "lookback_days": lookback_days,
         "promote": promote,
+        "git_repo": git_repo.as_ref().map(|p| p.display().to_string()),
+        "worked_in": worked_in,
+        "broke_in": broke_in,
+        "why_not": why_not,
     });
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -3699,6 +3783,184 @@ fn run_backfill(
             }
             println!();
         }
+    }
+    // why-not-X: name a suspect, get the rule that excluded it
+    if let Some(w) = result["why_not"].as_object() {
+        println!(
+            "{} {} — {}",
+            "Why not".yellow().bold(),
+            w.get("target").and_then(|v| v.as_str()).unwrap_or(""),
+            w.get("detail").and_then(|v| v.as_str()).unwrap_or("")
+        );
+        println!();
+    }
+    // strongest rejections, so a miss is explainable instead of silent
+    if let Some(rejected) = result["rejected"].as_array().filter(|r| !r.is_empty()) {
+        println!("{}", "Rejected (top candidates that failed a rule):".white());
+        for r in rejected {
+            println!(
+                "  {} {} — {}",
+                "✗".red(),
+                r["content_preview"].as_str().unwrap_or("").dimmed(),
+                r["reason"].as_str().unwrap_or("")
+            );
+        }
+        println!();
+    }
+    // trail-break report: what to record so the chain closes next time
+    if let Some(gap) = result["gap"].as_object() {
+        println!("{}", "TRAIL GAP:".yellow().bold());
+        println!("  {}", gap["note"].as_str().unwrap_or(""));
+        if let Some(s) = gap["suggestion"].as_str() {
+            println!("  {} {}", "→".magenta(), s);
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// Normalized remote identity for a repo: `git config remote.origin.url`
+/// stripped of protocol and `.git` (`https://github.com/a/b.git`,
+/// `git@github.com:a/b` -> `github.com/a/b`). None when no remote is set.
+fn git_repo_identity(path: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if url.is_empty() {
+        return None;
+    }
+    let stripped = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("git@")
+        .trim_start_matches("ssh://")
+        .trim_end_matches(".git")
+        .replace(':', "/");
+    Some(stripped)
+}
+
+/// Ingest git commits as memory records. Each commit becomes one event whose
+/// content carries the files, module dirs and hunk-header symbols — the
+/// query-time entity extractor turns those into the causal join keys. Records
+/// upsert on `(git, "<repo>#<sha>")`, so re-running is free, and created_at is
+/// the commit time so the backward reach is exact.
+fn run_ingest_git(
+    path: PathBuf,
+    since: Option<String>,
+    until: Option<String>,
+    max_commits: usize,
+    json: bool,
+) -> anyhow::Result<()> {
+    let repo_display = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "repo".to_string());
+    // Identity = remote URL (normalized), not the directory basename: two
+    // clones named "vestige" in different paths would otherwise share one
+    // source-key namespace and project tag.
+    let repo_name = git_repo_identity(&path).unwrap_or_else(|| {
+        path.canonicalize()
+            .map(|p| p.display().to_string())
+            .unwrap_or(repo_display.clone())
+    });
+    let mut git_args = vec![
+        "log".to_string(),
+        "-p".to_string(),
+        "--unified=0".to_string(),
+        "--no-color".to_string(),
+        "-n".to_string(),
+        max_commits.to_string(),
+        "--pretty=format:%x1e%H%x1f%aI%x1f%s".to_string(),
+    ];
+    if let Some(s) = &since {
+        git_args.push(format!("--since={s}"));
+    }
+    if let Some(u) = &until {
+        git_args.push(format!("--until={u}"));
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&path)
+        .args(&git_args)
+        .output()
+        .context("running git log — is `git` installed and is this a git repo?")?;
+    if !out.status.success() {
+        anyhow::bail!("git log failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    let commits = vestige_core::advanced::git_records::parse_git_log(&String::from_utf8_lossy(
+        &out.stdout,
+    ));
+
+    let storage = open_storage()?;
+    let mut created = 0usize;
+    let mut updated = 0usize;
+    let mut unchanged = 0usize;
+    for c in &commits {
+        // non_exhaustive: default-then-mutate is the only cross-crate construction
+        let mut envelope = SourceEnvelope::default();
+        envelope.source_system = Some(vestige_core::advanced::git_records::SOURCE_SYSTEM.into());
+        envelope.source_id = Some(format!("{repo_name}#{}", c.sha));
+        envelope.source_updated_at = Some(c.time);
+        envelope.content_hash = Some(format!("git-{}", c.sha));
+        envelope.synced_at = Some(Utc::now());
+        envelope.source_project = Some(repo_name.clone());
+        envelope.source_type = Some("commit".into());
+        let input = IngestInput {
+            content: vestige_core::advanced::git_records::record_content(c),
+            node_type: "event".to_string(),
+            source: Some("git".to_string()),
+            sentiment_score: 0.0,
+            sentiment_magnitude: 0.0,
+            tags: vec![
+                vestige_core::advanced::git_records::COMMIT_TAG.to_string(),
+                repo_name.clone(),
+            ],
+            valid_from: Some(c.time),
+            valid_until: None,
+            validity_inferred: false,
+            source_envelope: Some(envelope),
+        };
+        let result = storage.upsert_by_source(input)?;
+        match result.outcome {
+            SourceUpsertOutcome::Created => {
+                storage.set_created_at(&result.node_id, c.time)?;
+                created += 1;
+            }
+            SourceUpsertOutcome::Updated => {
+                storage.set_created_at(&result.node_id, c.time)?;
+                updated += 1;
+            }
+            SourceUpsertOutcome::Unchanged => unchanged += 1,
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "repo": repo_display,
+                "repo_identity": repo_name,
+                "commits_seen": commits.len(),
+                "created": created,
+                "updated": updated,
+                "unchanged": unchanged,
+            })
+        );
+    } else {
+        println!("{}", "=== Vestige Ingest Git ===".cyan().bold());
+        println!();
+        println!("{}: {}", "Repo".white().bold(), repo_display);
+        println!("{}: {}", "Identity".white().bold(), repo_name);
+        println!("{}: {}", "Commits seen".white().bold(), commits.len());
+        println!("{}: {}", "Created".white().bold(), created);
+        println!("{}: {}", "Updated".white().bold(), updated);
+        println!("{}: {}", "Unchanged".white().bold(), unchanged);
     }
     Ok(())
 }
