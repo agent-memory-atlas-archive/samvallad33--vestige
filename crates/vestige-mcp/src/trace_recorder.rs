@@ -57,7 +57,7 @@ const RECEIPT_ATTESTATION_ALGORITHM_V1: &str = "mcp-retrieval-receipt-v1";
 fn is_write_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "smart_ingest" | "ingest" | "session_checkpoint" | "memory" | "codebase"
+        "smart_ingest" | "ingest" | "session_checkpoint" | "memory" | "codebase" | "purge"
     )
 }
 
@@ -466,6 +466,26 @@ fn pending_memory_mutation(
             }
             Some(PendingMemoryMutation {
                 action,
+                id: args.get("id")?.as_str()?.to_string(),
+                reason: args
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            })
+        }
+        // #219: the standalone purge tool runs the same destructive path as
+        // memory(action='purge') and must hit the same review gate. Its args
+        // carry id/confirm directly (the dispatcher injects `action` later).
+        "purge" => {
+            if !args
+                .get("confirm")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            Some(PendingMemoryMutation {
+                action: "purge".to_string(),
                 id: args.get("id")?.as_str()?.to_string(),
                 reason: args
                     .get("reason")
@@ -2630,6 +2650,70 @@ mod tests {
             .list_memory_prs(Some(vestige_core::MemoryPrStatus::Pending), 10)
             .unwrap();
         assert_eq!(pr[0].diff["pendingAction"], serde_json::json!("suppress"));
+    }
+
+    #[test]
+    fn pre_gate_blocks_standalone_purge_tool_c2() {
+        // The standalone `purge` tool (#219) runs the identical destructive
+        // path as memory(action='purge'); review must hold it too, not just
+        // the memory-tool spelling of the same delete.
+        let s = store();
+        let node = s
+            .ingest(vestige_core::IngestInput {
+                content: "A memory targeted by the standalone purge tool.".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let args = Some(serde_json::json!({
+            "id": node.id,
+            "confirm": true,
+            "reason": "standalone purge"
+        }));
+
+        let response = gate_pending_memory_mutation(
+            &s,
+            None,
+            "run_purge_tool",
+            "purge",
+            &args,
+            vestige_core::ReviewMode::RiskGated,
+        )
+        .unwrap()
+        .expect("standalone purge must be pre-gated like memory(action='purge')");
+
+        assert_eq!(response["pendingReview"], serde_json::json!(true));
+        assert!(
+            s.get_node(&node.id).unwrap().is_some(),
+            "pre-gating must not delete before review"
+        );
+        let prs = s
+            .list_memory_prs(Some(vestige_core::MemoryPrStatus::Pending), 10)
+            .unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].diff["pendingAction"], serde_json::json!("purge"));
+        assert_eq!(prs[0].diff["node"]["deleted"], serde_json::json!(false));
+
+        // without confirm the tool itself errors before any gate is needed
+        let no_confirm = Some(serde_json::json!({ "id": node.id }));
+        assert!(
+            gate_pending_memory_mutation(
+                &s,
+                None,
+                "run_purge_tool_no_confirm",
+                "purge",
+                &no_confirm,
+                vestige_core::ReviewMode::RiskGated,
+            )
+            .unwrap()
+            .is_none(),
+            "missing confirm is the tool's own error path, not a gate hold"
+        );
+    }
+
+    #[test]
+    fn write_tool_set_includes_purge_tool() {
+        assert!(is_write_tool("purge"));
     }
 
     #[test]
