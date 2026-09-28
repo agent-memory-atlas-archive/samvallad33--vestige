@@ -77,6 +77,7 @@ RAG retrieves text that resembles the query. That works when the answer looks li
 
 The backward reach implements Retroactive Salience Backfill (Zaki, Cai et al., *Nature* 2024): when a memory turns out to matter, the earlier memories that led to it become retrievable too. Every backfill result ships with a receipt naming the exact evidence path. DeepMind separately proved single-vector retrieval is mathematically incapable of certain relevance patterns ([arXiv:2508.21038](https://arxiv.org/abs/2508.21038)).
 
+<a id="founding-operator"></a>
 ## 🛡️ Founding Operator
 
 The fail-closed authority kernel for AI agents. Your agent can think anything. Operator decides what it is allowed to do.
