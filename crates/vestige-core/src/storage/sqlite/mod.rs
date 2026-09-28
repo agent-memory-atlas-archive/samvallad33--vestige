@@ -635,23 +635,13 @@ pub(crate) struct PurgeCleanup {
 
 const DATA_DIR_ENV: &str = "VESTIGE_DATA_DIR";
 const DATABASE_FILE: &str = "vestige.db";
-#[cfg(feature = "vector-search")]
-const VESTIGE_DISABLE_VECTOR_SEARCH: &str = "VESTIGE_DISABLE_VECTOR_SEARCH";
-
-// Test-only override for the runtime vector-search gate, scoped to the
-// current thread. Tests run in parallel inside one process, so a test that
-// wants the index disabled must not touch the process environment: every
-// other test thread building a `Storage` at that moment would silently get
-// no index. This cell is what `with_vector_search_disabled` flips instead.
-#[cfg(all(test, feature = "vector-search"))]
-thread_local! {
-    static VECTOR_SEARCH_DISABLED_FOR_TEST: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
+// w1b search collapse: the VESTIGE_DISABLE_VECTOR_SEARCH kill-switch (env
+// const, its affirmative-value parser, and the cfg(test) thread-local
+// override) was removed together with the vector-search runtime paths.
 
 // Test-only override for `VESTIGE_AUTO_CONSOLIDATE_MERGE`, scoped to the
-// current thread for the same reason as the vector-search override: this
-// gate decides whether consolidation hard-deletes near-duplicates, so a
+// current thread for the same reason the old vector-search override was:
+// this gate decides whether consolidation hard-deletes near-duplicates, so a
 // process-wide flag would reach every consolidation test running at once.
 // `Some(None)` pins the variable unset; `Some(Some(v))` pins a value.
 #[cfg(all(test, feature = "embeddings", feature = "vector-search"))]
@@ -660,17 +650,6 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Whether an environment value asks for vector search to be turned off.
-/// Only affirmative values count, so `VESTIGE_DISABLE_VECTOR_SEARCH=0` leaves
-/// the index on and reports it as on.
-#[cfg(feature = "vector-search")]
-fn env_value_disables_vector_search(value: &std::ffi::OsStr) -> bool {
-    let value = value.to_ascii_lowercase();
-    matches!(
-        value.to_str(),
-        Some("1" | "true" | "yes" | "on" | "enable" | "enabled")
-    )
-}
 /// Immutable compatibility identity for vectors written before Embedding
 /// Profiles existed. It is deliberately explicit: raw-text vectors must never
 /// be confused with the corrected Nomic retrieval encoding contract.
@@ -1915,43 +1894,11 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     ) -> crate::storage::memory_store::MemoryStoreResult<
         Vec<crate::storage::memory_store::SearchResult>,
     > {
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        use crate::storage::memory_store::{MemoryStoreError, SearchResult};
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        {
-            let Some(index) = self.vector_index.as_ref() else {
-                return Ok(vec![]);
-            };
-            let index = index
-                .lock()
-                .map_err(|_| MemoryStoreError::Init("Vector index lock poisoned".into()))?;
-            let raw_results = index
-                .search_with_threshold(embedding, limit, 0.0_f32)
-                .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
-            drop(index);
-            let out = raw_results
-                .into_iter()
-                .filter_map(|(node_id, score)| {
-                    let node = self.get_node(&node_id).ok().flatten()?;
-                    let (domains, domain_scores) = self.read_domain_columns(&node_id);
-                    let mut rec = Self::node_to_record(node, None);
-                    rec.domains = domains;
-                    rec.domain_scores = domain_scores;
-                    Some(SearchResult {
-                        record: rec,
-                        score: score as f64,
-                        fts_score: None,
-                        vector_score: Some(score as f64),
-                    })
-                })
-                .collect();
-            Ok(out)
-        }
-        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
-        {
-            let _ = (embedding, limit);
-            Ok(vec![])
-        }
+        // w1b search collapse: vector retrieval is removed from this store.
+        // The trait signature is kept because MemoryStore requires it; this
+        // shell is inert until the exact resolver lands.
+        let _ = (embedding, limit);
+        Ok(vec![])
     }
 
     async fn get_scheduling(
