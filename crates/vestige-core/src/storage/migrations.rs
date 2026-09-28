@@ -189,6 +189,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "Intention scopes: project-namespaced intentions so prospective surfacing in recall never leaks across scopes",
         up: MIGRATION_V37_UP,
     },
+    Migration {
+        version: 38,
+        description: "Actor provenance (#252 Phase A): operator-controlled versioned role/weight policy, role memberships, and actor-attributed endorsement events with content-revision binding",
+        up: MIGRATION_V38_UP,
+    },
 ];
 
 /// A database migration
@@ -2513,6 +2518,85 @@ const MIGRATION_V37_UP: &str = r#"
 ALTER TABLE intentions ADD COLUMN scope TEXT;
 CREATE INDEX IF NOT EXISTS idx_intentions_scope ON intentions(scope);
 UPDATE schema_version SET version = 37, applied_at = datetime('now');
+"#;
+
+/// V38: Actor provenance (#252 Phase A).
+///
+/// - `actor_role_weights`: the operator-controlled flat prior table, seeded
+///   with the issue's initial policy. Weights are bounded (0, 1.5] by CHECK
+///   constraint — the maximum is reserved for human operator authority.
+/// - `actor_role_membership`: operator-granted role memberships. No MCP tool
+///   writes this table in Phase A, so a caller cannot self-grant a role.
+/// - `actor_policy_state`: the policy version stamped on every resolution;
+///   every operator policy change bumps it transactionally.
+/// - `actor_endorsement_events`: actor-attributed support/opposition bound
+///   to a content-revision digest, with the resolution recorded verbatim.
+///   Deterministic event ids make same-actor retries idempotent, and
+///   `independent_prior` is 0.0 for self-support.
+/// - `knowledge_nodes.author_actor_did`: nullable; NULL reads as
+///   unattributed at 1.0. No backfill in Phase A (that is Phase B).
+const MIGRATION_V38_UP: &str = r#"
+CREATE TABLE IF NOT EXISTS actor_role_weights (
+    role TEXT PRIMARY KEY,
+    weight_prior REAL NOT NULL CHECK (weight_prior > 0.0 AND weight_prior <= 1.5),
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS actor_role_membership (
+    actor_did TEXT NOT NULL,
+    role TEXT NOT NULL,
+    granted_at TEXT NOT NULL,
+    note TEXT,
+    PRIMARY KEY (actor_did, role)
+);
+
+CREATE TABLE IF NOT EXISTS actor_policy_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    policy_version INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO actor_policy_state (id, policy_version, updated_at)
+VALUES (1, 1, datetime('now'));
+
+INSERT OR IGNORE INTO actor_role_weights (role, weight_prior, updated_at)
+VALUES
+    ('operator', 1.50, datetime('now')),
+    ('destructive-tester', 1.30, datetime('now')),
+    ('architect', 1.25, datetime('now')),
+    ('functional-tester', 1.15, datetime('now')),
+    ('qa', 1.10, datetime('now')),
+    ('dev', 1.00, datetime('now'));
+
+CREATE TABLE IF NOT EXISTS actor_endorsement_events (
+    event_id TEXT PRIMARY KEY,
+    memory_id TEXT NOT NULL,
+    actor_did TEXT NOT NULL,
+    claimed_role TEXT,
+    effective_role TEXT NOT NULL,
+    resolved_weight REAL NOT NULL CHECK (resolved_weight > 0.0 AND resolved_weight <= 1.5),
+    resolution_disposition TEXT NOT NULL,
+    policy_version INTEGER NOT NULL,
+    endorsement_kind TEXT NOT NULL
+        CHECK (endorsement_kind IN ('support', 'oppose', 'self_support')),
+    revision_digest TEXT NOT NULL,
+    -- 0.0 exactly for self-support: a self-endorsement never contributes
+    -- independent prior.
+    independent_prior REAL NOT NULL CHECK (independent_prior >= 0.0),
+    tool TEXT NOT NULL,
+    receipt_id TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_actor_endorsements_memory
+    ON actor_endorsement_events(memory_id);
+CREATE INDEX IF NOT EXISTS idx_actor_endorsements_actor
+    ON actor_endorsement_events(actor_did);
+CREATE INDEX IF NOT EXISTS idx_actor_endorsements_revision
+    ON actor_endorsement_events(memory_id, revision_digest);
+
+ALTER TABLE knowledge_nodes ADD COLUMN author_actor_did TEXT;
+UPDATE schema_version SET version = 38, applied_at = datetime('now');
 "#;
 
 #[cfg(test)]

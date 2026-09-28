@@ -1130,6 +1130,7 @@ mod tests {
             decay_risk: DecayRisk::Medium,
             mutations: vec![],
             evidence: None,
+            actor: None,
         };
         s.save_receipt(&receipt, Some("run_abc"), Some("search"), Some("q"))
             .unwrap();
@@ -1150,6 +1151,7 @@ mod tests {
             decay_risk: DecayRisk::Low,
             mutations: vec![],
             evidence: None,
+            actor: None,
         };
         s.save_receipt(&mk("r_a1"), Some("run_a"), Some("search"), None)
             .unwrap();

@@ -80,6 +80,10 @@
 // MODULES
 // ============================================================================
 
+/// Actor provenance (#252 Phase A): process did:key identity, the
+/// operator-controlled versioned role policy, and neutral resolution.
+pub mod actor;
+
 /// Optional `vestige.toml` configuration (Phase 2: Configurable Output).
 pub mod config;
 pub mod connectors;
@@ -173,6 +177,16 @@ pub use fsrs::{
 // Configuration (vestige.toml output profiles / defaults)
 pub use config::{CONFIG_FILE, OutputConfig, OutputDefaults, OutputProfile, VestigeConfig};
 
+// Actor provenance (#252 Phase A)
+pub use actor::{
+    ActorIdentityError, ActorPolicySnapshot, ProcessActor, ResolutionDisposition, RoleResolution,
+    ACTOR_KEY_FILE, ED25519_MULTICODEC_PREFIX, FLAT_POLICY_V1, INITIAL_POLICY_VERSION,
+    MAX_AGGREGATE_ENDORSEMENT_WEIGHT, MAX_ROLE_WEIGHT, NEUTRAL_WEIGHT, UNATTRIBUTED_ROLE,
+    actor_key_path_for_data_dir, base58btc_decode, base58btc_encode, bounded_aggregate,
+    did_key_from_ed25519_public_key, ed25519_public_key_from_did_key, endorsement_event_id,
+    revision_digest,
+};
+
 // Agent Black Box / Receipts / Memory PRs (the cognitive flight recorder)
 pub use trace::{
     BACKFILL_RECEIPT_CLAIM_BOUNDARY, BACKFILL_RECEIPT_SCHEMA_V1, BackfillCandidateEvidence,
@@ -183,6 +197,7 @@ pub use trace::{
     SynapticCaptureTrigger, SynapticCaptureWindow, SynapticStrengthChange, WriteContext,
     WriteSource, classify_write,
 };
+pub use trace::ActorProvenance;
 
 // Storage layer
 pub use storage::{

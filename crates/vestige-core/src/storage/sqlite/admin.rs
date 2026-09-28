@@ -736,6 +736,7 @@ impl SqliteMemoryStore {
         let storage = Self {
             db_path: path,
             durability_status,
+            process_actor_did: std::sync::RwLock::new(None),
             writer: Mutex::new(writer_conn),
             reader: Mutex::new(reader_conn),
             scheduler: Mutex::new(FSRSScheduler::default()),

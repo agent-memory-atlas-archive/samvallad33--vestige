@@ -703,6 +703,11 @@ pub const LEGACY_EMBEDDING_PROFILE_ID: &str = "nomic-v1.5-legacy-raw-256";
 pub struct SqliteMemoryStore {
     db_path: PathBuf,
     durability_status: SqliteDurabilityStatus,
+    /// The stable process actor did:key bound to this store at startup
+    /// (#252 Phase A). `None` until a caller sets it; node writes stamp it
+    /// as `author_actor_did` so self-support can be detected. Every local
+    /// write through this store is by this process's actor.
+    process_actor_did: std::sync::RwLock<Option<String>>,
     // `pub(crate)` so the sibling `trace_store` module (Black Box / Receipts /
     // Memory PRs CRUD) can lock the same writer/reader connections and follow
     // the established store idiom without duplicating connection management.
@@ -2735,6 +2740,7 @@ mod write_transaction_policy {
 mod v3_regression_tests;
 
 mod admin;
+mod actors;
 mod connectors;
 mod embeddings;
 mod ingest;
@@ -2744,3 +2750,5 @@ mod purge;
 mod records;
 mod search;
 mod sync;
+
+pub use actors::{ActorMutationOutcome, EndorsementEventRecord};

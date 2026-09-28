@@ -52,12 +52,13 @@ pub use replay_store::{
 };
 pub use sqlite::{WalCheckpointMode, WalCheckpointStatus};
 pub use sqlite::{
-    ACCESS_LOG_RETENTION_DAYS, CompositionEventRecord, CompositionMemberRecord,
-    CompositionNeighborRecord, CompositionOutcomeRecord, ConnectionRecord, ConnectorCursor,
-    ConsolidationHistoryRecord, DEFAULT_MEMORY_SCOPE, DreamHistoryRecord,
-    EmbeddingProfileIntegrityManifest, EmbeddingProfileMigrationNodeCheckpoint,
-    EmbeddingProfileMigrationRecord, EmbeddingProfileVector, FilePortableSyncBackend,
-    HygieneNodeSummary, HygieneSnapshot, InsightRecord, IntentionRecord, NeverComposedCandidate,
+    ACCESS_LOG_RETENTION_DAYS, ActorMutationOutcome, CompositionEventRecord,
+    CompositionMemberRecord, CompositionNeighborRecord, CompositionOutcomeRecord,
+    ConnectionRecord, ConnectorCursor, ConsolidationHistoryRecord, DEFAULT_MEMORY_SCOPE,
+    DreamHistoryRecord, EmbeddingProfileIntegrityManifest,
+    EmbeddingProfileMigrationNodeCheckpoint, EmbeddingProfileMigrationRecord,
+    EmbeddingProfileVector, EndorsementEventRecord, FilePortableSyncBackend, HygieneNodeSummary,
+    HygieneSnapshot, InsightRecord, IntentionRecord, NeverComposedCandidate,
     PortableSyncBackend, PortableSyncReport, ReconcileReport, Result, SmartIngestResult,
     SourceUpsertOutcome, SourceUpsertResult, SqliteMemoryStore, StateTransitionRecord,
     StorageError, TagVocabulary,

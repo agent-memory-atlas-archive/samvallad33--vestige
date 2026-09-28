@@ -1218,6 +1218,7 @@ mod tests {
             decay_risk: DecayRisk::Low,
             mutations: vec![],
             evidence: None,
+            actor: None,
         }
     }
 

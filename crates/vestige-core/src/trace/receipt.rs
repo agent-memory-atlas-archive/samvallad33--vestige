@@ -60,6 +60,14 @@ pub struct Receipt {
     /// restart returns the same predicate that justified the mutation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<ReceiptEvidence>,
+
+    /// Actor provenance for this run (#252 Phase A): who made the call, the
+    /// claimed role, the effective role/weight the operator policy resolved,
+    /// and the policy version in force. Recorded identity NEVER overrides a
+    /// truth claim — it says who acted, nothing more. `None` on receipts
+    /// written before Phase A or in contexts with no process actor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<ActorProvenance>,
 }
 
 impl Receipt {
@@ -136,7 +144,14 @@ impl Receipt {
             decay_risk,
             mutations,
             evidence: None,
+            actor: None,
         }
+    }
+
+    /// Attach actor provenance (#252 Phase A) to this receipt.
+    pub fn with_actor_provenance(mut self, actor: ActorProvenance) -> Self {
+        self.actor = Some(actor);
+        self
     }
 
     /// Attach a typed evidence predicate to this receipt.
@@ -219,6 +234,44 @@ impl Receipt {
 
 /// Stable schema URI for Retroactive Salience Backfill receipt evidence.
 pub const BACKFILL_RECEIPT_SCHEMA_V1: &str = "https://vestige.dev/schemas/receipt/backfill/v1";
+
+/// Actor provenance recorded on every mutation receipt (#252 Phase A). The
+/// uniform surface: who the process actor is (a did:key minted per data
+/// directory), what role the caller claimed, what the operator policy
+/// actually resolved, and which policy version made that call. A claimed
+/// role that the operator never granted leaves the actor neutral at 1.0 —
+/// provenance records authority; it never grants it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActorProvenance {
+    /// Stable process actor id: `did:key:z6Mk…` (Ed25519).
+    pub actor_id: String,
+    /// Role exactly as the caller claimed it, when one was claimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_role: Option<String>,
+    /// Role that took effect (`unattributed` unless operator-granted).
+    pub effective_role: String,
+    /// Weight resolved from the operator policy. Neutral 1.0 fallback.
+    pub resolved_weight: f64,
+    /// How the claim was handled (`unclaimed`, `granted`,
+    /// `unregistered_claim`, `unknown_role_neutral`).
+    pub resolution_disposition: String,
+    /// Operator policy version in force for this resolution.
+    pub policy_version: u64,
+}
+
+impl ActorProvenance {
+    /// Build the receipt-facing provenance block from a [`RoleResolution`].
+    pub fn from_resolution(actor_id: &str, resolution: &crate::actor::RoleResolution) -> Self {
+        Self {
+            actor_id: actor_id.to_string(),
+            claimed_role: resolution.claimed_role.clone(),
+            effective_role: resolution.effective_role.clone(),
+            resolved_weight: resolution.resolved_weight,
+            resolution_disposition: resolution.disposition.as_str().to_string(),
+            policy_version: resolution.policy_version,
+        }
+    }
+}
 
 /// Explicit epistemic boundary for Backfill receipts: candidate evidence only.
 pub const BACKFILL_RECEIPT_CLAIM_BOUNDARY: &str = "Explicit-entity backward candidate evidence from a salient failure; not an asserted root cause or a universal claim about vector search.";
@@ -549,6 +602,7 @@ mod tests {
             decay_risk: DecayRisk::Medium,
             mutations: vec![],
             evidence: None,
+            actor: None,
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["receipt_id"], "r_2026_06_22_abc");
@@ -557,6 +611,51 @@ mod tests {
         assert_eq!(json["trust_floor"], 0.62);
         assert!(json["mutations"].as_array().unwrap().is_empty());
         assert!(json.get("evidence").is_none());
+        assert!(json.get("actor").is_none());
+    }
+
+    #[test]
+    fn actor_provenance_round_trips_and_legacy_rows_stay_readable() {
+        // A receipt WITH provenance serializes the full block.
+        let with_actor = Receipt::build(
+            fixed_now(),
+            "run_actor",
+            vec!["mem_1".into()],
+            vec![],
+            vec![],
+            &[0.9],
+            vec![],
+        )
+        .with_actor_provenance(ActorProvenance {
+            actor_id: "did:key:z6MkTest".into(),
+            claimed_role: Some("operator".into()),
+            effective_role: "unattributed".into(),
+            resolved_weight: 1.0,
+            resolution_disposition: "unregistered_claim".into(),
+            policy_version: 1,
+        });
+        let json = serde_json::to_value(&with_actor).unwrap();
+        assert_eq!(json["actor"]["actor_id"], "did:key:z6MkTest");
+        assert_eq!(json["actor"]["claimed_role"], "operator");
+        assert_eq!(json["actor"]["effective_role"], "unattributed");
+        assert_eq!(json["actor"]["resolved_weight"], 1.0);
+        assert_eq!(json["actor"]["resolution_disposition"], "unregistered_claim");
+        assert_eq!(json["actor"]["policy_version"], 1);
+        let decoded: Receipt = serde_json::from_value(json).expect("decode with actor");
+        assert_eq!(decoded.actor, with_actor.actor);
+
+        // A pre-Phase-A receipt row without the actor field stays readable.
+        let legacy: Receipt = serde_json::from_value(serde_json::json!({
+            "receipt_id": "r_2026_06_22_legacy",
+            "retrieved": [],
+            "suppressed": [],
+            "activation_path": [],
+            "trust_floor": 0.5,
+            "decay_risk": "medium",
+            "mutations": []
+        }))
+        .expect("legacy receipt");
+        assert!(legacy.actor.is_none());
     }
 
     #[test]

@@ -278,6 +278,11 @@ impl SqliteMemoryStore {
         let env_source_updated_at = env.source_updated_at.map(|dt| dt.to_rfc3339());
         let env_synced_at = env.synced_at.map(|dt| dt.to_rfc3339());
 
+        // #252 Phase A: stamp the process actor as the author. A store with
+        // no bound actor leaves the column NULL, which reads as unattributed
+        // at 1.0 — legacy nodes default neutral with no backfill.
+        let author_actor_did = self.process_actor_did();
+
         {
             let writer = self
                 .writer
@@ -292,7 +297,8 @@ impl SqliteMemoryStore {
                     source, tags, valid_from, valid_until, has_embedding, embedding_model,
                     domains, domain_scores,
                     scope, source_system, source_id, source_url, source_updated_at,
-                    content_hash, synced_at, source_project, source_type, source_author
+                    content_hash, synced_at, source_project, source_type, source_author,
+                    author_actor_did
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6,
                     ?7, ?8, ?9, ?10, ?11,
@@ -301,7 +307,8 @@ impl SqliteMemoryStore {
                     ?19, ?20, ?21, ?22, ?23, ?24,
                     '[]', '{}',
                     ?25, ?26, ?27, ?28, ?29,
-                    ?30, ?31, ?32, ?33, ?34
+                    ?30, ?31, ?32, ?33, ?34,
+                    ?35
                 )",
                 params![
                     id,
@@ -341,6 +348,7 @@ impl SqliteMemoryStore {
                     env.source_project,
                     env.source_type,
                     env.source_author,
+                    author_actor_did,
                 ],
             )?;
         }
@@ -741,8 +749,18 @@ impl SqliteMemoryStore {
                                 input.valid_until,
                             )?;
                         }
-                        // Just strengthen the existing memory
-                        self.strengthen_on_access(&target_id)?;
+                        // #252 Phase A: when a process actor is bound, the
+                        // reinforce strength bump is applied by the caller
+                        // through `record_reinforce_endorsement` TOGETHER with
+                        // the endorsement evidence and receipt in one
+                        // transaction (gate 3). Strengthening here AND there
+                        // would double-apply, so this branch leaves it to the
+                        // caller; a caller that never completes the handoff
+                        // fails closed with no strength change. Without a
+                        // bound actor the historical strengthen runs unchanged.
+                        if self.process_actor_did().is_none() {
+                            self.strengthen_on_access(&target_id)?;
+                        }
                         let node = self
                             .get_node(&target_id)?
                             .ok_or_else(|| StorageError::NotFound(target_id.clone()))?;
