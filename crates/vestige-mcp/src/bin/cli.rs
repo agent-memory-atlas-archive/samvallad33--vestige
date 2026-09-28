@@ -416,6 +416,48 @@ enum Commands {
         why_not: Option<String>,
     },
 
+    /// Causal walk — investigate a failure from EXPLICIT start points (a
+    /// failing test, a stack frame, a CI run, a logged write, a version
+    /// range) through exact mechanism edges to the change records behind it.
+    /// Successor to `backfill`; refuses with a needs_report instead of
+    /// guessing when a start point anchors to nothing.
+    CausalWalk {
+        /// Failing test name (walked to its file's co-touch commits)
+        #[arg(long)]
+        failing_test: Option<String>,
+        /// Stack frame "file:line" or "file" (last pre-failure toucher is the
+        /// prime suspect, SZZ-lite)
+        #[arg(long)]
+        stack_frame: Option<String>,
+        /// Agent-trace run id (its failure channel seeds the anchors)
+        #[arg(long)]
+        ci_run: Option<String>,
+        /// Memory / tool-call record id (its edges are walked)
+        #[arg(long)]
+        logged_write: Option<String>,
+        /// Git repository for --worked-in/--broke-in (single repo per call)
+        #[arg(long)]
+        git_repo: Option<PathBuf>,
+        /// Last-known-good tag (with --git-repo)
+        #[arg(long)]
+        worked_in: Option<String>,
+        /// First-bad tag (with --git-repo)
+        #[arg(long)]
+        broke_in: Option<String>,
+        /// How many days back from the failure anchor suspects may lie
+        #[arg(long, default_value = "30")]
+        lookback_days: i64,
+        /// Dry run: don't persist evidence_of trail edges
+        #[arg(long)]
+        no_promote: bool,
+        /// Project namespace to walk (default: user)
+        #[arg(long, default_value = "user")]
+        scope: String,
+        /// Machine-readable: print the raw causal walk result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Recall + reason across memories (deep_reference): hybrid search, FSRS-6 trust,
     /// spreading activation, supersession + contradiction analysis. Returns the
     /// synthesized answer, evidence, and confidence.
@@ -590,6 +632,31 @@ fn main() -> anyhow::Result<()> {
             worked_in,
             broke_in,
             why_not,
+        ),
+        Commands::CausalWalk {
+            failing_test,
+            stack_frame,
+            ci_run,
+            logged_write,
+            git_repo,
+            worked_in,
+            broke_in,
+            lookback_days,
+            no_promote,
+            scope,
+            json,
+        } => run_causal_walk(
+            failing_test,
+            stack_frame,
+            ci_run,
+            logged_write,
+            git_repo,
+            worked_in,
+            broke_in,
+            lookback_days,
+            !no_promote,
+            scope,
+            json,
         ),
         Commands::Recall {
             query,
@@ -3815,6 +3882,137 @@ fn run_backfill(
             println!("  {} {}", "→".magenta(), s);
         }
         println!();
+    }
+    Ok(())
+}
+
+/// Run a causal walk from the CLI: explicit start points -> exact mechanism
+/// edges -> ranked suspect change records. Mirrors the MCP `causal_walk`
+/// tool (same core engine); `--json` prints the raw result for tooling.
+#[allow(clippy::too_many_arguments)]
+fn run_causal_walk(
+    failing_test: Option<String>,
+    stack_frame: Option<String>,
+    ci_run: Option<String>,
+    logged_write: Option<String>,
+    git_repo: Option<PathBuf>,
+    worked_in: Option<String>,
+    broke_in: Option<String>,
+    lookback_days: i64,
+    promote: bool,
+    scope: String,
+    json: bool,
+) -> anyhow::Result<()> {
+    use vestige_core::advanced::causal_walk as cw;
+
+    // Assemble start points; the walk refuses (needs_report) rather than
+    // guessing when none resolve.
+    let mut start_points: Vec<cw::StartPoint> = Vec::new();
+    if let Some(name) = failing_test {
+        start_points.push(cw::StartPoint::FailingTest { name });
+    }
+    if let Some(frame) = stack_frame {
+        start_points.push(cw::StartPoint::StackFrame { frame });
+    }
+    if let Some(run_id) = ci_run {
+        start_points.push(cw::StartPoint::CiRun { run_id });
+    }
+    if let Some(node_id) = logged_write {
+        start_points.push(cw::StartPoint::LoggedWrite { node_id });
+    }
+    if let (Some(worked), Some(broke), Some(repo)) = (worked_in, broke_in, git_repo) {
+        start_points.push(cw::StartPoint::VersionRange {
+            worked_in: worked,
+            broke_in: broke,
+            repo: repo.display().to_string(),
+        });
+    }
+
+    let storage = open_storage()?;
+    #[cfg(feature = "embeddings")]
+    {
+        let _ = storage.init_embeddings();
+    }
+
+    let request = cw::CausalWalkRequest {
+        scope,
+        start_points,
+        lookback_days,
+        scan_limit: 500,
+    };
+    let result = cw::walk_storage(&storage, &request).map_err(anyhow::Error::msg)?;
+
+    if json {
+        let mut payload = serde_json::to_value(&result)?;
+        if promote && !result.causes.is_empty() {
+            payload["promoted_edges"] = serde_json::to_value(
+                cw::persist_evidence_edges(&storage, &result).unwrap_or_default(),
+            )?;
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    println!("{}", "=== Causal Walk ===".magenta().bold());
+    println!(
+        "  {} hypotheses, not proven causes — investigate before attributing cause",
+        "note:".dimmed()
+    );
+    println!();
+
+    if let Some(report) = &result.needs_report {
+        println!("{}", "NEEDS REPORT (the walk refused):".yellow().bold());
+        for m in &report.missing {
+            println!("  {} {m}", "!".red());
+        }
+        println!("{}", "Provide one of:".white());
+        for r in &report.required_start_points {
+            println!("  {} {r}", "->".cyan());
+        }
+        return Ok(());
+    }
+
+    for (rank, cause) in result.causes.iter().enumerate() {
+        println!(
+            "{} {} score {:.2}",
+            format!("#{}", rank + 1).green().bold(),
+            cause.sha.as_deref().unwrap_or(&cause.id),
+            cause.score
+        );
+        for hop in &cause.path {
+            println!("  {} via {} — {}", "->".cyan(), hop.via, hop.hop);
+        }
+        println!(
+            "  {} {}",
+            "anchors:".dimmed(),
+            cause.shared_anchors.join(", ")
+        );
+        println!();
+    }
+
+    if !result.rejected.is_empty() {
+        println!("{}", "Rejected (why-not, top candidates):".white());
+        for r in &result.rejected {
+            println!("  {} {} — {}", "✗".red(), r.id, r.reason);
+        }
+        println!();
+    }
+
+    if promote && !result.causes.is_empty() {
+        let written =
+        cw::persist_evidence_edges(&storage, &result).map_err(anyhow::Error::msg)?;
+        println!(
+            "{} {} evidence_of trail edge{} persisted",
+            "→".magenta(),
+            written.len(),
+            if written.len() == 1 { "" } else { "s" }
+        );
+    } else {
+        println!(
+            "  {}",
+            "(preview: nothing persisted; pass without --no-promote to record evidence_of edges)"
+                .dimmed()
+        );
     }
     Ok(())
 }

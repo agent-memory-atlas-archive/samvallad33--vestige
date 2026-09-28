@@ -17,6 +17,7 @@
 //! - **Reconsolidation**: Memories become modifiable on retrieval (Nader's theory)
 
 pub mod adaptive_embedding;
+pub mod causal_walk;
 pub mod chains;
 pub mod compression;
 pub mod contradiction;
@@ -83,5 +84,9 @@ pub use reconsolidation::{
 };
 pub use retroactive_backfill::{
     BackfillCandidate, BackfillResult, BackfilledCause, FailureEvent, RetroactiveBackfill,
+};
+pub use causal_walk::{
+    CausalWalkRequest, CausalWalkResult, EVIDENCE_LINK_TYPE, NeedsReport, PathHop, StartPoint,
+    persist_evidence_edges, walk_storage,
 };
 pub use speculative::{PredictedMemory, PredictionContext, SpeculativeRetriever, UsagePattern};

@@ -267,7 +267,10 @@ pub fn full_schema(name: &str) -> Option<Value> {
         "graph" => graph_unified::schema(),
         "session_start" => session_context::schema(),
         "suppress" => suppress::schema(),
-        "backfill" => backfill::schema(),
+        // v3.2: causal_walk replaced backfill on the advertised surface; the
+        // registry tracks the advertised catalog, so backfill (now a hidden
+        // alias) is intentionally absent.
+        "causal_walk" => causal_walk::schema(),
         "purge" => memory_unified::purge_schema(),
         _ => return None,
     })
