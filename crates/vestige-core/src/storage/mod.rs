@@ -7,6 +7,7 @@ mod attestation_store;
 mod cloud_crypto;
 #[cfg(feature = "cloud-sync")]
 mod cloud_sync;
+mod edges;
 mod intention_claim;
 mod intention_graph_store;
 mod memory_store;
@@ -34,6 +35,9 @@ pub use memory_store::{
     ClassificationResult, Domain, HealthStatus, LocalMemoryStore, MemoryEdge, MemoryRecord,
     MemoryStore, MemoryStoreError, MemoryStoreResult, MemoryStoreSend, ModelSignature,
     SchedulingState, SearchQuery, SearchResult, StoreStats,
+};
+pub use edges::{
+    EdgeDirection, EdgeKind, EdgeMeta, PurgeTombstone, TYPED_EDGE_VOCABULARY, TypedEdge,
 };
 pub use migrations::MIGRATIONS;
 pub use portable::{

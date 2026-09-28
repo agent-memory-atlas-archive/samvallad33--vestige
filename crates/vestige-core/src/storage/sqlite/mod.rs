@@ -86,6 +86,10 @@ pub enum StorageError {
     /// A project namespace must be a short, non-empty identifier.
     #[error("Invalid memory scope: {0}")]
     InvalidScope(String),
+    /// A typed-edge write or traversal referenced a link type outside the
+    /// owner-approved vocabulary, or otherwise malformed edge input.
+    #[error("Invalid typed edge: {0}")]
+    InvalidEdge(String),
     /// A profile operation would violate the explicit/reversible embedding
     /// profile contract.
     #[error("Invalid embedding profile: {0}")]
@@ -2623,6 +2627,7 @@ mod write_transaction_policy {
         ("sqlite/records.rs", include_str!("records.rs")),
         ("sqlite/search.rs", include_str!("search.rs")),
         ("sqlite/sync.rs", include_str!("sync.rs")),
+        ("edges.rs", include_str!("../edges.rs")),
         ("migrations.rs", include_str!("../migrations.rs")),
         ("trace_store.rs", include_str!("../trace_store.rs")),
         ("synaptic_store.rs", include_str!("../synaptic_store.rs")),
