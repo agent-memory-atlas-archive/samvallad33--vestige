@@ -15,6 +15,7 @@ mod migrations;
 mod portable;
 pub mod receipt_attestation;
 mod replay_store;
+mod resolver;
 mod sqlite;
 mod synaptic_store;
 mod trace_store;
@@ -40,6 +41,7 @@ pub use portable::{
     PORTABLE_ARCHIVE_FORMAT, PortableArchive, PortableImportMode, PortableImportReport,
     PortableTable, PortableValue,
 };
+pub use resolver::{HANDLE_REQUIRED_DETAIL, HandleKind, HandleResolution, MAX_CANDIDATES};
 pub use replay_store::{
     CounterfactualReplayResult, DurableCounterfactualReplay, DurableRetrievalReplayCapsule,
     FrozenReplayItem, REPLAY_ALGORITHM_VERSION, REPLAY_CLAIM_BOUNDARY, REPLAY_SCHEMA_VERSION,
