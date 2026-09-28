@@ -86,7 +86,7 @@ installation: |
 Current state:
 
 - Official MCP Registry already lists `io.github.samvallad33/vestige` at `https://registry.modelcontextprotocol.io/v0/servers?search=vestige`.
-- Smithery already lists Vestige and indexes 25 tools: `https://smithery.ai/server/@samvallad33/vestige`.
+- Smithery already lists Vestige (`https://smithery.ai/server/@samvallad33/vestige`). Vestige advertises 16 tools.
 - Glama already lists Vestige, but the listing needs a refresh/fix if it shows no tools: `https://glama.ai/mcp/servers/samvallad33/vestige`.
 - `mcp.so` does not show Vestige under the expected slugs yet; submit manually at `https://mcp.so/submit`.
 

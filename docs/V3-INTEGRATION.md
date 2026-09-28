@@ -37,15 +37,15 @@ applying its limit. The generated region is bounded to 10,000 UTF-8 bytes.
 Projection updates serialize Vestige writers and reject changed file snapshots;
 external editors do not share the writer lock.
 
-The expanded 15-tool catalog includes intention graph commands and complete
-maintenance schemas. Its integration baseline is 52,988 bytes; the common
+The expanded 16-tool catalog includes intention graph commands, complete
+maintenance schemas, and `purge`. Its integration baseline is 52,988 bytes; the common
 recall/smart_ingest/memory subset is below 13 KB. Full-catalog and subset budgets
 are tested separately. Progressive discovery reduces the definitions a client
 needs to send; clients that always send every tool still pay the full catalog.
 Byte reductions are not a measurement of provider charges.
 
-#239's additional purge tool and mandatory host interaction are not included:
-the existing memory purge action retains explicit `confirm=true`. #199's
+`purge` is advertised on its own. It requires `confirm=true` and uses the same
+path as `memory` action `purge`. #199's
 Pro/Operator promotion is separate from the open-source installation flow.
 
 Use `docs/V3-VALIDATION.md` for the local test commands and the task-cost examples
