@@ -206,26 +206,14 @@ impl SqliteMemoryStore {
     /// it, and cross-project retrieval is an explicit higher-level operation.
     pub fn recall_in_scope(&self, input: RecallInput, scope: &str) -> Result<Vec<KnowledgeNode>> {
         let scope = Self::normalize_scope(scope)?;
+        // w1b search collapse: vector retrieval is removed. Keyword/exact
+        // retrieval is the only retrieval until the exact resolver lands, so
+        // Semantic and Hybrid modes deliberately take the FTS5 keyword path
+        // (Semantic previously routed through the deleted embedding index).
         let nodes = match input.search_mode {
-            SearchMode::Keyword => {
+            SearchMode::Keyword | SearchMode::Semantic | SearchMode::Hybrid => {
                 self.keyword_search(&input.query, input.limit, input.min_retention)?
             }
-            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-            SearchMode::Semantic => {
-                if !self.vector_search_available() {
-                    self.keyword_search(&input.query, input.limit, input.min_retention)?
-                } else {
-                    let results = self.semantic_search(&input.query, input.limit, 0.3)?;
-                    results.into_iter().map(|r| r.node).collect()
-                }
-            }
-            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-            SearchMode::Hybrid => {
-                let results = self.hybrid_search(&input.query, input.limit, 0.3, 0.7)?;
-                results.into_iter().map(|r| r.node).collect()
-            }
-            #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
-            _ => self.keyword_search(&input.query, input.limit, input.min_retention)?,
         };
 
         // Retrieval is evidence that a memory was shown, not evidence that it
@@ -633,50 +621,13 @@ impl SqliteMemoryStore {
         }
     }
 
-    /// Semantic search
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-    pub fn semantic_search(
-        &self,
-        query: &str,
-        limit: i32,
-        min_similarity: f32,
-    ) -> Result<Vec<SimilarityResult>> {
-        let Some(index_lock) = self.vector_index.as_ref() else {
-            return Err(StorageError::Init(
-                "Vector search unavailable: disabled for this machine".to_string(),
-            ));
-        };
-
-        if !self.active_embedding_runtime_ready()? {
-            return Err(StorageError::Init("Embedding model not ready".to_string()));
-        }
-
-        let query_embedding = self.get_query_embedding(query)?;
-
-        self.refresh_vector_index_if_stale();
-        let index = index_lock
-            .lock()
-            .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
-
-        let results = index
-            .search_with_threshold(&query_embedding, limit as usize, min_similarity)
-            .map_err(|e| StorageError::Init(format!("Vector search failed: {}", e)))?;
-
-        let mut similarity_results = Vec::with_capacity(results.len());
-
-        for (node_id, similarity) in results {
-            if let Some(node) = self.get_node(&node_id)?
-                && node.has_embedding == Some(true)
-            {
-                similarity_results.push(SimilarityResult { node, similarity });
-            }
-        }
-
-        Ok(similarity_results)
-    }
-
-    /// Hybrid search (delegates to hybrid_search_filtered with no type filters)
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    /// Hybrid search (delegates to hybrid_search_filtered with no type filters).
+    ///
+    /// w1b search collapse: this is keyword-only retrieval. The semantic leg
+    /// (embedding-table join, vector score fusion, RRF-with-vector) was
+    /// removed; `keyword_weight`/`semantic_weight` are accepted to keep the
+    /// public signature unchanged and are inert — see
+    /// [`Self::hybrid_search_filtered`].
     pub fn hybrid_search(
         &self,
         query: &str,
@@ -687,14 +638,23 @@ impl SqliteMemoryStore {
         self.hybrid_search_filtered(query, limit, keyword_weight, semantic_weight, None, None)
     }
 
-    /// Hybrid search with optional type filtering pushed into the storage layer.
+    /// Keyword-only hybrid search with optional type filtering.
     ///
     /// When `include_types` is `Some`, only nodes whose `node_type` matches one of
     /// the given strings are returned. When `exclude_types` is `Some`, nodes whose
     /// `node_type` matches are excluded. `include_types` takes precedence over
     /// `exclude_types`. Both are case-sensitive and compared against the stored
     /// `node_type` value.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    ///
+    /// w1b search collapse: vector retrieval is removed from this store;
+    /// keyword/exact retrieval is the only retrieval until the exact
+    /// resolver lands. The former keyword-only fallback (previously built
+    /// only without the `embeddings`+`vector-search` features) is now THE
+    /// implementation, unconditional. `keyword_weight` and
+    /// `semantic_weight` are accepted purely to keep the public signature
+    /// unchanged and are deliberately ignored — ranking is FTS5 term-match
+    /// order, so a nonzero `semantic_weight` must behave identically to
+    /// `semantic_weight = 0`.
     pub fn hybrid_search_filtered(
         &self,
         query: &str,
@@ -704,171 +664,7 @@ impl SqliteMemoryStore {
         include_types: Option<&[String]>,
         exclude_types: Option<&[String]>,
     ) -> Result<Vec<SearchResult>> {
-        let has_type_filter = include_types.is_some() || exclude_types.is_some();
-        // Over-fetch more aggressively when type filters are active so that
-        // after filtering we still have enough candidates to fill `limit`.
-        let overfetch_factor = if has_type_filter { 4 } else { 2 };
-
-        let keyword_results = self.keyword_search_with_scores(
-            query,
-            limit * overfetch_factor,
-            include_types,
-            exclude_types,
-        )?;
-
-        let semantic_results =
-            if self.vector_search_available() && self.active_embedding_runtime_ready()? {
-                self.semantic_search_raw(query, limit * overfetch_factor)?
-            } else {
-                vec![]
-            };
-
-        // Reciprocal Rank Fusion (k=60) when both lists are present: it is scale-free
-        // and rewards a memory that appears in BOTH the keyword and semantic lists —
-        // exactly the structurally-similar-different-words paraphrase that linear
-        // max-norm fusion buried. Falls back to linear when only one list exists.
-        // (keyword_weight/semantic_weight retained in the signature for compatibility;
-        // RRF is rank-based so the weights no longer scale the fused score.)
         let _ = (keyword_weight, semantic_weight);
-        let combined = if !semantic_results.is_empty() {
-            reciprocal_rank_fusion(&keyword_results, &semantic_results, 60.0)
-        } else {
-            keyword_results.clone()
-        };
-
-        let mut results = Vec::with_capacity(limit as usize);
-
-        for (node_id, combined_score) in combined.into_iter() {
-            if results.len() >= limit as usize {
-                break;
-            }
-            if let Some(node) = self.get_node(&node_id)? {
-                // Apply type filtering for results that came from semantic search
-                // (keyword search already filters in SQL, but semantic search cannot)
-                if let Some(includes) = include_types {
-                    if !includes.iter().any(|t| t == &node.node_type) {
-                        continue;
-                    }
-                } else if let Some(excludes) = exclude_types
-                    && excludes.iter().any(|t| t == &node.node_type)
-                {
-                    continue;
-                }
-                let keyword_score = keyword_results
-                    .iter()
-                    .find(|(id, _)| id == &node_id)
-                    .map(|(_, s)| *s);
-                let semantic_score = semantic_results
-                    .iter()
-                    .find(|(id, _)| id == &node_id)
-                    .map(|(_, s)| *s);
-
-                let match_type = match (keyword_score.is_some(), semantic_score.is_some()) {
-                    (true, true) => MatchType::Both,
-                    (true, false) => MatchType::Keyword,
-                    (false, true) => MatchType::Semantic,
-                    (false, false) => MatchType::Keyword,
-                };
-
-                // Carry the RRF fused score as the relevance signal, NOT a linear
-                // kw*w + sem*w recomputation. RRF is what selected these candidates
-                // and rewards both-list agreement; overwriting it with the linear
-                // weighted_score made the final ranking diverge from RRF order
-                // (a both-list paraphrase could rank below a keyword-only hit).
-                // The min-max normalization in the rerank below then operates on
-                // RRF scores, so final relevance ordering matches RRF ordering.
-                results.push(SearchResult {
-                    node,
-                    keyword_score,
-                    semantic_score,
-                    combined_score,
-                    match_type,
-                });
-            }
-        }
-
-        // Three-signal reranking (Park et al. Generative Agents 2023)
-        // final_score = 0.2*recency + 0.3*importance + 0.5*relevance
-        //
-        // relevance MUST live in [0,1] for the weights to balance. The raw
-        // weighted_score does not: keyword-only results max out at
-        // `1.0 * keyword_weight` (0.3 by default), so the strongest match's
-        // relevance term was capped at 0.5*0.3 = 0.15 and lost to recency (up to
-        // 0.2) or importance (up to 0.3) — a fresh, weakly-relevant node could
-        // outrank the best match. Min-max normalize relevance across the result
-        // set so the best match scores ~1.0 regardless of the weight scaling.
-        let (min_rel, max_rel) = results
-            .iter()
-            .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), r| {
-                (mn.min(r.combined_score), mx.max(r.combined_score))
-            });
-        let rel_span = (max_rel - min_rel) as f64;
-
-        let now = Utc::now();
-        for result in &mut results {
-            let hours_since = (now - result.node.last_accessed).num_seconds() as f64 / 3600.0;
-            let recency = 0.995_f64.powf(hours_since.max(0.0));
-
-            // ACT-R activation as importance signal (pre-computed during consolidation)
-            let activation: f64 = self
-                .reader
-                .lock()
-                .map(|r| {
-                    r.query_row(
-                        "SELECT COALESCE(activation, 0.0) FROM knowledge_nodes WHERE id = ?1",
-                        params![result.node.id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0.0)
-                })
-                .unwrap_or(0.0);
-            // Normalize ACT-R activation [-2, 5] → [0, 1]
-            let importance = ((activation + 2.0) / 7.0).clamp(0.0, 1.0);
-
-            // Min-max normalized relevance in [0,1]. When every result ties
-            // (span 0), fall back to 1.0 so relevance still dominates ranking.
-            let relevance = if rel_span > f64::EPSILON {
-                (result.combined_score - min_rel) as f64 / rel_span
-            } else {
-                1.0
-            };
-
-            let final_score = 0.2 * recency + 0.3 * importance + 0.5 * relevance;
-            result.combined_score = final_score as f32;
-        }
-
-        results.sort_by(|a, b| {
-            b.combined_score
-                .partial_cmp(&a.combined_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        Ok(results)
-    }
-
-    /// Keyword-only fallback for builds without local embeddings/vector search.
-    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
-    pub fn hybrid_search(
-        &self,
-        query: &str,
-        limit: i32,
-        _keyword_weight: f32,
-        _semantic_weight: f32,
-    ) -> Result<Vec<SearchResult>> {
-        self.hybrid_search_filtered(query, limit, 1.0, 0.0, None, None)
-    }
-
-    /// Keyword-only fallback for builds without local embeddings/vector search.
-    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
-    pub fn hybrid_search_filtered(
-        &self,
-        query: &str,
-        limit: i32,
-        _keyword_weight: f32,
-        _semantic_weight: f32,
-        include_types: Option<&[String]>,
-        exclude_types: Option<&[String]>,
-    ) -> Result<Vec<SearchResult>> {
         let nodes = self.search_terms(query, limit.max(1) * 4)?;
         let mut results = Vec::new();
 
@@ -898,97 +694,6 @@ impl SqliteMemoryStore {
         }
 
         Ok(results)
-    }
-
-    /// Keyword search returning scores, with optional type filtering in the SQL query.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-    pub(super) fn keyword_search_with_scores(
-        &self,
-        query: &str,
-        limit: i32,
-        include_types: Option<&[String]>,
-        exclude_types: Option<&[String]>,
-    ) -> Result<Vec<(String, f32)>> {
-        // Use individual-term matching (implicit AND) so multi-word queries find
-        // documents where all words appear anywhere, not just as adjacent phrases.
-        use crate::fts::sanitize_fts5_terms;
-        let Some(terms_query) = sanitize_fts5_terms(query) else {
-            return Ok(vec![]);
-        };
-
-        // Build the type filter clause and collect parameter values.
-        // We use numbered parameters: ?1 = query, ?2 = limit, ?3.. = type strings.
-        let mut type_clause = String::new();
-        let type_values: Vec<&str>;
-
-        if let Some(includes) = include_types {
-            if !includes.is_empty() {
-                let placeholders: Vec<String> =
-                    (0..includes.len()).map(|i| format!("?{}", i + 3)).collect();
-                type_clause = format!(" AND n.node_type IN ({})", placeholders.join(","));
-                type_values = includes.iter().map(|s| s.as_str()).collect();
-            } else {
-                type_values = vec![];
-            }
-        } else if let Some(excludes) = exclude_types {
-            if !excludes.is_empty() {
-                let placeholders: Vec<String> =
-                    (0..excludes.len()).map(|i| format!("?{}", i + 3)).collect();
-                type_clause = format!(" AND n.node_type NOT IN ({})", placeholders.join(","));
-                type_values = excludes.iter().map(|s| s.as_str()).collect();
-            } else {
-                type_values = vec![];
-            }
-        } else {
-            type_values = vec![];
-        }
-
-        let sql = format!(
-            "SELECT n.id, rank FROM knowledge_nodes n
-             JOIN knowledge_fts fts ON n.id = fts.id
-             WHERE knowledge_fts MATCH ?1{}
-             ORDER BY rank
-             LIMIT ?2",
-            type_clause
-        );
-
-        let reader = self
-            .reader
-            .lock()
-            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
-        let mut stmt = reader.prepare(&sql)?;
-
-        // Build the parameter list: [query, limit, ...type_values]
-        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        param_values.push(Box::new(terms_query));
-        param_values.push(Box::new(limit));
-        for tv in &type_values {
-            param_values.push(Box::new(tv.to_string()));
-        }
-        let params_ref: Vec<&dyn rusqlite::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
-
-        let results: Vec<(String, f32)> = stmt
-            .query_map(params_ref.as_slice(), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)? as f32))
-            })?
-            .filter_map(warn_skipped_row("keyword_search_with_scores"))
-            .map(|(id, rank)| (id, (-rank).max(0.0)))
-            .collect();
-
-        if results.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let max_score = results.iter().map(|(_, s)| *s).fold(0.0_f32, f32::max);
-        if max_score > 0.0 {
-            Ok(results
-                .into_iter()
-                .map(|(id, s)| (id, s / max_score))
-                .collect())
-        } else {
-            Ok(results)
-        }
     }
 
     /// Query memories valid at a specific time
@@ -1099,5 +804,124 @@ impl SqliteMemoryStore {
             result.push(node?);
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod w1b_search_collapse_tests {
+    //! Regression guards for the w1b search collapse: keyword/exact retrieval
+    //! is the only retrieval. These live in search.rs (not tests.rs) because
+    //! tests.rs still carries vector-era helpers pending the cross-scope
+    //! cleanup tracked in SCOPE-HANDOFF.md.
+
+    use super::*;
+
+    fn fresh_store(dir: &tempfile::TempDir, tag: &str) -> SqliteMemoryStore {
+        SqliteMemoryStore::new(Some(dir.path().join(format!("w1b-{tag}.db"))))
+            .expect("store opens")
+    }
+
+    fn summary(results: &[SearchResult]) -> Vec<(String, Option<f32>, Option<f32>, f32, MatchType)> {
+        results
+            .iter()
+            .map(|r| {
+                (
+                    r.node.id.clone(),
+                    r.keyword_score,
+                    r.semantic_score,
+                    r.combined_score,
+                    r.match_type,
+                )
+            })
+            .collect()
+    }
+
+    /// `semantic_weight > 0` must behave identically to `semantic_weight = 0`:
+    /// the parameter is inert now that the semantic leg is gone.
+    #[test]
+    fn hybrid_search_filtered_semantic_weight_is_inert() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = fresh_store(&dir, "inert-weight");
+        for content in [
+            "wombat lantern protocol handles nightly signal routing",
+            "wombat lantern maintenance schedule and inspection points",
+            "unrelated tropical greenhouse irrigation notes",
+        ] {
+            store
+                .ingest(crate::memory::IngestInput {
+                    content: content.to_string(),
+                    node_type: "fact".to_string(),
+                    ..Default::default()
+                })
+                .expect("ingest");
+        }
+
+        let zero = store
+            .hybrid_search_filtered("wombat lantern", 10, 0.3, 0.0, None, None)
+            .expect("semantic_weight=0 search");
+        let positive = store
+            .hybrid_search_filtered("wombat lantern", 10, 0.3, 0.9, None, None)
+            .expect("semantic_weight=0.9 search");
+
+        assert!(
+            !zero.is_empty(),
+            "test is vacuous unless the keyword leg finds the wombat lantern facts"
+        );
+        assert_eq!(summary(&zero), summary(&positive));
+
+        // The collapse contract: every hit is keyword-only, never semantic.
+        for result in zero.iter().chain(positive.iter()) {
+            assert_eq!(result.match_type, MatchType::Keyword);
+            assert!(result.semantic_score.is_none());
+            assert!(result.keyword_score.is_some());
+        }
+    }
+
+    /// Inertness must hold under type filters too (they interact with the old
+    /// semantic leg's post-filtering path, which no longer exists).
+    #[test]
+    fn hybrid_search_filtered_semantic_weight_inert_with_type_filters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = fresh_store(&dir, "inert-weight-filtered");
+        for (content, node_type) in [
+            ("kelp forest canopy drift measurements", "fact"),
+            ("kelp forest harvesting tool inventory", "decision"),
+            ("kelp forest is not a keyword in this type", "pattern"),
+        ] {
+            store
+                .ingest(crate::memory::IngestInput {
+                    content: content.to_string(),
+                    node_type: node_type.to_string(),
+                    ..Default::default()
+                })
+                .expect("ingest");
+        }
+
+        let include = vec!["fact".to_string(), "decision".to_string()];
+        let exclude = vec!["pattern".to_string()];
+
+        for (include_types, exclude_types) in [
+            (Some(include.as_slice()), None),
+            (None, Some(exclude.as_slice())),
+        ] {
+            let zero = store
+                .hybrid_search_filtered("kelp forest", 10, 0.5, 0.0, include_types, exclude_types)
+                .expect("semantic_weight=0 filtered search");
+            let positive = store
+                .hybrid_search_filtered("kelp forest", 10, 0.5, 1.0, include_types, exclude_types)
+                .expect("semantic_weight=1.0 filtered search");
+
+            assert_eq!(summary(&zero), summary(&positive));
+            for result in &zero {
+                assert_eq!(result.match_type, MatchType::Keyword);
+                assert!(result.semantic_score.is_none());
+                if let Some(includes) = include_types {
+                    assert!(includes.contains(&result.node.node_type));
+                }
+                if let Some(excludes) = exclude_types {
+                    assert!(!excludes.contains(&result.node.node_type));
+                }
+            }
+        }
     }
 }

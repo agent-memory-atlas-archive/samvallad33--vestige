@@ -99,10 +99,17 @@ impl SqliteMemoryStore {
     ///
     /// Ordinary retrieval must use [`Self::record_batch_retrieval`] instead:
     /// being shown in search is not evidence that a memory was correct or
-    /// useful. This helper remains for explicit duplicate/reinforcement flows.
-    /// It implements the Testing Effect (Roediger & Karpicke 2006) + v1.4.0
-    /// content-aware cross-memory reinforcement: semantically similar neighbors
-    /// receive a diminished boost proportional to cosine similarity.
+    /// useful. This helper remains for explicit duplicate/reinforcement flows
+    /// and implements the Testing Effect (Roediger & Karpicke 2006).
+    ///
+    /// w1b search collapse: the cross-memory neighbor boost that used to run
+    /// here (top-6 HNSW neighbors at similarity >= 0.7, boosted by
+    /// `0.02 * similarity`) was deleted together with vector retrieval.
+    /// Co-access reinforcement already exists exactly and cheaply in
+    /// [`Self::strengthen_narrative_edges`], which links memories repeatedly
+    /// retrieved together via `memory_connections` / the access log — no
+    /// embedding similarity required — and fires from
+    /// [`Self::record_batch_retrieval`].
     pub fn strengthen_on_access(&self, id: &str) -> Result<()> {
         let now = Utc::now();
 
@@ -130,44 +137,6 @@ impl SqliteMemoryStore {
 
         // This is a deliberate reinforcement, not a passive search hit.
         let _ = self.log_access(id, "reinforce");
-
-        // Content-aware cross-memory reinforcement: boost semantically similar neighbors
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        {
-            if let Some(index) = self.vector_index.as_ref()
-                && let Ok(Some(embedding)) = self.get_node_embedding(id)
-            {
-                let index = index
-                    .lock()
-                    .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
-
-                // Query top-6 similar (one will be self, so we get ~5 neighbors)
-                let neighbors_result = index.search(&embedding, 6);
-                drop(index);
-
-                if let Ok(neighbors) = neighbors_result {
-                    let writer = self
-                        .writer
-                        .lock()
-                        .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
-                    for (neighbor_id, similarity) in neighbors {
-                        if neighbor_id == id || similarity < 0.7 {
-                            continue;
-                        }
-                        // Diminished boost: 0.02 * similarity (max ~0.02)
-                        let boost = 0.02 * similarity as f64;
-                        let retention_boost = 0.008 * similarity as f64;
-                        let _ = writer.execute(
-                            "UPDATE knowledge_nodes SET
-                                retrieval_strength = MIN(1.0, retrieval_strength + ?1),
-                                retention_strength = MIN(1.0, retention_strength + ?2)
-                            WHERE id = ?3",
-                            params![boost, retention_boost, neighbor_id],
-                        );
-                    }
-                }
-            }
-        }
 
         Ok(())
     }
