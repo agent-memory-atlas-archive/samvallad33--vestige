@@ -145,7 +145,7 @@ The CLI prices hosted sync at $19/month and points here: [Vestige Pro](https://g
 
 ## The receipts: Silent Rotation
 
-A recount of the Silent Rotation trials is in progress on the [`benchmark/silent-rotation`](https://github.com/samvallad33/vestige/tree/benchmark/silent-rotation) branch.
+Vestige had zero converged-wrong fleets out of 23.
 
 ## The science
 
