@@ -123,7 +123,8 @@ In Vestige's implementation:
 
 In Vestige:
 ```
-importance_score(
+maintain(
+  action="importance_score",
   content="the-important content",
   context_topics=["release", "memory"]
 )
@@ -137,14 +138,11 @@ When you flag something important, it strengthens ALL memories from the surround
 
 Based on **Tulving's Encoding Specificity (1973)**: we remember better when retrieval context matches encoding context.
 
-The `context` tool exploits this:
+`recall` exploits this:
 ```
-context(
+recall(
   query="error handling patterns",
-  project="my-api",
-  topics=["authentication"],
-  time_weight=0.3,
-  topic_weight=0.4
+  context_topics=["authentication"]
 )
 ```
 

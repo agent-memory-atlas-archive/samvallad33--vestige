@@ -206,13 +206,14 @@ In Vestige's current implementation:
 
 In Vestige's implementation:
 ```
-importance_score(
+maintain(
+  action="importance_score",
   content="the-important content",
   context_topics=["release", "memory"]
 )
 ```
 
-**Use case**: You realize mid-conversation that the architecture decision from 2 hours ago was pivotal. Call `importance` to retroactively strengthen it AND all related memories from that time window.
+**Use case**: You realize mid-conversation that the architecture decision from 2 hours ago was pivotal. Call `maintain` with `action="importance_score"` to retroactively strengthen it AND all related memories from that time window.
 
 *Based on neuroscience research showing synaptic consolidation windows of several hours. Vestige uses 9 hours backward and 2 hours forward by default, which can be configured per call.*
 </details>
@@ -289,15 +290,11 @@ This is how Claude can remember to follow up on things across sessions.
 
 Based on **Tulving's Encoding Specificity (1973)**: we remember better when retrieval context matches encoding context.
 
-The `context` tool exploits this:
+`recall` exploits this:
 ```
-context(
+recall(
   query="error handling patterns",
-  project="my-api",           # Project context
-  topics=["authentication"],  # Topic context
-  mood="neutral",             # Emotional context
-  time_weight=0.3,           # Weight for temporal matching
-  topic_weight=0.4           # Weight for topic matching
+  context_topics=["authentication"]
 )
 ```
 
@@ -307,7 +304,7 @@ context(
 <details>
 <summary><b>"What's the difference between all the search tools?"</b></summary>
 
-In v1.1, they're unified into one `search` tool that automatically uses hybrid search. But understanding the underlying methods helps:
+They're unified into one `recall` tool that automatically uses hybrid search. But understanding the underlying methods helps:
 
 | Method | How It Works | Best For |
 |--------|--------------|----------|
@@ -315,7 +312,7 @@ In v1.1, they're unified into one `search` tool that automatically uses hybrid s
 | **Semantic** | Embedding cosine similarity | Conceptual matching, synonyms |
 | **Hybrid (RRF)** | Combines both with rank fusion | Everything (default) |
 
-The unified `search` always uses hybrid, which gives you the best of both worlds.
+The unified `recall` always uses hybrid, which gives you the best of both worlds.
 </details>
 
 <details>
@@ -323,7 +320,7 @@ The unified `search` always uses hybrid, which gives you the best of both worlds
 
 Three approaches:
 
-1. **Mark as important**: `importance_score(content="...", event_type="user_flag")`
+1. **Mark as important**: `maintain(action="importance_score", content="...")`
 2. **Review when needed**: Retrieval is audit-only, so it never pins stale memories
 3. **Promote explicitly**: `memory(action="promote", id="xxx")` after it proves valuable
 
@@ -799,14 +796,14 @@ Contributions welcome!
 See [CLAUDE-SETUP.md](CLAUDE-SETUP.md) for the full template. The key elements:
 
 **Session Start**:
-1. Load identity: `search(query="my preferences my style who I am")`
+1. Load identity: `recall(query="my preferences my style who I am")`
 2. Load project context: `codebase(action="get_context", codebase="[project]")`
 3. Check reminders: `intention(action="check")`
 
 **During Work**:
 - Notice a pattern? `codebase(action="remember_pattern")`
 - Made a decision? `codebase(action="remember_decision")` with rationale
-- Something important? `importance_score(content="...")` to score it before saving or promoting
+- Something important? `maintain(action="importance_score", content="...")` to score it before saving or promoting
 
 **Memory Hygiene**:
 - When a memory helps: `memory(action="promote", id="...")`
@@ -871,7 +868,7 @@ touched by this repair.
 Rehearse the upgrade before you trust it:
 
 ```bash
-vestige-cli upgrade --dry-run
+vestige upgrade --dry-run
 ```
 
 This copies your store to a temp directory, runs every migration and strict
@@ -881,7 +878,7 @@ the original untouched. Add `--data-dir <dir>` to target a specific store.
 If a store still refuses to open, `VESTIGE_DISABLE_VECTOR_SEARCH=1` starts the
 server in keyword-only mode so nothing is blocked while you sort it out.
 
-Note that `vestige-cli health` and `vestige-cli consolidate` run without an
+Note that `vestige health` and `vestige consolidate` run without an
 embedding runtime. "Embedding Service: not started by the CLI" is a statement
 about that process, not about your store; the MCP server owns the embedder and
 fills missing vectors in the background.

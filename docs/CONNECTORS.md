@@ -97,7 +97,7 @@ the saved `cursor`, whether it ran authenticated, and a `hint` for the next step
 
 ## Investigation filters (Phase 4)
 
-`search` accepts source-aware filters so an agent can scope a query to indexed
+`recall` accepts source-aware filters so an agent can scope a query to indexed
 records. All are optional post-filters; combine with a larger `limit` if you
 expect heavy thinning. A source-scoped query excludes non-connector memories.
 

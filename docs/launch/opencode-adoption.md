@@ -119,5 +119,5 @@ High-signal channels after release:
 - `opencode debug config` accepts `mcp.vestige`.
 - `opencode mcp list` shows `vestige connected`.
 - Stale `mcpServers.vestige` examples fail in OpenCode and are migrated by `@vestige/init`.
-- OpenCode tools are prefixed as `vestige_search`, `vestige_smart_ingest`, `vestige_session_context`, and `vestige_deep_reference`.
+- OpenCode tools are prefixed as `vestige_recall`, `vestige_smart_ingest`, and `vestige_session_start`.
 - The OpenCode guide says `timeout: 60000` for direct `npx` and `timeout: 10000` for installed binaries.

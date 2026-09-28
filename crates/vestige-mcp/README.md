@@ -57,15 +57,10 @@ HTTP and dashboard bearer tokens are generated locally; see
 The server exposes the current unified MCP tools from
 [`src/server.rs`](src/server.rs), including:
 
-- `session_context`
+- `backfill`, `codebase`, `dedup`, `graph`, `intention`, `maintain`
+- `memory`, `memory_status`, `project`, `purge`, `recall`
 - `receipt` (inspect persisted retrieval receipts and run controlled evidence replay)
-- `search`, `smart_ingest`, `memory`, `codebase`, `intention`
-- `deep_reference`, `cross_reference`, `contradictions`
-- `dream`, `explore_connections`, `predict`
-- `memory_health`, `memory_graph`, `composed_graph`, `system_status`
-- `importance_score`, `find_duplicates`
-- `consolidate`, `memory_timeline`, `memory_changelog`
-- `backup`, `export`, `restore`, `gc`, `suppress`
+- `session_start`, `smart_ingest`, `source_sync`, `suppress`
 
 For the receipt workflow, replay claim boundary, signature status, durability,
 and privacy limits, see [`docs/DECISION_RECEIPTS.md`](../../docs/DECISION_RECEIPTS.md).

@@ -20,7 +20,7 @@ Useful memories include:
 - bug fixes: "OpenCode rejects `mcpServers`; use top-level `mcp.vestige` with a command array"
 - workflow state: "PR #67 was merged, but the config shape needed correction before promotion"
 
-Vestige is local-first. Memories are stored in SQLite on your machine, can be scoped globally or per project, and are retrieved with tools like `vestige_session_context`, `vestige_search`, `vestige_smart_ingest`, and `vestige_deep_reference`.
+Vestige is local-first. Memories are stored in SQLite on your machine, can be scoped globally or per project, and are retrieved with tools like `vestige_session_start`, `vestige_recall`, and `vestige_smart_ingest`.
 
 ---
 
@@ -100,7 +100,7 @@ You should see `vestige` listed. In a session, ask:
 
 > "What MCP tools can you use?"
 
-Vestige tools should be available with the `vestige_` prefix, such as `vestige_search`, `vestige_smart_ingest`, `vestige_session_context`, and `vestige_deep_reference`.
+Vestige tools should be available with the `vestige_` prefix, such as `vestige_recall`, `vestige_smart_ingest`, and `vestige_session_start`.
 
 ---
 

@@ -16,7 +16,7 @@ At the start of every conversation, check Vestige for context:
 2. Recall relevant project context
 3. Operate in proactive memory mode - save important info without being asked
 
-Query: `search` with "user preferences" and "instructions"
+Query: `recall` with "user preferences" and "instructions"
 ```
 
 ---
@@ -126,8 +126,8 @@ For users who want Claude to maintain a persistent identity:
 
 ```markdown
 ### Identity Recall (Every Session Start)
-1. `search` query="my identity my name who I am"
-2. `search` query="user preferences [username]"
+1. `recall` query="my identity my name who I am"
+2. `recall` query="user preferences [username]"
 3. `intention(action="check")` for pending commitments
 
 ### Identity Storage
@@ -168,7 +168,7 @@ This project uses Vestige for persistent context.
 
 ### On Session Start
 - `codebase(action="get_context", codebase="[project-name]")`
-- `search` query="[project-name] architecture decisions"
+- `recall` query="[project-name] architecture decisions"
 
 ### When Making Decisions
 - Use `codebase(action="remember_decision")` for all architectural choices
@@ -191,7 +191,7 @@ The most comprehensive setup for getting the most out of Vestige:
 You have persistent memory via Vestige. Use it intelligently:
 
 ### Session Start
-1. Load my identity: `search(query="my preferences my style who I am")`
+1. Load my identity: `recall(query="my preferences my style who I am")`
 2. Load project context: `codebase(action="get_context", codebase="[project]")`
 3. Check reminders: `intention(action="check")`
 
@@ -199,7 +199,7 @@ You have persistent memory via Vestige. Use it intelligently:
 - Notice a pattern? `codebase(action="remember_pattern")`
 - Made a decision? `codebase(action="remember_decision")` with rationale
 - I mention a preference? `smart_ingest` it
-- Something important? `importance_score` to check if worth saving
+- Something important? `maintain` (`action="importance_score"`) to check if worth saving
 - Need to follow up? `intention(action="set")`
 
 ### Session End
