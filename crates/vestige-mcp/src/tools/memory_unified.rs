@@ -59,6 +59,10 @@ pub fn schema() -> Value {
                 "type": "string",
                 "description": "Why (optional, logged)."
             },
+            "role": {
+                "type": "string",
+                "description": "[promote/demote] CLAIMED role for provenance. Resolved against the operator-controlled policy; claims never override the process identity or self-grant authority. Unregistered claims stay neutral at 1.0."
+            },
             "confirm": {
                 "type": "boolean",
                 "description": "Required for purge and delete. Removes canonical content and embeddings; legacy audit and sync rows keep opaque markers, so this is not verified unlearning.",
@@ -82,6 +86,10 @@ struct MemoryArgs {
     reason: Option<String>,
     confirm: Option<bool>,
     content: Option<String>,
+    /// #252 Phase A: claimed role for provenance. Never overrides the
+    /// process identity and never self-grants authority.
+    #[serde(alias = "claimed_role")]
+    role: Option<String>,
 }
 
 /// Execute the unified memory tool
@@ -95,6 +103,10 @@ pub fn purge_schema() -> Value {
             "id": {
                 "description": "Memory UUID to purge (for good; confirm=true).",
                 "type": "string"
+            },
+            "role": {
+                "type": "string",
+                "description": "[promote/demote] CLAIMED role for provenance. Resolved against the operator-controlled policy; claims never override the process identity or self-grant authority. Unregistered claims stay neutral at 1.0."
             },
             "confirm": {
                 "description": "Required: purge is irreversible. Content and embeddings are removed; legacy audit/sync rows keep only opaque markers.",
@@ -163,8 +175,12 @@ pub async fn execute(
             .await
         }
         "state" => execute_state(storage, &id).await,
-        "promote" => execute_promote(storage, cognitive, &id, args.reason).await,
-        "demote" => execute_demote(storage, cognitive, &id, args.reason).await,
+        "promote" => {
+            execute_promote(storage, cognitive, &id, args.reason, args.role.as_deref()).await
+        }
+        "demote" => {
+            execute_demote(storage, cognitive, &id, args.reason, args.role.as_deref()).await
+        }
         "edit" => execute_edit(storage, &id, args.content).await,
         _ => Err(format!(
             "Invalid action '{}'. Must be one of: get, get_batch, delete, purge, state, promote, demote, edit",
@@ -369,13 +385,30 @@ async fn execute_promote(
     cognitive: &Arc<Mutex<CognitiveEngine>>,
     id: &str,
     reason: Option<String>,
+    claimed_role: Option<&str>,
 ) -> Result<Value, String> {
     let before = storage
         .get_node(id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Node not found: {}", id))?;
 
-    let node = storage.promote_memory(id).map_err(|e| e.to_string())?;
+    // #252 Phase A: with a bound process actor, the promote is an
+    // actor-attributed endorsement — mutation, evidence, and receipt commit
+    // in one transaction, and same-actor retries never accumulate votes.
+    // Without a bound actor the historical path runs unchanged.
+    let endorsement = if storage.process_actor_did().is_some() {
+        Some(
+            storage
+                .promote_memory_as_actor(id, claimed_role, "memory")
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+    let node = match &endorsement {
+        Some(outcome) => outcome.node.clone(),
+        None => storage.promote_memory(id).map_err(|e| e.to_string())?,
+    };
 
     // Cognitive feedback pipeline
     if let Ok(mut cog) = cognitive.try_lock() {
@@ -392,7 +425,7 @@ async fn execute_promote(
         }
     }
 
-    Ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "success": true,
         "action": "promoted",
         "nodeId": node.id,
@@ -416,7 +449,12 @@ async fn execute_promote(
         },
         "message": format!("Memory promoted. It will now surface more often in searches. Retrieval: {:.2} -> {:.2}",
             before.retrieval_strength, node.retrieval_strength),
-    }))
+    });
+    if let Some(outcome) = &endorsement {
+        result["actor"] = crate::actor_surface::actor_block(&outcome.endorsement);
+        result["endorsement"] = crate::actor_surface::endorsement_block(outcome);
+    }
+    Ok(result)
 }
 
 /// Demote a memory (thumbs down) — decreases retrieval strength with cognitive feedback pipeline
@@ -425,13 +463,28 @@ async fn execute_demote(
     cognitive: &Arc<Mutex<CognitiveEngine>>,
     id: &str,
     reason: Option<String>,
+    claimed_role: Option<&str>,
 ) -> Result<Value, String> {
     let before = storage
         .get_node(id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Node not found: {}", id))?;
 
-    let node = storage.demote_memory(id).map_err(|e| e.to_string())?;
+    // #252 Phase A: negative feedback carries actor identity too (same
+    // transactional and idempotence contract as promote).
+    let endorsement = if storage.process_actor_did().is_some() {
+        Some(
+            storage
+                .demote_memory_as_actor(id, claimed_role, "memory")
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+    let node = match &endorsement {
+        Some(outcome) => outcome.node.clone(),
+        None => storage.demote_memory(id).map_err(|e| e.to_string())?,
+    };
 
     // Cognitive feedback pipeline
     if let Ok(mut cog) = cognitive.try_lock() {
@@ -448,7 +501,7 @@ async fn execute_demote(
         }
     }
 
-    Ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "success": true,
         "action": "demoted",
         "nodeId": node.id,
@@ -473,7 +526,12 @@ async fn execute_demote(
         "message": format!("Memory demoted. Better alternatives will now surface instead. Retrieval: {:.2} -> {:.2}",
             before.retrieval_strength, node.retrieval_strength),
         "note": "Memory is NOT deleted - it remains searchable but ranks lower."
-    }))
+    });
+    if let Some(outcome) = &endorsement {
+        result["actor"] = crate::actor_surface::actor_block(&outcome.endorsement);
+        result["endorsement"] = crate::actor_surface::endorsement_block(outcome);
+    }
+    Ok(result)
 }
 
 /// Edit a memory's content in-place — preserves FSRS state, regenerates embedding
@@ -1092,5 +1150,87 @@ mod tests {
         assert!(result.is_ok());
         let value = result.unwrap();
         assert_eq!(value["success"], true);
+    }
+
+    // === #252 PHASE A: ACTOR PROVENANCE (gates 1 and 2 at the tool layer) ===
+
+    #[tokio::test]
+    async fn test_promote_with_claimed_role_stays_neutral_and_records_endorsement() {
+        let (storage, _dir) = test_storage().await;
+        // Ingest BEFORE binding so the node is unattributed and a later
+        // support is a plain "support", not self-support.
+        let id = ingest_memory(&storage).await;
+        let actor = vestige_core::actor::ProcessActor::mint();
+        storage.set_process_actor(actor.did()).unwrap();
+
+        // Gate 1: claiming a privileged role without operator membership
+        // leaves the actor neutral at 1.0 — the claim never self-grants.
+        let args = serde_json::json!({ "action": "promote", "id": id, "role": "operator" });
+        let value = execute(&storage, &test_cognitive(), Some(args)).await.unwrap();
+        assert_eq!(value["actor"]["claimedRole"], "operator");
+        assert_eq!(value["actor"]["effectiveRole"], "unattributed");
+        assert_eq!(value["actor"]["resolvedWeight"], 1.0);
+        assert_eq!(value["actor"]["resolutionDisposition"], "unregistered_claim");
+        assert_eq!(value["actor"]["policyVersion"], 1);
+        assert_eq!(value["endorsement"]["kind"], "support");
+        assert!(value["endorsement"]["eventId"].as_str().is_some());
+        assert_eq!(value["endorsement"]["alreadyRecorded"], false);
+
+        // Gate 2: the same actor retrying — even under a different hat —
+        // does not create a second vote.
+        let retry = serde_json::json!({ "action": "promote", "id": id, "role": "qa" });
+        let value = execute(&storage, &test_cognitive(), Some(retry)).await.unwrap();
+        assert_eq!(value["endorsement"]["alreadyRecorded"], true);
+        let events = storage
+            .list_endorsement_events(Some(&id), None, 50)
+            .unwrap();
+        assert_eq!(events.len(), 1, "same-actor hats/retries are one stance");
+
+        // The endorsement binds the exact content revision.
+        assert_eq!(
+            events[0].revision_digest,
+            vestige_core::actor::revision_digest("Memory unified test content")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_demote_records_opposition_with_actor_identity() {
+        let (storage, _dir) = test_storage().await;
+        storage
+            .set_process_actor(vestige_core::actor::ProcessActor::mint().did())
+            .unwrap();
+        let id = ingest_memory(&storage).await;
+        let args = serde_json::json!({ "action": "demote", "id": id });
+        let value = execute(&storage, &test_cognitive(), Some(args)).await.unwrap();
+        assert_eq!(value["endorsement"]["kind"], "oppose");
+        assert!(value["actor"]["id"].as_str().unwrap().starts_with("did:key:z6Mk"));
+    }
+
+    #[tokio::test]
+    async fn test_promote_without_bound_actor_keeps_legacy_shape() {
+        let (storage, _dir) = test_storage().await;
+        let id = ingest_memory(&storage).await;
+        let args = serde_json::json!({ "action": "promote", "id": id });
+        let value = execute(&storage, &test_cognitive(), Some(args)).await.unwrap();
+        assert_eq!(value["success"], true);
+        assert!(value.get("actor").is_none(), "no bound actor, no provenance claim");
+        assert!(value.get("endorsement").is_none());
+        assert!(storage.list_endorsement_events(Some(&id), None, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_operator_granted_role_resolves_on_promote() {
+        let (storage, _dir) = test_storage().await;
+        let id = ingest_memory(&storage).await;
+        let did = vestige_core::actor::ProcessActor::mint().did().to_string();
+        storage.set_process_actor(&did).unwrap();
+        // Operator grants qa through the store (never through a tool call).
+        storage.grant_actor_role(&did, "qa", Some("operator reviewed")).unwrap();
+        let args = serde_json::json!({ "action": "promote", "id": id, "role": "qa" });
+        let value = execute(&storage, &test_cognitive(), Some(args)).await.unwrap();
+        assert_eq!(value["actor"]["effectiveRole"], "qa");
+        assert_eq!(value["actor"]["resolutionDisposition"], "granted");
+        assert!((value["actor"]["resolvedWeight"].as_f64().unwrap() - 1.10).abs() < 1e-9);
+        assert_eq!(value["endorsement"]["independentPrior"], 1.10);
     }
 }

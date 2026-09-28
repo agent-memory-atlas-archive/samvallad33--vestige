@@ -2,6 +2,8 @@
 //!
 //! Shared modules accessible to all binaries in the crate.
 
+pub mod actor_surface;
+
 pub mod autopilot;
 pub mod cognitive;
 pub mod dashboard;

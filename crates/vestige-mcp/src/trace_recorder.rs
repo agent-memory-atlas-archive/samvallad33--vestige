@@ -34,11 +34,11 @@ use vestige_core::storage::{
     },
 };
 use vestige_core::{
-    BACKFILL_RECEIPT_CLAIM_BOUNDARY, BACKFILL_RECEIPT_SCHEMA_V1, BackfillCandidateEvidence,
-    MemoryTraceEvent, REPLAY_SELECTION_BOUNDARY, Receipt, ReceiptEvidence, ReplayDecayRisk,
-    RetrievalReplayCapsuleDraft, RetrievalReplayItemDraft, Storage, SuppressReason,
-    SuppressedReceiptEntry, WriteSource, private_evidence_digest, replay_evidence_slot,
-    replay_policy_digest,
+    BACKFILL_RECEIPT_CLAIM_BOUNDARY, BACKFILL_RECEIPT_SCHEMA_V1, ActorProvenance,
+    BackfillCandidateEvidence, MemoryTraceEvent, REPLAY_SELECTION_BOUNDARY, Receipt,
+    ReceiptEvidence, ReplayDecayRisk, RetrievalReplayCapsuleDraft, RetrievalReplayItemDraft,
+    Storage, SuppressReason, SuppressedReceiptEntry, WriteSource, private_evidence_digest,
+    replay_evidence_slot, replay_policy_digest,
 };
 
 /// Opt-in environment configuration for the live receipt signer. The process
@@ -977,6 +977,10 @@ fn sign_retrieval_receipt(
 /// the activation path) — so the receipt is the auditable "nutrition label" for
 /// the answer and costs nothing extra to produce.
 ///
+/// `actor_provenance` (#252 Phase A) is the resolved actor/role block for the
+/// call, when the process actor is bound; it is recorded verbatim and never
+/// changes the answer.
+///
 /// Returns `None` for non-retrieval tools or empty results. When persistence
 /// fails, returns an explicit status object with no receipt id or payload, so a
 /// successful retrieval never implies it has durable receipt evidence.
@@ -985,6 +989,7 @@ pub fn build_and_save_receipt(
     run_id: &str,
     tool: &str,
     result: &serde_json::Value,
+    actor_provenance: Option<ActorProvenance>,
 ) -> Option<serde_json::Value> {
     if tool == "backfill" {
         return build_and_save_backfill_receipt(storage, run_id, result);
@@ -1034,6 +1039,9 @@ pub fn build_and_save_receipt(
         &trust_scores,
         Vec::new(),
     );
+    if let Some(provenance) = actor_provenance {
+        receipt = receipt.with_actor_provenance(provenance);
+    }
     let signing_result = configured_receipt_signer(storage).and_then(|signer| {
         let capsule_and_save = |receipt: &Receipt,
                                 signed: Option<(
@@ -2007,7 +2015,7 @@ mod tests {
         });
 
         let receipt_json =
-            build_and_save_receipt(&storage, "run_product_replay", "recall", &result)
+            build_and_save_receipt(&storage, "run_product_replay", "recall", &result, None)
                 .expect("retrieval should return its receipt");
         let receipt_id = receipt_json["receipt_id"]
             .as_str()

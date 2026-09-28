@@ -20,7 +20,7 @@
 //! handler — no lossy re-scoping required, and per-view fields validate as
 //! before. The `cognitive` lock is never held across a forwarded call.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -106,7 +106,7 @@ pub fn schema() -> Value {
         "properties": {
             "view": {
                 "type": "string",
-                "enum": ["health", "retention", "timeline", "changelog", "stats", "tools"],
+                "enum": ["health", "retention", "timeline", "changelog", "provenance", "stats", "tools"],
                 "default": "health",
                 "description": "'tools': current tool/action inventory, or one full schema with tool. 'health' (default): system health, stats, decay preview, warnings, structured diagnostics (with entity IDs and next actions), recommendations. 'retention': average, distribution, trend. 'timeline': memories by date, bounded by limit (returned/truncated are explicit). 'changelog': audit trail of consolidations, dreams, state transitions, and merge/supersede/undo/tag operations. 'stats': hygiene counts by type, tag, age, retention, and lifecycle, bounded detail lists, recommended actions with example IDs, and recent tag operations."
             },
@@ -172,10 +172,89 @@ pub async fn execute(
         "timeline" => super::timeline::execute(storage, output_config, args).await,
         "changelog" => super::changelog::execute(storage, args).await,
         "stats" => super::hygiene_stats::execute(storage, args).await,
+        // #252 Phase A: "who said what" — endorsement events with their role
+        // resolution, plus the operator policy snapshot in force.
+        "provenance" => execute_provenance(storage, args),
         other => Err(format!(
-            "Unknown memory_status view '{other}'. Use health|retention|timeline|changelog|stats|tools."
+            "Unknown memory_status view '{other}'. Use health|retention|timeline|changelog|provenance|stats|tools."
         )),
     }
+}
+
+/// The `provenance` view (#252 Phase A): actor-attributed endorsement events
+/// ("who said what"), optionally filtered by `memoryId` or `actorId`, with
+/// the operator-controlled role/weight policy snapshot and the process actor
+/// identity. Read-only; every list is bounded.
+pub fn execute_provenance(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
+    const MAX_PROVENANCE_RESULTS: usize = 50;
+    let memory_id = args
+        .as_ref()
+        .and_then(|a| a.get("memoryId"))
+        .and_then(|v| v.as_str());
+    let actor_id = args
+        .as_ref()
+        .and_then(|a| a.get("actorId"))
+        .and_then(|v| v.as_str());
+    let limit = args
+        .as_ref()
+        .and_then(|a| a.get("limit"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(MAX_PROVENANCE_RESULTS);
+
+    let events = storage
+        .list_endorsement_events(memory_id, actor_id, limit)
+        .map_err(|e| e.to_string())?;
+    let snapshot = storage.actor_policy_snapshot().map_err(|e| e.to_string())?;
+    let process_actor = storage.process_actor_did();
+
+    let events_json: Vec<Value> = events
+        .iter()
+        .map(|event| {
+            serde_json::json!({
+                "eventId": event.event_id,
+                "memoryId": event.memory_id,
+                "actorId": event.actor_did,
+                "claimedRole": event.claimed_role,
+                "effectiveRole": event.effective_role,
+                "resolvedWeight": event.resolved_weight,
+                "resolutionDisposition": event.resolution_disposition,
+                "policyVersion": event.policy_version,
+                "kind": event.endorsement_kind,
+                "revisionDigest": event.revision_digest,
+                "independentPrior": event.independent_prior,
+                "tool": event.tool,
+                "receiptId": event.receipt_id,
+                "createdAt": event.created_at,
+            })
+        })
+        .collect();
+
+    let weights_json: serde_json::Map<String, Value> = snapshot
+        .weights
+        .iter()
+        .map(|(role, weight)| (role.clone(), json!(weight)))
+        .collect();
+    let memberships_json: serde_json::Map<String, Value> = snapshot
+        .memberships
+        .iter()
+        .map(|(actor, roles)| (actor.clone(), json!(roles)))
+        .collect();
+
+    Ok(serde_json::json!({
+        "view": "provenance",
+        "processActor": process_actor,
+        "processActorBound": process_actor.is_some(),
+        "policy": {
+            "version": snapshot.policy_version,
+            "roleWeights": weights_json,
+            "membership": memberships_json,
+            "note": "Operator-controlled. No tool call can grant roles or change weights; edits happen directly in the store and bump the version.",
+        },
+        "endorsements": events_json,
+        "count": events_json.len(),
+        "claimBoundary": "Provenance records who made or endorsed a claim and at what resolved authority. It never establishes that a claim is true. Unregistered actors are neutral at 1.0; self-support carries zero independent prior.",
+    }))
 }
 
 #[cfg(test)]
@@ -196,7 +275,7 @@ mod tests {
     fn test_schema_views() {
         let s = schema();
         let views = s["properties"]["view"]["enum"].as_array().unwrap();
-        assert_eq!(views.len(), 6);
+        assert_eq!(views.len(), 7);
         assert_eq!(s["properties"]["view"]["default"], "health");
         assert_eq!(s["properties"]["scope"]["default"], "user");
         assert_eq!(s["properties"]["all_scopes"]["default"], false);
@@ -223,10 +302,67 @@ mod tests {
         let storage = test_storage();
         let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
         let oc = OutputConfig::default();
-        for view in ["health", "retention", "timeline", "changelog", "stats"] {
+        for view in ["health", "retention", "timeline", "changelog", "provenance", "stats"] {
             let args = Some(serde_json::json!({ "view": view }));
             let r = execute(&storage, &cognitive, &oc, args).await;
             assert!(r.is_ok(), "view={view} should resolve, got {r:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_provenance_view_lists_endorsements_and_policy() {
+        let storage = test_storage();
+        // Ingest before binding: the later support is plain "support".
+        let node = storage
+            .ingest(vestige_core::IngestInput {
+                content: "provenance view target".to_string(),
+                node_type: "fact".to_string(),
+                source: None,
+                sentiment_score: 0.0,
+                sentiment_magnitude: 0.0,
+                tags: vec![],
+                valid_from: None,
+                valid_until: None,
+                validity_inferred: false,
+                source_envelope: None,
+            })
+            .unwrap();
+        let did = vestige_core::actor::ProcessActor::mint().did().to_string();
+        storage.set_process_actor(&did).unwrap();
+        storage
+            .promote_memory_as_actor(&node.id, Some("qa"), "memory")
+            .unwrap();
+
+        let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
+        let oc = OutputConfig::default();
+        let args = Some(serde_json::json!({ "view": "provenance", "memoryId": node.id }));
+        let value = execute(&storage, &cognitive, &oc, args).await.unwrap();
+        assert_eq!(value["view"], "provenance");
+        assert_eq!(value["processActor"], did);
+        assert_eq!(value["count"], 1);
+        assert_eq!(value["endorsements"][0]["kind"], "support");
+        assert_eq!(value["endorsements"][0]["actorId"], did);
+        assert_eq!(value["endorsements"][0]["effectiveRole"], "unattributed");
+        assert_eq!(value["policy"]["version"], 1);
+        assert_eq!(value["policy"]["roleWeights"]["operator"], 1.50);
+        assert_eq!(value["policy"]["roleWeights"]["destructive-tester"], 1.30);
+        assert_eq!(value["policy"]["roleWeights"]["architect"], 1.25);
+        assert_eq!(value["policy"]["roleWeights"]["functional-tester"], 1.15);
+        assert_eq!(value["policy"]["roleWeights"]["qa"], 1.10);
+        assert_eq!(value["policy"]["roleWeights"]["dev"], 1.00);
+        assert!(value["claimBoundary"]
+            .as_str()
+            .unwrap()
+            .contains("never establishes that a claim is true"));
+
+        // Filter by actor id.
+        let args = Some(serde_json::json!({ "view": "provenance", "actorId": did }));
+        let value = execute(&storage, &cognitive, &oc, args).await.unwrap();
+        assert_eq!(value["count"], 1);
+
+        // Unknown filters return an empty, well-formed list.
+        let args = Some(serde_json::json!({ "view": "provenance", "actorId": "did:key:z6MkNobody" }));
+        let value = execute(&storage, &cognitive, &oc, args).await.unwrap();
+        assert_eq!(value["count"], 0);
     }
 }

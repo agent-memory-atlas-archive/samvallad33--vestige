@@ -29,6 +29,10 @@ pub fn promote_schema() -> Value {
             "reason": {
                 "type": "string",
                 "description": "Why this memory was helpful (optional, for logging)"
+            },
+            "role": {
+                "type": "string",
+                "description": "CLAIMED role for provenance; resolved against the operator-controlled policy and never self-granting."
             }
         },
         "required": ["id"]
@@ -47,6 +51,10 @@ pub fn demote_schema() -> Value {
             "reason": {
                 "type": "string",
                 "description": "Why this memory was unhelpful or wrong (optional, for logging)"
+            },
+            "role": {
+                "type": "string",
+                "description": "CLAIMED role for provenance; resolved against the operator-controlled policy and never self-granting."
             }
         },
         "required": ["id"]
@@ -57,6 +65,10 @@ pub fn demote_schema() -> Value {
 struct FeedbackArgs {
     id: String,
     reason: Option<String>,
+    /// #252 Phase A: claimed role for provenance. Never overrides the
+    /// process identity and never self-grants authority.
+    #[serde(alias = "claimed_role")]
+    role: Option<String>,
 }
 
 /// Promote a memory (thumbs up) - it led to a good outcome
@@ -79,9 +91,23 @@ pub async fn execute_promote(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Node not found: {}", args.id))?;
 
-    let node = storage
-        .promote_memory(&args.id)
-        .map_err(|e| e.to_string())?;
+    // #252 Phase A: with a bound process actor, the promote is an
+    // actor-attributed endorsement (one transaction: mutation + evidence +
+    // receipt). Without one, the historical path runs unchanged.
+    let claimed_role = args.role.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    let endorsement = if storage.process_actor_did().is_some() {
+        Some(
+            storage
+                .promote_memory_as_actor(&args.id, claimed_role, "promote_memory")
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+    let node = match &endorsement {
+        Some(outcome) => outcome.node.clone(),
+        None => storage.promote_memory(&args.id).map_err(|e| e.to_string())?,
+    };
 
     // ====================================================================
     // COGNITIVE FEEDBACK PIPELINE (promote)
@@ -106,7 +132,7 @@ pub async fn execute_promote(
         }
     }
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "success": true,
         "action": "promoted",
         "nodeId": node.id,
@@ -130,7 +156,12 @@ pub async fn execute_promote(
         },
         "message": format!("Memory promoted. It will now surface more often in searches. Retrieval: {:.2} -> {:.2}",
             before.retrieval_strength, node.retrieval_strength),
-    }))
+    });
+    if let Some(outcome) = &endorsement {
+        response["actor"] = crate::actor_surface::actor_block(&outcome.endorsement);
+        response["endorsement"] = crate::actor_surface::endorsement_block(outcome);
+    }
+    Ok(response)
 }
 
 /// Demote a memory (thumbs down) - it led to a bad outcome
@@ -153,7 +184,20 @@ pub async fn execute_demote(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Node not found: {}", args.id))?;
 
-    let node = storage.demote_memory(&args.id).map_err(|e| e.to_string())?;
+    let claimed_role = args.role.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    let endorsement = if storage.process_actor_did().is_some() {
+        Some(
+            storage
+                .demote_memory_as_actor(&args.id, claimed_role, "demote_memory")
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+    let node = match &endorsement {
+        Some(outcome) => outcome.node.clone(),
+        None => storage.demote_memory(&args.id).map_err(|e| e.to_string())?,
+    };
 
     // ====================================================================
     // COGNITIVE FEEDBACK PIPELINE (demote)
@@ -177,7 +221,7 @@ pub async fn execute_demote(
         }
     }
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "success": true,
         "action": "demoted",
         "nodeId": node.id,
@@ -202,7 +246,12 @@ pub async fn execute_demote(
         "message": format!("Memory demoted. Better alternatives will now surface instead. Retrieval: {:.2} -> {:.2}",
             before.retrieval_strength, node.retrieval_strength),
         "note": "Memory is NOT deleted - it remains searchable but ranks lower."
-    }))
+    });
+    if let Some(outcome) = &endorsement {
+        response["actor"] = crate::actor_surface::actor_block(&outcome.endorsement);
+        response["endorsement"] = crate::actor_surface::endorsement_block(outcome);
+    }
+    Ok(response)
 }
 
 /// Input schema for request_feedback tool

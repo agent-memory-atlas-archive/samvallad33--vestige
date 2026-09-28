@@ -314,6 +314,11 @@ fn log_level_rank(level: &str) -> Option<usize> {
 pub struct McpServer {
     storage: Arc<Storage>,
     cognitive: Arc<Mutex<CognitiveEngine>>,
+    /// The stable process actor (#252 Phase A): a did:key minted per data
+    /// directory at first run and persisted at `<data_dir>/actor.key`.
+    /// Identity comes from this field only; per-call `role` arguments supply
+    /// a claimed role and can never override it.
+    actor: Arc<vestige_core::actor::ProcessActor>,
     /// Handshake flag. Atomic rather than `bool` so `handle_request` can take
     /// `&self` and the stdio transport can dispatch requests concurrently
     /// behind an `Arc<McpServer>` (see `protocol/stdio.rs::run_io`).
@@ -344,6 +349,30 @@ fn load_output_config(storage: &Arc<Storage>) -> Arc<OutputConfig> {
     Arc::new(config.output())
 }
 
+/// Load or mint the process actor for this data directory and bind it to the
+/// store so node writes stamp `author_actor_did`. A mint failure must not
+/// take the whole server down: identity is provenance metadata, and storage
+/// paths fail closed (no endorsement) when no actor is bound.
+fn load_process_actor(storage: &Arc<Storage>) -> Arc<vestige_core::actor::ProcessActor> {
+    let key_path = vestige_core::actor::actor_key_path_for_data_dir(storage.data_dir());
+    match vestige_core::actor::ProcessActor::load_or_mint(&key_path) {
+        Ok(actor) => {
+            if let Err(error) = storage.set_process_actor(actor.did()) {
+                tracing::warn!(%error, "could not bind the process actor; endorsements stay disabled");
+            }
+            Arc::new(actor)
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %key_path.display(),
+                "could not load or mint the actor key; endorsements stay disabled"
+            );
+            Arc::new(vestige_core::actor::ProcessActor::mint())
+        }
+    }
+}
+
 /// Holds the right to run one inline consolidation, and releases it when the
 /// worker finishes, returns early, or unwinds.
 struct ConsolidationClaim(Arc<AtomicBool>);
@@ -358,9 +387,11 @@ impl McpServer {
     #[allow(dead_code)]
     pub fn new(storage: Arc<Storage>, cognitive: Arc<Mutex<CognitiveEngine>>) -> Self {
         let output_config = load_output_config(&storage);
+        let actor = load_process_actor(&storage);
         Self {
             storage,
             cognitive,
+            actor,
             initialized: AtomicBool::new(false),
             logging_level: AtomicUsize::new(1),
             tool_call_count: AtomicU64::new(0),
@@ -377,9 +408,11 @@ impl McpServer {
         event_tx: broadcast::Sender<VestigeEvent>,
     ) -> Self {
         let output_config = load_output_config(&storage);
+        let actor = load_process_actor(&storage);
         Self {
             storage,
             cognitive,
+            actor,
             initialized: AtomicBool::new(false),
             logging_level: AtomicUsize::new(1),
             tool_call_count: AtomicU64::new(0),
@@ -387,6 +420,41 @@ impl McpServer {
             event_tx: Some(event_tx),
             output_config,
         }
+    }
+
+    /// The process actor did:key, ONLY when it is actually bound to the
+    /// store. An unbound identity (key-file failure at startup) never
+    /// claims provenance.
+    fn bound_actor_did(&self) -> Option<String> {
+        let did = self.actor.did();
+        (self.storage.process_actor_did().as_deref() == Some(did))
+            .then(|| did.to_string())
+    }
+
+    /// Resolve the actor provenance for one tool call: the process identity
+    /// plus the effective role the operator policy assigns to the call's
+    /// CLAIMED role. The claimed role never overrides the identity.
+    pub fn resolve_actor_provenance(
+        &self,
+        claimed_role: Option<&str>,
+    ) -> Option<(String, vestige_core::actor::RoleResolution)> {
+        let did = self.bound_actor_did()?;
+        let snapshot = self.storage.actor_policy_snapshot().ok()?;
+        let resolution = snapshot.resolve(&did, claimed_role);
+        Some((did, resolution))
+    }
+
+    /// The JSON `actor` block shared by mutation responses (#252 Phase A).
+    pub fn actor_response_block(&self, claimed_role: Option<&str>) -> Option<serde_json::Value> {
+        let (did, resolution) = self.resolve_actor_provenance(claimed_role)?;
+        Some(serde_json::json!({
+            "id": did,
+            "claimedRole": resolution.claimed_role,
+            "effectiveRole": resolution.effective_role,
+            "resolvedWeight": resolution.resolved_weight,
+            "resolutionDisposition": resolution.disposition.as_str(),
+            "policyVersion": resolution.policy_version,
+        }))
     }
 
     /// Take the right to run one inline consolidation, or `None` when one is
@@ -1223,11 +1291,34 @@ description: Some("Investigate a recorded failure using earlier memories sharing
                 // evidence the tool actually used, rather than reconstructing an
                 // explanation after the fact. Non-retrieval tools safely return
                 // None and keep their existing response shape.
+                // #252 Phase A: the receipt records who made the call —
+                // process identity + the resolution of the call's CLAIMED
+                // role. Claims never override identity or grant authority.
+                let claimed_role = saved_args
+                    .as_ref()
+                    .and_then(|args| args.get("role"))
+                    .and_then(|r| r.as_str())
+                    .map(str::trim)
+                    .filter(|role| !role.is_empty())
+                    .or_else(|| {
+                        saved_args
+                            .as_ref()
+                            .and_then(|args| args.get("claimedRole"))
+                            .and_then(|r| r.as_str())
+                            .map(str::trim)
+                            .filter(|role| !role.is_empty())
+                    });
+                let actor_provenance = self
+                    .resolve_actor_provenance(claimed_role)
+                    .map(|(did, resolution)| {
+                        vestige_core::trace::ActorProvenance::from_resolution(&did, &resolution)
+                    });
                 if let Some(receipt) = crate::trace_recorder::build_and_save_receipt(
                     &self.storage,
                     &trace_run_id,
                     &tool_name,
                     content,
+                    actor_provenance,
                 ) && let Some(obj) = content.as_object_mut()
                 {
                     let receipt_id = receipt
@@ -3084,6 +3175,7 @@ mod tests {
                     { "id": "mem-2", "trustScore": 0.5 }
                 ]
             }),
+            None,
         )
         .expect("retrieval receipt built");
         let receipt_id = receipt["receipt_id"].as_str().unwrap().to_string();
@@ -5211,5 +5303,76 @@ mod tests {
             recall_tool.get("meta").is_none(),
             "recall tool has un-renamed `meta` key (regression — serde rename broke)"
         );
+    }
+
+    // === #252 PHASE A: actor identity and receipt provenance ===
+
+    #[tokio::test]
+    async fn server_binds_a_minted_process_actor_and_claims_stay_neutral() {
+        let (server, _dir) = test_server().await;
+        // Construction loads-or-mints the did:key from <data_dir>/actor.key
+        // and binds it to the store.
+        let did = server.bound_actor_did().expect("process actor bound");
+        assert!(did.starts_with("did:key:z6Mk"), "Ed25519 did:key shape: {did}");
+
+        // Gate 1: a claimed privileged role never self-grants authority.
+        let (resolved_did, resolution) =
+            server.resolve_actor_provenance(Some("operator")).expect("resolve");
+        assert_eq!(resolved_did, did, "identity comes from the process");
+        assert_eq!(resolution.effective_role, "unattributed");
+        assert_eq!(resolution.resolved_weight, 1.0);
+        assert_eq!(
+            resolution.disposition,
+            vestige_core::actor::ResolutionDisposition::UnregisteredClaim
+        );
+
+        // The response block carries the same resolution.
+        let block = server.actor_response_block(Some("operator")).unwrap();
+        assert_eq!(block["id"], did);
+        assert_eq!(block["resolutionDisposition"], "unregistered_claim");
+        assert_eq!(block["policyVersion"], 1);
+    }
+
+    #[tokio::test]
+    async fn retrieval_receipts_record_actor_provenance() {
+        let (storage, _dir) = test_storage().await;
+        let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
+        let server = McpServer::new(storage.clone(), cognitive);
+        let claimed = "operator";
+        let actor_provenance = server
+            .resolve_actor_provenance(Some(claimed))
+            .map(|(did, resolution)| {
+                vestige_core::trace::ActorProvenance::from_resolution(&did, &resolution)
+            });
+        let result = serde_json::json!({
+            "results": [
+                { "id": "mem-1", "trustScore": 0.9 },
+                { "id": "mem-2", "trustScore": 0.5 }
+            ]
+        });
+        let receipt = crate::trace_recorder::build_and_save_receipt(
+            &storage,
+            "run_actor_receipt",
+            "recall",
+            &result,
+            actor_provenance,
+        )
+        .expect("receipt built");
+        let actor = receipt["actor"].as_object().expect("provenance block");
+        assert!(actor["actor_id"].as_str().unwrap().starts_with("did:key:z6Mk"));
+        assert_eq!(actor["claimed_role"], "operator");
+        assert_eq!(actor["effective_role"], "unattributed");
+        assert_eq!(actor["resolved_weight"], 1.0);
+        assert_eq!(actor["resolution_disposition"], "unregistered_claim");
+        assert_eq!(actor["policy_version"], 1);
+        // The persisted row round-trips the provenance.
+        let receipt_id = receipt["receipt_id"].as_str().unwrap();
+        let stored = storage
+            .get_receipt(receipt_id)
+            .unwrap()
+            .expect("persisted");
+        let stored_actor = stored.actor.expect("persisted provenance");
+        assert_eq!(stored_actor.claimed_role.as_deref(), Some("operator"));
+        assert_eq!(stored_actor.resolution_disposition, "unregistered_claim");
     }
 }

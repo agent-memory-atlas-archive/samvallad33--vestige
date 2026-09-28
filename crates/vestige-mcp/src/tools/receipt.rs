@@ -442,6 +442,7 @@ mod tests {
             "run_receipt_product",
             "recall",
             &recall_result,
+            None,
         )
         .expect("recall should atomically persist receipt and final capsule");
         let source_receipt_id = source["receipt_id"].as_str().unwrap();

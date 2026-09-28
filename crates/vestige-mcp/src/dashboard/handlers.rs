@@ -2473,6 +2473,7 @@ pub async fn deep_reference_query(
         &run_id,
         "deep_reference",
         &response,
+        None,
     );
     let receipt_id = receipt
         .as_ref()
@@ -2562,6 +2563,7 @@ pub async fn backfill_query(
         &run_id,
         "backfill",
         &response,
+        None,
     );
     let receipt_id = receipt
         .as_ref()

@@ -93,6 +93,10 @@ pub fn schema() -> Value {
                 "description": "Batch only. 'force_create' (default) keeps items separate; 'smart' lets the gate merge.",
                 "default": "force_create"
             },
+            "role": {
+                "type": "string",
+                "description": "CLAIMED role for provenance (e.g. 'qa', 'architect'). Claims never override the process identity and never self-grant authority: the operator-controlled policy resolves the effective role, and unregistered claims stay neutral at 1.0. The response 'actor' block reports the resolution."
+            },
             "items": {
                 "type": "array",
                 "description": "Batch: up to 20 items with the same fields as single mode, each force-created unless batchMergePolicy='smart'. For session end or before compaction.",
@@ -168,6 +172,12 @@ struct SmartIngestArgs {
     accepted_tag_suggestions: Option<std::collections::BTreeMap<String, String>>,
     batch_merge_policy: Option<String>,
     items: Option<Vec<BatchItem>>,
+    /// #252 Phase A: the CALLER's claimed role. This never overrides the
+    /// process identity and never self-grants authority — the operator
+    /// policy decides the effective role and weight, and unknown claims
+    /// stay neutral at 1.0.
+    #[serde(alias = "claimed_role")]
+    role: Option<String>,
 }
 
 /// A single item in batch mode
@@ -785,6 +795,14 @@ async fn execute_verbose(
     let scope = args
         .scope
         .unwrap_or_else(|| DEFAULT_MEMORY_SCOPE.to_string());
+    // #252 Phase A: the claimed role. Trimmed here once; it can never
+    // override the process identity — the operator policy resolves it.
+    let claimed_role = args
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .map(str::to_string);
 
     // Detect mode: batch (items present) vs single (content present)
     if let Some(items) = args.items {
@@ -816,6 +834,7 @@ async fn execute_verbose(
             global_force,
             &batch_merge_policy,
             &scope,
+            claimed_role.as_deref(),
         )
         .await;
     }
@@ -970,6 +989,7 @@ async fn execute_verbose(
             "tagSuggestionStatus": tag_suggestions.status,
             "acceptedTagSuggestions": accepted_tag_suggestions,
         });
+        crate::actor_surface::attach_actor_block(&mut response, storage, claimed_role.as_deref());
         attach_failure_hooks(&mut response, failure_hooks);
         return Ok(response);
     }
@@ -1016,6 +1036,28 @@ async fn execute_verbose(
             importance_snapshot.clone(),
         );
 
+        // #252 Phase A: a reinforce decision IS the caller endorsing the
+        // existing revision as already correct. With a bound process actor,
+        // the storage layer left the strength bump to this call so the
+        // mutation, evidence, and receipt commit in ONE transaction.
+        let reinforcement = if result.decision == "reinforce" {
+            match storage.record_reinforce_endorsement(
+                &node_id,
+                claimed_role.as_deref(),
+                "smart_ingest",
+            ) {
+                Ok(outcome) => Some(outcome),
+                Err(error) => {
+                    return Err(format!(
+                        "reinforcement evidence failed and the mutation was rolled back; \
+                         no memory changed: {error}"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         let failure_hooks =
             run_failure_hooks(storage, &node_id, &node_content, &hook_tags, &scope).await;
         let mut response = serde_json::json!({
@@ -1056,6 +1098,19 @@ async fn execute_verbose(
         });
         if !has_embedding && let Some(warming) = super::warming::embedding_warming(storage) {
             response["warming"] = warming;
+        }
+        match &reinforcement {
+            Some(outcome) => {
+                response["actor"] = crate::actor_surface::actor_block(&outcome.endorsement);
+                response["endorsement"] = crate::actor_surface::endorsement_block(outcome);
+            }
+            None => {
+                crate::actor_surface::attach_actor_block(
+                    &mut response,
+                    storage,
+                    claimed_role.as_deref(),
+                );
+            }
         }
         attach_failure_hooks(&mut response, failure_hooks);
         Ok(response)
@@ -1100,6 +1155,7 @@ async fn execute_verbose(
             "tagSuggestionStatus": tag_suggestions.status,
             "acceptedTagSuggestions": accepted_tag_suggestions,
         });
+        crate::actor_surface::attach_actor_block(&mut response, storage, claimed_role.as_deref());
         attach_failure_hooks(&mut response, failure_hooks);
         Ok(response)
     }
@@ -1282,6 +1338,7 @@ async fn execute_batch(
     global_force_create: bool,
     batch_merge_policy: &str,
     default_scope: &str,
+    claimed_role: Option<&str>,
 ) -> Result<Value, String> {
     if items.is_empty() {
         return Err("Items array cannot be empty".to_string());
@@ -1625,7 +1682,7 @@ async fn execute_batch(
         }
     }
 
-    Ok(serde_json::json!({
+    let mut envelope = serde_json::json!({
         "success": errors == 0,
         "mode": "batch",
         "atomic": false,
@@ -1641,7 +1698,9 @@ async fn execute_batch(
             "errors": errors
         },
         "results": results
-    }))
+    });
+    crate::actor_surface::attach_actor_block(&mut envelope, storage, claimed_role);
+    Ok(envelope)
 }
 
 /// Cognitive post-ingest side effects: synaptic tagging, novelty update, hippocampal indexing.
