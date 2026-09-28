@@ -149,7 +149,17 @@ fn leading_identifier(ctx: &str) -> Option<String> {
             .collect();
         break;
     }
-    (!ident.is_empty() && ident.chars().any(|c| !c.is_ascii_digit())).then_some(ident)
+    // value-taking keywords ("return None;", "return true") hand us a VALUE,
+    // not a declaration name; language literals are never hunk symbols
+    const JUNK: &[&str] = &[
+        "none", "some", "ok", "err", "true", "false", "self", "super", "null",
+        "nil", "undefined", "return",
+    ];
+    let lower = ident.to_lowercase();
+    (!ident.is_empty()
+        && ident.chars().any(|c| !c.is_ascii_digit())
+        && !JUNK.contains(&lower.as_str()))
+        .then_some(ident)
 }
 
 /// Content for a commit record. Every token on the files/modules/symbols lines
@@ -280,7 +290,7 @@ index 111..222 100644
 diff --git a/src/store.rs b/src/store.rs
 @@ -40,6 +40,7 @@ impl LocalFileStore {
      ok
-\u{1e}fff000111222333444555666777888999aaaabbbb\u{1f}2026-09-02T08:30:00+00:00\u{1f}docs: readme
+\u{1e}fff000111222333444555666777888999aaaabbb\u{1f}2026-09-02T08:30:00+00:00\u{1f}docs: readme
 diff --git a/README.md b/README.md
 @@ -1,3 +1,4 @@ 
      text
