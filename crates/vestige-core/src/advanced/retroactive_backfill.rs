@@ -94,6 +94,11 @@ pub struct BackfillCandidate {
     /// Optional cosine similarity to the failure, ONLY used to demonstrate that
     /// the cause ranks LOW on similarity (the thing RAG misses). Not a ranker.
     pub similarity_to_failure: Option<f32>,
+    /// Set when this candidate stands in for an older record that was
+    /// bitemporally superseded: the trail follows the supersession link to the
+    /// current belief, dated by the superseded record (the fact's origin).
+    #[serde(default)]
+    pub via_supersession_of: Option<String>,
 }
 
 /// The salient failure event that triggers the backward reach.
@@ -121,8 +126,10 @@ pub struct FailureEvent {
 /// works if an "entity" is something specific. Anything that admits common
 /// vocabulary turns the causal join into "these two memories used the same
 /// word", which is precisely what a vector search already does and what backfill
-/// exists to complement.
-fn is_identifier_shaped(tok: &str) -> bool {
+/// exists to complement. Public so `git_records` emits only tokens that pass
+/// this same test (record entities are decided at write time, extracted at
+/// query time — both sides must agree).
+pub fn is_identifier_shaped(tok: &str) -> bool {
     if tok.len() < 3 {
         return false;
     }
@@ -266,11 +273,50 @@ pub struct BackfilledCause {
     pub reason: String,
 }
 
+/// One high-ranked record that was rejected, with the rule that excluded it
+/// ("why not X?"). Ranked by how many failure entities it shares, so the
+/// reported rejections are the ones a skeptic would name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RejectedCandidate {
+    pub memory_id: String,
+    pub reason: String,
+    /// Shared-entity count at rejection time (0 for no-entity rejections).
+    #[serde(default)]
+    pub shared_entities: usize,
+    /// Age in days vs the failure (negative = newer); 0 for caller exclusions.
+    #[serde(default)]
+    pub age_days: f64,
+}
+
+/// Reported when the trail stops short: which entities nothing in the window
+/// shares, and what record would close the chain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackfillGap {
+    /// Failure entities no in-window candidate carries (empty when matches
+    /// existed but were all excluded — see [`BackfillResult::rejected`]).
+    pub missing_entities: Vec<String>,
+    pub note: String,
+}
+
+/// A candidate the caller excluded before the reach (e.g. a commit outside the
+/// mapped version range), carried into why-not output.
+#[derive(Debug, Clone)]
+pub struct ExcludedCandidate {
+    pub candidate: BackfillCandidate,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackfillResult {
     pub triggered: bool,
     pub failure_id: String,
     pub causes: Vec<BackfilledCause>,
+    /// Strongest rejected records, for "why not X?" questions.
+    #[serde(default)]
+    pub rejected: Vec<RejectedCandidate>,
+    /// Set when the trail broke and nothing was surfaced.
+    #[serde(default)]
+    pub gap: Option<BackfillGap>,
     pub scanned: usize,
 }
 
@@ -284,6 +330,8 @@ pub struct RetroactiveBackfill {
     pub lookback_days: i64,
     pub min_shared_entities: usize,
     pub max_causes: usize,
+    /// How many rejected records to report for why-not questions.
+    pub max_rejections: usize,
 }
 
 impl Default for RetroactiveBackfill {
@@ -293,6 +341,7 @@ impl Default for RetroactiveBackfill {
             lookback_days: DEFAULT_LOOKBACK_DAYS,
             min_shared_entities: MIN_SHARED_ENTITIES,
             max_causes: 3,
+            max_rejections: 3,
         }
     }
 }
@@ -308,11 +357,27 @@ impl RetroactiveBackfill {
     /// Backward-only by construction: candidates with `age_days_before_failure`
     /// <= 0 (i.e. concurrent or future) are never considered.
     pub fn run(&self, failure: &FailureEvent, candidates: &[BackfillCandidate]) -> BackfillResult {
+        self.run_trail(failure, candidates, &[])
+    }
+
+    /// Like [`run`], plus: reports the strongest REJECTED records with the rule
+    /// that excluded each (why-not-X), and — when nothing surfaces — where the
+    /// trail broke and what record would close it (gap report). `excluded`
+    /// carries caller-side exclusions (e.g. a commit outside the mapped version
+    /// range) so they appear in the same why-not output.
+    pub fn run_trail(
+        &self,
+        failure: &FailureEvent,
+        candidates: &[BackfillCandidate],
+        excluded: &[ExcludedCandidate],
+    ) -> BackfillResult {
         if !failure.is_salient(self.salience_threshold) {
             return BackfillResult {
                 triggered: false,
                 failure_id: failure.id.clone(),
                 causes: vec![],
+                rejected: vec![],
+                gap: None,
                 scanned: 0,
             };
         }
@@ -330,13 +395,17 @@ impl RetroactiveBackfill {
             by_sim.iter().position(|(cid, _)| *cid == id).map(|p| p + 1)
         };
 
+        let mut rejected: Vec<RejectedCandidate> = Vec::new();
+        let note_supersession =
+            |c: &BackfillCandidate, reason: String| -> String {
+                match &c.via_supersession_of {
+                    Some(orig) => format!("{reason} Trail followed the supersession of {orig}."),
+                    None => reason,
+                }
+            };
+
         let mut scored: Vec<BackfilledCause> = candidates
             .iter()
-            // backward-only: must be strictly in the past, within lookback
-            .filter(|c| {
-                c.age_days_before_failure > 0.0
-                    && c.age_days_before_failure <= self.lookback_days as f64
-            })
             .filter_map(|c| {
                 let shared: Vec<String> = c
                     .entities
@@ -344,20 +413,49 @@ impl RetroactiveBackfill {
                     .filter(|e| failure_entities.contains(e.as_str()))
                     .cloned()
                     .collect();
-                if shared.len() < self.min_shared_entities {
+                let shared_n = shared.len();
+                // rejection bookkeeping: keep the rule that excluded the record
+                if c.age_days_before_failure <= 0.0 {
+                    rejected.push(RejectedCandidate {
+                        memory_id: c.id.clone(),
+                        reason: "record is newer than the failure".into(),
+                        shared_entities: shared_n,
+                        age_days: c.age_days_before_failure,
+                    });
                     return None;
                 }
-                let score = self.score(c, shared.len());
+                if c.age_days_before_failure > self.lookback_days as f64 {
+                    rejected.push(RejectedCandidate {
+                        memory_id: c.id.clone(),
+                        reason: format!("outside the {}d lookback window", self.lookback_days),
+                        shared_entities: shared_n,
+                        age_days: c.age_days_before_failure,
+                    });
+                    return None;
+                }
+                if shared_n < self.min_shared_entities {
+                    rejected.push(RejectedCandidate {
+                        memory_id: c.id.clone(),
+                        reason: "shares no entity with the failure".into(),
+                        shared_entities: shared_n,
+                        age_days: c.age_days_before_failure,
+                    });
+                    return None;
+                }
+                let score = self.score(c, shared_n);
                 let promoted = (c.stability * PROMOTION_STABILITY_FACTOR).min(c.stability + 365.0);
                 let rank = sim_rank(&c.id);
-                let reason = format!(
-                    "Reached back {:.1}d to a quiet memory sharing {} entit{} ({}) with the failure; \
-                     its similarity rank was {} among the scanned candidates. Shared entities support an association, not proof of cause.",
-                    c.age_days_before_failure,
-                    shared.len(),
-                    if shared.len() == 1 { "y" } else { "ies" },
-                    shared.join(", "),
-                    rank.map(|r| format!("#{r}")).unwrap_or_else(|| "untracked".into()),
+                let reason = note_supersession(
+                    c,
+                    format!(
+                        "Reached back {:.1}d to a quiet memory sharing {} entit{} ({}) with the failure; \
+                         its similarity rank was {} among the scanned candidates. Shared entities support an association, not proof of cause.",
+                        c.age_days_before_failure,
+                        shared_n,
+                        if shared_n == 1 { "y" } else { "ies" },
+                        shared.join(", "),
+                        rank.map(|r| format!("#{r}")).unwrap_or_else(|| "untracked".into()),
+                    ),
                 );
                 Some(BackfilledCause {
                     memory_id: c.id.clone(),
@@ -371,13 +469,80 @@ impl RetroactiveBackfill {
             })
             .collect();
 
+        for ex in excluded {
+            let shared_n = ex
+                .candidate
+                .entities
+                .iter()
+                .filter(|e| failure_entities.contains(e.as_str()))
+                .count();
+            rejected.push(RejectedCandidate {
+                memory_id: ex.candidate.id.clone(),
+                reason: ex.reason.clone(),
+                shared_entities: shared_n,
+                age_days: 0.0,
+            });
+        }
+
         scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(self.max_causes);
+
+        // strongest rejections first: most shared entities, then most recent
+        rejected.sort_by(|a, b| {
+            b.shared_entities
+                .cmp(&a.shared_entities)
+                .then(a.age_days.partial_cmp(&b.age_days).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        rejected.truncate(self.max_rejections);
+
+        // gap report: the trail broke — name the missing link
+        let gap = if scored.is_empty() {
+            let matched_but_excluded = rejected
+                .iter()
+                .filter(|r| r.shared_entities >= self.min_shared_entities)
+                .count();
+            if matched_but_excluded > 0 {
+                Some(BackfillGap {
+                    missing_entities: vec![],
+                    note: format!(
+                        "{matched_but_excluded} record(s) share entities with the failure but were all excluded — see rejected. Widen the window/range or ingest the missing link records."
+                    ),
+                })
+            } else {
+                let window_entities: HashSet<&str> = candidates
+                    .iter()
+                    .filter(|c| {
+                        c.age_days_before_failure > 0.0
+                            && c.age_days_before_failure <= self.lookback_days as f64
+                    })
+                    .flat_map(|c| c.entities.iter().map(|s| s.as_str()))
+                    .collect();
+                let missing: Vec<String> = failure
+                    .entities
+                    .iter()
+                    .filter(|e| !window_entities.contains(e.as_str()))
+                    .cloned()
+                    .collect();
+                let shown = missing.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                Some(BackfillGap {
+                    missing_entities: missing,
+                    note: format!(
+                        "No record within {}d shares any of the failure's entities ({}). A commit or note touching one of those inside the window would close this trail.",
+                        self.lookback_days,
+                        if shown.is_empty() { "(the failure names no entities)" } else { &shown }
+                    ),
+                })
+            }
+        } else {
+            None
+        };
 
         BackfillResult {
             triggered: true,
             failure_id: failure.id.clone(),
             causes: scored,
+            rejected,
+            gap,
             scanned: candidates.len(),
         }
     }
@@ -437,6 +602,7 @@ mod tests {
                 age_days_before_failure: 3.0,
                 stability: 5.0,
                 similarity_to_failure: Some(0.11), // dissimilar — RAG would miss it
+                via_supersession_of: None,
             },
             // a noisy distractor: semantically similar to the crash, but NOT causal
             // (shares no entity with the failure).
@@ -447,6 +613,7 @@ mod tests {
                 age_days_before_failure: 20.0,
                 stability: 3.0,
                 similarity_to_failure: Some(0.82), // similar — RAG WOULD surface this
+                via_supersession_of: None,
             },
             // a future memory — must never be backfilled (backward-only).
             BackfillCandidate {
@@ -456,6 +623,7 @@ mod tests {
                 age_days_before_failure: -1.0,
                 stability: 2.0,
                 similarity_to_failure: Some(0.4),
+                via_supersession_of: None,
             },
         ];
 
@@ -556,6 +724,7 @@ mod tests {
             age_days_before_failure: 2.0,
             stability: 4.0,
             similarity_to_failure: Some(0.3),
+                via_supersession_of: None,
         }];
         let result = RetroactiveBackfill::new().run(&manual, &candidates);
         assert!(result.triggered, "manual override must trigger regardless of markers/PE");
@@ -573,6 +742,7 @@ mod tests {
             age_days_before_failure: 1.0,
             stability: 4.0,
             similarity_to_failure: Some(0.05),
+                via_supersession_of: None,
         }];
         let result = RetroactiveBackfill::new().run(&failure(), &candidates);
         assert!(result.triggered);
@@ -580,5 +750,115 @@ mod tests {
             result.causes.is_empty(),
             "no shared entity => no backfill (don't fabricate a cause)"
         );
+    }
+
+    // ---- why-not-X and the gap report ----
+
+    fn failure_with_entities() -> FailureEvent {
+        FailureEvent {
+            id: "fail".into(),
+            content: "crash in events/local.py after upgrading".into(),
+            entities: vec!["events/local.py".into(), "API_TIMEOUT".into()],
+            tags: vec![],
+            prediction_error: 0.9,
+            manual: false,
+        }
+    }
+
+    #[test]
+    fn rejections_carry_the_rule_that_excluded_each() {
+        let candidates = vec![
+            // newer than the failure — excluded despite sharing an entity
+            BackfillCandidate {
+                id: "later-fix".into(),
+                content: "commit f1 fixed local.py".into(),
+                entities: vec!["events/local.py".into()],
+                age_days_before_failure: -2.0,
+                stability: 4.0,
+                similarity_to_failure: None,
+                via_supersession_of: None,
+            },
+            // too old for the window
+            BackfillCandidate {
+                id: "ancient".into(),
+                content: "touched local.py long ago".into(),
+                entities: vec!["events/local.py".into()],
+                age_days_before_failure: 90.0,
+                stability: 4.0,
+                similarity_to_failure: None,
+                via_supersession_of: None,
+            },
+            // in-window but shares nothing
+            BackfillCandidate {
+                id: "unrelated".into(),
+                content: "readme badge churn".into(),
+                entities: vec!["README".into()],
+                age_days_before_failure: 1.0,
+                stability: 4.0,
+                similarity_to_failure: None,
+                via_supersession_of: None,
+            },
+        ];
+        let result =
+            RetroactiveBackfill::new().run_trail(&failure_with_entities(), &candidates, &[]);
+        assert!(result.causes.is_empty());
+        let reasons: Vec<(&str, &str)> = result
+            .rejected
+            .iter()
+            .map(|r| (r.memory_id.as_str(), r.reason.as_str()))
+            .collect();
+        assert!(reasons.contains(&("later-fix", "record is newer than the failure")));
+        assert!(reasons.iter().any(|(id, r)| *id == "ancient" && r.contains("lookback")));
+        assert!(reasons.contains(&("unrelated", "shares no entity with the failure")));
+        // the skeptic's first question gets the direct answer: the entity-sharing
+        // record outranks the truly unrelated one in the why-not list
+        assert_eq!(result.rejected[0].memory_id, "later-fix");
+    }
+
+    #[test]
+    fn gap_report_names_the_missing_link() {
+        // in-window candidates exist, but none carries a failure entity
+        let candidates = vec![BackfillCandidate {
+            id: "other".into(),
+            content: "unrelated deploy note".into(),
+            entities: vec!["deploy-env".into()],
+            age_days_before_failure: 2.0,
+            stability: 4.0,
+            similarity_to_failure: None,
+            via_supersession_of: None,
+        }];
+        let result =
+            RetroactiveBackfill::new().run_trail(&failure_with_entities(), &candidates, &[]);
+        let gap = result.gap.expect("empty causes must produce a gap report");
+        assert!(gap.missing_entities.contains(&"events/local.py".to_string()));
+        assert!(gap.note.contains("local.py"), "note names the entity: {}", gap.note);
+        assert!(gap.note.contains("would close this trail"));
+    }
+
+    #[test]
+    fn caller_exclusions_surface_in_why_not() {
+        let candidate = BackfillCandidate {
+            id: "commit-x".into(),
+            content: "commit abc touched local.py".into(),
+            entities: vec!["events/local.py".into()],
+            age_days_before_failure: 2.0,
+            stability: 4.0,
+            similarity_to_failure: None,
+            via_supersession_of: None,
+        };
+        let excluded = vec![ExcludedCandidate {
+            candidate,
+            reason: "outside version range 1.41.0..1.42.1".into(),
+        }];
+        let result =
+            RetroactiveBackfill::new().run_trail(&failure_with_entities(), &[], &excluded);
+        assert!(result.causes.is_empty());
+        assert_eq!(result.rejected.len(), 1);
+        assert_eq!(result.rejected[0].memory_id, "commit-x");
+        assert_eq!(result.rejected[0].reason, "outside version range 1.41.0..1.42.1");
+        // a match existed but was excluded: the gap says so instead of "missing"
+        let gap = result.gap.expect("excluded match must still report the break");
+        assert!(gap.missing_entities.is_empty());
+        assert!(gap.note.contains("excluded"), "{}", gap.note);
     }
 }

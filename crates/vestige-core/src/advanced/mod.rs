@@ -22,6 +22,7 @@ pub mod compression;
 pub mod contradiction;
 pub mod cross_project;
 pub mod dreams;
+pub mod git_records;
 pub mod importance;
 pub mod intent;
 pub mod merge_supersede;

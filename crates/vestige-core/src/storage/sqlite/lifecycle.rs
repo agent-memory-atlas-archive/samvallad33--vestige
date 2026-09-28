@@ -1354,6 +1354,7 @@ impl SqliteMemoryStore {
                                 age_days_before_failure: age,
                                 stability: c.stability,
                                 similarity_to_failure: None,
+                                via_supersession_of: None,
                             })
                         })
                         .collect();
