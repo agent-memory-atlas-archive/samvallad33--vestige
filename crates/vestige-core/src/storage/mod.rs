@@ -17,6 +17,7 @@ mod migrations;
 mod portable;
 pub mod receipt_attestation;
 mod replay_store;
+mod session_queries;
 mod sqlite;
 mod synaptic_store;
 mod trace_store;
@@ -78,6 +79,9 @@ pub use synaptic_store::{
     SYNAPTIC_CAPTURE_SCHEMA_V2, SYNAPTIC_CONTEXT_ALGORITHM_V1, SYNAPTIC_CONTEXT_THRESHOLD_V1,
     SynapticCapturePolicy, SynapticCaptureRequest, SynapticImportanceEvent, SynapticIngestOutcome,
     SynapticIngestRequest, SynapticSignalSnapshot,
+};
+pub use session_queries::{
+    ClosedIssueNode, FailedToolCall, GitCommitNode, OpenFailureTouching, FAILED_CALLS_MAX,
 };
 pub use trace_store::{
     AgentRunSummary, PendingMemoryMutationDecision, PendingMemoryMutationEffect,

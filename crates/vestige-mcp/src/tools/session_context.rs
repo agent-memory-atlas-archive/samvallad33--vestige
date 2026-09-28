@@ -62,6 +62,12 @@ pub fn schema() -> Value {
                 "type": "boolean",
                 "description": "Include memory predictions (default: true)",
                 "default": true
+            },
+            "changed_files": {
+                "type": "array",
+                "items": { "type": "string" },
+                "maxItems": 200,
+                "description": "Repository-relative paths changed in this working tree. When present, the packet adds an open-failures section listing failure memories whose source anchors or git-commit-record `files:` entries match these paths EXACTLY (no prefix/fuzzy matching). Absent = section skipped."
             }
         }
     })
@@ -76,6 +82,8 @@ struct SessionContextArgs {
     include_status: Option<bool>,
     include_intentions: Option<bool>,
     include_predictions: Option<bool>,
+    #[serde(default, alias = "changedFiles")]
+    changed_files: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -200,6 +208,69 @@ pub async fn execute(
 
     if !memory_lines.is_empty() {
         context_parts.push(format!("**Memories:**\n{}", memory_lines.join("\n")));
+    }
+
+    // ====================================================================
+    // 1b. Open failures touching the caller's changed files (opt-in via
+    //     `changed_files`; absent arg = section skipped, no matches = no
+    //     section — silence, never an empty header).
+    // ====================================================================
+    if let Some(changed) = args.changed_files.as_deref() {
+        // Purely additive: a query failure degrades to "no section" rather
+        // than failing the whole session start.
+        if let Ok(failures) = storage.open_failures_touching(changed)
+            && !failures.is_empty()
+        {
+            let failure_lines: Vec<String> = failures
+                .iter()
+                .take(8)
+                .map(|f| match &f.anchor {
+                    Some(anchor) => format!("- [{}] {} ({})", f.id, f.content_preview, anchor),
+                    None => format!("- [{}] {}", f.id, f.content_preview),
+                })
+                .collect();
+            let section = format!(
+                "**Open failures touching changed files:**\n{}",
+                failure_lines.join("\n")
+            );
+            let section_len = section.len() + 1;
+            if char_count + section_len <= budget_chars {
+                context_parts.push(section);
+                char_count += section_len;
+            }
+        }
+    }
+
+    // ====================================================================
+    // 1c. Failed tool calls of the latest agent run (automatic). Rows whose
+    //     trace payload has no `success: false` are not failed calls, so an
+    //     ordinary recorder that never records outcomes stays silent here.
+    // ====================================================================
+    if let Ok(failed_calls) = storage.last_session_failed_calls(None)
+        && !failed_calls.is_empty()
+    {
+        let run_id = failed_calls[0].run_id.clone();
+        let call_lines: Vec<String> = failed_calls
+            .iter()
+            .take(8)
+            .map(|c| {
+                if c.error_excerpt.is_empty() {
+                    format!("- {}", c.tool)
+                } else {
+                    format!("- {}: {}", c.tool, c.error_excerpt)
+                }
+            })
+            .collect();
+        let section = format!(
+            "**Last session failed calls ({}):**\n{}",
+            run_id,
+            call_lines.join("\n")
+        );
+        let section_len = section.len() + 1;
+        if char_count + section_len <= budget_chars {
+            context_parts.push(section);
+            char_count += section_len;
+        }
     }
 
     // ====================================================================
@@ -625,6 +696,7 @@ mod tests {
         assert!(s["properties"]["include_status"].is_object());
         assert!(s["properties"]["include_intentions"].is_object());
         assert!(s["properties"]["include_predictions"].is_object());
+        assert!(s["properties"]["changed_files"].is_object());
     }
 
     #[test]
@@ -870,6 +942,186 @@ mod tests {
                 "lean profile should omit the inline year in memory dates"
             );
         }
+    }
+
+    // ========================================================================
+    // SESSION SECTIONS: open failures + failed calls
+    // ========================================================================
+
+    /// Seeded store: a failure memory anchored to a file, a failure-like
+    /// git-commit record whose `files:` line names another file, and noise.
+    async fn failure_seeded_storage() -> (Arc<Storage>, TempDir) {
+        let (storage, dir) = test_storage().await;
+
+        // Failure matched via its code anchor.
+        let failure_id = ingest_test_content(
+            &storage,
+            "Deploy failed: connection pool saturated at 100% during the release cut.",
+            vec![],
+        )
+        .await;
+        storage
+            .record_code_anchors(&[vestige_core::codebase::CodeAnchor {
+                id: "anchor-pool".to_string(),
+                node_id: failure_id,
+                file_path: "src/pool.rs".to_string(),
+                symbol: Some("acquire".to_string()),
+                symbol_kind: None,
+                start_line: Some(1),
+                end_line: Some(2),
+                span_lines: Some(2),
+                content_hash: None,
+                captured_at: chrono::Utc::now(),
+                last_verified_at: None,
+                last_status: None,
+            }])
+            .unwrap();
+
+        // Failure-like git-commit record matched via its `files:` line.
+        ingest_test_content(
+            &storage,
+            "commit 1111111111111111111111111111111111111111 chore: cleanup after crash\nfiles: src/other.rs, docs/guide.md",
+            vec!["git-commit"],
+        )
+        .await;
+
+        // Noise: non-failure memory anchored to one of the same files.
+        let quiet_id = ingest_test_content(&storage, "Prefer Rust for systems work.", vec![])
+            .await;
+        storage
+            .record_code_anchors(&[vestige_core::codebase::CodeAnchor {
+                id: "anchor-quiet".to_string(),
+                node_id: quiet_id,
+                file_path: "src/pool.rs".to_string(),
+                symbol: None,
+                symbol_kind: None,
+                start_line: Some(1),
+                end_line: Some(1),
+                span_lines: Some(1),
+                content_hash: None,
+                captured_at: chrono::Utc::now(),
+                last_verified_at: None,
+                last_status: None,
+            }])
+            .unwrap();
+
+        (storage, dir)
+    }
+
+    #[tokio::test]
+    async fn session_sections_open_failures_populate_from_changed_files() {
+        let (storage, _dir) = failure_seeded_storage().await;
+
+        let args = serde_json::json!({
+            "changed_files": ["src/pool.rs", "src/other.rs"]
+        });
+        let value = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await
+        .unwrap();
+        let ctx = value["context"].as_str().unwrap();
+        assert!(
+            ctx.contains("**Open failures touching changed files:**"),
+            "section header missing: {ctx}"
+        );
+        assert!(ctx.contains("Deploy failed"), "anchor-matched failure missing: {ctx}");
+        assert!(ctx.contains("(src/pool.rs:acquire)"), "anchor detail missing: {ctx}");
+        assert!(ctx.contains("cleanup after crash"), "files-line failure missing: {ctx}");
+        assert!(
+            !ctx.contains("Prefer Rust"),
+            "a non-failure memory on the same file is noise: {ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_sections_open_failures_negative_no_noise() {
+        let (storage, _dir) = failure_seeded_storage().await;
+
+        // No matching file (exact intersection only): no section at all.
+        let args = serde_json::json!({
+            "changed_files": ["src/unrelated.rs", "src/pool.rs.bak"]
+        });
+        let value = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await
+        .unwrap();
+        let ctx = value["context"].as_str().unwrap();
+        assert!(
+            !ctx.contains("**Open failures"),
+            "near-miss paths must not populate the section: {ctx}"
+        );
+
+        // Absent arg: section skipped entirely (existing sections intact).
+        let value = execute(&storage, &test_cognitive(), &OutputConfig::default(), None)
+            .await
+            .unwrap();
+        let ctx = value["context"].as_str().unwrap();
+        assert!(!ctx.contains("**Open failures"));
+        assert!(ctx.contains("Session"), "existing sections must survive");
+    }
+
+    #[tokio::test]
+    async fn session_sections_failed_calls_from_latest_run() {
+        let (storage, _dir) = test_storage().await;
+        let base = chrono::Utc::now().timestamp_millis();
+        // Older run: one success, one failure.
+        storage
+            .append_mcp_call_outcome("run_a", "recall", true, None, base)
+            .unwrap();
+        storage
+            .append_mcp_call_outcome(
+                "run_a",
+                "backfill",
+                false,
+                Some("scope must be non-empty"),
+                base + 10,
+            )
+            .unwrap();
+        // Latest run: one failure — the only one that may surface.
+        storage
+            .append_mcp_call_outcome("run_b", "memory", false, Some("NotFound: abc"), base + 20)
+            .unwrap();
+
+        let value = execute(&storage, &test_cognitive(), &OutputConfig::default(), None)
+            .await
+            .unwrap();
+        let ctx = value["context"].as_str().unwrap();
+        assert!(
+            ctx.contains("**Last session failed calls (run_b):**"),
+            "failed-calls header missing: {ctx}"
+        );
+        assert!(ctx.contains("- memory: NotFound: abc"), "failed call missing: {ctx}");
+        assert!(
+            !ctx.contains("backfill"),
+            "older runs must not leak into the section: {ctx}"
+        );
+        assert!(
+            !ctx.contains("- recall"),
+            "successful calls are not failures: {ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_sections_failed_calls_silent_without_outcome_rows() {
+        let (storage, _dir) = test_storage().await;
+        ingest_test_content(&storage, "Plain memory, no traces.", vec![]).await;
+
+        let value = execute(&storage, &test_cognitive(), &OutputConfig::default(), None)
+            .await
+            .unwrap();
+        let ctx = value["context"].as_str().unwrap();
+        assert!(
+            !ctx.contains("**Last session failed calls"),
+            "no outcome rows -> no section, not an empty header: {ctx}"
+        );
     }
 
     // ========================================================================
