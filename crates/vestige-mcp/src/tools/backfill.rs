@@ -217,6 +217,11 @@ fn build_candidates(
             (Some(f), Some(c)) if f.len() == c.len() => Some(cosine_similarity(f, &c)),
             _ => None,
         };
+        let is_commit = current
+            .tags
+            .iter()
+            .chain(origin.tags.iter())
+            .any(|t| t == git_records::COMMIT_TAG);
         let candidate = BackfillCandidate {
             id: current.id.clone(),
             content: current.content.clone(),
@@ -229,13 +234,9 @@ fn build_candidates(
             } else {
                 None
             },
+            is_change_record: is_commit,
         };
 
-        let is_commit = current
-            .tags
-            .iter()
-            .chain(origin.tags.iter())
-            .any(|t| t == git_records::COMMIT_TAG);
         if is_commit {
             commit_records += 1;
             if let Some((worked, broke, allowed)) = range {
@@ -866,6 +867,8 @@ mod tests {
         );
         assert_eq!(commit_records, 2);
         assert!(candidates.iter().any(|c| c.id == "c-good"));
+        // commit records carry the change-record flag the scorer bonuses
+        assert!(candidates.iter().find(|c| c.id == "c-good").unwrap().is_change_record);
         assert!(!candidates.iter().any(|c| c.id == "c-bad"));
         assert_eq!(excluded.len(), 1);
         assert_eq!(excluded[0].candidate.id, "c-bad");

@@ -74,6 +74,12 @@ pub const FAILURE_MARKERS: &[&str] = &[
 /// recalls — without overwriting the FSRS history.
 pub const PROMOTION_STABILITY_FACTOR: f64 = 2.5;
 
+/// Bonus for candidates that ARE a change record (a commit) rather than a
+/// description of one. Real histories are full of reports quoting the same
+/// changelog line; when evidence is close, the change outranks the chatter.
+/// Small on purpose: shared-entity evidence still dominates.
+pub const CHANGE_RECORD_BONUS: f64 = 0.25;
+
 // ============================================================================
 // INPUT TYPES
 // ============================================================================
@@ -99,6 +105,10 @@ pub struct BackfillCandidate {
     /// current belief, dated by the superseded record (the fact's origin).
     #[serde(default)]
     pub via_supersession_of: Option<String>,
+    /// True when this candidate is itself a change (a commit record), not a
+    /// report about one. Wins ties against reports.
+    #[serde(default)]
+    pub is_change_record: bool,
 }
 
 /// The salient failure event that triggers the backward reach.
@@ -269,6 +279,9 @@ pub struct BackfilledCause {
     /// similar). A high number here is the proof: the cause is NOT what a
     /// similarity search would have surfaced.
     pub similarity_rank: Option<usize>,
+    /// Whether the surfaced cause is itself a change record (a commit).
+    #[serde(default)]
+    pub is_change_record: bool,
     /// Human-readable why.
     pub reason: String,
 }
@@ -385,6 +398,22 @@ impl RetroactiveBackfill {
         let failure_entities: HashSet<&str> =
             failure.entities.iter().map(|s| s.as_str()).collect();
 
+        // Inverse document frequency over the scanned pool: an entity that
+        // nearly every record carries (issue-template paths, the product's own
+        // package name) is boilerplate, not a clue. Replaces the raw shared
+        // count, which let two boilerplate matches outrank one real one.
+        let n = candidates.len();
+        let mut df: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for c in candidates {
+            for e in &c.entities {
+                *df.entry(e.as_str()).or_default() += 1;
+            }
+        }
+        let idf = |e: &str| -> f64 {
+            let d = df.get(e).copied().unwrap_or(1).max(1) as f64;
+            (1.0 + n as f64 / d).ln()
+        };
+
         // similarity ranking (only to PROVE the cause ranks low on similarity)
         let mut by_sim: Vec<(&str, f32)> = candidates
             .iter()
@@ -442,7 +471,7 @@ impl RetroactiveBackfill {
                     });
                     return None;
                 }
-                let score = self.score(c, shared_n);
+                let score = self.score(c, &shared, &idf);
                 let promoted = (c.stability * PROMOTION_STABILITY_FACTOR).min(c.stability + 365.0);
                 let rank = sim_rank(&c.id);
                 let reason = note_supersession(
@@ -464,6 +493,7 @@ impl RetroactiveBackfill {
                     score,
                     promoted_stability: promoted,
                     similarity_rank: rank,
+                    is_change_record: c.is_change_record,
                     reason,
                 })
             })
@@ -484,7 +514,14 @@ impl RetroactiveBackfill {
             });
         }
 
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // near-ties: the change, not the newest report about it
+                .then(b.is_change_record.cmp(&a.is_change_record))
+                .then(a.age_days.partial_cmp(&b.age_days).unwrap_or(std::cmp::Ordering::Equal))
+        });
         scored.truncate(self.max_causes);
 
         // strongest rejections first: most shared entities, then most recent
@@ -554,8 +591,15 @@ impl RetroactiveBackfill {
     /// LOW similarity is rewarded slightly: a cause that is dissimilar to the
     /// failure is exactly the one RAG cannot find, so it is the most valuable
     /// to backfill.
-    fn score(&self, c: &BackfillCandidate, shared: usize) -> f64 {
-        let entity_term = shared as f64; // dominant signal
+    fn score(
+        &self,
+        c: &BackfillCandidate,
+        shared: &[String],
+        idf: &impl Fn(&str) -> f64,
+    ) -> f64 {
+        // dominant signal, per-entity weighted: boilerplate names count for
+        // almost nothing, rare identifiers count for a lot
+        let entity_term: f64 = shared.iter().map(|e| idf(e)).sum();
         // gentle recency-in-the-past: 1.0 at the failure, fading with age
         let recency_term =
             0.3 * (1.0 / (1.0 + c.age_days_before_failure / self.lookback_days as f64));
@@ -564,7 +608,8 @@ impl RetroactiveBackfill {
             .similarity_to_failure
             .map(|s| 0.5 * (1.0 - s as f64).max(0.0))
             .unwrap_or(0.0);
-        entity_term + recency_term + dissim_term
+        let change_term = if c.is_change_record { CHANGE_RECORD_BONUS } else { 0.0 };
+        entity_term + recency_term + dissim_term + change_term
     }
 }
 
@@ -603,6 +648,7 @@ mod tests {
                 stability: 5.0,
                 similarity_to_failure: Some(0.11), // dissimilar — RAG would miss it
                 via_supersession_of: None,
+            is_change_record: false,
             },
             // a noisy distractor: semantically similar to the crash, but NOT causal
             // (shares no entity with the failure).
@@ -614,6 +660,7 @@ mod tests {
                 stability: 3.0,
                 similarity_to_failure: Some(0.82), // similar — RAG WOULD surface this
                 via_supersession_of: None,
+            is_change_record: false,
             },
             // a future memory — must never be backfilled (backward-only).
             BackfillCandidate {
@@ -624,6 +671,7 @@ mod tests {
                 stability: 2.0,
                 similarity_to_failure: Some(0.4),
                 via_supersession_of: None,
+            is_change_record: false,
             },
         ];
 
@@ -725,6 +773,7 @@ mod tests {
             stability: 4.0,
             similarity_to_failure: Some(0.3),
                 via_supersession_of: None,
+            is_change_record: false,
         }];
         let result = RetroactiveBackfill::new().run(&manual, &candidates);
         assert!(result.triggered, "manual override must trigger regardless of markers/PE");
@@ -743,6 +792,7 @@ mod tests {
             stability: 4.0,
             similarity_to_failure: Some(0.05),
                 via_supersession_of: None,
+            is_change_record: false,
         }];
         let result = RetroactiveBackfill::new().run(&failure(), &candidates);
         assert!(result.triggered);
@@ -777,6 +827,7 @@ mod tests {
                 stability: 4.0,
                 similarity_to_failure: None,
                 via_supersession_of: None,
+            is_change_record: false,
             },
             // too old for the window
             BackfillCandidate {
@@ -787,6 +838,7 @@ mod tests {
                 stability: 4.0,
                 similarity_to_failure: None,
                 via_supersession_of: None,
+            is_change_record: false,
             },
             // in-window but shares nothing
             BackfillCandidate {
@@ -797,6 +849,7 @@ mod tests {
                 stability: 4.0,
                 similarity_to_failure: None,
                 via_supersession_of: None,
+            is_change_record: false,
             },
         ];
         let result =
@@ -826,6 +879,7 @@ mod tests {
             stability: 4.0,
             similarity_to_failure: None,
             via_supersession_of: None,
+            is_change_record: false,
         }];
         let result =
             RetroactiveBackfill::new().run_trail(&failure_with_entities(), &candidates, &[]);
@@ -833,6 +887,88 @@ mod tests {
         assert!(gap.missing_entities.contains(&"events/local.py".to_string()));
         assert!(gap.note.contains("local.py"), "note names the entity: {}", gap.note);
         assert!(gap.note.contains("would close this trail"));
+    }
+
+    #[test]
+    fn boilerplate_matches_lose_to_the_rare_one() {
+        // Issue-template paths land in every report; under raw shared counts,
+        // two template matches beat the one real identifier. They must not.
+        let failure = FailureEvent {
+            id: "fail".into(),
+            content: "crash after upgrade: T1 T3 RARE_SETTING".into(),
+            entities: vec!["T1".into(), "T3".into(), "RARE_SETTING".into()],
+            tags: vec![],
+            prediction_error: 0.9,
+            manual: false,
+        };
+        let mut candidates = Vec::new();
+        // five template-carrying records; the distractor shares TWO of them
+        for i in 0..5 {
+            candidates.push(BackfillCandidate {
+                id: format!("filler-{i}"),
+                content: "template report".into(),
+                entities: vec!["T1".into(), "T2".into(), "T3".into()],
+                age_days_before_failure: 1.0,
+                stability: 4.0,
+                similarity_to_failure: None,
+                via_supersession_of: None,
+                is_change_record: false,
+            });
+            if i == 0 {
+                candidates[0].id = "distractor".into();
+            }
+        }
+        // the real cause shares only the rare identifier
+        candidates.push(BackfillCandidate {
+            id: "cause".into(),
+            content: "commit flipping RARE_SETTING default".into(),
+            entities: vec!["RARE_SETTING".into()],
+            age_days_before_failure: 1.0,
+            stability: 4.0,
+            similarity_to_failure: None,
+            via_supersession_of: None,
+            is_change_record: true,
+        });
+
+        let result = RetroactiveBackfill::new().run(&failure, &candidates);
+        assert_eq!(result.causes[0].memory_id, "cause",
+            "the rare shared identifier must outrank two boilerplate matches");
+        assert!(result.causes[0].is_change_record);
+    }
+
+    #[test]
+    fn ties_go_to_the_change_not_the_newest_report() {
+        let failure = FailureEvent {
+            id: "fail".into(),
+            content: "crash in local.py".into(),
+            entities: vec!["local.py".into()],
+            tags: vec![],
+            prediction_error: 0.9,
+            manual: false,
+        };
+        let make = |id: &str, change: bool, age: f64| BackfillCandidate {
+            id: id.into(),
+            content: "touched local.py".into(),
+            entities: vec!["local.py".into()],
+            age_days_before_failure: age,
+            stability: 4.0,
+            similarity_to_failure: None,
+            via_supersession_of: None,
+            is_change_record: change,
+        };
+        // equal evidence, equal age: the change record wins
+        let result = RetroactiveBackfill::new().run(
+            &failure,
+            &[make("report", false, 5.0), make("change", true, 5.0)],
+        );
+        assert_eq!(result.causes[0].memory_id, "change");
+
+        // the change may be considerably older and still win the near-tie
+        let result = RetroactiveBackfill::new().run(
+            &failure,
+            &[make("report", false, 1.0), make("change", true, 8.0)],
+        );
+        assert_eq!(result.causes[0].memory_id, "change");
     }
 
     #[test]
@@ -845,6 +981,7 @@ mod tests {
             stability: 4.0,
             similarity_to_failure: None,
             via_supersession_of: None,
+            is_change_record: false,
         };
         let excluded = vec![ExcludedCandidate {
             candidate,
