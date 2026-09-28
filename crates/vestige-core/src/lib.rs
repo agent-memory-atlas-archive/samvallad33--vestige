@@ -180,13 +180,13 @@ pub use actor::{
 
 // Agent Black Box / Receipts / Memory PRs (the cognitive flight recorder)
 pub use trace::{
-    BACKFILL_RECEIPT_CLAIM_BOUNDARY, BACKFILL_RECEIPT_SCHEMA_V1, BackfillCandidateEvidence,
-    DecayRisk, HIGH_TRUST_FLOOR, LOW_CONFIDENCE_FLOOR, MemoryPr, MemoryPrAction, MemoryPrKind,
-    MemoryPrStatus, MemoryTraceEvent, Receipt, ReceiptEvidence, ReceiptMutation, ReviewMode,
-    RiskClass, RiskSignal, StrengthDelta, SuppressReason, SuppressedReceiptEntry,
-    SynapticCaptureCandidate, SynapticCaptureDisposition, SynapticCaptureEvidence,
-    SynapticCaptureTrigger, SynapticCaptureWindow, SynapticStrengthChange, WriteContext,
-    WriteSource, classify_write,
+    BACKFILL_RECEIPT_CLAIM_BOUNDARY, BACKFILL_RECEIPT_SCHEMA_V1, WALK_RECEIPT_CLAIM_BOUNDARY,
+    WALK_RECEIPT_SCHEMA_V1, BackfillCandidateEvidence, DecayRisk, HIGH_TRUST_FLOOR,
+    LOW_CONFIDENCE_FLOOR, MemoryPr, MemoryPrAction, MemoryPrKind, MemoryPrStatus,
+    MemoryTraceEvent, Receipt, ReceiptEvidence, ReceiptMutation, ReviewMode, RiskClass,
+    RiskSignal, StrengthDelta, SuppressReason, SuppressedReceiptEntry, SynapticCaptureCandidate,
+    SynapticCaptureDisposition, SynapticCaptureEvidence, SynapticCaptureTrigger,
+    SynapticCaptureWindow, SynapticStrengthChange, WriteContext, WriteSource, classify_write,
 };
 pub use trace::ActorProvenance;
 

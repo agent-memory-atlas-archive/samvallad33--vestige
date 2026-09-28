@@ -106,9 +106,9 @@ pub fn schema() -> Value {
         "properties": {
             "view": {
                 "type": "string",
-                "enum": ["health", "retention", "timeline", "changelog", "provenance", "stats", "tools"],
+                "enum": ["health", "retention", "timeline", "changelog", "provenance", "coverage", "stats", "tools"],
                 "default": "health",
-                "description": "'tools': current tool/action inventory, or one full schema with tool. 'health' (default): system health, stats, decay preview, warnings, structured diagnostics (with entity IDs and next actions), recommendations. 'retention': average, distribution, trend. 'timeline': memories by date, bounded by limit (returned/truncated are explicit). 'changelog': audit trail of consolidations, dreams, state transitions, and merge/supersede/undo/tag operations. 'stats': hygiene counts by type, tag, age, retention, and lifecycle, bounded detail lists, recommended actions with example IDs, and recent tag operations."
+                "description": "'tools': current tool/action inventory, or one full schema with tool. 'health' (default): system health, stats, decay preview, warnings, structured diagnostics (with entity IDs and next actions), recommendations. 'retention': average, distribution, trend. 'timeline': memories by date, bounded by limit (returned/truncated are explicit). 'changelog': audit trail of consolidations, dreams, state transitions, and merge/supersede/undo/tag operations. 'coverage': anchor coverage (nodes with code_memory_anchors / total), memory edge counts by link type, and index freshness (newest git-commit record age, newest agent trace age). 'stats': hygiene counts by type, tag, age, retention, and lifecycle, bounded detail lists, recommended actions with example IDs, and recent tag operations."
             },
             "tool": {
                 "type": "string",
@@ -175,10 +175,65 @@ pub async fn execute(
         // #252 Phase A: "who said what" — endorsement events with their role
         // resolution, plus the operator policy snapshot in force.
         "provenance" => execute_provenance(storage, args),
+        // Coverage: anchor coverage, edge counts by type, index freshness.
+        "coverage" => execute_coverage(storage),
         other => Err(format!(
-            "Unknown memory_status view '{other}'. Use health|retention|timeline|changelog|provenance|stats|tools."
+            "Unknown memory_status view '{other}'. Use health|retention|timeline|changelog|provenance|coverage|stats|tools."
         )),
     }
+}
+
+/// The `coverage` view: exact store aggregates for how much of the knowledge
+/// graph is anchored to source, how the edge population breaks down by link
+/// type, and how fresh the indexes that feed code memory are. Read-only, no
+/// lists — counts and ages only, so the output shape is constant.
+pub fn execute_coverage(storage: &Arc<Storage>) -> Result<Value, String> {
+    let snapshot = storage
+        .coverage_snapshot()
+        .map_err(|e| e.to_string())?;
+
+    let mut edge_counts = serde_json::Map::new();
+    for (link_type, count) in &snapshot.edge_counts_by_type {
+        edge_counts.insert(link_type.clone(), json!(count));
+    }
+
+    // Deterministic staleness note derived from the two age probes.
+    let commit_age = snapshot.newest_git_commit_record_age_days;
+    let trace_age = snapshot.newest_agent_trace_age_hours;
+    let staleness_note = match (commit_age, trace_age) {
+        (None, None) => "no git-commit records and no agent traces recorded yet; index freshness is unknown".to_string(),
+        (None, Some(_)) => "no git-commit records in this store; commit coverage is unknown".to_string(),
+        (Some(_), None) => "no agent trace events yet; Black Box freshness is unknown".to_string(),
+        (Some(days), Some(hours)) => {
+            let commit_side = if days > 30 {
+                format!("git-commit records are {days} days old")
+            } else {
+                "git-commit records are fresh".to_string()
+            };
+            let trace_side = if hours > 72.0 {
+                format!("agent traces are {hours} hours old")
+            } else {
+                "agent traces are fresh".to_string()
+            };
+            format!("{commit_side}; {trace_side}")
+        }
+    };
+
+    Ok(json!({
+        "view": "coverage",
+        "anchorCoveragePct": snapshot.anchor_coverage_pct,
+        "anchoredNodes": snapshot.anchored_nodes,
+        "totalNodes": snapshot.total_nodes,
+        "edgeCountsByType": Value::Object(edge_counts),
+        "indexFreshness": {
+            "newestGitCommitRecord": snapshot.newest_git_commit_record,
+            "newestGitCommitRecordAgeDays": commit_age,
+            "newestAgentTraceAt": snapshot.newest_agent_trace_at,
+            "newestAgentTraceAgeHours": trace_age,
+            "stalenessNote": staleness_note,
+        },
+        "claimBoundary": "Coverage counts anchors, edges, and record ages. It measures how much of the store is anchored and how fresh the indexes are; it says nothing about memory truth or causal linkage.",
+    }))
 }
 
 /// The `provenance` view (#252 Phase A): actor-attributed endorsement events
@@ -275,7 +330,7 @@ mod tests {
     fn test_schema_views() {
         let s = schema();
         let views = s["properties"]["view"]["enum"].as_array().unwrap();
-        assert_eq!(views.len(), 7);
+        assert_eq!(views.len(), 8);
         assert_eq!(s["properties"]["view"]["default"], "health");
         assert_eq!(s["properties"]["scope"]["default"], "user");
         assert_eq!(s["properties"]["all_scopes"]["default"], false);
@@ -302,11 +357,147 @@ mod tests {
         let storage = test_storage();
         let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
         let oc = OutputConfig::default();
-        for view in ["health", "retention", "timeline", "changelog", "provenance", "stats"] {
+        for view in [
+            "health",
+            "retention",
+            "timeline",
+            "changelog",
+            "provenance",
+            "coverage",
+            "stats",
+        ] {
             let args = Some(serde_json::json!({ "view": view }));
             let r = execute(&storage, &cognitive, &oc, args).await;
             assert!(r.is_ok(), "view={view} should resolve, got {r:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_coverage_view_math_on_seeded_store() {
+        let storage = test_storage();
+        // Empty store: zero coverage, no NaN, unknown freshness.
+        let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
+        let oc = OutputConfig::default();
+        let empty = execute(
+            &storage,
+            &cognitive,
+            &oc,
+            Some(serde_json::json!({ "view": "coverage" })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty["view"], "coverage");
+        assert_eq!(empty["anchorCoveragePct"], 0.0);
+        assert_eq!(empty["totalNodes"], 0);
+        assert_eq!(empty["anchoredNodes"], 0);
+        assert_eq!(empty["edgeCountsByType"], serde_json::json!({}));
+        assert_eq!(
+            empty["indexFreshness"]["stalenessNote"],
+            "no git-commit records and no agent traces recorded yet; index freshness is unknown"
+        );
+
+        // Seed: 1 anchored node of 4 others, two edge types, a git-commit
+        // record, and one trace event. memory_connections is keyed
+        // (source_id, target_id), so distinct pairs are needed per edge.
+        let anchored = storage
+            .ingest(vestige_core::IngestInput {
+                content: "pattern: prefer canonical json for digests".to_string(),
+                node_type: "pattern".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut facts = Vec::new();
+        for content in ["plain fact one", "plain fact two", "plain fact three"] {
+            facts.push(
+                storage
+                    .ingest(vestige_core::IngestInput {
+                        content: content.to_string(),
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .id,
+            );
+        }
+        let commit = storage
+            .ingest(vestige_core::IngestInput {
+                content: "commit aabbcc0 bump schema".to_string(),
+                tags: vec!["git-commit".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        use chrono::Utc;
+        use vestige_core::codebase::CodeAnchor;
+        use vestige_core::ConnectionRecord;
+        storage
+            .record_code_anchors(&[CodeAnchor {
+                id: "anc_cov".into(),
+                node_id: anchored.id.clone(),
+                file_path: "src/main.rs".into(),
+                symbol: None,
+                symbol_kind: None,
+                start_line: Some(1),
+                end_line: Some(1),
+                span_lines: Some(1),
+                content_hash: Some("b3:deadbeef".into()),
+                captured_at: Utc::now(),
+                last_verified_at: None,
+                last_status: None,
+            }])
+            .unwrap();
+        for (target, link) in [
+            (commit.id.as_str(), "backfill_candidate"),
+            (facts[0].as_str(), "backfill_candidate"),
+            (facts[1].as_str(), "semantic"),
+        ] {
+            storage
+                .save_connection(&ConnectionRecord {
+                    source_id: anchored.id.clone(),
+                    target_id: target.to_string(),
+                    strength: 0.4,
+                    link_type: link.to_string(),
+                    created_at: Utc::now(),
+                    last_activated: Utc::now(),
+                    activation_count: 0,
+                })
+                .unwrap();
+        }
+        storage
+            .append_trace_event(&vestige_core::MemoryTraceEvent::McpCall {
+                run_id: "run_cov".into(),
+                tool: "memory_status".into(),
+                args_hash: "0".into(),
+                at: Utc::now().timestamp_millis(),
+            })
+            .unwrap();
+
+        let coverage = execute(
+            &storage,
+            &cognitive,
+            &oc,
+            Some(serde_json::json!({ "view": "coverage" })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(coverage["totalNodes"], 5);
+        assert_eq!(coverage["anchoredNodes"], 1);
+        assert_eq!(coverage["anchorCoveragePct"], 20.0);
+        assert_eq!(
+            coverage["edgeCountsByType"],
+            serde_json::json!({"backfill_candidate": 2, "semantic": 1})
+        );
+        let freshness = &coverage["indexFreshness"];
+        assert!(
+            freshness["newestGitCommitRecordAgeDays"].as_i64().unwrap() <= 1,
+            "seeded commit is seconds old"
+        );
+        assert!(
+            freshness["newestAgentTraceAgeHours"].as_f64().unwrap() < 1.0,
+            "seeded trace is seconds old"
+        );
+        assert_eq!(
+            freshness["stalenessNote"],
+            "git-commit records are fresh; agent traces are fresh"
+        );
     }
 
     #[tokio::test]

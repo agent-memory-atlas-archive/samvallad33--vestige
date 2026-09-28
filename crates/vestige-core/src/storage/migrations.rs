@@ -199,6 +199,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "Typed edge vocabulary: JSON edge metadata + run provenance on memory_connections, typed-(link_type, target_id) index, and purge tombstones",
         up: MIGRATION_V39_UP,
     },
+    Migration {
+        version: 40,
+        description: "Walk receipts: canonical backfill parameter envelopes with blake3 digests for deterministic re-execution",
+        up: MIGRATION_V40_UP,
+    },
 ];
 
 /// A database migration
@@ -2604,6 +2609,7 @@ ALTER TABLE knowledge_nodes ADD COLUMN author_actor_did TEXT;
 UPDATE schema_version SET version = 38, applied_at = datetime('now');
 "#;
 
+<<<<<<< HEAD
 /// V39: Typed edge vocabulary (build/w2b-edge-schema).
 ///
 /// `memory_connections` stays the single edge table. The owner-approved
@@ -2648,8 +2654,39 @@ CREATE TABLE IF NOT EXISTS purge_tombstones (
 
 CREATE INDEX IF NOT EXISTS idx_purge_tombstones_purged_at
     ON purge_tombstones(purged_at);
+=======
+/// V39: walk receipts for backfill re-execution.
+///
+/// A "walk receipt" freezes the exact parameter envelope of a Retroactive
+/// Salience Backfill run together with the blake3 digest of its canonical
+/// JSON encoding, so the same walk can be re-executed later against the
+/// current store and its verdict compared. Non-destructive: a pure new
+/// table, no existing table is touched.
+///
+/// * `receipt_id` is derived from the digest (`wr_<digest-prefix>`), so
+///   saving the same canonical params twice is idempotent — one row, one
+///   handle returned. Deterministic ids make retries safe.
+/// * `digest` is UNIQUE: two different receipt ids can never claim the same
+///   canonical parameters, and one parameter envelope can never fork into
+///   two rows.
+/// * `engine_version` records the vestige-core version that canonicalized
+///   and digested the envelope; a replay compares it against the running
+///   version before trusting byte-stability of the verdict.
+/// * The table stores parameters only — never memory content, never scan
+///   results. Replays re-derive everything from the live store.
+const MIGRATION_V40_UP: &str = r#"
+CREATE TABLE IF NOT EXISTS walk_receipts (
+    receipt_id     TEXT PRIMARY KEY,
+    digest         TEXT NOT NULL UNIQUE,
+    canonical_json TEXT NOT NULL,
+    engine_version TEXT NOT NULL,
+    created_at     TEXT NOT NULL
+);
 
-UPDATE schema_version SET version = 39, applied_at = datetime('now');
+CREATE INDEX IF NOT EXISTS idx_walk_receipts_created_at ON walk_receipts(created_at DESC);
+>>>>>>> build/w3e-receipts-status
+
+UPDATE schema_version SET version = 40, applied_at = datetime('now');
 "#;
 
 #[cfg(test)]

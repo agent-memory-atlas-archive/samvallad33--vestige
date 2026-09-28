@@ -235,6 +235,16 @@ impl Receipt {
 /// Stable schema URI for Retroactive Salience Backfill receipt evidence.
 pub const BACKFILL_RECEIPT_SCHEMA_V1: &str = "https://vestige.dev/schemas/receipt/backfill/v1";
 
+/// Stable schema URI for walk receipts (canonical backfill parameter
+/// envelopes persisted for deterministic re-execution).
+pub const WALK_RECEIPT_SCHEMA_V1: &str = "https://vestige.dev/schemas/receipt/walk/v1";
+
+/// Explicit epistemic boundary for walk receipts and their replays. A walk
+/// receipt freezes parameters and a digest — never results. Replaying it
+/// re-executes those parameters against the current store; any verdict delta
+/// is a comparison of candidate rankings, not a causal claim.
+pub const WALK_RECEIPT_CLAIM_BOUNDARY: &str = "A walk receipt records canonical backfill parameters and their digest only; replay re-executes them against the current store and compares candidate verdicts. Neither establishes causation, and a verdict delta is evidence about the ranking, not about the world.";
+
 /// Actor provenance recorded on every mutation receipt (#252 Phase A). The
 /// uniform surface: who the process actor is (a did:key minted per data
 /// directory), what role the caller claimed, what the operator policy

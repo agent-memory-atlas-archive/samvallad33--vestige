@@ -781,7 +781,7 @@ description: Some("Retrieve from memory. mode 'lookup' (default): fast hybrid ke
                     idempotent_hint: true,
                     open_world_hint: false,
                 }),
-description: Some("Inspect a persisted retrieval receipt ('get') or ablate its frozen evidence pack ('replay'): named slots withheld, no rerun, no model, no causal claim.".to_string()),
+description: Some("Inspect a persisted retrieval receipt ('get'), ablate its frozen evidence pack ('replay': named slots withheld, no rerun, no model, no causal claim), save a canonical backfill parameter envelope as a walk receipt ('save_walk'), or re-execute a saved walk receipt against the current store ('replay' with a 'wr_…' id, optionally filtering one candidate edge and reporting the verdict delta).".to_string()),
                 input_schema: tools::compact::of(&tools::receipt::schema()),
                 output_schema: Some(serde_json::json!({
                     "type": "object",
