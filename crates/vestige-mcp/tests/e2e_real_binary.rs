@@ -2,51 +2,31 @@
 //!
 //! # Why this file exists
 //!
-//! The repository has ~281 e2e tests, and they run against mocks
-//! (`tests/e2e/src/mocks/mock_embedding.rs`) inside the process. Before this
-//! file, exactly one test spawned the shipped executable
-//! (`crates/vestige-mcp/tests/stdio_shutdown.rs`). Every defect worth catching
-//! at the seam between "the code is correct" and "the product works" lives in
-//! that gap: process startup, SQLite migration against a real file, integrity
-//! repair on a damaged store, JSON-RPC framing over a real pipe, and the actual
-//! embedding runtime being loaded rather than stubbed.
-//!
-//! Every test here drives `target/<profile>/vestige-mcp` as a child process and
-//! speaks line-framed JSON-RPC over its stdin/stdout, exactly as an MCP client
-//! does.
+//! This file drives the shipped executable directly, speaking line-framed
+//! JSON-RPC over its stdin/stdout, exactly as an MCP client does. Every
+//! defect worth catching at the seam between "the code is correct" and
+//! "the product works" lives in that gap: process startup, SQLite
+//! migration against a real file, integrity repair on a damaged store,
+//! and JSON-RPC framing over a real pipe.
 //!
 //! # Running it
 //!
 //! ```sh
-//! # Fast suite. No model load, no network. This is what CI runs.
 //! cargo test -p vestige-mcp --test e2e_real_binary
-//!
-//! # Full suite, including tests that need the real embedding runtime.
-//! cargo test -p vestige-mcp --test e2e_real_binary -- --ignored
 //! ```
 //!
-//! # The embedding trap
+//! # Keyword-path only
 //!
-//! `smart_ingest` and `recall` behave differently before the ONNX embedding
-//! model finishes loading: ingest returns `hasEmbedding: false` and retrieval
-//! silently degrades to a keyword-only path. A test that ingests immediately
-//! after `initialize` and then asserts on semantic behaviour is measuring the
-//! fallback and proves nothing.
-//!
-//! Rather than sleeping blindly, [`Server::wait_for_embeddings`] blocks on the
-//! server's own readiness line on stderr, and [`Server::ingest_embedded`]
-//! additionally asserts `hasEmbedding == true` on every write. A test cannot
-//! silently drift onto the degraded path: it fails instead.
-//!
-//! Tests that genuinely need that runtime are `#[ignore]`d, because on a cold
-//! machine the first run downloads a ~670 MB model. Tests whose subject is
-//! embedding-independent by construction (FTS/BM25 keyword retrieval, SQLite
-//! integrity, migration, JSON-RPC framing, purge, suppression, durability) run
-//! by default and use [`Server::ingest_keyword_only`], which documents that
-//! choice at the call site.
-//!
-//! The correction-ingest regression also requires the real model. Its ignore
-//! marker selects the optional runtime suite; it is not an expected failure.
+//! The embedding/vector runtime is being removed from the product. Every
+//! test here exercises the keyword/FTS/BM25 retrieval path, SQLite
+//! integrity, migration, JSON-RPC framing, purge, suppression, and
+//! durability — none of them depend on vector machinery. Tests that
+//! previously required the real (~670 MB) embedding model were removed
+//! with it; the contradiction and correction regressions were converted
+//! to the keyword path because their subjects (retrieval-side
+//! contradiction protection, the ingest gate's shared contradiction
+//! detector) are lexical by construction: the two sides of a
+//! contradiction share nearly every token.
 
 // The process harness (Server, store helpers, payload assertions) lives in
 // `common/mod.rs`, shared verbatim with `e2e_failure_cases.rs` so both suites
@@ -221,51 +201,6 @@ fn uninitialized_requests_are_refused_but_discover_is_exempt() {
     server.handshake();
     assert!(server.result("tools/list", None)["tools"].is_array());
 
-    server.shutdown();
-}
-
-/// The first minute of a fresh install used to be silent: the model download
-/// printed to stderr, which stdio clients hide. The server now announces its
-/// warm-up as MCP logging, after the handshake and never before the initialize
-/// response (that ordering is what every other test in this file proves by
-/// reading responses line by line).
-#[test]
-fn warm_up_is_announced_as_mcp_logging_after_the_handshake() {
-    let dir = data_dir();
-    let mut server = Server::spawn(dir.path());
-    let init = server.handshake();
-    assert!(
-        init["capabilities"]["logging"].is_object(),
-        "logging capability must be declared: {init}"
-    );
-    assert!(
-        server.notifications.is_empty(),
-        "nothing may precede the initialize response: {:?}",
-        server.notifications
-    );
-
-    let note = server.wait_for_log_notification("vestige.embeddings", Duration::from_secs(20));
-    let event = note["params"]["data"]["event"].as_str().unwrap_or("");
-    assert!(
-        matches!(
-            event,
-            "model_loading"
-                | "model_download_started"
-                | "embedding_runtime_ready"
-                | "embedding_runtime_unavailable"
-        ),
-        "unexpected warm-up event: {note}"
-    );
-    assert_eq!(
-        note["params"]["level"]
-            .as_str()
-            .map(|l| l == "info" || l == "warning"),
-        Some(true)
-    );
-
-    // Ordinary traffic keeps working with notifications interleaved.
-    let list = server.result("tools/list", None);
-    assert!(!list["tools"].as_array().unwrap().is_empty());
     server.shutdown();
 }
 
@@ -1390,14 +1325,6 @@ fn approved_purge_removes_content_and_leaves_a_content_free_tombstone() {
         )
         .expect("count nodes");
     assert_eq!(nodes, 0, "the row itself must be gone");
-    let embeddings: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM node_embeddings WHERE node_id = ?1",
-            [&subject],
-            |row| row.get(0),
-        )
-        .expect("count embeddings");
-    assert_eq!(embeddings, 0, "the embedding must be gone too");
     let leaked: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM knowledge_nodes WHERE content LIKE '%4.2 million%'",
@@ -1511,79 +1438,13 @@ fn suppression_survives_a_restart_and_keeps_compounding() {
 }
 
 // ============================================================================
-// 5. Tests that require the real embedding runtime
+// 5. Contradiction and correction handling on the keyword path
 //
-// These load a ~670 MB ONNX model (downloading it on a cold machine), so they
-// are ignored by default. Run them with:
-//     cargo test -p vestige-mcp --test e2e_real_binary -- --ignored
+// These two regressions used to require the real embedding runtime, but their
+// subjects are lexical by construction: the two sides of a contradiction
+// share nearly every token, so keyword retrieval reaches them without any
+// vector machinery. They run in the default suite now.
 // ============================================================================
-
-/// Baseline for every ignored test below: the real runtime must actually be in
-/// play, and hybrid retrieval must be the path taken.
-///
-/// If this fails, the rest of this section is measuring the keyword fallback
-/// and its results are meaningless.
-#[test]
-#[ignore = "loads the real embedding runtime (~670 MB model); run with --ignored"]
-fn the_real_embedding_runtime_produces_vectors_and_hybrid_retrieval() {
-    let dir = data_dir();
-    let mut server = Server::spawn(dir.path());
-    server.handshake();
-    server.wait_for_embeddings();
-
-    let id = server.ingest_embedded(
-        "The deployment pipeline uses blue-green rollout on the Kubernetes cluster",
-        &["infra"],
-    );
-
-    let node = server.call_tool_ok("memory", json!({ "action": "get", "id": &id }))["node"].clone();
-    assert_eq!(
-        node["hasEmbedding"],
-        json!(true),
-        "no vector was stored: {node}"
-    );
-    assert!(
-        node["embeddingModel"]
-            .as_str()
-            .is_some_and(|m| !m.is_empty()),
-        "the stored vector must record which model produced it: {node}"
-    );
-
-    // A paraphrase sharing NO content word with the memory. If the vector side
-    // is dead, BM25 alone cannot bridge this and the result set is empty.
-    let value = server.call_tool_ok(
-        "recall",
-        json!({
-            "query": "zero downtime release strategy",
-            "limit": 5,
-            "min_similarity": 0.3,
-        }),
-    );
-    assert_eq!(
-        value["method"],
-        json!("hybrid+cognitive"),
-        "expected the hybrid path, got {}",
-        value["method"]
-    );
-    let hit = value["results"]
-        .as_array()
-        .expect("results")
-        .iter()
-        .find(|r| r["id"] == json!(&id))
-        .unwrap_or_else(|| {
-            panic!("semantic retrieval failed to find a paraphrased match: {value}")
-        });
-    assert!(
-        hit["keywordScore"].is_null(),
-        "the paraphrase must have matched semantically, not lexically: {hit}"
-    );
-    assert!(
-        hit["semanticScore"].as_f64().is_some_and(|s| s > 0.3),
-        "expected a real semantic score on the paraphrase: {hit}"
-    );
-
-    server.shutdown();
-}
 
 /// Both sides of a contradiction must survive retrieval, and the dissenting
 /// side must be flagged rather than quietly demoted.
@@ -1618,26 +1479,24 @@ fn the_real_embedding_runtime_produces_vectors_and_hybrid_retrieval() {
 /// The invariant that must hold unconditionally — both sides returned — is
 /// asserted without any retry.
 #[test]
-#[ignore = "loads the real embedding runtime (~670 MB model); run with --ignored"]
 fn contradictions_are_returned_intact_and_flagged_as_protected() {
     let dir = data_dir();
     let mut server = Server::spawn(dir.path());
     server.handshake();
-    server.wait_for_embeddings();
 
-    let never = server.ingest_embedded(
+    let never = server.ingest_keyword_only(
         "Never use prompt diversity when the sampling temperature exceeds zero point six",
         &[],
     );
-    let always = server.ingest_embedded(
+    let always = server.ingest_keyword_only(
         "Always use prompt diversity when the sampling temperature exceeds zero point six",
         &[],
     );
-    let hurts = server.ingest_embedded(
+    let hurts = server.ingest_keyword_only(
         "Prompt diversity hurts accuracy on the competition benchmark evaluation",
         &[],
     );
-    let improves = server.ingest_embedded(
+    let improves = server.ingest_keyword_only(
         "Prompt diversity improves accuracy on the competition benchmark evaluation",
         &[],
     );
@@ -1714,99 +1573,26 @@ fn contradictions_are_returned_intact_and_flagged_as_protected() {
     server.shutdown();
 }
 
-/// Tag filtering must be case-insensitive on the full hybrid path too.
-///
-/// The keyword path and the hybrid path apply this filter in two different
-/// places, so covering only one leaves half the surface untested.
-#[test]
-#[ignore = "loads the real embedding runtime (~670 MB model); run with --ignored"]
-fn tag_prefix_filtering_is_case_insensitive_on_the_hybrid_path() {
-    let dir = data_dir();
-    let mut server = Server::spawn(dir.path());
-    server.handshake();
-    server.wait_for_embeddings();
-
-    let deploy = server.ingest_embedded(
-        "Rollout gate alpha guards the payments service release",
-        &["Infra:Deploy"],
-    );
-    let staging = server.ingest_embedded(
-        "Rollout gate beta guards the payments service release",
-        &["Infra:Staging"],
-    );
-    let office = server.ingest_embedded(
-        "Rollout gate gamma guards the office kitchen refit",
-        &["Office:Kitchen"],
-    );
-
-    let unfiltered = server.recall_ids(json!({ "query": "rollout gate guards", "limit": 10 }));
-    assert!(
-        unfiltered.contains(&office),
-        "baseline hybrid query must include the memory the filter should later drop: {unfiltered:?}"
-    );
-
-    for prefix in ["Infra:", "infra:", "INFRA:"] {
-        let mut filtered = server.recall_ids(
-            json!({ "query": "rollout gate guards", "limit": 10, "tag_prefix": prefix }),
-        );
-        filtered.sort();
-        let mut expected = vec![deploy.clone(), staging.clone()];
-        expected.sort();
-        assert_eq!(
-            filtered, expected,
-            "hybrid tag_prefix {prefix:?} must be case-insensitive and must exclude {office}"
-        );
-    }
-
-    server.shutdown();
-}
-
 /// A correction must not be swallowed by the ingest gate.
 ///
-/// # THIS TEST FAILS AGAINST THE CURRENT BUILD. It documents a real defect and
-/// is deliberately NOT fixed here.
+/// # History
 ///
-/// Reproduction, end to end over the real binary, with the embedding runtime
-/// loaded:
+/// This test documented a real defect over the real binary: ingesting
+/// "Never use prompt diversity …" and then "Always use prompt diversity …"
+/// returned `decision: "reinforce"` at similarity 0.965 — the correction was
+/// discarded and the contradicted memory strengthened, while reversing the
+/// order returned `create`. The root cause was a write-path copy of
+/// contradiction detection
+/// (`crates/vestige-core/src/advanced/prediction_error.rs`) that only fired
+/// when the NEW content was the negative one, and had no antonym or
+/// mutually-exclusive-value branches, while the richer retrieval-side
+/// detector could see every one of those shapes.
 ///
-/// 1. ingest `"Never use prompt diversity when the sampling temperature exceeds
-///    zero point six"`
-/// 2. ingest `"Always use prompt diversity when the sampling temperature
-///    exceeds zero point six"`
-///
-/// Observed: the second ingest returns `decision: "reinforce"` at similarity
-/// 0.965. The correction is DISCARDED and the memory it contradicts is
-/// STRENGTHENED. `recall` afterwards returns only the stale "Never" memory.
-///
-/// Reversing the order changes the outcome: ingesting "Always" first and
-/// "Never" second returns `decision: "create"` and keeps both. Same two
-/// memories, same similarity — only the order differs.
-///
-/// Root cause: `crates/vestige-core/src/advanced/prediction_error.rs`. The
-/// near-identical branch is correctly guarded by `!best.appears_contradictory`,
-/// but the flag comes from `detect_contradiction` in that same file, which
-/// tests `new.contains(neg) && old.contains(pos)` — it only fires when the NEW
-/// content is the negative one. It also has no antonym branch and no
-/// mutually-exclusive-value branch, so these are swallowed identically
-/// (all measured over the real binary):
-///
-/// | first ingest | second ingest | decision | similarity |
-/// |---|---|---|---|
-/// | Never use prompt diversity … | Always use prompt diversity … | reinforce | 0.965 |
-/// | … hurts accuracy … | … improves accuracy … | reinforce | 0.962 |
-/// | … PostgreSQL 14 … | … PostgreSQL 16 … | reinforce | 0.940 |
-/// | Priya holds a Bachelor degree … | Priya holds a Master of Science degree … | reinforce | 0.976 |
-///
-/// That was the pre-fix state: the richer retrieval-side detector could see
-/// every one of these shapes, but the write path had its own blind copy, and
-/// retrieval-side protection cannot protect a memory destroyed at ingest one
-/// stage earlier. Both paths now consult the shared detector in
+/// Both paths now consult the shared detector in
 /// `vestige-core/src/advanced/contradiction.rs`; this test locks the write
-/// path's behaviour over the real binary.
+/// path's behaviour. The pairs are lexically near-identical, so the keyword
+/// path drives the same gate decisions the embedding runtime used to.
 #[test]
-#[ignore = "loads the real embedding runtime (~670 MB model); run with --ignored. \
-            (Documented the ingest-gate defect before the shared-detector fix; \
-            it now passes and guards the regression.)"]
 fn correction_must_not_be_swallowed_by_the_ingest_gate() {
     const NEGATIVE: &str =
         "Never use prompt diversity when the sampling temperature exceeds zero point six";
@@ -1820,7 +1606,6 @@ fn correction_must_not_be_swallowed_by_the_ingest_gate() {
         let control_dir = data_dir();
         let mut control = Server::spawn(control_dir.path());
         control.handshake();
-        control.wait_for_embeddings();
         control.call_tool_ok("smart_ingest", json!({ "content": POSITIVE }));
         let flipped = control.call_tool_ok("smart_ingest", json!({ "content": NEGATIVE }));
         assert_eq!(
@@ -1845,12 +1630,10 @@ fn correction_must_not_be_swallowed_by_the_ingest_gate() {
     let dir = data_dir();
     let mut server = Server::spawn(dir.path());
     server.handshake();
-    server.wait_for_embeddings();
 
     // Deliberately NOT forceCreate: this is the Prediction Error Gate under test.
     let original = server.call_tool_ok("smart_ingest", json!({ "content": NEGATIVE }));
     assert_eq!(original["decision"], json!("create"));
-    assert_eq!(original["hasEmbedding"], json!(true));
     let original_id = original["nodeId"].as_str().expect("nodeId").to_string();
 
     let correction = server.call_tool_ok("smart_ingest", json!({ "content": POSITIVE }));
@@ -1886,173 +1669,6 @@ fn correction_must_not_be_swallowed_by_the_ingest_gate() {
     );
 
     server.shutdown();
-}
-
-/// An approved purge must also drop the vector, not just the row.
-///
-/// The keyword-path purge test cannot prove this: with no embedding runtime
-/// there was never a vector to remove. This one seeds a real vector first.
-#[test]
-#[ignore = "loads the real embedding runtime (~670 MB model); run with --ignored"]
-fn approved_purge_removes_the_stored_embedding() {
-    let dir = data_dir();
-    disable_review_gate(dir.path());
-    let mut server = Server::spawn(dir.path());
-    server.handshake();
-    server.wait_for_embeddings();
-
-    let subject = server.ingest_embedded(
-        "The quarterly revenue figure for the Helsinki office was 4.2 million euros",
-        &["finance"],
-    );
-
-    {
-        // The vector must exist before we can claim the purge removed it.
-        let conn = open_db(dir.path());
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM node_embeddings WHERE node_id = ?1",
-                [&subject],
-                |row| row.get(0),
-            )
-            .expect("count embeddings");
-        assert_eq!(count, 1, "fixture must have stored a real vector first");
-    }
-
-    let purged = server.call_tool_ok(
-        "memory",
-        json!({ "action": "purge", "id": &subject, "confirm": true }),
-    );
-    assert_eq!(
-        purged["success"],
-        json!(true),
-        "purge did not apply: {purged}"
-    );
-    server.shutdown();
-
-    let conn = open_db(dir.path());
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM node_embeddings WHERE node_id = ?1",
-            [&subject],
-            |row| row.get(0),
-        )
-        .expect("count embeddings");
-    assert_eq!(count, 0, "the vector outlived the purged memory");
-}
-
-/// Everything, including vectors, must survive a restart.
-///
-/// Catches a rebuilt-on-boot vector index that silently drops rows: the memory
-/// is still listed but no longer semantically reachable, which looks like a
-/// ranking regression rather than data loss.
-#[test]
-#[ignore = "loads the real embedding runtime (~670 MB model); run with --ignored"]
-fn embeddings_and_semantic_retrieval_survive_a_restart() {
-    let dir = data_dir();
-
-    let mut first = Server::spawn(dir.path());
-    first.handshake();
-    first.wait_for_embeddings();
-    let id = first.ingest_embedded(
-        "The deployment pipeline uses blue-green rollout on the Kubernetes cluster",
-        &["infra"],
-    );
-    first.shutdown();
-
-    let mut second = Server::spawn(dir.path());
-    second.handshake();
-    second.wait_for_embeddings();
-
-    let node = second.call_tool_ok("memory", json!({ "action": "get", "id": &id }))["node"].clone();
-    assert_eq!(
-        node["hasEmbedding"],
-        json!(true),
-        "the stored vector did not survive the restart: {node}"
-    );
-
-    let ids = second.recall_ids(json!({
-        "query": "zero downtime release strategy",
-        "limit": 5,
-        "min_similarity": 0.3,
-    }));
-    assert!(
-        ids.contains(&id),
-        "semantic retrieval broke across the restart: {ids:?}"
-    );
-
-    second.shutdown();
-    assert_store_is_healthy(dir.path());
-}
-
-/// A corrupt FTS index must be rebuilt without losing vectors either.
-///
-/// The default-suite version of this test proves memories and keyword search
-/// survive. This one additionally proves the rebuild does not disturb the
-/// vector side of the store.
-#[test]
-#[ignore = "loads the real embedding runtime (~670 MB model); run with --ignored"]
-fn corrupt_fts_rebuild_preserves_embeddings() {
-    let dir = data_dir();
-
-    let mut server = Server::spawn(dir.path());
-    server.handshake();
-    server.wait_for_embeddings();
-    let mut ids = Vec::new();
-    for i in 0..5 {
-        ids.push(server.ingest_embedded(
-            &format!("Memory number {i} about the deployment rollout checklist"),
-            &[],
-        ));
-    }
-    server.shutdown();
-
-    {
-        let conn = open_db(dir.path());
-        conn.execute_batch(
-            // Fixed byte pattern, not randomblob(): an unseeded random block
-            // sometimes damages the segment so badly that quick_check itself
-            // fails with SQLITE_NOMEM, and the test flakes (Aug 30, Sep 1).
-            &format!(
-                "UPDATE knowledge_fts_data SET block = x'{}' \
-                 WHERE id = (SELECT id FROM knowledge_fts_data WHERE id > 1 LIMIT 1);",
-                "A5".repeat(200)
-            ),
-        )
-        .expect("corrupt the fts index");
-        assert!(
-            conn.execute_batch(
-                "INSERT INTO knowledge_fts(knowledge_fts) VALUES('integrity-check');"
-            )
-            .is_err(),
-            "the fixture must actually corrupt the index"
-        );
-    }
-
-    let mut reopened = Server::spawn(dir.path());
-    reopened.handshake();
-    reopened.wait_for_embeddings();
-
-    for id in &ids {
-        let node =
-            reopened.call_tool_ok("memory", json!({ "action": "get", "id": id }))["node"].clone();
-        assert_eq!(
-            node["hasEmbedding"],
-            json!(true),
-            "memory {id} lost its vector during the FTS rebuild: {node}"
-        );
-    }
-    let semantic = reopened.recall_ids(json!({
-        "query": "what do we check before shipping a release",
-        "limit": 10,
-    }));
-    assert!(
-        !semantic.is_empty(),
-        "semantic retrieval must work again after the rebuild"
-    );
-
-    reopened.shutdown();
-    assert_store_is_healthy(dir.path());
 }
 
 // ============================================================================
@@ -2109,12 +1725,7 @@ fn memory_status_every_view_has_its_shape_and_an_unknown_view_errors() {
     let health = server.call_tool_ok("memory_status", json!({ "view": "health" }));
     assert_keys(
         &health,
-        &[
-            "embeddingsCompiledIn",
-            "embeddingReady",
-            "cognitiveHealth",
-            "averageRetention",
-        ],
+        &["cognitiveHealth", "averageRetention"],
         "memory_status health",
     );
     assert_under(&health, 8_000, "memory_status health");

@@ -226,50 +226,6 @@ fn v3_purge_erases_neighbor_snapshots_and_keeps_foreign_keys_valid() {
     );
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
-#[test]
-fn v3_delayed_embedding_cannot_resurrect_a_purged_memory() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = SqliteMemoryStore::new(Some(dir.path().join("embedding-purge.db"))).unwrap();
-    let id = node(&store, "delayed embedding", "user");
-    let profile = store.active_embedding_profile().unwrap().unwrap();
-    let vector = vec![0.0; EMBEDDING_DIMENSIONS];
-    let bytes = Embedding::new(vector.clone()).to_bytes();
-    store.purge_node(&id, Some("fixture")).unwrap();
-    assert!(
-        store
-            .persist_node_embedding(
-                &id,
-                &bytes,
-                "fixture",
-                &vector,
-                true,
-                ("delayed embedding", profile.profile_id.as_str())
-            )
-            .is_err()
-    );
-    let reader = store.reader.lock().unwrap();
-    for table in ["node_embeddings", "embedding_profile_vectors"] {
-        assert_eq!(
-            reader
-                .query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE node_id=?1"),
-                    params![id],
-                    |r| r.get::<_, i64>(0)
-                )
-                .unwrap(),
-            0
-        );
-    }
-    assert!(
-        !reader
-            .prepare("PRAGMA foreign_key_check")
-            .unwrap()
-            .exists([])
-            .unwrap()
-    );
-}
-
 #[test]
 fn v3_upgrade_preserves_legacy_suppression_without_inventing_undo() {
     let dir = tempfile::tempdir().unwrap();

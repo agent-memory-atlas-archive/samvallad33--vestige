@@ -32,15 +32,6 @@ use serde_json::{Value, json};
 /// wedged CI job.
 pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// How long to wait for the embedding runtime. Generous because the first run
-/// on a cold machine downloads the model; warm it is well under a second.
-pub(crate) const EMBEDDING_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// The server's own readiness line. Waiting for this is strictly better than
-/// sleeping: it is the exact event we care about, and it fails loudly if the
-/// runtime never comes up instead of quietly proceeding on the fallback path.
-pub(crate) const EMBEDDINGS_READY: &str = "Legacy Nomic embedding service initialized successfully";
-
 /// A running `vestige-mcp` child process plus its stdio plumbing.
 ///
 /// Reader threads drain stdout and stderr so the child can never block on a
@@ -246,33 +237,6 @@ impl Server {
         }
     }
 
-    /// Wait until a `notifications/message` from `logger` has arrived, reading
-    /// and stashing lines until then.
-    pub(crate) fn wait_for_log_notification(&mut self, logger: &str, window: Duration) -> Value {
-        let deadline = Instant::now() + window;
-        loop {
-            if let Some(found) = self.notifications.iter().find(|n| {
-                n["method"] == json!("notifications/message")
-                    && n["params"]["logger"] == json!(logger)
-            }) {
-                return found.clone();
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(
-                !remaining.is_zero(),
-                "no notifications/message from {logger} within {window:?}; saw {:?}",
-                self.notifications
-            );
-            if let Ok(line) = self.stdout.recv_timeout(remaining) {
-                if let Some(notification) = Self::is_server_notification(&line) {
-                    self.notifications.push(notification);
-                } else {
-                    panic!("unexpected response while waiting for a notification: {line}");
-                }
-            }
-        }
-    }
-
     /// Send a raw line and read one response line. For malformed-input tests.
     pub(crate) fn raw_roundtrip(&mut self, line: &str) -> Value {
         self.write_line(line);
@@ -341,37 +305,6 @@ impl Server {
         result
     }
 
-    /// Block until the embedding runtime reports ready.
-    ///
-    /// This is the honest replacement for "sleep 45 seconds and hope": it waits
-    /// for the exact event, returns as soon as it happens, and panics with the
-    /// server's own log if it never does.
-    pub(crate) fn wait_for_embeddings(&mut self) {
-        let deadline = Instant::now() + EMBEDDING_TIMEOUT;
-        loop {
-            if self
-                .stderr_lines()
-                .iter()
-                .any(|line| line.contains(EMBEDDINGS_READY))
-            {
-                return;
-            }
-            assert!(
-                self.is_running(),
-                "vestige-mcp exited before the embedding runtime came up. stderr: {:?}",
-                self.stderr_lines()
-            );
-            if Instant::now() >= deadline {
-                panic!(
-                    "embedding runtime never became ready within {EMBEDDING_TIMEOUT:?}. \
-                     stderr: {:?}",
-                    self.stderr_lines()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
     /// Call a tool and return its structured payload.
     ///
     /// Vestige reports tool-level failures as `isError: true` with a JSON body,
@@ -398,21 +331,9 @@ impl Server {
     }
 
     /// Ingest a memory whose retrieval is exercised only through keyword/FTS
-    /// paths, so the embedding runtime is irrelevant to the assertion.
+    /// paths, so the (removed) embedding runtime is irrelevant to the
+    /// assertion. This is the only ingest helper now.
     pub(crate) fn ingest_keyword_only(&mut self, content: &str, tags: &[&str]) -> String {
-        self.ingest_inner(content, tags, false)
-    }
-
-    /// Ingest a memory and assert the real embedding runtime produced a vector.
-    ///
-    /// This is the guard against silently testing the degraded no-embedding
-    /// path: if the model is not loaded, `hasEmbedding` is `false` and the test
-    /// fails here rather than producing a meaningless green.
-    pub(crate) fn ingest_embedded(&mut self, content: &str, tags: &[&str]) -> String {
-        self.ingest_inner(content, tags, true)
-    }
-
-    pub(crate) fn ingest_inner(&mut self, content: &str, tags: &[&str], require_embedding: bool) -> String {
         let value = self.call_tool_ok(
             "smart_ingest",
             json!({ "content": content, "tags": tags, "forceCreate": true }),
@@ -422,14 +343,6 @@ impl Server {
             json!(true),
             "smart_ingest failed for {content:?}: {value}"
         );
-        if require_embedding {
-            assert_eq!(
-                value["hasEmbedding"],
-                json!(true),
-                "the embedding runtime was not actually used for {content:?}; this test would \
-                 have measured the degraded keyword-only fallback. Response: {value}"
-            );
-        }
         value["nodeId"]
             .as_str()
             .unwrap_or_else(|| panic!("smart_ingest returned no nodeId: {value}"))
