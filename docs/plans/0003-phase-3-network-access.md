@@ -1159,7 +1159,7 @@ Files (each one a standalone binary test file):
 
 - `phase_3/http_mcp_round_trip.rs` -- boot server, mint a key, send
   `initialize` over `POST /mcp` with `Authorization: Bearer vst_...`, follow
-  with `tools/list`, assert we see the expected tool count (greater than 20).
+  with `tools/list`, assert we see the expected tool count (16).
 
 - `phase_3/http_sse_stream.rs` -- `POST /api/v1/consolidate` returns 202 +
   `session_id`. `GET /mcp?op=consolidate&session=...` streams at least one

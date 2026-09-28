@@ -48,7 +48,7 @@ Quit Xcode completely (Cmd+Q) and reopen your project.
 
 ### 4. Verify
 
-Type `/context` in the Agent panel. You should see `vestige` listed with 25 tools.
+Type `/context` in the Agent panel. You should see `vestige` listed with 16 tools.
 
 ---
 

@@ -10,7 +10,7 @@ VS Code supports MCP servers through GitHub Copilot's agent mode. Vestige plugs 
 
 - **VS Code 1.99+** (or latest stable)
 - **GitHub Copilot** extension installed and active
-- **vestige-mcp** binary installed ([Installation guide](../../README.md#quick-start))
+- **vestige-mcp** binary installed ([Installation guide](../../README.md#install))
 
 ---
 
@@ -73,7 +73,7 @@ Open **Copilot Chat** (agent mode) and ask:
 
 > "What MCP tools do you have?"
 
-Vestige's tools (search, smart_ingest, memory, etc.) should appear.
+Vestige's tools (recall, smart_ingest, memory, etc.) should appear.
 
 ---
 

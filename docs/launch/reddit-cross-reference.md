@@ -78,7 +78,7 @@ Memory systems need to be SMARTER, not just bigger. That's what Vestige does —
 - **cross_reference** — the new tool that catches contradictions before they become wrong answers
 
 ### Stats:
-- 22 MCP tools
+- 16 MCP tools
 - 746 tests, 0 failures
 - Zero `unsafe` code
 - Clean security audit (0 findings — AgentAudit verified)
@@ -121,10 +121,10 @@ You use a memory system. Over months, you accumulate 1000+ memories. Your projec
 
 When your AI searches memory, it finds 5 results. Two of them disagree. The AI picks one — maybe the wrong one — and gives you a confident answer based on outdated information.
 
-I built `cross_reference` to fix this. It's tool #22 in Vestige, my cognitive memory MCP server.
+I built this into `recall` (mode `contradictions`). It is one of the 16 advertised tools.
 
 ```
-cross_reference({ query: "what database does the project use?" })
+recall({ mode: "contradictions", topic: "what database does the project use?" })
 ```
 
 Returns:
@@ -195,7 +195,7 @@ The latest addition: `cross_reference` — pairwise contradiction detection acro
 Axum 0.8 (dashboard + HTTP transport)
   ↕ WebSocket event bus (tokio::broadcast, 1024 capacity)
 MCP Server (stdio JSON-RPC)
-  → 22 tools dispatched via match on tool name
+  → 16 tools dispatched via match on tool name
   → Arc<Storage> + Arc<Mutex<CognitiveEngine>>
 SQLite WAL + FTS5 + USearch HNSW
   → fastembed 5.11 (Nomic Embed v1.5, 768D → 256D Matryoshka)

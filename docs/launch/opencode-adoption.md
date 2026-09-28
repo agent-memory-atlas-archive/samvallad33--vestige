@@ -86,7 +86,7 @@ installation: |
 Current state:
 
 - Official MCP Registry already lists `io.github.samvallad33/vestige` at `https://registry.modelcontextprotocol.io/v0/servers?search=vestige`.
-- Smithery already lists Vestige and indexes 25 tools: `https://smithery.ai/server/@samvallad33/vestige`.
+- Smithery already lists Vestige (`https://smithery.ai/server/@samvallad33/vestige`). Vestige advertises 16 tools.
 - Glama already lists Vestige, but the listing needs a refresh/fix if it shows no tools: `https://glama.ai/mcp/servers/samvallad33/vestige`.
 - `mcp.so` does not show Vestige under the expected slugs yet; submit manually at `https://mcp.so/submit`.
 
@@ -119,5 +119,5 @@ High-signal channels after release:
 - `opencode debug config` accepts `mcp.vestige`.
 - `opencode mcp list` shows `vestige connected`.
 - Stale `mcpServers.vestige` examples fail in OpenCode and are migrated by `@vestige/init`.
-- OpenCode tools are prefixed as `vestige_search`, `vestige_smart_ingest`, `vestige_session_context`, and `vestige_deep_reference`.
+- OpenCode tools are prefixed as `vestige_recall`, `vestige_smart_ingest`, and `vestige_session_start`.
 - The OpenCode guide says `timeout: 60000` for direct `npx` and `timeout: 10000` for installed binaries.

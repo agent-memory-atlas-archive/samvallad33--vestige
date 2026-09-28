@@ -42,7 +42,7 @@ Vestige implements a cognitive architecture with three core principles:
 │  AI Agent (Claude, GPT, etc.)                       │
 │  ↕ JSON-RPC over stdio (MCP protocol)               │
 ├─────────────────────────────────────────────────────┤
-│  vestige-mcp          19 MCP tools                  │
+│  vestige-mcp          16 MCP tools                  │
 │  ├── Axum HTTP server  (dashboard + WebSocket)      │
 │  ├── CognitiveEngine   (29 stateful modules)        │
 │  └── Tool handlers     (one file per tool)          │

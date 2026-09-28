@@ -43,7 +43,7 @@ EOF
 
 **Step 3:** Restart Xcode.
 
-That's it. Type `/context` in the Agent panel and you'll see 23 Vestige tools loaded alongside Xcode's built-in tools.
+That's it. Type `/context` in the Agent panel and you'll see 16 Vestige tools loaded alongside Xcode's built-in tools.
 
 ## What Happened Next
 
@@ -53,7 +53,7 @@ It responded:
 
 > Remembering...
 
-Then it searched Vestige for existing context (`mcp__vestige__search`), checked my intentions (`mcp__vestige__intention`), and since it didn't find SoulVault context yet, it saved the information (`mcp__vestige__smart_ingest`).
+Then it searched Vestige for existing context (`mcp__vestige__recall`), checked my intentions (`mcp__vestige__intention`), and since it didn't find SoulVault context yet, it saved the information (`mcp__vestige__smart_ingest`).
 
 Then — without me asking — it surfaced my pending reminders. Product launch deadlines, hackathon dates, even personal events. All pulled from Vestige's memory, displayed right inside Xcode's Agent panel.
 
@@ -82,7 +82,7 @@ Vestige remembers the way a brain does:
 - **Prediction error gating** — automatically deduplicates and decides whether to create, update, or supersede memories
 - **Spreading activation** — searching for one memory surfaces related memories without changing their durable strength
 - **Synaptic tagging** — important memories get tagged for long-term consolidation
-- **23 cognitive tools** — search, ingest, dream, predict, explore connections, garbage collect, and more
+- **16 advertised tools** — `recall`, `smart_ingest`, `backfill`, `purge`, and the rest of the catalog
 
 All running locally in a single Rust binary. No cloud. No API keys. No data leaves your machine.
 

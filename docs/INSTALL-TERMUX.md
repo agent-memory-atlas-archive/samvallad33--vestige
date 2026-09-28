@@ -9,7 +9,7 @@ after that. This page tracks what works right now. Progress is on issue #145.
 ## What you get in this build
 
 - Every MCP tool, the memory lifecycle (FSRS scheduling, consolidation,
-  suppression, purge), receipts, the dashboard, and `vestige-cli`.
+  suppression, purge), receipts, the dashboard, and `vestige`.
 - Keyword recall (SQLite FTS5) and the full graph.
 
 ## What this build does not have
@@ -22,7 +22,7 @@ after that. This page tracks what works right now. Progress is on issue #145.
 - Git history for the `codebase` tool. libgit2 is left out of this build, and the
   tool reports git history as unavailable instead of failing.
 
-`vestige-cli health` reports `Embedding Service: not compiled into this build`
+`vestige health` reports `Embedding Service: not compiled into this build`
 rather than "Not Ready", so the missing runtime is never mistaken for a broken
 store.
 

@@ -74,7 +74,7 @@ retrieval. Written in Rust, 100% local, single 22MB binary.
   embedded via Rust's `include_dir!` macro. No Docker, no Node runtime, no
   external services.
 
-**Numbers:** 77,840 lines of Rust, 734 tests, 29 cognitive modules, 21 MCP
+**Numbers:** 77,840 lines of Rust, 734 tests, 29 cognitive modules, 16 MCP
 tools, search under 50ms for 1000 memories (SQLite FTS5 + USearch HNSW).
 
 **What it is NOT:** This is not RAG. RAG treats memory as a static database —
@@ -154,7 +154,7 @@ Fair question. Roughly:
 - ~22K: fastembed (vendored fork of the embedding library, ONNX inference)
 - ~15K: 29 cognitive modules (FSRS-6, prediction error gating, synaptic
   tagging, spreading activation, dreaming, hippocampal index, etc.)
-- ~12K: MCP server + 21 tool implementations
+- ~12K: MCP server + 16 tool implementations
 - ~8K: Storage layer (SQLite, FTS5, HNSW vector index, migrations)
 - ~7K: SvelteKit dashboard (TypeScript/Svelte, embedded in binary)
 - ~6K: Tests (734 tests across core + mcp + e2e + doctests)
@@ -358,7 +358,7 @@ Happy to discuss any of the Rust architecture decisions.
 
 ### r/ClaudeAI
 
-**Title:** `Vestige v2.0 "Cognitive Leap" — give Claude real long-term memory with neuroscience-backed forgetting, a 3D dashboard, and 21 MCP tools`
+**Title:** `Vestige v2.0 "Cognitive Leap" — give Claude real long-term memory with neuroscience-backed forgetting, a 3D dashboard, and 16 MCP tools`
 
 **Body:**
 
@@ -418,7 +418,7 @@ on Project X ended with a tricky race condition in the WebSocket handler.
 It's the difference between talking to someone with amnesia vs. someone who
 actually knows you.
 
-21 MCP tools. 77,840 lines of Rust. 734 tests. Works with Claude Code, Claude
+16 MCP tools. 77,840 lines of Rust. 734 tests. Works with Claude Code, Claude
 Desktop, Cursor, VS Code Copilot, JetBrains, Windsurf, and Xcode.
 
 Source: https://github.com/samvallad33/vestige
@@ -483,7 +483,7 @@ algorithms:
 - 3D force-directed memory graph with real-time WebSocket events
 - HyDE query expansion (template-based hypothetical document embeddings)
 - FSRS decay visualization with retention curves
-- 734 tests, 29 cognitive modules, 21 tools
+- 734 tests, 29 cognitive modules, 16 tools
 - fastembed 5.11 with feature flags for Nomic v2 MoE + Qwen3 reranker
 
 **Performance:**

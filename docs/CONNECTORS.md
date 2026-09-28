@@ -1,7 +1,7 @@
 # External-Source Connectors
 
 > Status: **v3.0.0** — GitHub Issues + Redmine reference connectors, plus
-> source-aware investigation filters for search. Tracking issue:
+> source-aware investigation filters on `recall`. Tracking issue:
 > [#57](https://github.com/samvallad33/vestige/issues/57).
 
 Connectors let Vestige act as a durable, local **retrieval and reasoning layer**
@@ -97,7 +97,7 @@ the saved `cursor`, whether it ran authenticated, and a `hint` for the next step
 
 ## Investigation filters (Phase 4)
 
-`search` accepts source-aware filters so an agent can scope a query to indexed
+`recall` accepts source-aware filters so an agent can scope a query to indexed
 records. All are optional post-filters; combine with a larger `limit` if you
 expect heavy thinning. A source-scoped query excludes non-connector memories.
 
