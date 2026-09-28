@@ -82,6 +82,9 @@ pub(crate) mod lookup_packet;
 // v2.0.5: Active Forgetting — Anderson 2025 + Davis Rac1
 pub mod suppress;
 
+// Blast Radius — exact downstream reach of a cause/source record
+pub mod blast_radius;
+
 // Retroactive Salience Backfill — Cai 2024 Nature (memory with hindsight)
 pub mod backfill;
 

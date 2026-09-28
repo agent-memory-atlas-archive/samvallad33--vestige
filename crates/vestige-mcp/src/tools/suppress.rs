@@ -39,6 +39,11 @@ pub fn schema() -> Value {
                 "type": "boolean",
                 "default": false,
                 "description": "If true, reverse a previous suppression. Requires a matching snapshot within the 24-hour labile window; later state changes and legacy suppressions need review. Includes journaled neighbor cascades when their state still matches."
+            },
+            "cascade_derived_from": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, extend this suppression along derived_from edges (blast traversal, depth cap 5, exact, cycle-safe) before suppressing. Each derived target is routed through the same Memory-PR review gate as a direct suppress: Fast mode suppresses them directly; Risk-Gated/Paranoid opens one pending Memory PR per target and suppresses NOTHING until approved. Ignored by reverse=true."
             }
         },
         "required": ["id"]
@@ -53,6 +58,10 @@ struct SuppressArgs {
     reason: Option<String>,
     #[serde(default)]
     reverse: bool,
+    // Primary wire name is camelCase like the siblings; the snake_case
+    // spelling (the name used in the schema description) is accepted too.
+    #[serde(default, alias = "cascade_derived_from")]
+    cascade_derived_from: bool,
 }
 
 pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
@@ -108,6 +117,20 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
             .map(|n| n.suppression_count)
             .unwrap_or(0);
 
+        // Optional derived_from cascade: compute the exact blast set FIRST
+        // (scope before effect — the traversal happens before ANY
+        // suppression), then route every derived target through the same
+        // Memory-PR review gate a direct suppress hits (#296 purge
+        // discipline). The primary id below is gated by the server pre-gate;
+        // the cascade ids are new victims and are gated here, per id:
+        // Fast mode executes directly, Risk-Gated/Paranoid holds each behind
+        // a pending Memory PR and suppresses nothing until approved.
+        let cascade = if args.cascade_derived_from {
+            Some(derive_and_gate_cascade(storage, &args.id, args.reason.as_deref()).await?)
+        } else {
+            None
+        };
+
         let node = storage
             .suppress_memory(&args.id)
             .map_err(|e| format!("Suppress failed: {}", e))?;
@@ -145,6 +168,7 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
             "retrievalStrength": node.retrieval_strength,
             "stability": node.stability,
             "estimatedCascadeNeighbors": estimated_cascade,
+            "cascadeDerivedFrom": cascade,
             "reversibleUntil": reversible_until.to_rfc3339(),
             "labileWindowHours": DEFAULT_LABILE_HOURS,
             "reason": args.reason,
@@ -155,6 +179,101 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
             "citation": "Anderson et al. 2025, Nat Rev Neurosci, DOI: 10.1038/s41583-025-00929-y"
         }))
     }
+}
+
+/// Exact derived_from blast from `id`, each target gated like a direct
+/// suppress. Returns a JSON summary for the tool response; suppression of
+/// held targets does NOT happen until their Memory PR is approved.
+async fn derive_and_gate_cascade(
+    storage: &Arc<Storage>,
+    id: &str,
+    reason: Option<&str>,
+) -> Result<Value, String> {
+    let report = storage
+        .blast_radius_with_link_types(id, false, &["derived_from"])
+        .map_err(|e| format!("cascade traversal failed: {}", e))?;
+    let targets: Vec<_> = report
+        .affected
+        .into_iter()
+        .filter(|a| a.id != id)
+        .collect();
+
+    let mode = crate::trace_recorder::read_review_mode(storage);
+    let mut entries = Vec::with_capacity(targets.len());
+    let mut allowed: Vec<String> = Vec::new();
+    let mut held = 0usize;
+
+    for target in targets {
+        let gate_args = Some(json!({"id": target.id, "reason": reason}));
+        match crate::trace_recorder::gate_pending_memory_mutation(
+            storage,
+            None,
+            "suppress_cascade_derived_from",
+            "suppress",
+            &gate_args,
+            mode,
+        ) {
+            Ok(None) => {
+                allowed.push(target.id.clone());
+                entries.push(json!({
+                    "id": target.id,
+                    "via": target.via,
+                    "depth": target.depth,
+                    "outcome": "suppressed",
+                }));
+            }
+            Ok(Some(pending)) => {
+                held += 1;
+                entries.push(json!({
+                    "id": target.id,
+                    "via": target.via,
+                    "depth": target.depth,
+                    "outcome": "pending_review",
+                    "requiresReview": true,
+                    "memoryPr": pending["memoryPrsOpened"][0]["id"],
+                }));
+            }
+            Err(error) => {
+                // Fail closed: a broken gate must not degrade into an
+                // ungated cascade suppression.
+                held += 1;
+                entries.push(json!({
+                    "id": target.id,
+                    "via": target.via,
+                    "depth": target.depth,
+                    "outcome": "gate_error",
+                    "requiresReview": true,
+                    "error": error,
+                }));
+            }
+        }
+    }
+
+    if !allowed.is_empty() {
+        let refs: Vec<&str> = allowed.iter().map(String::as_str).collect();
+        for outcome in storage.retire_affected(&refs, reason.unwrap_or("derived_from cascade")) {
+            let entry = entries
+                .iter_mut()
+                .find(|e| e["id"] == json!(outcome.id))
+                .expect("outcome id came from allowed set");
+            if !outcome.suppressed {
+                entry["outcome"] = json!("failed");
+                entry["error"] = json!(outcome.error);
+            }
+        }
+    }
+
+    Ok(json!({
+        "linkType": "derived_from",
+        "targets": entries,
+        "suppressed": entries.len() - held,
+        "heldForReview": held,
+        "note": if held > 0 {
+            "Held targets were NOT suppressed; approve their Memory PRs (forget) or keep them (promote)."
+        } else {
+            "All derived_from targets suppressed through the existing suppression mechanism (no deletions)."
+        },
+    }))
 }
 
 #[cfg(test)]
@@ -314,5 +433,120 @@ mod tests {
 
         let node = storage.get_node(&id).unwrap().unwrap();
         assert!(node.suppressed_at.is_some(), "suppressed_at must be set");
+    }
+
+    // ================================================================
+    // cascade_derived_from — blast traversal + per-id review gate
+    // ================================================================
+
+    fn link(storage: &Storage, source: &str, target: &str, link_type: &str) {
+        storage
+            .save_connection(&vestige_core::ConnectionRecord {
+                source_id: source.to_string(),
+                target_id: target.to_string(),
+                strength: 0.8,
+                link_type: link_type.to_string(),
+                created_at: chrono::Utc::now(),
+                last_activated: chrono::Utc::now(),
+                activation_count: 0,
+            })
+            .unwrap();
+    }
+
+    fn set_mode(storage: &Storage, mode: &str) {
+        std::fs::write(
+            storage.data_dir().join("review_mode.json"),
+            json!({"mode": mode}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn seed_derived_chain(storage: &Storage) -> (String, String, String, String) {
+        let root = ingest(storage, "root decision");
+        let child = ingest(storage, "derived summary");
+        let grandchild = ingest(storage, "derived postmortem");
+        let unrelated = ingest(storage, "unrelated memory");
+        link(storage, &root, &child, "derived_from");
+        link(storage, &child, &grandchild, "derived_from");
+        // a non-derived edge type must NOT be pulled in by the cascade
+        link(storage, &root, &unrelated, "backfill_candidate");
+        (root, child, grandchild, unrelated)
+    }
+
+    #[tokio::test]
+    async fn test_cascade_fast_mode_suppresses_derived_chain() {
+        let (storage, _dir) = test_storage();
+        set_mode(&storage, "fast");
+        let (root, child, grandchild, unrelated) = seed_derived_chain(&storage);
+
+        let r = execute(
+            &storage,
+            Some(json!({"id": root.clone(), "cascade_derived_from": true, "reason": "bad derivation"})),
+        )
+        .await
+        .unwrap();
+
+        let cascade = r["cascadeDerivedFrom"].as_object().unwrap();
+        assert_eq!(cascade["suppressed"], 2);
+        assert_eq!(cascade["heldForReview"], 0);
+
+        for id in [&root, &child, &grandchild] {
+            let node = storage.get_node(id).unwrap().unwrap();
+            assert_eq!(node.suppression_count, 1, "{id} must be suppressed");
+        }
+        let stranger = storage.get_node(&unrelated).unwrap().unwrap();
+        assert_eq!(stranger.suppression_count, 0, "non-derived edges must not cascade");
+    }
+
+    #[tokio::test]
+    async fn test_cascade_risk_gated_holds_targets_behind_prs() {
+        use vestige_core::MemoryPrStatus;
+
+        let (storage, _dir) = test_storage();
+        set_mode(&storage, "risk_gated");
+        let (root, child, grandchild, _unrelated) = seed_derived_chain(&storage);
+
+        // Direct execute() call: the server pre-gate would normally hold the
+        // primary suppress itself; here we verify the per-id gate on the
+        // cascade targets.
+        let r = execute(
+            &storage,
+            Some(json!({"id": root.clone(), "cascade_derived_from": true, "reason": "review me"})),
+        )
+        .await
+        .unwrap();
+
+        let cascade = r["cascadeDerivedFrom"].as_object().unwrap();
+        assert_eq!(cascade["heldForReview"], 2);
+        assert_eq!(cascade["suppressed"], 0);
+
+        // Cascade targets were NOT suppressed; each has a pending PR.
+        for id in [&child, &grandchild] {
+            assert_eq!(
+                storage.get_node(id).unwrap().unwrap().suppression_count, 0,
+                "cascade target must wait for review"
+            );
+        }
+        let prs = storage
+            .list_memory_prs(Some(MemoryPrStatus::Pending), 10)
+            .unwrap();
+        assert_eq!(prs.len(), 2, "one PR per derived target");
+        assert!(prs.iter().all(|pr| pr.diff["pendingAction"] == json!("suppress")));
+    }
+
+    #[tokio::test]
+    async fn test_cascade_default_off() {
+        let (storage, _dir) = test_storage();
+        set_mode(&storage, "fast");
+        let (root, child, _grandchild, _unrelated) = seed_derived_chain(&storage);
+
+        let r = execute(&storage, Some(json!({"id": root.clone()})))
+            .await
+            .unwrap();
+        assert!(r["cascadeDerivedFrom"].is_null(), "no cascade unless asked");
+        assert_eq!(
+            storage.get_node(&child).unwrap().unwrap().suppression_count, 0,
+            "default suppress must not touch derived targets"
+        );
     }
 }

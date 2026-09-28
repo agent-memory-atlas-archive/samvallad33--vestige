@@ -2224,6 +2224,17 @@ description: Some("Investigate a recorded failure using earlier memories sharing
             // ================================================================
             "suppress" => tools::suppress::execute(&self.storage, request.arguments).await,
 
+            // ================================================================
+            // BLAST RADIUS — exact downstream reach of a cause/source record.
+            // Dispatched by name; advertising it in tools/list additionally
+            // needs a compact.rs registry entry + the catalog-count test
+            // update (see SCOPE-HANDOFF.md). Retire routes every id through
+            // the same pre-call Memory-PR gate as suppress/purge.
+            // ================================================================
+            "blast_radius" => {
+                tools::blast_radius::execute(&self.storage, request.arguments).await
+            }
+
             name => {
                 return Err(JsonRpcError::invalid_params(&format!(
                     "Unknown tool: {}",
