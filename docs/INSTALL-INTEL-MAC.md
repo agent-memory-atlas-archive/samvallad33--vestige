@@ -6,7 +6,7 @@ x86_64 macOS prebuilts after ONNX Runtime v1.23.0, so we use the
 `ort-dynamic` feature to runtime-link against the version you install locally.
 This keeps Vestige working on Intel Mac without waiting for a dead upstream.
 
-As of Vestige 3.0.0 this is still the Intel Mac path. Homebrew ONNX Runtime
+As of Vestige 3.1.1 this is still the Intel Mac path. Homebrew ONNX Runtime
 remains required; there is no pure-Rust Intel backend in the current release.
 
 ## Prerequisite
@@ -20,8 +20,8 @@ brew install onnxruntime
 ## Install
 
 ```bash
-# 1. Install the binary
-npm install -g vestige-mcp-server@latest
+# 1. Download vestige-mcp-x86_64-apple-darwin.tar.gz from
+#    https://github.com/samvallad33/vestige/releases and unpack vestige-mcp
 
 # 2. Point the binary at Homebrew's libonnxruntime (CLI / terminal clients)
 echo 'export ORT_DYLIB_PATH="'"$(brew --prefix onnxruntime)"'/lib/libonnxruntime.dylib"' >> ~/.zshrc

@@ -105,11 +105,10 @@ Version tags (`vX.Y.Z`) drive two independent workflows:
    `mcp-publisher login github-oidc` and publishes repo-root
    `server.json` to `https://registry.modelcontextprotocol.io`.
 
-npm is **not** published by CI. The official registry checks `mcpName`
-(`io.github.samvallad33/vestige`) on the published `vestige-mcp-server`
-package, so `vestige-mcp-server@X.Y.Z` must already exist on npm
-**before** this job can succeed. If npm is late, the registry job fails
-with an error; publish npm, then re-run **Publish MCP Registry**.
+v3.1.1 ships from the GitHub Release archives only. The npm publish
+jobs and the MCP registry job are `if: false` while the npm account is
+suspended. Do not `npm install` this version. Nothing publishes to
+crates.io.
 
 GitHub OIDC for `io.github.samvallad33/*` is automatic from this
 repository (`id-token: write` on the registry job). No PAT, no GitHub

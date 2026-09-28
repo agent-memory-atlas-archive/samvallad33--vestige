@@ -265,7 +265,7 @@ Add to `~/.claude/settings.json`:
 
 ### Claude Desktop (macOS)
 
-Claude Desktop is a GUI app: it does not inherit your shell PATH and does not expand `~` in JSON. After `npm install -g vestige-mcp-server@latest`, paste the absolute path from `which vestige-mcp`. nvm/fnm/Homebrew npm will not be `/usr/local/bin`.
+Claude Desktop is a GUI app: it does not inherit your shell PATH and does not expand `~` in JSON. After you unpack the GitHub Release archive, paste the absolute path to `vestige-mcp`.
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ```json
@@ -406,7 +406,7 @@ vestige update --sandwich-companion
 
 **Pin to specific version:**
 ```bash
-vestige update --version v3.0.0
+vestige update --version v3.1.1
 ```
 
 **Manage the optional Cognitive Sandwich layer without updating binaries:**

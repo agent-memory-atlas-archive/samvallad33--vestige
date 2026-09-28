@@ -1,12 +1,14 @@
 [package]
 name = "vestige-core"
-version = "3.1.0"
+version = "3.1.1"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Vestige Team"]
 description = "Cognitive memory engine - FSRS-6 spaced repetition, semantic embeddings, and temporal memory"
 license = "AGPL-3.0-only"
 repository = "https://github.com/samvallad33/vestige"
+# crates.io already has this name under conorluddy/Vestige. Do not publish.
+publish = false
 keywords = ["memory", "spaced-repetition", "fsrs", "embeddings", "knowledge-graph"]
 categories = ["science", "database"]
 
