@@ -194,6 +194,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "Actor provenance (#252 Phase A): operator-controlled versioned role/weight policy, role memberships, and actor-attributed endorsement events with content-revision binding",
         up: MIGRATION_V38_UP,
     },
+    Migration {
+        version: 39,
+        description: "Typed edge vocabulary: JSON edge metadata + run provenance on memory_connections, typed-(link_type, target_id) index, and purge tombstones",
+        up: MIGRATION_V39_UP,
+    },
 ];
 
 /// A database migration
@@ -2597,6 +2602,54 @@ CREATE INDEX IF NOT EXISTS idx_actor_endorsements_revision
 
 ALTER TABLE knowledge_nodes ADD COLUMN author_actor_did TEXT;
 UPDATE schema_version SET version = 38, applied_at = datetime('now');
+"#;
+
+/// V39: Typed edge vocabulary (build/w2b-edge-schema).
+///
+/// `memory_connections` stays the single edge table. The owner-approved
+/// 8-type vocabulary (`touched`, `anchored_to`, `derived_from`, `supersedes`,
+/// `corrects`, `closed_by`, `projected_to`, `evidence_of`) is enforced at the
+/// application layer ([`crate::storage::edges`]), not by a CHECK constraint,
+/// so legacy link types (`semantic`, `temporal`, ...) keep validating and the
+/// vocabulary can evolve without a schema rewrite.
+///
+/// - `edge_meta` — nullable JSON payload `{sha, span, run_id}` for anchor/commit
+///   evidence. Existing rows backfill to NULL (no envelope).
+/// - `created_by_run` — nullable run id provenance, linking an edge to the
+///   agent run that declared it (Black Box `agent_runs.run_id`).
+/// - `idx_connections_type_target` — composite index for the typed-edge read
+///   path (walk trails, reachability, `closed_by` chains) which filters by
+///   `link_type` and fans out from `target_id`.
+///
+/// `purge_tombstones` is the chosen ONE of the two tombstone designs (the
+/// synthetic `tombstone_of` marker-node edge was rejected: it would require a
+/// fake `knowledge_nodes` row and collide with FK enforcement). A row records
+/// that a memory id was purged, when, why, and a content hash — content-free,
+/// matching the V13 `deletion_tombstones` stance but keyed to the typed-edge
+/// purge flow with a verifiable `prior_content_hash`.
+///
+/// Purely additive and non-destructive: no column is renamed, dropped, or
+/// backfilled with a non-NULL value. The `ALTER TABLE ... ADD COLUMN`
+/// statements are split out by the migration runner's generic
+/// `split_add_column_statements` path, so replay is idempotent.
+const MIGRATION_V39_UP: &str = r#"
+ALTER TABLE memory_connections ADD COLUMN edge_meta TEXT;
+ALTER TABLE memory_connections ADD COLUMN created_by_run TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_connections_type_target
+    ON memory_connections(link_type, target_id);
+
+CREATE TABLE IF NOT EXISTS purge_tombstones (
+    purged_id TEXT PRIMARY KEY,
+    purged_at TEXT NOT NULL,
+    reason TEXT,
+    prior_content_hash TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_purge_tombstones_purged_at
+    ON purge_tombstones(purged_at);
+
+UPDATE schema_version SET version = 39, applied_at = datetime('now');
 "#;
 
 #[cfg(test)]
