@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-vestige-core = { path = "../../crates/vestige-core", features = ["embeddings", "vector-search"] }
+vestige-core = { path = "../../crates/vestige-core", features = [] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"

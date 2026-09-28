@@ -753,16 +753,6 @@ impl SqliteMemoryStore {
             registered_model: std::sync::RwLock::new(None),
         };
 
-        // V20 seeds a minimal SQL row so old databases migrate atomically.
-        // Replace that bootstrap with the complete, serializable manifest before
-        // exposing the store to callers.
-        storage.ensure_legacy_embedding_profile_manifest()?;
-
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        if storage.vector_index.is_some() {
-            storage.load_embeddings_into_index()?;
-        }
-
         Ok(storage)
     }
 
@@ -1102,20 +1092,8 @@ impl SqliteMemoryStore {
             }
         }
 
-        // Convenience: active-profile coverage is the number of nodes with no
-        // vector in the currently selected isolated vector space.
-        let active_profile_id = Self::active_profile_id_from_conn(&reader)?;
-        let embedding_null_count: i64 = reader
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_nodes kn
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM embedding_profile_vectors epv
-                     WHERE epv.node_id = kn.id AND epv.profile_id = ?1
-                 )",
-                params![active_profile_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
+        // vector coverage stats removed with the vector subsystem
+        let embedding_null_count: i64 = 0;
 
         #[cfg(feature = "embeddings")]
         let active_embedding_model = active_profile_id.as_deref().and_then(|profile_id| {
