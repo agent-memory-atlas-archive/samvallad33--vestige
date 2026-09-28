@@ -25,6 +25,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use vestige_core::storage::Storage;
+use vestige_core::ConnectionRecord;
 
 /// JSON schema for the `source_sync` tool.
 pub fn schema() -> Value {
@@ -199,13 +200,24 @@ async fn execute_github(
     let total = report.created + report.updated + report.unchanged;
     let authed = github_token().is_some();
 
+    // closed_by chain linking: local-only, deterministic, best-effort. The
+    // connector payload carries no closing-PR reference (issues + comments
+    // only; no timeline events), so the link is built purely from what is
+    // already ingested. Failures degrade to zero links, never a sync error.
+    let closed_by_links = link_closed_by_from_local_commits(storage, &scope);
+
     let summary = format!(
-        "Synced {scope}: {} created, {} updated, {} unchanged{} ({total} records seen{}).",
+        "Synced {scope}: {} created, {} updated, {} unchanged{}{} ({total} records seen{}).",
         report.created,
         report.updated,
         report.unchanged,
         if report.reconciled {
             format!(", {} tombstoned", report.tombstoned)
+        } else {
+            String::new()
+        },
+        if closed_by_links > 0 {
+            format!(", {closed_by_links} closed_by links ensured")
         } else {
             String::new()
         },
@@ -222,6 +234,7 @@ async fn execute_github(
         "unchanged": report.unchanged,
         "tombstoned": report.tombstoned,
         "reconciled": report.reconciled,
+        "closedByLinks": closed_by_links,
         "cursor": report.new_cursor.map(|d| d.to_rfc3339()),
         "authenticated": authed,
         "warnings": report.warnings,
@@ -233,6 +246,122 @@ async fn execute_github(
             "Search these with the normal search tools; results cite the GitHub issue URL."
         }
     }))
+}
+
+// ============================================================================
+// closed_by CHAIN LINKING (github issues → closing commits)
+// ============================================================================
+
+/// GitHub's issue-closing keywords ("Linking a pull request to an issue"),
+/// matched case-insensitively as whole words.
+const CLOSING_KEYWORDS: &[&str] = &[
+    "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+];
+
+/// Does `line` contain any closing keyword as a whole word? ("discloses"
+/// contains "closes" but is not one.)
+fn line_has_closing_keyword(line_lower: &str) -> bool {
+    for keyword in CLOSING_KEYWORDS {
+        let mut from = 0usize;
+        while let Some(pos) = line_lower[from..].find(keyword) {
+            let start = from + pos;
+            let end = start + keyword.len();
+            let before_ok = line_lower[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+            let after_ok = line_lower[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+            if before_ok && after_ok {
+                return true;
+            }
+            from = start + 1;
+        }
+    }
+    false
+}
+
+/// Does `line` reference `#<issue_number>` EXACTLY? `#420` must not satisfy
+/// issue 42, and the `#` must start the reference (not `##42` or `abc#42`).
+fn line_references_issue(line: &str, issue_number: &str) -> bool {
+    let target = format!("#{issue_number}");
+    let mut from = 0usize;
+    while let Some(pos) = line[from..].find(&target) {
+        let start = from + pos;
+        let end = start + target.len();
+        let leading_ok = line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '#'));
+        let trailing_ok = line[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_digit());
+        if leading_ok && trailing_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Does this commit-record content close `#<issue_number>`?
+///
+/// Exact and line-scoped: a closing keyword and the bare `#<number>` must
+/// appear on the SAME line, so a keyword in the subject never pairs with a
+/// reference three lines down in the diff body, and near-miss numbers
+/// (`#420` for #42) never match.
+fn commit_closes_issue(content: &str, issue_number: &str) -> bool {
+    if issue_number.is_empty() || !issue_number.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    content.lines().any(|line| {
+        line_has_closing_keyword(&line.to_lowercase()) && line_references_issue(line, issue_number)
+    })
+}
+
+/// Ensure a `closed_by` edge (issue node → closing commit node) for every
+/// closed github issue in `scope` that a locally ingested git-commit record
+/// claims to close. Local-only and deterministic: no remote fetch, no new
+/// API calls — the connector payload carries no closing-PR reference, so the
+/// link is built from `memory_connections` neighbors that already exist in
+/// the store. Edges are written through the existing `save_connection`
+/// (`INSERT OR REPLACE`), so re-running a sync re-ensures the same edge
+/// instead of duplicating it. Returns the number of edges ensured.
+pub(crate) fn link_closed_by_from_local_commits(storage: &Arc<Storage>, scope: &str) -> usize {
+    let Ok(issues) = storage.closed_issue_nodes("github", scope) else {
+        return 0;
+    };
+    if issues.is_empty() {
+        return 0;
+    }
+    let Ok(commits) = storage.git_commit_nodes(1_000) else {
+        return 0;
+    };
+    let now = chrono::Utc::now();
+    let mut linked = 0usize;
+    for issue in &issues {
+        for commit in &commits {
+            if !commit_closes_issue(&commit.content, &issue.issue_number) {
+                continue;
+            }
+            let edge = ConnectionRecord {
+                source_id: issue.node_id.clone(),
+                target_id: commit.node_id.clone(),
+                strength: 1.0,
+                link_type: "closed_by".to_string(),
+                created_at: now,
+                last_activated: now,
+                activation_count: 0,
+            };
+            if storage.save_connection(&edge).is_ok() {
+                linked += 1;
+            }
+        }
+    }
+    linked
 }
 
 #[cfg(feature = "connectors")]
@@ -291,4 +420,185 @@ async fn execute_redmine(
             "Search these with the normal search tools; results cite the Redmine issue URL."
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use vestige_core::{IngestInput, SourceEnvelope};
+
+    fn test_storage() -> (Arc<Storage>, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new(Some(dir.path().join("source_sync_test.db"))).unwrap();
+        (Arc::new(storage), dir)
+    }
+
+    fn ingest_commit(storage: &Arc<Storage>, sha: &str, subject: &str, files: &str) -> String {
+        let content = format!("commit {sha} {subject}\nfiles: {files}");
+        storage
+            .ingest(IngestInput {
+                content,
+                node_type: "fact".to_string(),
+                tags: vec!["git-commit".to_string()],
+                ..Default::default()
+            })
+            .unwrap()
+            .id
+    }
+
+    fn upsert_issue(
+        storage: &Arc<Storage>,
+        number: u64,
+        state: &str,
+        scope: &str,
+    ) -> String {
+        // SourceEnvelope is #[non_exhaustive]; build via Default + field set.
+        let mut envelope = SourceEnvelope::default();
+        envelope.source_system = Some("github".to_string());
+        envelope.source_id = Some(number.to_string());
+        envelope.source_url = Some(format!("https://github.com/{scope}/issues/{number}"));
+        envelope.content_hash = Some(format!("h-{number}-{state}"));
+        envelope.source_project = Some(scope.to_string());
+        envelope.source_type = Some("issue".to_string());
+        storage
+            .upsert_by_source(IngestInput {
+                content: format!("[{scope}#{number}] Something broke"),
+                node_type: "event".to_string(),
+                tags: vec!["github".to_string(), format!("state:{state}")],
+                source_envelope: Some(envelope),
+                ..Default::default()
+            })
+            .unwrap()
+            .node_id
+    }
+
+    // ========================================================================
+    // MATCHER TESTS
+    // ========================================================================
+
+    #[test]
+    fn source_sync_matcher_accepts_closing_keyword_forms() {
+        for subject in [
+            "fix: closes #42",
+            "Fixes #42",
+            "fixed #42 in the pool",
+            "close #42",
+            "Closed #42",
+            "resolve: resolves #42",
+            "resolved #42 and #43",
+        ] {
+            assert!(
+                commit_closes_issue(&format!("commit {subject}\nfiles: x.rs"), "42"),
+                "'{subject}' must close #42"
+            );
+        }
+    }
+
+    #[test]
+    fn source_sync_matcher_rejects_near_misses() {
+        // Wrong number with a digit tail: #420 is not #42.
+        assert!(!commit_closes_issue("commit fix: closes #420\nfiles: x.rs", "42"));
+        assert!(!commit_closes_issue("commit fix: closes #4\nfiles: x.rs", "42"));
+        // Keyword hidden inside another word.
+        assert!(!commit_closes_issue("commit discloses #42\nfiles: x.rs", "42"));
+        assert!(!commit_closes_issue("commit prefixes #42\nfiles: x.rs", "42"));
+        // Reference without a closing keyword on the line.
+        assert!(!commit_closes_issue("commit see #42 for context\nfiles: x.rs", "42"));
+        // Keyword and reference on DIFFERENT lines never pair.
+        assert!(!commit_closes_issue(
+            "commit fixes the thing\nsee #42 for context",
+            "42"
+        ));
+        // Glued references are not bare references.
+        assert!(!commit_closes_issue("commit fix: abc#42\nfiles: x.rs", "42"));
+        assert!(!commit_closes_issue("commit fix: ##42\nfiles: x.rs", "42"));
+        // Non-numeric / empty issue numbers never match.
+        assert!(!commit_closes_issue("commit fix: closes #42", "abc"));
+        assert!(!commit_closes_issue("commit fix: closes #42", ""));
+    }
+
+    // ========================================================================
+    // LINKING TESTS
+    // ========================================================================
+
+    #[tokio::test]
+    async fn source_sync_closed_by_edge_appears_after_linking() {
+        let (storage, _dir) = test_storage();
+        let issue_node = upsert_issue(&storage, 42, "closed", "o/r");
+        let commit_node = ingest_commit(
+            &storage,
+            &"a".repeat(40),
+            "fix: closes #42",
+            "src/pool.rs",
+        );
+        // Decoys: open issue, unrelated commit.
+        let open_node = upsert_issue(&storage, 43, "open", "o/r");
+        let unrelated = ingest_commit(
+            &storage,
+            &"b".repeat(40),
+            "docs: readme",
+            "README.md",
+        );
+
+        let linked = link_closed_by_from_local_commits(&storage, "o/r");
+        assert_eq!(linked, 1, "exactly the closes-#42 pair links");
+
+        let edges = storage.get_connections_for_memory(&issue_node).unwrap();
+        let closed_by: Vec<&ConnectionRecord> = edges
+            .iter()
+            .filter(|e| e.link_type == "closed_by")
+            .collect();
+        assert_eq!(closed_by.len(), 1, "one closed_by edge, not duplicates");
+        assert_eq!(closed_by[0].source_id, issue_node, "source is the issue node");
+        assert_eq!(closed_by[0].target_id, commit_node, "target is the commit node");
+
+        // Negative: the open issue and the unrelated commit carry no edges.
+        assert!(
+            storage
+                .get_connections_for_memory(&open_node)
+                .unwrap()
+                .is_empty(),
+            "an open issue is never closed_by-linked"
+        );
+        assert!(
+            storage
+                .get_connections_for_memory(&unrelated)
+                .unwrap()
+                .is_empty(),
+            "a commit that closes nothing gets no edge"
+        );
+
+        // Idempotent: re-running re-ensures the same edge, never a second one.
+        let again = link_closed_by_from_local_commits(&storage, "o/r");
+        assert_eq!(again, 1);
+        let edges = storage.get_connections_for_memory(&issue_node).unwrap();
+        assert_eq!(
+            edges.iter().filter(|e| e.link_type == "closed_by").count(),
+            1,
+            "INSERT OR REPLACE must not duplicate the edge"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_sync_closed_by_silent_without_candidates() {
+        let (storage, _dir) = test_storage();
+        // Closed issue but no commit records at all: no links, no noise.
+        upsert_issue(&storage, 7, "closed", "o/r");
+        assert_eq!(link_closed_by_from_local_commits(&storage, "o/r"), 0);
+        // Wrong scope: the issue is not this connector instance's.
+        let commit_node = ingest_commit(
+            &storage,
+            &"c".repeat(40),
+            "fix: closes #7",
+            "src/x.rs",
+        );
+        assert_eq!(link_closed_by_from_local_commits(&storage, "other/scope"), 0);
+        assert!(
+            storage
+                .get_connections_for_memory(&commit_node)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
