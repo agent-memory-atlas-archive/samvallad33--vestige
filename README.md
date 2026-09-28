@@ -30,13 +30,7 @@ Agents re-learn the same lessons. They recommend a change you already tested and
 
 ## Install
 
-The npm package needs Node.js 18 or newer. No Docker, no signup, no compile step. Release archives cover five targets: macOS ARM, macOS Intel, Linux x86_64, Linux arm64, and Windows x86_64. Each archive contains three binaries: `vestige` (the CLI), `vestige-mcp` (the MCP server), and `vestige-restore`.
-
-```bash
-npm install -g vestige-mcp-server@3.1.1
-```
-
-The published package resolves its binary from an exact-pinned optional dependency, one of `@vestige/mcp-darwin-arm64`, `@vestige/mcp-darwin-x64`, `@vestige/mcp-linux-x64`, `@vestige/mcp-linux-arm64`, or `@vestige/mcp-win32-x64`. Install does not run a lifecycle script. `npm install --no-optional` leaves the binary for a GitHub download the first time you run a command.
+Download a release archive from [GitHub Releases](https://github.com/samvallad33/vestige/releases/latest). No Docker, no signup, no compile step. The archives are `vestige-mcp-aarch64-apple-darwin.tar.gz` (macOS ARM), `vestige-mcp-x86_64-apple-darwin.tar.gz` (macOS Intel), `vestige-mcp-x86_64-unknown-linux-gnu.tar.gz` (Linux x86_64), `vestige-mcp-aarch64-unknown-linux-gnu.tar.gz` (Linux arm64), and `vestige-mcp-x86_64-pc-windows-msvc.zip` (Windows x86_64). Each one contains three binaries: `vestige` (the CLI), `vestige-mcp` (the MCP server), and `vestige-restore`.
 
 Prefer Homebrew?
 
@@ -44,7 +38,7 @@ Prefer Homebrew?
 brew install samvallad33/tap/vestige
 ```
 
-`eget samvallad33/vestige` installs from GitHub Releases. The published archives are `vestige-mcp-<target>.tar.gz` (`.zip` on Windows), and each one contains `vestige`, `vestige-mcp`, and `vestige-restore`. Intel Mac builds are linked against a system ONNX Runtime: `brew install onnxruntime` before the first run, and set `ORT_DYLIB_PATH` to that library. That tarball includes `INSTALL-INTEL-MAC.md`.
+`eget samvallad33/vestige` installs those same GitHub Release archives. Intel Mac builds are linked against a system ONNX Runtime: `brew install onnxruntime` before the first run, and set `ORT_DYLIB_PATH` to that library. That tarball includes `INSTALL-INTEL-MAC.md`.
 
 Connect the MCP server. The client command is `vestige-mcp`:
 
@@ -77,7 +71,7 @@ limit = 10
 
 `lean` presets brief detail and a limit of 5. `audit` presets full detail. `research` presets full detail and a limit of 25. `default` leaves the historical tool limits alone.
 
-Verify the CLI: `vestige dashboard`. It binds `http://127.0.0.1:3927` (override with `--port`) and `/` redirects to `/dashboard`. The first start of `vestige-mcp` downloads the Nomic embedding model (about 130 MB) and logs the milestone that keyword search works immediately and semantic ranking joins when the runtime is ready. Until then, `recall` and a save that stored no vector carry a `warming` block. The Jina reranker (about 150 MB) loads in the background; until it does, ranking stays BM25. A release build also compares its version with the npm registry for `vestige-mcp-server`. When a newer version is published it sends an MCP `notifications/message` on logger `vestige.update` (`newer_version_available`) whose hint is `npm install -g vestige-mcp-server@latest` or `brew upgrade vestige`. It does not update itself, and a failed check is skipped. After those downloads, memory calls stay on the machine. `source_sync` and `vestige sync --cloud` are the calls that use the network. Full walkthrough: [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md).
+Verify the CLI: `vestige dashboard`. It binds `http://127.0.0.1:3927` (override with `--port`) and `/` redirects to `/dashboard`. The first start of `vestige-mcp` downloads the Nomic embedding model (about 130 MB) and logs the milestone that keyword search works immediately and semantic ranking joins when the runtime is ready. Until then, `recall` and a save that stored no vector carry a `warming` block. The Jina reranker (about 150 MB) loads in the background; until it does, ranking stays BM25. A release build also compares its version with the npm registry for `vestige-mcp-server`. When a newer version is published it sends an MCP `notifications/message` on logger `vestige.update` (`newer_version_available`). It does not update itself, and a failed check is skipped. After those downloads, memory calls stay on the machine. `source_sync` and `vestige sync --cloud` are the calls that use the network. Full walkthrough: [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md).
 
 `vestige --help` lists the CLI. The subcommands are `stats`, `health`, `consolidate`, `upgrade`, `update`, `sandwich`, `embeddings`, `restore`, `backup`, `export`, `portable-export`, `portable-import`, `sync`, `gc`, `dashboard`, `ingest`, `scan-secrets`, `backfill`, `recall`, `compose`, `project`, and `serve`. `--data-dir` is global.
 
