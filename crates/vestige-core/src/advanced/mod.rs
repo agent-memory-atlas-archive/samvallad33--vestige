@@ -11,12 +11,10 @@
 //! - **Cross-Project Learning**: Learn patterns that apply across ALL projects
 //! - **Intent Detection**: Understand WHY the user is doing something
 //! - **Memory Chains**: Build chains of reasoning from memory
-//! - **Adaptive Embedding**: Use DIFFERENT embedding models for different content
 //! - **Memory Dreams**: Enhanced consolidation that creates NEW insights
 //! - **Sleep Consolidation**: Automatic background consolidation during idle periods
 //! - **Reconsolidation**: Memories become modifiable on retrieval (Nader's theory)
 
-pub mod adaptive_embedding;
 pub mod chains;
 pub mod compression;
 pub mod contradiction;
@@ -32,7 +30,6 @@ pub mod retroactive_backfill;
 pub mod speculative;
 
 // Re-exports for convenient access
-pub use adaptive_embedding::{AdaptiveEmbedder, ContentType, EmbeddingStrategy, Language};
 pub use chains::{
     ChainStep, Connection, ConnectionType, MemoryChainBuilder, MemoryNode, MemoryPath,
     ReasoningChain,
