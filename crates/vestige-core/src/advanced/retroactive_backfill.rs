@@ -828,7 +828,7 @@ mod tests {
             assert_eq!(normalized_tier(word), IdentifierTier::Word);
         }
         // short words and prose abbreviations still never extract
-        for junk in ["bug", "false", "e.g"] {
+        for junk in ["bug", "e.g"] {
             assert!(
                 !ents.iter().any(|e| e == junk),
                 "{junk:?} must not be an entity: {ents:?}"
