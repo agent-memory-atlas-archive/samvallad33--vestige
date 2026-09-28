@@ -85,8 +85,15 @@ pub mod suppress;
 // Blast Radius — exact downstream reach of a cause/source record
 pub mod blast_radius;
 
-// Retroactive Salience Backfill — Cai 2024 Nature (memory with hindsight)
+// Retroactive Salience Backfill — Cai 2024 Nature (memory with hindsight).
+// v3.2: superseded as the advertised flagship by `causal_walk` below; still
+// dispatched as a hidden back-compat alias.
 pub mod backfill;
+
+// Causal Walk — the successor to backfill: explicit start points (failing
+// test, stack frame, CI run, logged write, version range) walked through
+// exact mechanism edges to the change records behind a failure.
+pub mod causal_walk;
 
 // w3d: planted-cause self-calibration + decayed-lesson detection, both
 // built on the backfill surface above.

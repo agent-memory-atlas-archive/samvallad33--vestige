@@ -1045,23 +1045,23 @@ description: Some("Inhibit a memory without deleting it: out of retrieval, faste
                 ..Default::default()
             },
             // ================================================================
-            // RETROACTIVE SALIENCE BACKFILL — Cai 2024 Nature
-            // "Memory with hindsight": failure -> backward causal reach.
-            // A flagship v2.2 capability, kept as its own advertised tool — it
-            // is a distinct cognitive primitive (backward causal promotion),
-            // not a maintenance op that folds into `maintain`.
+            // CAUSAL WALK — successor to retroactive backfill
+            // "Memory with hindsight", now anchored to explicit evidence
+            // handles: failing test, stack frame, CI run, logged write,
+            // version range. `backfill` remains dispatchable as a hidden
+            // back-compat alias (see handle_tools_call).
             // ================================================================
             ToolDescription {
-                name: "backfill".to_string(),
-                title: Some("Backfill".to_string()),
+                name: "causal_walk".to_string(),
+                title: Some("Causal Walk".to_string()),
                 annotations: Some(ToolAnnotations {
                     read_only_hint: false,
                     destructive_hint: false,
                     idempotent_hint: false,
                     open_world_hint: false,
                 }),
-description: Some("Investigate a recorded failure using earlier memories sharing entities. Results are hypotheses, not proven causes. Default promote=false previews without graph or strength changes; explicit promote=true records candidate edges and reinforces eligible memories after review. scope defaults to user; failure_id defaults to the latest failure in that scope.".to_string()),
-                input_schema: tools::compact::of(&tools::backfill::schema()),
+description: Some("Investigate a failure from explicit start points (failing_test, stack_frame, ci_run, logged_write, version_range) through exact mechanism edges to suspect change records. Results are hypotheses, not proven causes. Default promote=false previews without graph changes; explicit promote=true records evidence_of trail edges after review. Never guesses a start point: missing anchors return needs_report.".to_string()),
+                input_schema: tools::compact::of(&tools::causal_walk::schema()),
                 ..Default::default()
             },
             // ================================================================
@@ -1116,9 +1116,11 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
         reject_unknown_cursor(params)?;
 
         // v2.3: 14 advertised tools after adding the controlled `receipt`
-        // surface and retaining the distinct flagship `backfill` primitive.
-        // 22 deprecated/folded names still work as hidden redirects in
-        // handle_tools_call. See docs/launch/tool-consolidation-v2.2.0.md.
+        // surface; v3.2 swaps the flagship `backfill` primitive for its
+        // successor `causal_walk` (same count — backfill stays dispatchable
+        // as a hidden redirect). 22+ deprecated/folded names still work as
+        // hidden redirects in handle_tools_call. See
+        // docs/launch/tool-consolidation-v2.2.0.md.
         let mut tools = Self::tool_catalog();
 
         // Per-tool result-size annotation `_meta["anthropic/maxResultSizeChars"]`.
@@ -1620,7 +1622,13 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
             "source_sync" => tools::source_sync::execute(&self.storage, request.arguments).await,
 
             // ================================================================
-            // Retroactive Salience Backfill (Cai 2024 Nature) — flagship v2.2
+            // CAUSAL WALK — the advertised flagship (successor to backfill)
+            // ================================================================
+            "causal_walk" => tools::causal_walk::execute(&self.storage, request.arguments).await,
+
+            // ================================================================
+            // HIDDEN ALIAS (v3.2): backfill → causal_walk replaced it on the
+            // advertised surface; the original stays dispatchable verbatim.
             // ================================================================
             "backfill" => tools::backfill::execute(&self.storage, request.arguments).await,
 
@@ -4395,14 +4403,15 @@ mod tests {
         // v2.2 Tool Consolidation (Layer 1): 34 → 27 after `dedup` folds
         // find_duplicates + the 7 Phase-3 merge tools (8 → 1). Old names remain
         // dispatchable as hidden back-compat aliases but drop off the advertised list.
-        // w3d: +2 → 18 with the append-only `selftest` and `forgotten_lesson`
-        // entries (both read-only query/calibration surfaces).
+        // w3d: +2 with `selftest` + `forgotten_lesson`; v3.2: `causal_walk`
+        // replaced `backfill` on the advertised surface (backfill stays
+        // dispatchable as a hidden alias).
         assert_eq!(
             tools.len(),
             18,
             "Expected 18 tools: the v2.3/v3 consolidated set (dedup + memory_status + \
              graph + maintain + recall; session_context renamed) plus `receipt`, \
-             `backfill`, `project`, the #219 standalone `purge`, and the w3d \
+             `causal_walk`, `project`, the #219 standalone `purge`, and the w3d \
              `selftest` + `forgotten_lesson`"
         );
 
@@ -4471,8 +4480,13 @@ mod tests {
         assert!(tool_names.contains(&"codebase"));
         assert!(tool_names.contains(&"intention"));
 
-        // Flagship retroactive-salience backfill stays advertised (not folded).
-        assert!(tool_names.contains(&"backfill"));
+        // Flagship causal walk is advertised; its predecessor backfill dropped
+        // to a hidden dispatch-only alias in v3.2 (causal_walk replaces it).
+        assert!(tool_names.contains(&"causal_walk"));
+        assert!(
+            !tool_names.contains(&"backfill"),
+            "backfill is hidden in v3.2: dispatchable, not advertised"
+        );
 
         // Core memory (smart_ingest absorbs ingest + checkpoint in v1.7)
         assert!(tool_names.contains(&"smart_ingest"));

@@ -267,7 +267,7 @@ pub fn full_schema(name: &str) -> Option<Value> {
         "graph" => graph_unified::schema(),
         "session_start" => session_context::schema(),
         "suppress" => suppress::schema(),
-        "backfill" => backfill::schema(),
+        "causal_walk" => causal_walk::schema(),
         "selftest" => selftest::schema(),
         "forgotten_lesson" => forgotten_lesson::schema(),
         "purge" => memory_unified::purge_schema(),
