@@ -8,6 +8,7 @@ mod cloud_crypto;
 #[cfg(feature = "cloud-sync")]
 mod cloud_sync;
 mod edges;
+mod blast;
 mod intention_claim;
 mod intention_graph_store;
 mod memory_store;
@@ -30,6 +31,10 @@ pub use attestation_store::{
     ReceiptAttestationStatus, ReceiptSigningKeyTransition, SignedReceiptWrite,
     StoredReceiptAttestationVerification, load_receipt_signing_seed,
     provision_receipt_signing_key_sidecar,
+};
+pub use blast::{
+    BLAST_LINK_TYPES, BLAST_MAX_DEPTH, BLAST_SCAN_NODE_CAP, BlastAffected, BlastReport,
+    RetireOutcome, commit_sha_of,
 };
 pub use memory_store::{
     ClassificationResult, Domain, HealthStatus, LocalMemoryStore, MemoryEdge, MemoryRecord,
