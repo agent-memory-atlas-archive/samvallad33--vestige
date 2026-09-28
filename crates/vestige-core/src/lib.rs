@@ -4,10 +4,8 @@
 //!
 //! - **FSRS-6**: 21-parameter spaced repetition (30% more efficient than SM-2)
 //! - **Dual-Strength Model**: Bjork & Bjork (1992) storage/retrieval strength
-//! - **Semantic Embeddings**: Local fastembed v5 (nomic-embed-text-v1.5, 768 dimensions)
-//! - **HNSW Vector Search**: USearch (20x faster than FAISS)
 //! - **Temporal Memory**: Bi-temporal model with validity periods
-//! - **Hybrid Search**: RRF fusion of keyword (BM25/FTS5) + semantic
+//! - **Hybrid Search Fusion**: RRF fusion of ranked result lists
 //!
 //! ## Advanced Features (Bleeding Edge 2026)
 //!
@@ -17,7 +15,6 @@
 //! - **Cross-Project Learning**: Learn patterns that apply across all projects
 //! - **Intent Detection**: Understand why the user is doing something
 //! - **Memory Chains**: Build chains of reasoning from memory
-//! - **Adaptive Embedding**: Different embedding strategies for different content
 //! - **Memory Dreams**: Enhanced consolidation that creates new insights
 //!
 //! ## Neuroscience-Inspired Features
@@ -66,10 +63,11 @@
 //!
 //! ## Feature Flags
 //!
-//! - `embeddings` (default): Enable local embedding generation with fastembed
-//! - `vector-search` (default): Enable HNSW vector search with USearch
-//! - `full`: All features including MCP protocol support
-//! - `mcp`: Model Context Protocol for Claude integration
+//! - `bundled-sqlite` (default): Bundle SQLite
+//! - `codebase-git` (default): Git history analysis for codebase memory
+//! - `encryption`: Encrypted SQLite via SQLCipher
+//! - `connectors`: Network-backed external-source connectors
+//! - `cloud-sync`: Hosted managed-sync backend
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 // Only warn about missing docs for public items exported from the crate root
@@ -88,7 +86,6 @@ pub mod actor;
 pub mod config;
 pub mod connectors;
 pub mod consolidation;
-pub mod embedder;
 /// Durable profile contracts for local embedding vector spaces.
 pub mod embedding;
 pub mod fsrs;
@@ -103,12 +100,7 @@ pub mod storage;
 /// recorder, immune system, and reviewable-diff model for agent memory.
 pub mod trace;
 
-#[cfg(feature = "embeddings")]
-#[cfg_attr(docsrs, doc(cfg(feature = "embeddings")))]
-pub mod embeddings;
-
-#[cfg(feature = "vector-search")]
-#[cfg_attr(docsrs, doc(cfg(feature = "vector-search")))]
+/// Hybrid and temporal search over ranked result lists.
 pub mod search;
 
 /// Advanced memory features - bleeding edge 2026 cognitive capabilities
@@ -296,11 +288,6 @@ pub use storage::{
     replay_policy_digest,
 };
 
-// Embedder trait and implementations
-pub use embedder::{
-    Embedder, EmbedderError, EmbedderResult, EmbedderSend, FastembedEmbedder, LocalEmbedder,
-};
-
 // Embedding profile contracts are feature-independent so profile discovery,
 // storage metadata, and explicit install workflows remain available in a
 // lightweight build without an inference runtime.
@@ -332,8 +319,6 @@ pub use advanced::{
     ActionType,
     ActivityStats,
     ActivityTracker,
-    // Adaptive embedding
-    AdaptiveEmbedder,
     ApplicableKnowledge,
     AppliedModification,
     // Prediction Error Gating (solves bad vs good similar memory problem)
@@ -350,7 +335,6 @@ pub use advanced::{
     ConsolidationReport,
     // Sleep consolidation (automatic background consolidation)
     ConsolidationScheduler,
-    ContentType,
     CreateReason,
     // Cross-project learning
     CrossProjectLearner,
@@ -361,7 +345,6 @@ pub use advanced::{
     // DreamMemory - input type for dreaming
     DreamMemory,
     DreamResult,
-    EmbeddingStrategy,
     EvaluationIntent,
     GateDecision,
     GateStats,
@@ -372,7 +355,6 @@ pub use advanced::{
     // Intent detection
     IntentDetector,
     LabileState,
-    Language,
     MaintenanceType,
     // Merge / Supersede controls (Phase 3)
     MatchClass,
@@ -566,30 +548,9 @@ pub use neuroscience::{
     TopicalContext,
 };
 
-// Embeddings (when feature enabled)
-#[cfg(feature = "embeddings")]
-pub use embeddings::{
-    EMBEDDING_DIMENSIONS, Embedding, EmbeddingError, EmbeddingService, cosine_similarity,
-    euclidean_distance,
-};
-
-// Search (when feature enabled)
-#[cfg(feature = "vector-search")]
+// Search fusion (RRF + linear combination over ranked result lists)
 pub use search::{
-    HybridSearchConfig,
-    // Hybrid search
-    HybridSearcher,
-    RerankedResult,
-    // GOD TIER 2026: Reranking
-    Reranker,
-    RerankerConfig,
-    RerankerError,
-    VectorIndex,
-    VectorIndexConfig,
-    VectorIndexStats,
-    VectorSearchError,
-    linear_combination,
-    reciprocal_rank_fusion,
+    HybridSearchConfig, HybridSearcher, linear_combination, reciprocal_rank_fusion,
 };
 
 // ============================================================================
@@ -602,10 +563,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// FSRS algorithm version (6 = 21 parameters)
 pub const FSRS_VERSION: u8 = 6;
 
-/// Default embedding model (2026 GOD TIER: nomic-embed-text-v1.5)
-/// 8192 token context, Matryoshka support, fully open source
-pub const DEFAULT_EMBEDDING_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
-
 // ============================================================================
 // PRELUDE
 // ============================================================================
@@ -617,16 +574,11 @@ pub mod prelude {
         NodeType, Rating, RecallInput, Result, SearchMode, Storage, StorageError,
     };
 
-    #[cfg(feature = "embeddings")]
-    pub use crate::{Embedding, EmbeddingService};
-
-    #[cfg(feature = "vector-search")]
-    pub use crate::{HybridSearcher, VectorIndex};
+    pub use crate::HybridSearcher;
 
     // Advanced features
     pub use crate::{
         ActivityTracker,
-        AdaptiveEmbedder,
         ConnectionGraph,
         ConsolidationReport,
         // Sleep consolidation
