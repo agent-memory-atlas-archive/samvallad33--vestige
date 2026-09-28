@@ -487,6 +487,21 @@ enum Commands {
         #[arg(long, default_value = "3927")]
         dashboard_port: u16,
     },
+
+    /// Run the planted-cause selftest against a throwaway copy of the store
+    Selftest,
+
+    /// Find decayed fix/lesson memories sharing an anchor with a failure
+    ForgottenLesson {
+        /// Failure memory id to inspect
+        failure_id: String,
+        /// Exact project namespace of the failure (default: user)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output raw JSON (same payload as the MCP tool)
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -612,6 +627,12 @@ fn main() -> anyhow::Result<()> {
             dashboard,
             dashboard_port,
         } => run_serve(port, dashboard, dashboard_port),
+        Commands::Selftest => run_selftest(),
+        Commands::ForgottenLesson {
+            failure_id,
+            scope,
+            json,
+        } => run_forgotten_lesson(failure_id, scope, json),
     }
 }
 
@@ -2776,6 +2797,98 @@ fn run_backup(output: PathBuf) -> anyhow::Result<()> {
             .bold()
     );
 
+    Ok(())
+}
+
+/// Run the planted-cause selftest (the MCP `selftest` tool) from the CLI.
+/// Snapshots the store to a tempdir copy, plants causes/failures there, runs
+/// the real backfill against the copy, and prints the same payload the MCP
+/// tool returns. The live store is only read.
+fn run_selftest() -> anyhow::Result<()> {
+    println!("{}", "=== Planted-Cause Selftest ===".cyan().bold());
+    println!();
+
+    let storage = std::sync::Arc::new(open_storage()?);
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt
+        .block_on(vestige_mcp::tools::selftest::execute(&storage, None))
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    if result["hits"] == serde_json::json!(result["rounds"]) && result["gap_calibration"] == true {
+        println!(
+            "{}",
+            format!(
+                "hit@1 {}/{} · hit@3 {}/{} · gap calibration OK",
+                result["hits"], result["rounds"], result["hit_at_3"], result["rounds"]
+            )
+            .green()
+            .bold()
+        );
+    } else {
+        println!(
+            "{}",
+            format!(
+                "hit@1 {}/{} · hit@3 {}/{} · gap calibration {}",
+                result["hits"],
+                result["rounds"],
+                result["hit_at_3"],
+                result["rounds"],
+                result["gap_calibration"]
+            )
+            .yellow()
+        );
+    }
+    println!("{}", "(live store untouched; temp copy deleted)".dimmed());
+    println!();
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+/// Run the forgotten-lesson scan (the MCP `forgotten_lesson` tool) from the
+/// CLI: decayed fix/lesson memories sharing an exact anchor with a failure.
+fn run_forgotten_lesson(
+    failure_id: String,
+    scope: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let storage = std::sync::Arc::new(open_storage()?);
+    let args = serde_json::json!({"failure_id": failure_id, "scope": scope});
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt
+        .block_on(vestige_mcp::tools::forgotten_lesson::execute(&storage, Some(args)))
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Machine-readable path: the raw tool payload, byte-for-byte the MCP shape.
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    println!("{}", "=== Forgotten Lessons ===".cyan().bold());
+    println!();
+    let lessons = result["forgotten_lessons"].as_array().cloned().unwrap_or_default();
+    if lessons.is_empty() {
+        println!("{}", "No decayed lesson shares an anchor with this failure.".dimmed());
+    } else {
+        for lesson in &lessons {
+            println!(
+                "  {} · retention {}% · anchor {}",
+                lesson["lesson_id"].as_str().unwrap_or("?").normal(),
+                lesson["retention_pct"].to_string().yellow(),
+                lesson["shared_anchor"].as_str().unwrap_or("?").cyan(),
+            );
+            let preview = lesson["content_preview"].as_str().unwrap_or("");
+            if !preview.is_empty() {
+                println!("    {}", preview.dimmed());
+            }
+        }
+        println!();
+        println!(
+            "{}",
+            "Recorded fixes the store can no longer retrieve — review before relearning."
+                .dimmed()
+        );
+    }
     Ok(())
 }
 

@@ -1064,6 +1064,45 @@ description: Some("Investigate a recorded failure using earlier memories sharing
                 input_schema: tools::compact::of(&tools::backfill::schema()),
                 ..Default::default()
             },
+            // ================================================================
+            // w3d SELF-CALIBRATION — planted-cause selftest. Verifies the
+            // backfill surface end-to-end against a temp COPY of the store
+            // (backup_to snapshot): plants quiet causes + failures, scores
+            // hit@1/hit@3, and checks the gap report fires on a no-anchor
+            // round. Read-only with respect to the live store.
+            // ================================================================
+            ToolDescription {
+                name: "selftest".to_string(),
+                title: Some("Selftest".to_string()),
+                annotations: Some(ToolAnnotations {
+                    read_only_hint: true,
+                    destructive_hint: false,
+                    idempotent_hint: true,
+                    open_world_hint: false,
+                }),
+description: Some("Planted-cause selftest: backfill hit@1/hit@3 + gap calibration on a temp copy.".to_string()),
+                input_schema: tools::compact::of(&tools::selftest::schema()),
+                ..Default::default()
+            },
+            // ================================================================
+            // w3d FORGOTTEN LESSON — decayed corrective-memory detection.
+            // Earlier fix/lesson memories that share an exact anchor with a
+            // failure but had FSRS retrievability < 0.5 at failure time.
+            // Pure query: no graph, strength, or FSRS state is written.
+            // ================================================================
+            ToolDescription {
+                name: "forgotten_lesson".to_string(),
+                title: Some("Forgotten Lesson".to_string()),
+                annotations: Some(ToolAnnotations {
+                    read_only_hint: true,
+                    destructive_hint: false,
+                    idempotent_hint: true,
+                    open_world_hint: false,
+                }),
+description: Some("Decayed fix/lesson memories sharing an exact anchor with a failure; FSRS R below 0.5 at failure time.".to_string()),
+                input_schema: tools::compact::of(&tools::forgotten_lesson::schema()),
+                ..Default::default()
+            },
             ]
 
 }
@@ -1584,6 +1623,14 @@ description: Some("Investigate a recorded failure using earlier memories sharing
             // Retroactive Salience Backfill (Cai 2024 Nature) — flagship v2.2
             // ================================================================
             "backfill" => tools::backfill::execute(&self.storage, request.arguments).await,
+
+            // ================================================================
+            // w3d: planted-cause selftest + forgotten-lesson detection
+            // ================================================================
+            "selftest" => tools::selftest::execute(&self.storage, request.arguments).await,
+            "forgotten_lesson" => {
+                tools::forgotten_lesson::execute(&self.storage, request.arguments).await
+            }
 
             // ================================================================
             // DEPRECATED (v1.7): ingest → smart_ingest
@@ -4171,7 +4218,7 @@ mod tests {
     #[test]
     fn full_schema_registry_matches_the_advertised_catalog() {
         let catalog = McpServer::tool_catalog();
-        assert_eq!(catalog.len(), 16, "catalog size changed; update the registry");
+        assert_eq!(catalog.len(), 18, "catalog size changed; update the registry");
         for tool in &catalog {
             assert!(
                 tools::compact::full_schema(&tool.name).is_some(),
@@ -4348,12 +4395,15 @@ mod tests {
         // v2.2 Tool Consolidation (Layer 1): 34 → 27 after `dedup` folds
         // find_duplicates + the 7 Phase-3 merge tools (8 → 1). Old names remain
         // dispatchable as hidden back-compat aliases but drop off the advertised list.
+        // w3d: +2 → 18 with the append-only `selftest` and `forgotten_lesson`
+        // entries (both read-only query/calibration surfaces).
         assert_eq!(
             tools.len(),
-            16,
-            "Expected 16 tools: the v2.3/v3 consolidated set (dedup + memory_status + \
+            18,
+            "Expected 18 tools: the v2.3/v3 consolidated set (dedup + memory_status + \
              graph + maintain + recall; session_context renamed) plus `receipt`, \
-             `backfill`, `project`, and the #219 standalone `purge`"
+             `backfill`, `project`, the #219 standalone `purge`, and the w3d \
+             `selftest` + `forgotten_lesson`"
         );
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -4395,7 +4445,12 @@ mod tests {
         }
         read_only.sort();
         destructive.sort();
-        assert_eq!(read_only, ["memory_status", "session_start"]);
+        // w3d: `selftest` (writes only a temp copy) and `forgotten_lesson`
+        // (pure query) join the read-only set.
+        assert_eq!(
+            read_only,
+            ["forgotten_lesson", "memory_status", "selftest", "session_start"]
+        );
         // Reanchoring replaces existing evidence, so the mixed codebase tool
         // must advertise its destructive action conservatively.
         assert_eq!(

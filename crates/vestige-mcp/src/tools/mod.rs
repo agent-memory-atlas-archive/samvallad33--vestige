@@ -88,6 +88,11 @@ pub mod blast_radius;
 // Retroactive Salience Backfill — Cai 2024 Nature (memory with hindsight)
 pub mod backfill;
 
+// w3d: planted-cause self-calibration + decayed-lesson detection, both
+// built on the backfill surface above.
+pub mod selftest;
+pub mod forgotten_lesson;
+
 // Internal/backwards-compat tools still dispatched by server.rs for specific
 // tool names. Each module below has live callers via string dispatch in
 // `server.rs` (match arms on request.name).

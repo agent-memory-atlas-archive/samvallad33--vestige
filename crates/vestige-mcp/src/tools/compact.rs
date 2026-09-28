@@ -268,6 +268,8 @@ pub fn full_schema(name: &str) -> Option<Value> {
         "session_start" => session_context::schema(),
         "suppress" => suppress::schema(),
         "backfill" => backfill::schema(),
+        "selftest" => selftest::schema(),
+        "forgotten_lesson" => forgotten_lesson::schema(),
         "purge" => memory_unified::purge_schema(),
         _ => return None,
     })
