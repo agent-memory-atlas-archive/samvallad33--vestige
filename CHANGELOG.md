@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-09-25
+
+Vestige v3.1.0 is the current tree. Everything below landed after the v3.0.0 tag.
+
+### Added
+
+- Concurrent request dispatch over stdio: one slow handler no longer stalls
+  every other request on the connection. One writer task owns stdout so JSON
+  documents never interleave, backpressure is bounded at every layer
+  (in-flight cap, pending cap, writer queue), the post-EOF drain is bounded
+  and hands abandoned request ids a -32603, and inline consolidation can no
+  longer be triggered twice at once. By @randomnimbus in #268.
+- Homebrew (`brew install samvallad33/tap/vestige`) and eget install paths in
+  the README (#269).
+- Actor provenance (#252 phase A): a process `did:key` per data directory,
+  an operator-controlled role and weight policy, and transactional
+  endorsements on promote, demote, and reinforce. Receipts and `smart_ingest`
+  carry the actor block. `memory_status` view `provenance` reads it.
+- MCP 2026-07-28 stateless serving beside the legacy handshake, and a
+  receipt card at `ui://vestige/receipt/{id}` (#241).
+- `outputSchema` on `recall`, `smart_ingest`, `memory_status`, and `receipt`.
+  `purge` is its own tool, same path as `memory` action `purge` (#275).
+- Recall abstains below `abstain_floor` (default 0.35) and returns the nearest
+  matches instead of a weak answer (#276).
+- Current-time recall withholds superseded memories unless
+  `include_superseded` is set (#281).
+- Below the precision floor, recall returns a gist and `precisionLow`.
+  `memory` get still returns the full text (#283).
+- Narrative edges between memories retrieved together, capped and rank-bounded
+  (#284).
+- `maintain` action `dream_compile` runs the four-phase dream engine and files
+  Memory PRs. Memory rows are not mutated; co-hit connection strengths can
+  move. `VESTIGE_DREAM_COMPILE_AUTOFIRE` defaults off.
+- A write that conflicts with a memory still inside its labile window opens a
+  reconsolidation plan. `dedup` action `verdict` approves, rejects, or
+  quarantines it.
+- Armed intentions can resurface on recall, inside the request scope, capped
+  at three.
+- Startup asks npm whether a newer `vestige-mcp-server` exists and logs the
+  upgrade command. The first model download says what works when (#287).
+
+### Fixed
+
+- Shutdown SIGSEGV: returning from `main` ran libc exit handlers while a
+  warm-up task was still inside ONNX Runtime's `CreateSession`, corrupting the
+  op-schema registry in 7 of 15 integration runs. The runtime now joins with a
+  bound, and when it cannot, the process leaves without running exit-time
+  teardown (#268).
+- `abstain_floor` and `include_superseded` match the snake_case names the
+  schema advertises. The camelCase spellings still work.
+- Backfill wording on the CLI and the consolidation log matches the tool:
+  shared-entity candidates, not a proven cause (#280).
+
+### Changed
+
+- README hero renamed to Transaction-Security OS; Operator rituals named in
+  the Founding Operator section (#266).
+- Benchmark writeups published: The Blast, The Refund, The Autoscale
+  (Phase-2 STOP→ALLOW evidence) (#258, #259, #260, #248).
+- Release workflow skips binary builds and registry publish for announcement
+  tags — `launch-*`, `vestige-*`, `benchmark-*` (#264).
+- v3 distribution manifests and installer references aligned (#254).
+
 ### Changed — code memory closes the loop at retrieval time
 
 - A remembered pattern or decision always surfaced in `recall` (the
@@ -170,42 +233,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is lost — a build-time guard fails if the wire payload ever exceeds 20 KiB
   again. Recall's investigation filters are grouped into `source` and
   `filters` objects in the compact form; the full schema keeps them flat.
-
-## [3.1.0] - 2026-09-25
-
-Vestige v3.1.0 is a concurrency and distribution release: the stdio transport
-serves requests concurrently with bounded backpressure, the shutdown path no
-longer races ONNX Runtime teardown, and the README gains Homebrew and eget
-install paths.
-
-### Added
-
-- Concurrent request dispatch over stdio: one slow handler no longer stalls
-  every other request on the connection. One writer task owns stdout so JSON
-  documents never interleave, backpressure is bounded at every layer
-  (in-flight cap, pending cap, writer queue), the post-EOF drain is bounded
-  and hands abandoned request ids a -32603, and inline consolidation can no
-  longer be triggered twice at once. By @randomnimbus in #268.
-- Homebrew (`brew install samvallad33/tap/vestige`) and eget install paths in
-  the README (#269).
-
-### Fixed
-
-- Shutdown SIGSEGV: returning from `main` ran libc exit handlers while a
-  warm-up task was still inside ONNX Runtime's `CreateSession`, corrupting the
-  op-schema registry in 7 of 15 integration runs. The runtime now joins with a
-  bound, and when it cannot, the process leaves without running exit-time
-  teardown (#268).
-
-### Changed
-
-- README hero renamed to Transaction-Security OS; Operator rituals named in
-  the Founding Operator section (#266).
-- Benchmark writeups published: The Blast, The Refund, The Autoscale
-  (Phase-2 STOP→ALLOW evidence) (#258, #259, #260, #248).
-- Release workflow skips binary builds and registry publish for announcement
-  tags — `launch-*`, `vestige-*`, `benchmark-*` (#264).
-- v3 distribution manifests and installer references aligned (#254).
 
 ## [3.0.0] - 2026-09-10
 

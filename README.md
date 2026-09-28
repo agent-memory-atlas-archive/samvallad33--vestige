@@ -4,11 +4,9 @@
 
 # Vestige
 
-**Cognitive Deterministic Memory Transaction-Security OS for Agentic AI.**
+**Local MCP memory for coding agents. Version 3.1.0.**
 
-Your agent can think anything. Vestige decides what it is allowed to do.
-
-It remembers every decision your project ever made, reaches backward through time to find the quiet choice behind today's failure, and blocks the actions your agent should never take. Receipt, one-use permit, effect. Or STOP with zero effects. Local. Encrypted. No cloud, no telemetry.
+The server binary is `vestige-mcp`. The CLI is `vestige`. Memories live in a SQLite file on the machine. `smart_ingest` creates a memory, merges it into a similar one, or supersedes an outdated one. `recall` retrieves. A retrieval can persist a receipt. Review mode defaults to `fast` (writes auto-commit). Cloud sync stays off until you run it.
 
 [![Release](https://img.shields.io/github/v/release/samvallad33/vestige?color=06b6d4)](https://github.com/samvallad33/vestige/releases/latest)
 [![Tests](https://img.shields.io/github/actions/workflow/status/samvallad33/vestige/ci.yml?branch=main&label=CI)](https://github.com/samvallad33/vestige/actions)
@@ -20,33 +18,29 @@ It remembers every decision your project ever made, reaches backward through tim
 <a id="getting-started"></a>
 ## The cause never looks like the bug
 
-Agents re-learn the same lessons. They recommend a change you already tested and rejected, re-derive a fix that was already written down, and treat every session as if the last one never happened. Vestige is the deterministic memory security OS that ends that. Any MCP-capable agent writes memories as you work and retrieves them later: redundant memories merge, contradicted ones are flagged, unused ones fade, and when a failure hits, Vestige reaches **backward** to the decision that set it up.
+A new session does not automatically have the last session's decisions. Vestige keeps them in the local store. Redundant writes merge. `recall` with `mode` `contradictions` returns disagreement pairs for a topic. When a failure is already stored, `backfill` lists earlier memories that share entities with it. Those rows are hypotheses: `evidence_status` is `hypothesis` and `causality_verified` is false. `promote` defaults to false, so the preview writes no candidate edges and changes no strength.
 
 <p align="center">
   <a href="https://raw.githubusercontent.com/samvallad33/vestige/media/vestige-black-box.mp4">
-    <img src="https://raw.githubusercontent.com/samvallad33/vestige/media/black-box-cause.gif" alt="Vestige Black Box: a SIGSEGV on startup traced back to a version pin set 23 days earlier, with the receipt" width="100%">
+    <img src="https://raw.githubusercontent.com/samvallad33/vestige/media/black-box-cause.gif" alt="vestige backfill --contrast: a similarity ranking, then shared-entity candidates" width="100%">
   </a>
 </p>
 
-<p align="center"><sub><b>A labeled fixture store, a real run.</b> A SIGSEGV on startup in an arm64 container, and the version pin set 23 days earlier that shares zero words with the failure. Similarity ranked the pin fourth. Backfill ranked it first. It names the suspects and never calls the verdict. <a href="https://raw.githubusercontent.com/samvallad33/vestige/media/vestige-black-box.mp4">Watch the 58 second walk</a>.</sub></p>
+<p align="center"><sub><b>`vestige backfill --contrast`</b> prints a similarity ranking first (hybrid when embeddings are ready, otherwise keyword), labeled as resemblance, then the backward pass. Candidates that share entities are associations, not a proven cause. <a href="https://raw.githubusercontent.com/samvallad33/vestige/media/vestige-black-box.mp4">Watch the walk</a>.</sub></p>
 
 ## Install
 
-You need Node.js. No Docker, no signup, no compile step. Prebuilt for macOS ARM and Intel, Linux x86_64 and arm64, Windows x86_64.
+The npm package needs Node.js. Homebrew and eget install a prebuilt binary. Release targets: macOS ARM and Intel, Linux x86_64 and arm64, Windows x86_64.
 
 ```bash
 npm install -g vestige-mcp-server@latest
 ```
 
-Prefer Homebrew?
-
 ```bash
 brew install samvallad33/tap/vestige
 ```
 
-Scripted installs work too: `eget samvallad33/vestige` pulls the right prebuilt binary from Releases.
-
-Connect it to your agent. Every MCP client understands this config:
+`eget samvallad33/vestige` pulls the matching prebuilt binary from Releases.
 
 ```json
 {
@@ -64,78 +58,83 @@ Connect it to your agent. Every MCP client understands this config:
 | Claude Desktop | [docs/CONFIGURATION.md](docs/CONFIGURATION.md#claude-desktop-macos) |
 | Cline / Continue / Zed / Goose | the JSON above, in that client's MCP settings |
 
-Verify it: `vestige dashboard`, then open **http://localhost:3927/dashboard**. First run downloads a 130MB embedding model once; after that Vestige is fully offline, forever. Full walkthrough: [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md).
+`vestige dashboard` serves the UI at **http://localhost:3927/dashboard** (override with `--port` or `VESTIGE_DASHBOARD_PORT`). On a build with embeddings, the first run logs a ~130 MB download of `nomic-ai/nomic-embed-text-v1.5`. Keyword search and `smart_ingest` work before that download finishes; semantic ranking starts when the runtime is ready. Walkthrough: [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md).
+
+### CLI
+
+`vestige` is the clap binary in `src/bin/cli.rs`. `vestige-mcp` is the stdio server. Subcommands:
+
+`stats`, `health`, `consolidate`, `upgrade` (`--dry-run`), `update`, `sandwich`, `embeddings`, `restore`, `backup`, `export`, `portable-export`, `portable-import`, `sync`, `gc`, `dashboard`, `ingest`, `scan-secrets`, `backfill`, `recall`, `compose`, `project`, `serve`.
+
+`backfill` takes `--failure-id`, `--manual`, `--lookback-days` (default 30), `--no-promote`, `--contrast`, and `--json`. `serve` listens on 3928 and can also start the dashboard on 3927. `sync --cloud` talks to a hosted endpoint; a plain `sync <archive>` is a file.
+
+Global `--data-dir` overrides `VESTIGE_DATA_DIR`.
+
+### Server config
+
+`vestige-mcp` reads these (defaults from its `--help`):
+
+| Variable | Default |
+|---|---|
+| `VESTIGE_DATA_DIR` | platform data dir, `vestige.db` inside it |
+| `VESTIGE_HTTP_ENABLED` | off |
+| `VESTIGE_HTTP_PORT` | 3928 |
+| `VESTIGE_HTTP_BIND` | `127.0.0.1` |
+| `VESTIGE_HTTP_ALLOWED_ORIGINS` | unset |
+| `VESTIGE_AUTH_TOKEN` | override; otherwise `auth_token` in the data dir, created if missing |
+| `VESTIGE_DASHBOARD_ENABLED` | off for the server process; `vestige dashboard` starts it |
+| `VESTIGE_DASHBOARD_PORT` | 3927 |
+| `VESTIGE_SYSTEM_PROMPT_MODE` | `minimal` (`full` injects the composition mandate) |
+| `VESTIGE_CONSOLIDATION_INTERVAL_HOURS` | 6 |
+| `VESTIGE_DREAM_COMPILE_AUTOFIRE` | off |
+| `VESTIGE_ENCRYPTION_KEY` | used only when the `encryption` feature (SQLCipher) is compiled in |
+| `VESTIGE_CLOUD_SYNC_KEY`, `VESTIGE_CLOUD_ENDPOINT` | required for `vestige sync --cloud` |
+| `VESTIGE_CLOUD_ENCRYPTION_KEY` | passphrase for the client-side archive; never sent |
 
 ## Why not just RAG?
 
-RAG retrieves text that resembles the query. That works when the answer looks like the question. It fails when the cause of a problem looks nothing like the symptom.
+Similarity search ranks memories that resemble the query. `vestige backfill --contrast` shows that ranking, then a second list: earlier memories that share entities with a stored failure.
 
 | | Vector search | Vestige |
 |---|---|---|
-| Retrieval basis | Similarity to the query | Causal and temporal links, plus similarity |
-| Root cause of a failure | Cannot. The cause does not resemble the bug | `vestige backfill --contrast` reaches backward to it |
-| Contradictions | Both stored, both returned | Detected and flagged |
-| Redundant writes | Accumulate | Merged on write |
-| Unused memories | Persist at full weight | Fade (FSRS-6 spaced repetition) |
-| Your data | Usually a cloud service | Never leaves your machine |
+| Retrieval basis | Similarity to the query | `recall` mode `lookup` is hybrid keyword and semantic search. `reason` adds trust, spreading activation, supersession, and contradictions |
+| A stored failure | The lookalike, not a shared-entity candidate | `backfill` returns hypotheses. `promote=false` by default |
+| Contradictions | Both stored, both returned | `recall` mode `contradictions` returns disagreement pairs |
+| Redundant writes | Accumulate | `smart_ingest` merges into a similar memory |
+| Unused memories | Stay at full weight | FSRS-6 decay, via consolidation |
+| Where the file sits | Often a hosted index | SQLite on the machine. `vestige sync --cloud` is opt-in and encrypts the archive first |
 
-The backward reach implements Retroactive Salience Backfill (Zaki, Cai et al., *Nature* 2024): when a memory turns out to matter, the earlier memories that led to it become retrievable too. Every backfill result ships with a receipt naming the exact evidence path. DeepMind separately proved single-vector retrieval is mathematically incapable of certain relevance patterns ([arXiv:2508.21038](https://arxiv.org/abs/2508.21038)).
+The backward pass is the Retroactive Salience Backfill path (Cai 2024, *Nature*, named in the CLI and the `backfill` tool).
 
 ## 🛡️ Founding Operator
 
-The fail-closed authority kernel for AI agents. Your agent can think anything. Operator decides what it is allowed to do.
+Review is `crates/vestige-core/src/trace/review.rs`.
 
-Receipt, then a one-use permit, then the effect. Or STOP with zero effects. Thinking is not authority.
+- **`fast`** (default). Writes auto-commit. Purge runs directly.
+- **`risk_gated`**. Ordinary writes auto-commit. Risky writes open a Memory PR.
+- **`paranoid`**. Every write waits for approval.
 
-**See it stop a real agent: [▶ THE LIVE GATE (1:44)](https://github.com/samvallad33/vestige/releases/tag/launch-night-live-gate-20260914)**, recorded in one take. An agent tries to permanently purge its own memory trail. Operator refuses the effect, opens a Memory PR, and waits for a human.
+Under `risk_gated` and `paranoid`, `purge`, `delete`, and `suppress` are pre-gated: the server opens a pending Memory PR and returns without applying the mutation. The dashboard lists those PRs and can promote, merge, supersede, quarantine, or forget them.
 
-- **$49 first month, first 100 people. $149/mo after.**
-- Includes Managed Continuity.
-- Login and checkout: **https://vestige-pro-production.fly.dev/account**
-
-**What Operator buys, the daily ritual surface:**
-
-- **Taste Lock** — the moment your agent commits to something consequential, it is locked and receipted before it can drift.
-- **The Seven** — seven signed receipts of the last consequential writes, laid out like polaroids. What your agent actually did today, at a glance.
-- **Almost-Forgot** — the three dim memories that are still load-bearing but fading, surfaced before they fail.
-- **Night Letter** — a signed letter from your store at night: what changed, what contradicted, what decayed. Not a merge log. A letter.
-- **Facepalm Backfill** — it broke again? Walk backward from the failure to the quiet decision that set it up, evidence path attached.
-- **Canary Bite** — a secret about to leave the store gets eaten before it ships.
-
-**Investigator ($79/mo)** is the instruments tier: deep backfill passes, evidence packets, retrieval tribunals, the full forensics surface for postmortems and audits. For engineers who debug with receipts.
+**See it stop a real agent: [▶ THE LIVE GATE (1:44)](https://github.com/samvallad33/vestige/releases/tag/launch-night-live-gate-20260914)**, recorded in one take.
 
 <a id="managed-continuity"></a>
 <a id="vestige-pro"></a>
 ## 🔄 Managed Continuity
 
-Your agent's memory survives crashes, new machines, and reinstalls. Decisions, receipts, traces, and memory PRs follow you everywhere.
+`vestige backup <file>` copies the SQLite database. `vestige sync <archive>` two-way syncs a portable archive (Dropbox, iCloud, Syncthing, or git all work as the folder). `vestige sync --cloud` uses the hosted endpoint instead of a file.
 
-End to end encrypted: XChaCha20-Poly1305 applied on your device, Argon2id over a passphrase only you know, ciphertext-only server. Lose the passphrase and the data is unrecoverable, by anyone.
+Cloud bytes are encrypted on the client before upload: Argon2id derives a key from `VESTIGE_CLOUD_ENCRYPTION_KEY`, XChaCha20-Poly1305 seals the archive. The hosted service stores ciphertext. Losing the passphrase makes that archive unrecoverable.
 
 ```bash
-# 1. Full local backup
 vestige backup ~/vestige-backup.db
-
-# 2. Encrypted archive, drop it in iCloud, Dropbox, Syncthing, or Git
 vestige sync ~/vestige-archive.vportable
-
-# 3. Restore on any machine
 vestige --data-dir ~/new-machine-store sync ~/vestige-archive.vportable
 ```
 
-**$19/mo.** Subscribe at **https://vestige-pro-production.fly.dev/account**
-
 ## The receipts: Silent Rotation
 
-The claim is testable, and the test ships with all 246 agent transcripts it produced. Three coding agents fix one failing e2e test; the fix needs a signing key id that exists only in the memory layer. The dangerous outcome is converging on a planted decoy: tests pass, the merge is clean, production breaks.
-
-| Arm (6 models, 25 trials) | Converged correct | Converged wrong | Split |
-|---|---|---|---|
-| No memory | 0/25 | **21/25** | 4/25 |
-| Dense cosine RAG | 4/23 | **12/23** | 7/23 |
-| Vestige | 20/23 | **0/23** | 3/23 |
-
-Reproduce the central measurement in two seconds:
+The pooled Silent Rotation numbers are being recounted on branch `benchmark/silent-rotation`. This README does not publish a score.
 
 ```bash
 git clone -b benchmark/silent-rotation --depth 1 https://github.com/samvallad33/vestige.git
@@ -143,38 +142,45 @@ cd vestige/benchmarks/silent-rotation
 python3 tests/bm25_baseline.py results/runA-trial-1/corpus-export.json --no-dense
 ```
 
-Caveats are published alongside the results, including the trials a plain cosine baseline ties.
-
 ## The science
 
-Every mechanism is a cited result, implemented in Rust, running locally. Full write-up: [docs/SCIENCE.md](docs/SCIENCE.md).
+Mechanisms that ship in this tree. Write-up: [docs/SCIENCE.md](docs/SCIENCE.md).
 
-| Mechanism | What it does | Source |
+| Mechanism | What the code does | Where |
 |---|---|---|
-| Prediction-Error Gating | Stores only the novel; merges redundant | Hippocampal novelty gating |
-| FSRS-6 spaced repetition | Used memories persist, unused ones fade | Modern spaced-repetition research |
-| Retroactive Salience Backfill | Reaches backward to a failure's root cause | Zaki, Cai et al. 2024, *Nature* |
-| Synaptic Tagging | Marks memories for later consolidation | Frey & Morris 1997 |
-| Spreading Activation | One retrieval activates related memories | Collins & Loftus 1975 |
-| Dual-Strength | Storage vs retrieval strength, tracked separately | Bjork & Bjork 1992 |
-| Memory Dreaming | Sleep-like replay and synthesis | Sleep consolidation research |
-| Active Forgetting | Reversible top-down suppression | Anderson 2025, Davis 2020 |
+| Prediction-error gating | `smart_ingest` creates, merges, or supersedes | `tools/smart_ingest` |
+| FSRS-6 | Unused memories decay; consolidation refreshes scores | `vestige-core/src/fsrs` |
+| Retroactive salience backfill | Shared-entity hypotheses from a stored failure | `tools/backfill.rs` |
+| Synaptic tagging | Tags memories for later consolidation | `tools/tagging.rs` |
+| Spreading activation | `recall` mode `reason` activates related memories | `neuroscience/spreading_activation.rs` |
+| Dual strength | Storage strength and retrieval strength are separate fields | `advanced/reconsolidation.rs` |
+| Dream compile | `maintain` action `dream_compile` files Memory PRs | `tools/dream_compile.rs` |
+| Active forgetting | `suppress` inhibits retrieval without deleting | `tools/suppress.rs` |
 
 ## The tools
 
-Your agent calls these; you rarely do.
+`tools/list` advertises these sixteen. Folded names (`search`, `importance_score`, `context`, `deep_reference`, `session_context`) are not in that list.
 
-| Tool | Purpose |
+| Tool | What it does |
 |---|---|
-| `recall` | Retrieve memories relevant to the current context |
-| `smart_ingest` | Store a fact, gated for novelty and contradiction |
-| `backfill` | Reach backward from a failure to its candidate cause |
-| `receipt` | Inspect retrieval receipts and evidence replay |
-| `project` | Project durable decisions into CLAUDE.md or MEMORY.md |
-| `memory` · `graph` · `intention` | Inspect, promote, explore, track goals |
-| `maintain` · `dedup` · `suppress` | Consolidation, merge, bounded suppression |
+| `recall` | `lookup` (default): hybrid keyword and semantic search. `reason`: trust, spreading activation, supersession, contradictions. `contradictions`: disagreement pairs |
+| `receipt` | Read a persisted retrieval receipt, or replay its frozen evidence pack |
+| `memory` | `get`, `get_batch`, `state`, `promote`, `demote`, `edit`, `purge` (`confirm=true`) |
+| `purge` | Remove one memory's content and embeddings. Irreversible. `confirm=true`. Same path as `memory` action `purge` |
+| `codebase` | `remember_pattern`, `remember_decision`, `get_context`, `verify`, `reanchor` |
+| `project` | Preview or write a fenced region of `CLAUDE.md` or `MEMORY.md`. `write` needs `confirm=true` |
+| `intention` | `set`, `check`, `update`, `list`; `graph` for evidence-aware plans |
+| `smart_ingest` | Save through prediction-error gating. Batch via `items` (max 20) |
+| `source_sync` | Index GitHub (`GITHUB_TOKEN`) or Redmine (`REDMINE_URL`, `REDMINE_API_KEY`) into local memories |
+| `memory_status` | `health`, `retention`, `timeline`, `changelog`, `stats`, `tools` (full schema for one tool) |
+| `maintain` | `consolidate`, `dream`, `dream_compile`, `gc` (`dry_run` default true), `importance_score`, `backup`, `export`, `restore` |
+| `dedup` | `scan`, merge and supersede plans, `apply`, `undo`, `verdict` (approve, reject, or quarantine a reconsolidation plan), tag rename/merge, `protect`, `policy` |
+| `graph` | `chain`, `associations`, `bridges`, `predict`, composition topology. `label` is the write |
+| `session_start` | One call: memories, open intentions, status, predictions, codebase context, under a token budget |
+| `suppress` | Inhibit retrieval and speed decay without deleting. `reverse=true` undoes it within 24 hours |
+| `backfill` | Hypotheses from earlier memories that share entities with a failure. `promote` defaults to false |
 
-Full contracts: [docs/TOOL-CONTRACTS.md](docs/TOOL-CONTRACTS.md) · Hygiene and standing habits: [docs/MEMORY_HYGIENE.md](docs/MEMORY_HYGIENE.md)
+Contracts: [docs/TOOL-CONTRACTS.md](docs/TOOL-CONTRACTS.md). Hygiene: [docs/MEMORY_HYGIENE.md](docs/MEMORY_HYGIENE.md).
 
 ## The dashboard
 
@@ -182,16 +188,16 @@ Full contracts: [docs/TOOL-CONTRACTS.md](docs/TOOL-CONTRACTS.md) · Hygiene and 
 vestige dashboard
 ```
 
-A living observatory of your memory at **http://localhost:3927/dashboard**: memories appear, link, strengthen, and fade in real time, 1000+ nodes at 60fps. It renders a deterministic 12-second loop of your store's life that you can export as an mp4 with one click. Share artifacts are structure-only by design: your brain, never your memories.
+The observatory is at **http://localhost:3927/dashboard**. Its clock is a fixed 60fps loop, 720 frames (12 seconds). Loop export writes that loop to an mp4. Brain-print share links are structure only: a quantized shape, not memory text.
 
 ## Under the hood
 
 | | |
 |---|---|
-| Engine | Rust 2024, ~145k lines, single 25MB binary, 2,000+ tests, clippy clean at `-D warnings` |
-| Retrieval | Nomic Embed v1.5 (Matryoshka 768d→256d) + USearch HNSW + SQLite FTS5, optional Qwen3 reranker |
-| Storage | SQLite, optional SQLCipher encryption ([docs/STORAGE.md](docs/STORAGE.md)) |
-| Offline | Two model downloads on first run, then no network, ever |
+| Engine | Rust 2024. Workspace, `vestige-mcp`, and `vestige-core` are version 3.1.0 |
+| Retrieval | `nomic-ai/nomic-embed-text-v1.5` stored at 256 dimensions (Matryoshka truncation of the 768-d output), USearch HNSW, SQLite FTS5. Optional Qwen3 profiles behind `qwen3-embeddings` |
+| Storage | SQLite. SQLCipher when built with `--features encryption` and `VESTIGE_ENCRYPTION_KEY` is set |
+| Sync | Local by default. `vestige sync --cloud` encrypts first |
 
 ## Go deeper
 
@@ -199,4 +205,4 @@ A living observatory of your memory at **http://localhost:3927/dashboard**: memo
 
 ## License
 
-AGPL-3.0. The hosted Continuity and Operator services are separate proprietary products.
+AGPL-3.0. See [LICENSE](LICENSE).
