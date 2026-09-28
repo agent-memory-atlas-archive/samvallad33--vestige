@@ -2609,7 +2609,6 @@ ALTER TABLE knowledge_nodes ADD COLUMN author_actor_did TEXT;
 UPDATE schema_version SET version = 38, applied_at = datetime('now');
 "#;
 
-<<<<<<< HEAD
 /// V39: Typed edge vocabulary (build/w2b-edge-schema).
 ///
 /// `memory_connections` stays the single edge table. The owner-approved
@@ -2684,7 +2683,6 @@ CREATE TABLE IF NOT EXISTS walk_receipts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_walk_receipts_created_at ON walk_receipts(created_at DESC);
->>>>>>> build/w3e-receipts-status
 
 UPDATE schema_version SET version = 40, applied_at = datetime('now');
 "#;
