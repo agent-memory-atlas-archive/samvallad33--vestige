@@ -3,7 +3,7 @@
 //! Provides comprehensive testing utilities for 250+ end-to-end tests:
 //!
 //! - **Harness**: Test setup, time travel, database management
-//! - **Mocks**: MockEmbeddingService (FxHash-based), test fixtures
+//! - **Mocks**: Test fixtures
 //! - **Assertions**: Custom assertions for memory states, decay, etc.
 //!
 //! ## Quick Start
@@ -33,13 +33,13 @@ pub mod mocks;
 
 // Re-export commonly used items
 pub use harness::{TestDatabaseManager, TimeTravelEnvironment};
-pub use mocks::{MockEmbeddingService, TestDataFactory};
+pub use mocks::TestDataFactory;
 
 /// Convenient imports for tests
 pub mod prelude {
     pub use crate::assertions::*;
     pub use crate::harness::{TestDatabaseManager, TimeTravelEnvironment};
-    pub use crate::mocks::{MockEmbeddingService, TestDataFactory};
+    pub use crate::mocks::TestDataFactory;
 
     // Re-export vestige-core essentials
     pub use vestige_core::{

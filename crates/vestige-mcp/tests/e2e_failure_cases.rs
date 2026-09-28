@@ -7,10 +7,10 @@
 //! deletions. Every test drives the real built binary over stdio JSON-RPC
 //! through the shared harness in `common/mod.rs`.
 //!
-//! All tests here are embedding-independent by construction unless marked
-//! `#[ignore]` (the one reconsolidation test needs the real embedding runtime,
-//! because the prediction-error gate — and therefore the supersede path it
-//! defers — is embedding-gated by design).
+//! All tests here are embedding-independent by construction. The one
+//! reconsolidation test that needed the real embedding runtime (the
+//! prediction-error gate's supersede path was vector-gated by design) was
+//! removed with the embedding machinery.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -699,91 +699,6 @@ fn scope_isolated_writes_are_invisible_to_other_scopes() {
         !seen(json!({})).contains(&id),
         "default-scope (user) recall must not see another namespace's memory"
     );
-    server.shutdown();
-}
-
-/// A conflict against a memory inside its labile (reconsolidation) window is
-/// DEFERRED: the incoming memory is stored, the old one keeps its validity,
-/// and the whole thing lands behind a reviewable reconsolidation plan —
-/// nothing is silently overwritten.
-///
-/// Requires the real embedding runtime: the prediction-error gate that routes
-/// conflicts is embedding-gated, so without vectors there is no supersede to
-/// defer (the keyword fallback creates instead — see the harness notes).
-#[test]
-#[ignore = "loads the real embedding runtime (~670 MB model); run with --ignored"]
-fn conflicting_ingest_during_a_labile_window_is_deferred_to_a_reconsolidation_plan() {
-    let dir = data_dir();
-    // Widen the labile window so the test does not race it (floor 10s,
-    // ceiling 6h; 30 min is far above any scheduling noise).
-    let mut server = Server::spawn_with_env(
-        dir.path(),
-        &[("VESTIGE_LABILE_WINDOW_SECS", "1800")],
-        &[],
-    );
-    server.handshake();
-    server.wait_for_embeddings();
-
-    let original = server.ingest_embedded(
-        "The payments reconciliation job exports at 04:00 UTC to the S3 audit bucket",
-        &["ops"],
-    );
-
-    // Recall makes the memory labile (the retrieval side-effect is the only
-    // thing that opens the window).
-    let seen = server.recall_ids(json!({
-        "query": "payments reconciliation exports S3 audit bucket", "limit": 5,
-    }));
-    assert!(seen.contains(&original), "fixture: recall must surface it: {seen:?}");
-
-    // Demote it: the gate only routes a high-similarity follow-up to Supersede
-    // for demoted memories, which is the path the reconsolidation deferral
-    // guards.
-    let demoted = server.call_tool_ok("memory", json!({ "action": "demote", "id": &original }));
-    assert!(demoted.get("error").is_none(), "{demoted}");
-
-    // A near-identical follow-up (same sentence, new time). Not forceCreate:
-    // the prediction-error gate is the subject under test.
-    let follow_up = server.call_tool_ok(
-        "smart_ingest",
-        json!({
-            "content": "The payments reconciliation job exports at 05:00 UTC to the S3 audit bucket",
-        }),
-    );
-
-    // Whatever the gate decides (create / supersede / merge), a conflict
-    // against a labile memory must be routed behind a reviewable plan instead
-    // of mutating in place: the response surfaces the plan id with its
-    // verdict options, and the reason says the target was labile.
-    let plan = &follow_up["reconsolidation"];
-    assert!(
-        plan["planId"].as_str().is_some(),
-        "a conflict with a labile memory must be deferred to a reconsolidation \
-         plan for review, got: {follow_up}"
-    );
-    assert!(
-        plan["verdicts"]["approve"].as_str().is_some()
-            && plan["verdicts"]["reject"].as_str().is_some()
-            && plan["verdicts"]["quarantine"].as_str().is_some(),
-        "the plan must surface the caller's verdict options: {follow_up}"
-    );
-    assert!(
-        follow_up["reason"]
-            .as_str()
-            .is_some_and(|r| r.contains("labile") && r.contains("reconsolidation")),
-        "the reason must state that the target was labile and the conflict \
-         routed for review: {follow_up}"
-    );
-    assert!(
-        server.memory_found(&original),
-        "the labile original must NOT have been overwritten by the deferred conflict"
-    );
-    let incoming = follow_up["nodeId"].as_str().expect("nodeId").to_string();
-    assert!(
-        server.memory_found(&incoming),
-        "nothing the caller said may be dropped: the incoming memory is stored"
-    );
-
     server.shutdown();
 }
 

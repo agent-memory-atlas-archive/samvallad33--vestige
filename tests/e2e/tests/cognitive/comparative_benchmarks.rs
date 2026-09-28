@@ -5,21 +5,23 @@
 //! 1. **FSRS-6 vs SM-2**: Modern spaced repetition beats the 1987 algorithm
 //! 2. **Spreading Activation vs Similarity**: Association networks find hidden connections
 //! 3. **Retroactive Importance**: A capability unique to Vestige
-//! 4. **Hippocampal Indexing**: Two-phase retrieval is faster and more efficient
 //!
 //! Reference papers:
 //! - FSRS: https://github.com/open-spaced-repetition/fsrs4anki
 //! - SM-2: Pimsleur, P. (1967) / Wozniak & Gorzelanczyk (1994)
 //! - Spreading Activation: Collins & Loftus (1975)
 //! - Synaptic Tagging: Frey & Morris (1997), Redondo & Morris (2011)
-//! - Hippocampal Indexing: Teyler & Rudy (2007)
+//!
+//! The former hippocampal-indexing benchmarks (two-phase vs flat search,
+//! index compression ratio) were vector-only and were removed with the
+//! embedding machinery. The barcode/content-pointer tests at the bottom
+//! remain: they are hash/structural and need no vector feature.
 
 use chrono::{Duration, Utc};
 use std::collections::{HashMap, HashSet};
 
 use vestige_core::neuroscience::hippocampal_index::{
-    BarcodeGenerator, ContentPointer, ContentType, HippocampalIndex, HippocampalIndexConfig,
-    INDEX_EMBEDDING_DIM, IndexQuery, MemoryBarcode,
+    BarcodeGenerator, ContentPointer, ContentType, HippocampalIndex, MemoryBarcode,
 };
 use vestige_core::neuroscience::spreading_activation::{
     ActivationConfig, ActivationNetwork, LinkType,
@@ -1505,97 +1507,8 @@ fn test_proof_unique_to_vestige() {
 }
 
 // ============================================================================
-// HIPPOCAMPAL INDEXING TESTS (4 tests)
+// HIPPOCAMPAL INDEX STRUCTURAL TESTS (2 tests)
 // ============================================================================
-
-/// Test that two-phase retrieval is faster than flat search.
-#[test]
-fn test_two_phase_vs_flat_search() {
-    let index = HippocampalIndex::new();
-    let now = Utc::now();
-
-    // Create test data with embeddings
-    const NUM_MEMORIES: usize = 100;
-
-    for i in 0..NUM_MEMORIES {
-        let embedding: Vec<f32> = (0..384)
-            .map(|j| ((i * 17 + j) as f32 / 1000.0).sin())
-            .collect();
-
-        let _ = index.index_memory(
-            &format!("memory_{}", i),
-            &format!("Content for memory {} with some text", i),
-            "fact",
-            now,
-            Some(embedding),
-        );
-    }
-
-    // Phase 1: Fast index search (compressed embeddings)
-    let query = IndexQuery::from_text("memory").with_limit(10);
-
-    let start = std::time::Instant::now();
-    let results = index.search_indices(&query).unwrap();
-    let index_search_time = start.elapsed();
-
-    // Should complete quickly
-    assert!(
-        index_search_time.as_millis() < 50,
-        "Index search should be fast: {:?}",
-        index_search_time
-    );
-
-    // Should find results
-    assert!(!results.is_empty(), "Should find matching memories");
-
-    // The index search uses compressed embeddings (128 dim vs 384)
-    // which is fundamentally faster for large-scale search
-    let stats = index.stats();
-    assert_eq!(
-        stats.index_dimensions, INDEX_EMBEDDING_DIM,
-        "Index should use compressed embeddings ({}D)",
-        INDEX_EMBEDDING_DIM
-    );
-}
-
-/// Test that index embeddings are smaller than full embeddings.
-#[test]
-fn test_index_compression_ratio() {
-    let config = HippocampalIndexConfig::default();
-
-    // Full embedding size (e.g., BGE-base-en-v1.5 = 768 or 384)
-    let full_embedding_dim = 384;
-
-    // Index embedding size
-    let index_embedding_dim = config.summary_dimensions; // 128 by default
-
-    // Compression ratio
-    let compression_ratio = full_embedding_dim as f64 / index_embedding_dim as f64;
-
-    assert!(
-        compression_ratio >= 2.0,
-        "Index should compress embeddings by at least 2x: {:.1}x",
-        compression_ratio
-    );
-
-    // Default should be 3x compression (384 -> 128)
-    assert_eq!(
-        index_embedding_dim, INDEX_EMBEDDING_DIM,
-        "Default index dimension should be {}",
-        INDEX_EMBEDDING_DIM
-    );
-
-    // Memory savings per memory
-    let full_size_bytes = full_embedding_dim * 4; // f32 = 4 bytes
-    let index_size_bytes = index_embedding_dim * 4;
-    let savings_per_memory = full_size_bytes - index_size_bytes;
-
-    assert!(
-        savings_per_memory > 0,
-        "Should save {} bytes per memory",
-        savings_per_memory
-    );
-}
 
 /// Test that barcodes are unique and orthogonal.
 #[test]
