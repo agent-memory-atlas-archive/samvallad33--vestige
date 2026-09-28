@@ -145,7 +145,13 @@ The CLI prices hosted sync at $19/month and points here: [Vestige Pro](https://g
 
 ## The receipts: Silent Rotation
 
-Vestige had zero converged-wrong fleets out of 23.
+| Arm (6 models, 25 trials) | Converged correct | Converged wrong | Split |
+|---|---|---|---|
+| No memory | 0/25 | **21/25** | 4/25 |
+| Dense cosine RAG | 4/23 | **12/23** | 7/23 |
+| Vestige | 20/23 | **0/23** | 3/23 |
+
+Outcomes come from `tests/by_model_tables.py`: a trial is correct when the tests were green, the production replay passed, and the key was right; wrong when the tests were green but production failed; split when the merge conflicted.
 
 ## The science
 
