@@ -1,0 +1,71 @@
+//! # strata — append-only, fail-stop log
+//!
+//! Segment files (`NNNNNNNN-<uuid>.seg`) hold a borsh-encoded header, a chain
+//! of hash-linked frames, and a signed trailer (see [`crate::format`]).
+//!
+//! ## Commit protocol (fail-stop, TigerBeetle-style)
+//!
+//! `WRITING -> SYNCING -> VERIFYING -> DURABLE -> ACK`
+//!
+//! * **WRITING**: frame bytes are appended at the end of the active segment.
+//! * **SYNCING**: one durability barrier per commit group. Linux:
+//!   `fdatasync`. macOS: `fcntl(F_FULLFSYNC)` — on APFS a plain `fsync` only
+//!   drains the kernel page cache and does not force the drive to acknowledge
+//!   the write to stable storage, so we pay for the full barrier.
+//! * **VERIFYING**: every frame is pread back and its blake3 recomputed; any
+//!   mismatch or I/O error triggers a deliberate `panic!` carrying a
+//!   fail-stop report `{last_acked_seq, op, errno}`. No retry, no fallback.
+//! * **DURABLE**: the `head.state` watermark (`last_acked_seq`) is replaced
+//!   atomically (temp file + fsync + rename + directory fsync).
+//! * **ACK**: [`SeqAck`] is returned only after verify + watermark.
+//!
+//! In production binaries, build with `panic = "abort"` so a fail-stop panic
+//! takes the process down; the library uses `panic!` (not a hard `abort`) so
+//! tests can exercise the path with `catch_unwind`.
+//!
+//! ## Group commit (v1)
+//!
+//! Frames queued within a <=2ms coalescing window or <=64 frames share one
+//! sync. v1 is a synchronous leader/follower design behind one mutex plus one
+//! condvar: the first appender becomes the batch leader, holds the window open
+//! for more frames, then runs the whole pipeline while later appenders queue
+//! and wait. There is no dedicated flusher thread yet (documented v1
+//! simplification), so a lone append also pays the 2ms window. Batch-heavy
+//! callers should use [`StrataLog::append_batch`].
+//!
+//! ## Recovery
+//!
+//! On open every segment is scanned: frame blake3s and chain links are
+//! recomputed. A torn/short/zero tail above the acked watermark is truncated
+//! at the first bad frame (unacked frames may vanish). Damage at or below the
+//! watermark returns [`StrataError::Halt`] — history is never truncated.
+//! A fully-written, chain-valid frame above the watermark that survived the
+//! crash is retained: its bytes are durable, only its ack was lost, and the
+//! watermark is not advanced for it.
+//!
+//! ## Single writer
+//!
+//! Enforced by `strata.lock`, created with `O_EXCL`, holding the owner pid.
+//! Stale locks are detected best-effort with a `kill(pid, 0)` liveness probe;
+//! the probe/unlink pair is racy (TOCTOU) and an unparseable or empty lock
+//! file is treated as held. Remove the file by hand if a writer crashed
+//! between creating the lock and writing its pid.
+
+mod error;
+mod format;
+mod lockfile;
+mod log;
+mod sync;
+
+#[cfg(test)]
+mod tests;
+
+pub use error::{HaltDetail, StrataError};
+pub use format::{
+    Frame, FrameRecord, SegmentHeader, SegmentTrailer, GENESIS_PREV_SEGMENT_HASH, SEGMENT_MAGIC,
+    SEGMENT_VERSION,
+};
+pub use log::{
+    HeadInfo, SealInfo, SeqAck, StrataLog, TailReport, TrailerCheck, GROUP_COMMIT_WINDOW_MS,
+    MAX_BATCH_FRAMES,
+};
