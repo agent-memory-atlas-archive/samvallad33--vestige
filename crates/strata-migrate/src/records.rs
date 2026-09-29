@@ -10,11 +10,10 @@
 //! future migration format can evolve without kind renegotiation. Version 1
 //! is the layout documented here.
 //!
-//! The `FSRS_REVIEW` payload is NOT a bespoke struct: it is the kernel's own
-//! `strata_kernel::event::ReviewEvent` borsh encoding, and the `CHECKPOINT`
-//! payload is `strata_kernel::checkpoint::Checkpoint` verbatim. Migration
-//! records reuse kernel wire types wherever one exists — one encoding per
-//! concept, forever.
+//! The `FSRS_REVIEW` payload is the kernel's `ReviewEvent` followed by
+//! `borsh(Option<i64>)` `reviewed_at_ms`. The `CHECKPOINT` payload is
+//! `strata_kernel::checkpoint::Checkpoint` verbatim. Migration records reuse
+//! kernel wire types wherever one exists — one encoding per concept.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::Signer;
@@ -332,39 +331,27 @@ const REVIEW_EVENT_WIRE_LEN: usize = 8 + 1 + 8;
 /// Decode a `KIND_FSRS_REVIEW` payload.
 ///
 /// The prefix is the kernel `ReviewEvent` (unchanged, so checkpoint hashes
-/// stay valid). A trailing `i64` is `reviewed_at_ms`, same rule as
-/// `strata_store::StoreOp::ReviewNode`: absent means unset. Old frames are
-/// not rewritten.
+/// stay valid). It is always followed by `borsh(Option<i64>)`
+/// `reviewed_at_ms`. A bare `ReviewEvent` does not decode.
 pub fn decode_review(payload: &[u8]) -> Result<ReviewEvent, borsh::io::Error> {
-    ReviewEvent::try_from_slice(review_event_prefix(payload)?)
+    Ok(split_review(payload)?.0)
 }
 
-/// `reviewed_at_ms` carried after the kernel `ReviewEvent`, if the frame has it.
+/// `reviewed_at_ms` after the kernel `ReviewEvent`.
 pub fn decode_reviewed_at_ms(payload: &[u8]) -> Result<Option<i64>, borsh::io::Error> {
-    let prefix = review_event_prefix(payload)?;
-    match payload.len() - prefix.len() {
-        0 => Ok(None),
-        8 => {
-            let mut buf = [0u8; 8];
-            buf.copy_from_slice(&payload[prefix.len()..]);
-            Ok(Some(i64::from_le_bytes(buf)))
-        }
-        _ => Err(borsh::io::Error::new(
-            borsh::io::ErrorKind::InvalidData,
-            "reviewed_at_ms truncated",
-        )),
-    }
+    Ok(split_review(payload)?.1)
 }
 
-fn review_event_prefix(payload: &[u8]) -> Result<&[u8], borsh::io::Error> {
-    if payload.len() == REVIEW_EVENT_WIRE_LEN || payload.len() == REVIEW_EVENT_WIRE_LEN + 8 {
-        Ok(&payload[..REVIEW_EVENT_WIRE_LEN])
-    } else {
-        Err(borsh::io::Error::new(
+fn split_review(payload: &[u8]) -> Result<(ReviewEvent, Option<i64>), borsh::io::Error> {
+    if payload.len() < REVIEW_EVENT_WIRE_LEN + 1 {
+        return Err(borsh::io::Error::new(
             borsh::io::ErrorKind::InvalidData,
-            "FSRS review payload is not a ReviewEvent or ReviewEvent||i64",
-        ))
+            "FSRS review is missing reviewed_at_ms",
+        ));
     }
+    let event = ReviewEvent::try_from_slice(&payload[..REVIEW_EVENT_WIRE_LEN])?;
+    let reviewed_at_ms = Option::<i64>::try_from_slice(&payload[REVIEW_EVENT_WIRE_LEN..])?;
+    Ok((event, reviewed_at_ms))
 }
 
 /// Decode a `KIND_TOMBSTONE` payload.

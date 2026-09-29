@@ -504,14 +504,19 @@ fn review_payload(card_id: u64, rating: u8, reviewed_at_ms: Option<i64>) -> Vec<
     let mut bytes = vec![3u8];
     bytes.extend_from_slice(&card_id.to_le_bytes());
     bytes.push(rating);
-    if let Some(ms) = reviewed_at_ms {
-        bytes.extend_from_slice(&ms.to_le_bytes());
+    // borsh Option: tag 0 = None, tag 1 + i64 = Some. Always present.
+    match reviewed_at_ms {
+        None => bytes.push(0),
+        Some(ms) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&ms.to_le_bytes());
+        }
     }
     bytes
 }
 
 #[test]
-fn review_node_round_trip_and_old_frame() {
+fn review_node_round_trip() {
     let stamped = StoreOp::ReviewNode {
         card_id: 0x1122_3344_5566_7788,
         rating: 4,
@@ -523,21 +528,21 @@ fn review_node_round_trip_and_old_frame() {
         review_payload(0x1122_3344_5566_7788, 4, Some(1_700_000_000_000))
     );
     assert_eq!(StoreOp::try_from_slice(&bytes).unwrap(), stamped);
+    assert!(bytes.ends_with(&1_700_000_000_000i64.to_le_bytes()));
 
     let unset = StoreOp::ReviewNode {
         card_id: 7,
         rating: 1,
         reviewed_at_ms: None,
     };
-    let old = review_payload(7, 1, None);
-    assert_eq!(borsh::to_vec(&unset).unwrap(), old);
-    // Pre-field payload: discriminant, card id, rating. No tag, no i64.
-    assert_eq!(old.len(), 10);
-    assert_eq!(StoreOp::try_from_slice(&old).unwrap(), unset);
+    let bytes = borsh::to_vec(&unset).unwrap();
+    assert_eq!(bytes, review_payload(7, 1, None));
+    assert_eq!(bytes.last(), Some(&0));
+    assert_eq!(StoreOp::try_from_slice(&bytes).unwrap(), unset);
 
-    let mut torn = old.clone();
-    torn.push(0x01);
-    assert!(StoreOp::try_from_slice(&torn).is_err());
+    // Discriminant + card_id + rating, and nothing else, is not a frame.
+    let short = &bytes[..10];
+    assert!(StoreOp::try_from_slice(short).is_err());
 }
 
 #[test]
@@ -610,14 +615,19 @@ fn review_without_clock_replays_as_unset() {
     let dir = temp_dir("review-unset");
     let mut store = StrataStore::open(&dir).expect("open");
     let id = store.ingest(input("no clock", &[])).expect("ingest");
-    store.review_at(&id, 2, None).expect("old-shaped review");
+    store
+        .review_at(&id, 2, None)
+        .expect("review without a clock");
     let frames = store.log().read_frames(1).expect("frames");
     let frame = frames
         .iter()
         .rev()
         .find(|frame| frame.kind == KIND_STORE_WRITE && frame.payload.first() == Some(&3))
         .expect("review frame");
-    assert_eq!(frame.payload.len(), 10);
+    assert_eq!(
+        frame.payload,
+        review_payload(handle_of(&id), 2, None).as_slice()
+    );
     assert!(store.reviewed_at_ms(&id).is_none());
     drop(store);
     let reopened = StrataStore::open(&dir).expect("reopen");

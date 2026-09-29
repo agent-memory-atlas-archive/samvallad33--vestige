@@ -28,9 +28,9 @@
 //! ## Determinism
 //!
 //! * Ordering stays sequence-based. `created_at_ms` is caller-supplied
-//!   (default 0). An explicit [`StoreOp::ReviewNode`] records
-//!   `reviewed_at_ms` from the admission clock; retrievability reads that
-//!   clock. Frames written before the field omit it and stay valid.
+//!   (default 0). An explicit [`StoreOp::ReviewNode`] always carries
+//!   `reviewed_at_ms` (`borsh` `Option`, tag present). Live admits use the
+//!   admission clock. Retrievability reads that clock; `None` uses seq distance.
 //! * No floats in persisted state: edge strength is `strength_milli` (i64);
 //!   FSRS stability/difficulty live quantized inside the kernel's Q32.32
 //!   `CardState`. Retrievability is derived on read and never stored.

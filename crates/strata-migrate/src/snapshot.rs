@@ -19,8 +19,7 @@ pub struct Snapshot {
     pub nodes: Vec<NodeRecord>,
     pub edges: Vec<EdgeRecord>,
     pub reviews: Vec<ReviewEvent>,
-    /// Parallel to `reviews`: `reviewed_at_ms` from a trailing `i64`, or
-    /// `None` when the frame omitted it.
+    /// Parallel to `reviews`: `reviewed_at_ms` from the required option suffix.
     pub review_times: Vec<Option<i64>>,
     pub tombstones: Vec<TombstoneRecord>,
     pub supersessions: Vec<SupersessionRecord>,

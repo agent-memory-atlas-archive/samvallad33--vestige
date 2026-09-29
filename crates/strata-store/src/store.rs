@@ -605,7 +605,7 @@ impl StrataStore {
 
     /// Same as [`Self::review`] with a caller-supplied clock.
     ///
-    /// `None` writes the pre-field payload (no trailing `i64`).
+    /// `None` is written as `borsh` option tag `0`, not an omitted field.
     pub fn review_at(
         &mut self,
         id: &str,
@@ -643,9 +643,8 @@ impl StrataStore {
     /// never stored, and reads append nothing (v1).
     ///
     /// An explicit review with `reviewed_at_ms` measures elapsed whole days
-    /// from that timestamp. A card whose latest review omitted the field
-    /// (old frames, or no last-review date) still uses sequence distance
-    /// from `last_seq` to the log head.
+    /// from that timestamp. `None` uses sequence distance from `last_seq`
+    /// to the log head.
     pub fn retrievability(&self, id: &str) -> Result<Option<f64>, StoreError> {
         self.retrievability_at(id, admission_now_ms())
     }

@@ -214,8 +214,7 @@ impl FsrsFold {
     /// Derived retrievability at `as_of_ms`.
     ///
     /// `Some(reviewed_at_ms)` measures `t` in whole days since that review.
-    /// `None` (pre-field frames, or a source with no last-review time) keeps
-    /// `t = fallback_seq - last_seq`.
+    /// `None` (no last-review time) keeps `t = fallback_seq - last_seq`.
     pub fn retrievability_at_review(
         card: &CardState,
         reviewed_at_ms: Option<i64>,
