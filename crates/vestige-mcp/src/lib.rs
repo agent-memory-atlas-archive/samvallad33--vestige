@@ -14,6 +14,7 @@ pub mod actor_surface;
 pub mod autopilot;
 pub mod cognitive;
 pub mod dashboard;
+mod intention_graph_log;
 pub mod protocol;
 #[cfg(all(test, not(feature = "legacy-sqlite")))]
 mod protocol_stdio_store;

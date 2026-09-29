@@ -12,17 +12,18 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use strata_store::VALID_FOREVER_MS;
+use vestige_core::intention_graph::Command;
 use vestige_core::storage::{
     CompositionEventRecord, ConnectionRecord as VestigeEdge, ConsolidationHistoryRecord,
-    CoverageSnapshot, HandleKind, HandleResolution, HealthStatus, HygieneNodeSummary,
-    HygieneSnapshot, MemoryEdge, MemoryRecord, MemoryStoreError, MemoryStoreResult,
-    MemoryStoreSend, ModelSignature, NeverComposedCandidate, ReceiptAttestationStatus,
-    SchedulingState, SearchQuery, StateTransitionRecord, Storage, StorageError, StoreStats,
-    WalCheckpointMode, WalCheckpointStatus, HANDLE_REQUIRED_DETAIL, MAX_CANDIDATES,
+    CoverageSnapshot, HANDLE_REQUIRED_DETAIL, HandleKind, HandleResolution, HealthStatus,
+    HygieneNodeSummary, HygieneSnapshot, MAX_CANDIDATES, MemoryEdge, MemoryRecord,
+    MemoryStoreError, MemoryStoreResult, MemoryStoreSend, ModelSignature, NeverComposedCandidate,
+    ReceiptAttestationStatus, SchedulingState, SearchQuery, StateTransitionRecord, Storage,
+    StorageError, StoreStats, WalCheckpointMode, WalCheckpointStatus,
 };
 use vestige_core::{
-    scan_secrets, ConsolidationResult, DecayRisk, IngestInput, KnowledgeNode, MemoryStats, Rating,
-    Receipt, SecretPolicy,
+    ConsolidationResult, DecayRisk, IngestInput, KnowledgeNode, MemoryStats, Rating, Receipt,
+    SecretPolicy, scan_secrets,
 };
 
 const Q32_SCALE: f64 = 4294967296.0;
@@ -162,6 +163,10 @@ fn core_intention(
     })
 }
 
+fn is_prospective(row: &vestige_core::storage::IntentionRecord) -> bool {
+    row.source_type != crate::intention_graph_log::SOURCE
+}
+
 fn sort_intentions(
     mut rows: Vec<vestige_core::storage::IntentionRecord>,
 ) -> Vec<vestige_core::storage::IntentionRecord> {
@@ -221,9 +226,16 @@ fn to_store_input(input: &IngestInput) -> strata_store::IngestInput {
     }
 }
 
-fn project_node(store: &strata_store::StrataStore, record: &strata_store::NodeRecord) -> KnowledgeNode {
+fn project_node(
+    store: &strata_store::StrataStore,
+    record: &strata_store::NodeRecord,
+) -> KnowledgeNode {
     let card = store.card_state(&record.id);
-    let retrieval = store.retrievability(&record.id).ok().flatten().unwrap_or(0.0);
+    let retrieval = store
+        .retrievability(&record.id)
+        .ok()
+        .flatten()
+        .unwrap_or(0.0);
     let mut node = KnowledgeNode::default();
     node.id = record.id.clone();
     node.content = record.content.clone();
@@ -233,7 +245,8 @@ fn project_node(store: &strata_store::StrataStore, record: &strata_store::NodeRe
     node.last_accessed = node.created_at;
     node.tags = record.tags.clone();
     node.valid_from = Some(ms_to_dt(record.valid_from_ms));
-    node.valid_until = (record.valid_until_ms != VALID_FOREVER_MS).then(|| ms_to_dt(record.valid_until_ms));
+    node.valid_until =
+        (record.valid_until_ms != VALID_FOREVER_MS).then(|| ms_to_dt(record.valid_until_ms));
     // Kernel retrievability is the only strength the log can justify.
     node.stability = card.as_ref().map(|c| q32(c.stability_q)).unwrap_or(0.0);
     node.difficulty = card.as_ref().map(|c| q32(c.difficulty_q)).unwrap_or(0.0);
@@ -399,11 +412,7 @@ impl MemoryStoreSend for StrataMemory {
         Err(pending_async("get_edges"))
     }
 
-    async fn remove_edge(
-        &self,
-        _source: uuid::Uuid,
-        _target: uuid::Uuid,
-    ) -> MemoryStoreResult<()> {
+    async fn remove_edge(&self, _source: uuid::Uuid, _target: uuid::Uuid) -> MemoryStoreResult<()> {
         Err(pending_async("remove_edge"))
     }
 
@@ -484,7 +493,8 @@ impl MemoryStoreSend for StrataMemory {
         *self
             .actor
             .lock()
-            .unwrap_or_else(|err| panic!("strata actor lock poisoned: {err}")) = Some(did.to_string());
+            .unwrap_or_else(|err| panic!("strata actor lock poisoned: {err}")) =
+            Some(did.to_string());
         Ok(())
     }
 
@@ -496,7 +506,12 @@ impl MemoryStoreSend for StrataMemory {
 
     fn resolve_handle(&self, query: &str) -> HandleResolution {
         let query = query.trim();
-        let ids: Vec<String> = self.lock().origins().into_iter().map(|(id, _)| id).collect();
+        let ids: Vec<String> = self
+            .lock()
+            .origins()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         if query.is_empty() {
             return HandleResolution {
                 kind: HandleKind::Unknown,
@@ -568,7 +583,10 @@ impl MemoryStoreSend for StrataMemory {
         self.lock().backup_to(path).map_err(map_store)
     }
 
-    fn checkpoint_wal(&self, _mode: WalCheckpointMode) -> Result<WalCheckpointStatus, StorageError> {
+    fn checkpoint_wal(
+        &self,
+        _mode: WalCheckpointMode,
+    ) -> Result<WalCheckpointStatus, StorageError> {
         Ok(WalCheckpointStatus {
             busy: 0,
             log_frames: 0,
@@ -589,7 +607,11 @@ impl MemoryStoreSend for StrataMemory {
     }
 
     fn ingest(&self, input: IngestInput) -> Result<KnowledgeNode, StorageError> {
-        self.ingest_in_scope_with_secret_policy(input, vestige_core::DEFAULT_MEMORY_SCOPE, SecretPolicy::Reject)
+        self.ingest_in_scope_with_secret_policy(
+            input,
+            vestige_core::DEFAULT_MEMORY_SCOPE,
+            SecretPolicy::Reject,
+        )
     }
 
     fn ingest_in_scope(
@@ -646,7 +668,10 @@ impl MemoryStoreSend for StrataMemory {
 
     fn get_node(&self, id: &str) -> Result<Option<KnowledgeNode>, StorageError> {
         let store = self.lock();
-        Ok(store.get_node(id).as_ref().map(|record| project_node(&store, record)))
+        Ok(store
+            .get_node(id)
+            .as_ref()
+            .map(|record| project_node(&store, record)))
     }
 
     fn get_all_nodes(&self, limit: i32, offset: i32) -> Result<Vec<KnowledgeNode>, StorageError> {
@@ -708,7 +733,13 @@ impl MemoryStoreSend for StrataMemory {
         let nodes = store.nodes();
         let strengths: Vec<f64> = nodes
             .iter()
-            .map(|record| store.retrievability(&record.id).ok().flatten().unwrap_or(0.0))
+            .map(|record| {
+                store
+                    .retrievability(&record.id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0.0)
+            })
             .collect();
         let total = strengths.len() as i64;
         let average = if strengths.is_empty() {
@@ -863,8 +894,10 @@ impl MemoryStoreSend for StrataMemory {
     fn code_anchors_for_nodes(
         &self,
         _node_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, Vec<vestige_core::codebase::CodeAnchor>>, StorageError>
-    {
+    ) -> Result<
+        std::collections::HashMap<String, Vec<vestige_core::codebase::CodeAnchor>>,
+        StorageError,
+    > {
         // Anchors are not admitted on this log, so the recorded set is empty.
         Ok(std::collections::HashMap::new())
     }
@@ -1059,7 +1092,11 @@ impl MemoryStoreSend for StrataMemory {
         tag_filter: Option<&[String]>,
         scope: Option<&str>,
     ) -> Result<Vec<NeverComposedCandidate>, StorageError> {
-        self.never_composed(scope.or(Some(vestige_core::DEFAULT_MEMORY_SCOPE)), limit, tag_filter)
+        self.never_composed(
+            scope.or(Some(vestige_core::DEFAULT_MEMORY_SCOPE)),
+            limit,
+            tag_filter,
+        )
     }
 
     fn get_recent_composition_events(
@@ -1096,7 +1133,9 @@ impl MemoryStoreSend for StrataMemory {
                     && node_type.is_none_or(|kind| record.node_type == kind)
                     && tags.is_none_or(|tags| {
                         tags.is_empty()
-                            || tags.iter().any(|tag| record.tags.iter().any(|stored| stored == tag))
+                            || tags
+                                .iter()
+                                .any(|tag| record.tags.iter().any(|stored| stored == tag))
                     })
             })
             .map(|record| project_node(&store, record))
@@ -1235,7 +1274,9 @@ impl MemoryStoreSend for StrataMemory {
     ) -> Result<Vec<vestige_core::storage::IntentionRecord>, StorageError> {
         let rows = self.intentions()?;
         Ok(sort_intentions(
-            rows.into_iter().filter(|row| row.status == "active").collect(),
+            rows.into_iter()
+                .filter(|row| is_prospective(row) && row.status == "active")
+                .collect(),
         ))
     }
 
@@ -1247,7 +1288,9 @@ impl MemoryStoreSend for StrataMemory {
         let rows = self.intentions()?;
         Ok(sort_intentions(
             rows.into_iter()
-                .filter(|row| row.status == "active" && row.effective_scope() == scope)
+                .filter(|row| {
+                    is_prospective(row) && row.status == "active" && row.effective_scope() == scope
+                })
                 .collect(),
         ))
     }
@@ -1257,7 +1300,13 @@ impl MemoryStoreSend for StrataMemory {
         id: &str,
     ) -> Result<Option<vestige_core::storage::IntentionRecord>, StorageError> {
         match self.lock().get_intention(id) {
-            Some(record) => core_intention(&record).map(Some),
+            Some(record) => {
+                let row = core_intention(&record)?;
+                if !is_prospective(&row) {
+                    return Ok(None);
+                }
+                Ok(Some(row))
+            }
             None => Ok(None),
         }
     }
@@ -1268,7 +1317,9 @@ impl MemoryStoreSend for StrataMemory {
     ) -> Result<Vec<vestige_core::storage::IntentionRecord>, StorageError> {
         let rows = self.intentions()?;
         Ok(sort_intentions(
-            rows.into_iter().filter(|row| row.status == status).collect(),
+            rows.into_iter()
+                .filter(|row| is_prospective(row) && row.status == status)
+                .collect(),
         ))
     }
 
@@ -1278,7 +1329,9 @@ impl MemoryStoreSend for StrataMemory {
         let now = Utc::now();
         let mut rows = self.intentions()?;
         rows.retain(|row| {
-            row.status == "active" && row.deadline.is_some_and(|deadline| deadline < now)
+            is_prospective(row)
+                && row.status == "active"
+                && row.deadline.is_some_and(|deadline| deadline < now)
         });
         rows.sort_by(|a, b| a.deadline.cmp(&b.deadline).then(a.id.cmp(&b.id)));
         Ok(rows)
@@ -1299,6 +1352,9 @@ impl MemoryStoreSend for StrataMemory {
         let Some(current) = store.get_intention(id) else {
             return Ok(false);
         };
+        if current.source_type == crate::intention_graph_log::SOURCE {
+            return Ok(false);
+        }
         let mut record = core_intention(&current)?;
         record.status = "snoozed".to_string();
         record.snoozed_until = Some(until);
@@ -1313,6 +1369,9 @@ impl MemoryStoreSend for StrataMemory {
         let Some(current) = store.get_intention(id) else {
             return Ok(false);
         };
+        if current.source_type == crate::intention_graph_log::SOURCE {
+            return Ok(false);
+        }
         let mut record = core_intention(&current)?;
         record.status = status.to_string();
         record.fulfilled_at = if status == "fulfilled" {
@@ -1360,6 +1419,28 @@ impl MemoryStoreSend for StrataMemory {
             .upsert_intentions(next)
             .map(|_| ())
             .map_err(|err| err.to_string())
+    }
+
+    fn apply_intention_graph(
+        &self,
+        scope: &str,
+        command: Command,
+        now: DateTime<Utc>,
+    ) -> Result<Value, String> {
+        crate::intention_graph_log::apply(&mut self.lock(), scope, command, now)
+    }
+
+    fn replay_intention_graph(&self, scope: &str) -> Result<Value, String> {
+        crate::intention_graph_log::replay(&self.lock(), scope)
+    }
+
+    fn intention_memory_snapshot(
+        &self,
+        scope: &str,
+        memory_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Value, String> {
+        crate::intention_graph_log::memory_snapshot(&self.lock(), scope, memory_id, now)
     }
 
     fn suppress_memory(&self, _id: &str) -> Result<KnowledgeNode, StorageError> {
@@ -1426,7 +1507,10 @@ impl StrataMemory {
             };
             if let Some(tags) = tag_filter.filter(|tags| !tags.is_empty()) {
                 let has = |record: &strata_store::NodeRecord| {
-                    record.tags.iter().any(|tag| tags.iter().any(|want| want == tag))
+                    record
+                        .tags
+                        .iter()
+                        .any(|tag| tags.iter().any(|want| want == tag))
                 };
                 if !has(a) || !has(b) {
                     continue;
@@ -1460,7 +1544,10 @@ impl StrataMemory {
     }
 }
 
-fn lookup_origin(store: &strata_store::StrataStore, receipt_or_node: &str) -> Option<(String, u64)> {
+fn lookup_origin(
+    store: &strata_store::StrataStore,
+    receipt_or_node: &str,
+) -> Option<(String, u64)> {
     if let Some(seq) = parse_receipt_seq(receipt_or_node) {
         return store
             .origins()
@@ -1475,6 +1562,7 @@ fn lookup_origin(store: &strata_store::StrataStore, receipt_or_node: &str) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use vestige_core::IngestInput;
 
     fn no_sqlite(dir: &Path) -> bool {
@@ -1653,6 +1741,32 @@ mod tests {
             store.get_receipt(&right.id).unwrap().unwrap().receipt_id,
             right_receipt.receipt_id
         );
+        assert!(no_sqlite(dir.path()));
+    }
+
+    #[test]
+    fn intention_graph_rows_stay_out_of_prospective_lists() {
+        use vestige_core::storage::MemoryStoreSend;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = StrataMemory::open(dir.path()).unwrap();
+        let at = "2026-10-01T09:00:00Z".parse().unwrap();
+        let command = serde_json::from_value(json!({
+            "action": "plan",
+            "id": "p1",
+            "description": "Synthetic graph plan",
+            "requirements": [],
+            "conflict_keys": []
+        }))
+        .unwrap();
+        let written = store.apply_intention_graph("user", command, at).unwrap();
+        assert!(written["journal_seq"].as_i64().unwrap() >= 1);
+        assert!(store.get_active_intentions().unwrap().is_empty());
+        assert!(store.get_intentions_by_status("active").unwrap().is_empty());
+        assert!(store.get_intention("igs|user").unwrap().is_none());
+        let replayed = store.replay_intention_graph("user").unwrap();
+        assert_eq!(replayed["matched"], true);
+        assert_eq!(replayed["commands"], 1);
         assert!(no_sqlite(dir.path()));
     }
 }

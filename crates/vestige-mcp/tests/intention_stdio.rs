@@ -196,27 +196,150 @@ fn set_intention(session: &mut Session) -> String {
     id
 }
 
+fn graph(session: &mut Session, command: Value) -> Value {
+    session.tool(
+        "intention",
+        json!({
+            "action": "graph",
+            "scope": "user",
+            "at": "2026-10-01T09:00:00Z",
+            "command": command,
+        }),
+    )
+}
+
 #[test]
-fn intention_set_over_stdio_admits_a_receipt_and_survives_restart() {
+fn intention_set_list_check_update_graph_survives_restart() {
     let dir = tempfile::tempdir().expect("data dir");
     let id = {
         let mut session = Session::spawn(dir.path());
         handshake(&mut session);
         let id = set_intention(&mut session);
+        let listed = session.tool("intention", json!({"action": "list"}));
+        assert!(
+            listed["intentions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == id && row["description"] == "Synthetic reminder"),
+            "{listed}"
+        );
+        let checked = session.tool(
+            "intention",
+            json!({"action": "check", "context": {"current_time": "2020-01-02T00:00:00Z"}}),
+        );
+        assert!(
+            checked["triggered"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == id),
+            "{checked}"
+        );
+        assert!(
+            checked["receiptId"].as_str().unwrap().starts_with("eff-"),
+            "{checked}"
+        );
+        let updated = session.tool(
+            "intention",
+            json!({"action": "update", "id": id, "status": "complete"}),
+        );
+        assert_eq!(updated["success"], json!(true), "{updated}");
+        assert!(
+            updated["receiptId"].as_str().unwrap().starts_with("eff-"),
+            "{updated}"
+        );
+        let fulfilled = session.tool(
+            "intention",
+            json!({"action": "list", "filter_status": "fulfilled"}),
+        );
+        assert!(
+            fulfilled["intentions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == id),
+            "{fulfilled}"
+        );
+        let planned = graph(
+            &mut session,
+            json!({
+                "action": "plan",
+                "id": "fixture-plan",
+                "description": "Synthetic graph plan",
+                "requirements": [],
+                "conflict_keys": []
+            }),
+        );
+        assert!(planned["journal_seq"].as_i64().unwrap() >= 1, "{planned}");
+        let replayed = graph(&mut session, json!({"action": "replay"}));
+        assert_eq!(replayed["matched"], json!(true), "{replayed}");
+        assert_eq!(replayed["commands"], json!(1), "{replayed}");
+        let explained = graph(
+            &mut session,
+            json!({"action": "explain", "id": "fixture-plan"}),
+        );
+        assert!(
+            explained.to_string().contains("Synthetic graph plan"),
+            "{explained}"
+        );
+        let visible = session.tool(
+            "intention",
+            json!({"action": "list", "filter_status": "all", "limit": 50}),
+        );
+        let visible_text = visible.to_string();
+        assert!(!visible_text.contains("Synthetic graph plan"), "{visible}");
+        assert!(!visible_text.contains("igj|"), "{visible}");
+        assert!(
+            visible["intentions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == id),
+            "{visible}"
+        );
         session.shutdown();
         id
     };
     assert!(no_sqlite(dir.path()));
     let mut again = Session::spawn(dir.path());
     handshake(&mut again);
-    let listed = again.tool("intention", json!({"action": "list"}));
+    let fulfilled = again.tool(
+        "intention",
+        json!({"action": "list", "filter_status": "fulfilled"}),
+    );
     assert!(
-        listed["intentions"]
+        fulfilled["intentions"]
             .as_array()
             .unwrap()
             .iter()
             .any(|row| row["id"] == id && row["description"] == "Synthetic reminder"),
-        "{listed}"
+        "{fulfilled}"
+    );
+    let active = again.tool("intention", json!({"action": "list"}));
+    assert!(
+        !active["intentions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == id),
+        "{active}"
+    );
+    let replayed = graph(&mut again, json!({"action": "replay"}));
+    assert_eq!(replayed["matched"], json!(true), "{replayed}");
+    assert_eq!(replayed["commands"], json!(1), "{replayed}");
+    assert_eq!(
+        replayed["state_digest"].as_str().unwrap().len(),
+        64,
+        "{replayed}"
+    );
+    let explained = graph(
+        &mut again,
+        json!({"action": "explain", "id": "fixture-plan"}),
+    );
+    assert!(
+        explained.to_string().contains("Synthetic graph plan"),
+        "{explained}"
     );
     again.shutdown();
     assert!(no_sqlite(dir.path()));

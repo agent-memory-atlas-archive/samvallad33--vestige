@@ -191,6 +191,33 @@ def run(binary, output):
             assert updated["success"] is True and updated["receiptId"].startswith("eff-")
             fulfilled = tool("intention", {"action": "list", "filter_status": "fulfilled"})
             assert any(row["id"] == intention_id for row in fulfilled["intentions"])
+            planned = tool("intention", {
+                "action": "graph",
+                "scope": "user",
+                "at": "2026-10-01T09:00:00Z",
+                "command": {
+                    "action": "plan",
+                    "id": "fixture-plan",
+                    "description": "Synthetic graph plan",
+                    "requirements": [],
+                    "conflict_keys": [],
+                },
+            })
+            assert isinstance(planned.get("journal_seq"), int) and planned["journal_seq"] >= 1
+            replayed = tool("intention", {
+                "action": "graph",
+                "scope": "user",
+                "command": {"action": "replay"},
+            })
+            assert replayed["matched"] is True and replayed["commands"] == 1
+            explained = tool("intention", {
+                "action": "graph",
+                "scope": "user",
+                "at": "2026-10-01T09:00:00Z",
+                "command": {"action": "explain", "id": "fixture-plan"},
+            })
+            assert "Synthetic graph plan" in json.dumps(explained)
+            passed("intention graph replays the recorded plan")
             typed("intention", {"action": "set", "description": "  "}, "empty")
             tool("source_sync", {"source": "gitlab", "repo": "a/b"}, error=True)
             for view in ("health", "retention", "timeline", "changelog", "stats", "coverage"):
