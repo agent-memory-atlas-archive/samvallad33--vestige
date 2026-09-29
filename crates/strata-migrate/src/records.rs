@@ -326,9 +326,45 @@ pub fn decode_edge(payload: &[u8]) -> Result<EdgeRecord, borsh::io::Error> {
     EdgeRecord::try_from_slice(payload)
 }
 
-/// Decode a `KIND_FSRS_REVIEW` payload (kernel wire type).
+/// `ReviewEvent` borsh size: `card_id u64 || rating u8 || event_seq u64`.
+const REVIEW_EVENT_WIRE_LEN: usize = 8 + 1 + 8;
+
+/// Decode a `KIND_FSRS_REVIEW` payload.
+///
+/// The prefix is the kernel `ReviewEvent` (unchanged, so checkpoint hashes
+/// stay valid). A trailing `i64` is `reviewed_at_ms`, same rule as
+/// `strata_store::StoreOp::ReviewNode`: absent means unset. Old frames are
+/// not rewritten.
 pub fn decode_review(payload: &[u8]) -> Result<ReviewEvent, borsh::io::Error> {
-    ReviewEvent::try_from_slice(payload)
+    ReviewEvent::try_from_slice(review_event_prefix(payload)?)
+}
+
+/// `reviewed_at_ms` carried after the kernel `ReviewEvent`, if the frame has it.
+pub fn decode_reviewed_at_ms(payload: &[u8]) -> Result<Option<i64>, borsh::io::Error> {
+    let prefix = review_event_prefix(payload)?;
+    match payload.len() - prefix.len() {
+        0 => Ok(None),
+        8 => {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&payload[prefix.len()..]);
+            Ok(Some(i64::from_le_bytes(buf)))
+        }
+        _ => Err(borsh::io::Error::new(
+            borsh::io::ErrorKind::InvalidData,
+            "reviewed_at_ms truncated",
+        )),
+    }
+}
+
+fn review_event_prefix(payload: &[u8]) -> Result<&[u8], borsh::io::Error> {
+    if payload.len() == REVIEW_EVENT_WIRE_LEN || payload.len() == REVIEW_EVENT_WIRE_LEN + 8 {
+        Ok(&payload[..REVIEW_EVENT_WIRE_LEN])
+    } else {
+        Err(borsh::io::Error::new(
+            borsh::io::ErrorKind::InvalidData,
+            "FSRS review payload is not a ReviewEvent or ReviewEvent||i64",
+        ))
+    }
 }
 
 /// Decode a `KIND_TOMBSTONE` payload.

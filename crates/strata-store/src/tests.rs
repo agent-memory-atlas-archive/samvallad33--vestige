@@ -5,11 +5,13 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use borsh::BorshDeserialize;
+use strata::payload_blake3;
 use strata_gate::policy::{ANY_KIND, WILDCARD_PREFIX};
 use strata_gate::record::{RecordKind, Verdict};
 use strata_gate::{Policy, Rule};
+use strata_kernel::fsrs::{FsrsFold, ALGO_V2};
 
-use crate::op::{KIND_STORE_CHECKPOINT, KIND_STORE_WRITE};
+use crate::op::{StoreOp, KIND_STORE_CHECKPOINT, KIND_STORE_WRITE};
 use crate::store::handle_of;
 use crate::types::{ConnectionRecord, EdgeDirection, EdgeKind, IngestInput};
 use crate::{looks_like_failure, StoreError, StrataStore};
@@ -495,5 +497,130 @@ fn node_ids_are_log_derived_and_handle_is_stable() {
     assert_eq!(handle_of(&a), handle_of(&a));
     assert_ne!(handle_of(&a), handle_of(&b));
     assert_eq!(store.card_state(&a).map(|c| c.review_count), Some(1));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn review_payload(card_id: u64, rating: u8, reviewed_at_ms: Option<i64>) -> Vec<u8> {
+    let mut bytes = vec![3u8];
+    bytes.extend_from_slice(&card_id.to_le_bytes());
+    bytes.push(rating);
+    if let Some(ms) = reviewed_at_ms {
+        bytes.extend_from_slice(&ms.to_le_bytes());
+    }
+    bytes
+}
+
+#[test]
+fn review_node_round_trip_and_old_frame() {
+    let stamped = StoreOp::ReviewNode {
+        card_id: 0x1122_3344_5566_7788,
+        rating: 4,
+        reviewed_at_ms: Some(1_700_000_000_000),
+    };
+    let bytes = borsh::to_vec(&stamped).expect("encode");
+    assert_eq!(
+        bytes,
+        review_payload(0x1122_3344_5566_7788, 4, Some(1_700_000_000_000))
+    );
+    assert_eq!(StoreOp::try_from_slice(&bytes).unwrap(), stamped);
+
+    let unset = StoreOp::ReviewNode {
+        card_id: 7,
+        rating: 1,
+        reviewed_at_ms: None,
+    };
+    let old = review_payload(7, 1, None);
+    assert_eq!(borsh::to_vec(&unset).unwrap(), old);
+    // Pre-field payload: discriminant, card id, rating. No tag, no i64.
+    assert_eq!(old.len(), 10);
+    assert_eq!(StoreOp::try_from_slice(&old).unwrap(), unset);
+
+    let mut torn = old.clone();
+    torn.push(0x01);
+    assert!(StoreOp::try_from_slice(&torn).is_err());
+}
+
+#[test]
+fn retrievability_uses_review_time_not_import_seq() {
+    let dir = temp_dir("review-time");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let id = store
+        .ingest(input("reviewed years ago", &[]))
+        .expect("ingest");
+    let reviewed_at = 1_577_836_800_000i64; // 2020-01-01T00:00:00Z
+    let as_of = reviewed_at + 400 * 86_400_000;
+    store
+        .review_at(&id, 3, Some(reviewed_at))
+        .expect("review at past clock");
+
+    let card = store.card_state(&id).expect("card");
+    let head = store.log().head().last_acked_seq;
+    let got = store
+        .retrievability_at(&id, as_of)
+        .expect("r")
+        .expect("card");
+    let from_review =
+        FsrsFold::retrievability_at_review(&card, Some(reviewed_at), as_of, head, ALGO_V2)
+            .expect("formula");
+    let from_import =
+        FsrsFold::retrievability_at_review(&card, None, as_of, head, ALGO_V2).expect("seq");
+    assert_eq!(got, from_review);
+    assert!(
+        (head - card.last_seq) < 20,
+        "import distance is a handful of frames, not 400 days"
+    );
+    assert!(
+        got < from_import,
+        "review clock decays; import seq does not: {got} vs {from_import}"
+    );
+    assert_eq!(store.reviewed_at_ms(&id), Some(reviewed_at));
+
+    let frames = store.log().read_frames(1).expect("frames");
+    let frame = frames
+        .iter()
+        .rev()
+        .find(|frame| {
+            matches!(
+                StoreOp::try_from_slice(&frame.payload),
+                Ok(StoreOp::ReviewNode {
+                    reviewed_at_ms: Some(_),
+                    ..
+                })
+            )
+        })
+        .expect("review frame");
+    assert_eq!(
+        frame.payload_blake3,
+        payload_blake3(frame.kind, &frame.payload)
+    );
+    assert!(frame.payload.ends_with(&reviewed_at.to_le_bytes()));
+
+    drop(store);
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    assert_eq!(reopened.reviewed_at_ms(&id), Some(reviewed_at));
+    assert_eq!(
+        reopened.retrievability_at(&id, as_of).unwrap().unwrap(),
+        got
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn review_without_clock_replays_as_unset() {
+    let dir = temp_dir("review-unset");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let id = store.ingest(input("no clock", &[])).expect("ingest");
+    store.review_at(&id, 2, None).expect("old-shaped review");
+    let frames = store.log().read_frames(1).expect("frames");
+    let frame = frames
+        .iter()
+        .rev()
+        .find(|frame| frame.kind == KIND_STORE_WRITE && frame.payload.first() == Some(&3))
+        .expect("review frame");
+    assert_eq!(frame.payload.len(), 10);
+    assert!(store.reviewed_at_ms(&id).is_none());
+    drop(store);
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    assert!(reopened.reviewed_at_ms(&id).is_none());
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -197,6 +197,41 @@ impl FsrsFold {
         Ok(Self::r(Self::dequantized_stability(card), elapsed, w))
     }
 
+    /// Whole days from `reviewed_at_ms` to `as_of_ms` (0 if `as_of` is earlier).
+    ///
+    /// The fold still uses sequence numbers. This only turns a caller-supplied
+    /// review clock into the `t` that [`Self::retrievability`] already takes.
+    /// Not a new algorithm version.
+    pub fn elapsed_review_days(reviewed_at_ms: i64, as_of_ms: i64) -> u64 {
+        let delta = as_of_ms.saturating_sub(reviewed_at_ms);
+        if delta <= 0 {
+            0
+        } else {
+            delta as u64 / 86_400_000
+        }
+    }
+
+    /// Derived retrievability at `as_of_ms`.
+    ///
+    /// `Some(reviewed_at_ms)` measures `t` in whole days since that review.
+    /// `None` (pre-field frames, or a source with no last-review time) keeps
+    /// `t = fallback_seq - last_seq`.
+    pub fn retrievability_at_review(
+        card: &CardState,
+        reviewed_at_ms: Option<i64>,
+        as_of_ms: i64,
+        fallback_seq: u64,
+        version: u32,
+    ) -> Result<f64, UnknownAlgoVersion> {
+        let current = match reviewed_at_ms {
+            Some(at) => card
+                .last_seq
+                .saturating_add(Self::elapsed_review_days(at, as_of_ms)),
+            None => fallback_seq,
+        };
+        Self::retrievability(card, current, version)
+    }
+
     fn dequantized_stability(card: &CardState) -> f64 {
         from_q32_32(card.stability_q).max(S_MIN)
     }
