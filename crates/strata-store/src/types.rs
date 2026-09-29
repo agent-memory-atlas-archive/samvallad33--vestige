@@ -126,6 +126,10 @@ pub struct NodeRecord {
     pub valid_until_ms: i64,
     /// Set when a later record superseded this one: the superseder's id.
     pub superseded_by: Option<String>,
+    /// Source provenance key, when the memory came from a connector or a v3 row.
+    pub source: Option<SourceKey>,
+    /// Source row's last-updated timestamp (unix ms).
+    pub source_updated_at_ms: Option<i64>,
 }
 
 impl NodeRecord {
@@ -135,6 +139,23 @@ impl NodeRecord {
     }
 }
 
+/// Provenance key for re-derivation: `(source_system, source_project,
+/// source_id)`. Re-deriving the same key with a later `source_updated_at`
+/// is a sanctioned supersede path — same source, same fact slot.
+///
+/// A v3 row that only has the free-form `source` text (no
+/// `source_system` / `source_id`) is stored as `system = <that text>` with
+/// empty `project` and `id`. `None` means the row had no source.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct SourceKey {
+    /// Connector/system name (exact bytes; never case-folded).
+    pub system: String,
+    /// Project namespace within the system.
+    pub project: String,
+    /// The source row id.
+    pub id: String,
+}
+
 /// Input for creating a new memory (store-local mirror of the vestige-core
 /// ingest input; float sentiment fields are dropped — no floats in persisted
 /// state).
@@ -142,6 +163,10 @@ impl NodeRecord {
 pub struct IngestInput {
     /// The content to memorize.
     pub content: String,
+    /// Source provenance key, when the memory came from a connector or a v3 row.
+    pub source: Option<SourceKey>,
+    /// Source row's last-updated timestamp (unix ms) for re-derivation.
+    pub source_updated_at_ms: Option<i64>,
     /// Knowledge type; empty string defaults to "fact".
     pub node_type: String,
     /// Tags (sorted + deduplicated on ingest).

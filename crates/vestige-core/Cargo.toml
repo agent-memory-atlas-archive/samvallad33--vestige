@@ -61,8 +61,10 @@ encryption = ["legacy-sqlite", "rusqlite/bundled-sqlcipher"]
 #   - crates/vestige-mcp/Cargo.toml (embeddings, vector-search, ort-download,
 #     ort-dynamic, qwen3-embeddings, metal, cuda, cudnn)
 #   - tests/e2e/Cargo.toml (embeddings, vector-search)
-# They enable no code or dependencies. Delete the stubs together with those
-# references. See SCOPE-HANDOFF.md.
+# They enable no code or dependencies. Rust cfg sites use the unset
+# `vestige_embeddings_removed` cfg, not these feature names, so
+# `--all-features` does not compile the deleted embedding paths.
+# Delete the stubs together with the forwarded names. See SCOPE-HANDOFF.md.
 # ---------------------------------------------------------------------------
 embeddings = []
 vector-search = []
@@ -162,3 +164,6 @@ doctest = true
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(vestige_embeddings_removed)"] }

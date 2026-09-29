@@ -660,6 +660,15 @@ pub trait LocalMemoryStore: Sync + 'static {
         ))
     }
 
+    /// True when this store is the Strata log.
+    ///
+    /// The default is false. Callers that only need to tell Strata from
+    /// every other backend use this instead of [`Self::db_path`], whose
+    /// default panics.
+    fn is_strata(&self) -> bool {
+        false
+    }
+
     /// See the SQLite reference implementation for semantics.
     fn decide_memory_pr(&self, _id: &str, _action: MemoryPrAction) -> StoreResult<MemoryPr> {
         Err(StorageError::Init(
@@ -2773,6 +2782,8 @@ pub trait MemoryStore: Send + Sync + 'static {
     ) -> StoreResult<Vec<KnowledgeNode>>;
     fn data_dir(&self) -> &Path;
     fn db_path(&self) -> &Path;
+    /// True when this store is the Strata log. Default backends are not.
+    fn is_strata(&self) -> bool;
     fn decide_memory_pr(&self, id: &str, action: MemoryPrAction) -> StoreResult<MemoryPr>;
     fn decide_pending_memory_mutation(
         &self,
@@ -3462,6 +3473,9 @@ where
     }
     fn db_path(&self) -> &Path {
         <T as MemoryStoreSend>::db_path(self)
+    }
+    fn is_strata(&self) -> bool {
+        <T as MemoryStoreSend>::is_strata(self)
     }
     fn decide_memory_pr(&self, id: &str, action: MemoryPrAction) -> StoreResult<MemoryPr> {
         <T as MemoryStoreSend>::decide_memory_pr(self, id, action)

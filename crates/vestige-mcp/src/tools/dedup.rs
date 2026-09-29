@@ -349,7 +349,7 @@ pub async fn execute_unified(
 
 /// Pending reconsolidation plans shaped for the scan surface. Read-only; the
 /// storage listing runs the expiry sweep first so nothing stale is offered.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 fn reconsolidation_plan_entries(storage: &Arc<Storage>) -> Vec<Value> {
     match storage.list_reconsolidation_plans(20) {
         Ok(plans) => plans
@@ -372,7 +372,7 @@ fn reconsolidation_plan_entries(storage: &Arc<Storage>) -> Vec<Value> {
     }
 }
 
-#[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+#[cfg(not(vestige_embeddings_removed))]
 fn reconsolidation_plan_entries(_storage: &Arc<Storage>) -> Vec<Value> {
     Vec::new()
 }
@@ -381,7 +381,7 @@ fn reconsolidation_plan_entries(_storage: &Arc<Storage>) -> Vec<Value> {
 /// existing apply path (reversible via undo); reject closes the plan leaving
 /// the memory untouched; quarantine suppresses the memory through the
 /// existing suppress path and closes the in-memory labile window.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 fn obj(args: &Option<Value>) -> serde_json::Map<String, Value> {
     args.as_ref()
         .and_then(|v| v.as_object().cloned())
@@ -393,7 +393,7 @@ fn execute_verdict(
     cognitive: Option<&Arc<Mutex<CognitiveEngine>>>,
     args: Option<Value>,
 ) -> Result<Value, String> {
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     {
         let a = obj(&args);
         let plan_id = a
@@ -449,7 +449,7 @@ fn execute_verdict(
             "note": "Reconsolidation verdicts are recorded in the merge_operations reflog. Expired plans cannot be verdicted; they auto-close with their labile window."
         }))
     }
-    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+    #[cfg(not(vestige_embeddings_removed))]
     {
         let _ = (storage, cognitive, args);
         Err("Reconsolidation verdicts require embeddings and vector-search features.".into())

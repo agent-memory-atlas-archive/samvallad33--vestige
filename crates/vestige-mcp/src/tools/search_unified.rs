@@ -1324,7 +1324,7 @@ pub async fn execute(
     // ====================================================================
     // STAGE 3: Temporal boosting (recency + validity windows)
     // ====================================================================
-    #[cfg(feature = "vector-search")]
+    #[cfg(vestige_embeddings_removed)]
     if let Ok(cog) = cognitive.try_lock() {
         for (index, result) in filtered_results.iter_mut().enumerate() {
             let recency = cog.temporal_searcher.recency_boost(result.node.created_at);

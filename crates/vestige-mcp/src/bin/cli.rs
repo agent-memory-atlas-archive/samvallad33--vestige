@@ -1707,6 +1707,10 @@ fn run_update(
 
 /// Run stats command
 fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
+    #[cfg(feature = "migrate-to-strata")]
+    if let Some(log_dir) = upgraded_strata_log()? {
+        return run_strata_stats(&log_dir, show_tagging, show_states);
+    }
     let storage = open_storage()?;
     let stats = storage.get_stats()?;
 
@@ -2091,14 +2095,6 @@ fn cli_db_path() -> anyhow::Result<PathBuf> {
     Ok(cli_data_dir()?.join("vestige.db"))
 }
 
-fn refuse_v3_sqlite(data_dir: &Path) -> anyhow::Result<()> {
-    let db = data_dir.join("vestige.db");
-    let Some(v3) = vestige_core::detect_v3(&db)? else {
-        return Ok(());
-    };
-    anyhow::bail!("{}", v3.refusal_message());
-}
-
 /// Apply pending migrations, or rehearse them on a throwaway copy of the store.
 ///
 /// A v1.x to v2.6.0 jump (issue #191) aborted at startup on a strict check
@@ -2111,6 +2107,14 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
     let source = cli_db_path()?;
     if !source.exists() {
         anyhow::bail!("no store at {} (nothing to upgrade)", source.display());
+    }
+
+    #[cfg(feature = "migrate-to-strata")]
+    if !dry_run
+        && let vestige_mcp::auto_upgrade::UpgradeStatus::StrataReady { .. } =
+            vestige_mcp::auto_upgrade::upgrade_if_needed(&source)?
+    {
+        return Ok(());
     }
 
     // PR 0a: a v3 SQLite store is refused before anything opens it — the
@@ -2494,7 +2498,7 @@ fn run_migrate_to_strata_linked(
     let options = strata_migrate::MigrateOptions {
         dry_run,
         accept_wal_snapshot,
-        seed: None,
+        ..Default::default()
     };
     let report = strata_migrate::migrate_with_options(&from, &destination, options)?;
 
@@ -2546,9 +2550,97 @@ fn run_migrate_to_strata_linked(
     Ok(())
 }
 
+/// The strata log installed by the shared first-launch upgrade, when this
+/// data dir was a v3 store (or already held a log).
+#[cfg(feature = "migrate-to-strata")]
+fn upgraded_strata_log() -> anyhow::Result<Option<std::path::PathBuf>> {
+    let path = cli_db_path()?;
+    match vestige_mcp::auto_upgrade::upgrade_if_needed(&path)? {
+        vestige_mcp::auto_upgrade::UpgradeStatus::StrataReady { log_dir } => Ok(Some(log_dir)),
+        vestige_mcp::auto_upgrade::UpgradeStatus::NoV3 => Ok(None),
+    }
+}
+
+/// `stats` after the switch. Reads the installed log; does not open the v3 file.
+#[cfg(feature = "migrate-to-strata")]
+fn run_strata_stats(
+    log_dir: &std::path::Path,
+    show_tagging: bool,
+    show_states: bool,
+) -> anyhow::Result<()> {
+    let verified = strata_verify::migration::verify_migrated_log(log_dir)
+        .map_err(|err| anyhow::anyhow!("strata log at {}: {err}", log_dir.display()))?;
+    if !verified.ok {
+        anyhow::bail!(
+            "strata log at {} failed verification: {}",
+            log_dir.display(),
+            verified.failures.join("; ")
+        );
+    }
+    let memories = migrated_memory_count(log_dir)?;
+
+    println!("{}", "=== Vestige Memory Statistics ===".cyan().bold());
+    println!();
+    println!("{}: {}", "Total Memories".white().bold(), memories);
+    println!("{}: {}", "Store".white().bold(), log_dir.display());
+    if show_tagging || show_states {
+        println!(
+            "{}",
+            "Tagging and state breakdowns are not on the strata log yet.".yellow()
+        );
+    }
+    Ok(())
+}
+
+/// Count migrated memories without `StrataLog::open`. That open creates
+/// `strata.lock` with this process's pid and would exclude the server (and
+/// the release-matrix dump) from the same log. `stats` only reads segments.
+#[cfg(feature = "migrate-to-strata")]
+fn migrated_memory_count(log_dir: &Path) -> anyhow::Result<usize> {
+    let mut segments = Vec::new();
+    for entry in fs::read_dir(log_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".seg") {
+            segments.push(entry.path());
+        }
+    }
+    segments.sort();
+    if segments.is_empty() {
+        anyhow::bail!("no segment files in {}", log_dir.display());
+    }
+    let mut memories = 0usize;
+    for path in segments {
+        let bytes = fs::read(&path)?;
+        let mut off = strata::HEADER_WIRE_SIZE;
+        while off < bytes.len() {
+            let Ok((frame, consumed)) = strata::parse_frame(&bytes[off..]) else {
+                break;
+            };
+            if consumed == 0 {
+                break;
+            }
+            if frame.kind == strata_migrate::records::KIND_NODE
+                && let Ok(node) = strata_migrate::records::decode_node(&frame.payload)
+                && node.node_type != "walk_receipt"
+            {
+                memories += 1;
+            }
+            off += consumed;
+        }
+    }
+    Ok(memories)
+}
+
 fn open_storage() -> anyhow::Result<std::sync::Arc<Storage>> {
     let dir = cli_data_dir()?;
-    refuse_v3_sqlite(&dir)?;
+    // Same first-launch upgrade `vestige-mcp` runs before stdio. Progress
+    // stays on stderr. The strata open below does not open the v3 file.
+    #[cfg(feature = "migrate-to-strata")]
+    {
+        let _ = vestige_mcp::auto_upgrade::upgrade_if_needed(&dir.join("vestige.db"))?;
+    }
     Ok(vestige_mcp::strata_memory::open(&dir)?)
 }
 
@@ -3694,7 +3786,7 @@ fn run_causal_walk(
     }
 
     let storage = open_storage()?;
-    #[cfg(feature = "embeddings")]
+    #[cfg(vestige_embeddings_removed)]
     {
         let _ = storage.init_embeddings();
     }

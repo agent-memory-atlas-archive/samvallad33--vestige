@@ -244,15 +244,6 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
     }
 }
 
-fn exit_if_v3(db_path: &Path) {
-    if let Ok(Some(v3)) = vestige_core::detect_v3(db_path) {
-        let message = v3.refusal_message();
-        error!("{message}");
-        eprintln!("{message}");
-        std::process::exit(1);
-    }
-}
-
 fn default_strata_dir() -> io::Result<PathBuf> {
     if let Some(data_dir) = data_dir_from_env() {
         let data_dir = expand_tilde(data_dir);
@@ -427,6 +418,34 @@ fn main() {
     );
 }
 
+/// Exclusive lock held for the life of `serve`. The kernel releases it when
+/// the process dies. Not a pid file and not a timeout.
+fn hold_serve_lock(data_dir: &Path) -> fs::File {
+    let path = data_dir.join(".serve.lock");
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            error!("Failed to create the serve lock {}: {}", path.display(), e);
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = file.lock() {
+        error!(
+            "Failed to lock {} (another vestige-mcp holds it): {}",
+            path.display(),
+            e
+        );
+        std::process::exit(1);
+    }
+    file
+}
+
 async fn serve() {
     // Parse CLI arguments first (before logging init, so --help/--version work cleanly)
     let config = parse_args();
@@ -456,26 +475,20 @@ async fn serve() {
         }
     };
 
-    // PR 0a: a v3 SQLite store at the configured path is refused before any
-    // storage constructor runs, so tools never see a half-open store. The
-    // guard itself never writes; detection is a 100-byte header read. The
-    // default-path case (None) is guarded inside the storage constructor.
-    // One v3 check. exit_if_v3 prints the 0a refusal and exits 1.
-    if let Some(db_path) = storage_path.as_deref() {
-        exit_if_v3(db_path);
-    }
-
-    // The probed path is `<data-dir>/vestige.db` so a v3 file is still refused.
-    // The Strata log itself lives in the data directory and never creates that file.
-    let strata_dir = match storage_path.as_deref() {
-        Some(db_path) => db_path
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| db_path.to_path_buf()),
+    // The probed path is `<data-dir>/vestige.db`. The Strata log lives in the
+    // data directory (`log/`) and the open below never creates that sqlite file.
+    let (strata_dir, db_path) = match storage_path.as_deref() {
+        Some(db_path) => {
+            let dir = db_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| db_path.to_path_buf());
+            (dir, db_path.to_path_buf())
+        }
         None => match default_strata_dir() {
             Ok(dir) => {
-                exit_if_v3(&dir.join(DATABASE_FILE));
-                dir
+                let db_path = dir.join(DATABASE_FILE);
+                (dir, db_path)
             }
             Err(e) => {
                 error!("Failed to resolve the Strata data directory: {}", e);
@@ -483,6 +496,26 @@ async fn serve() {
             }
         },
     };
+
+    // v3 detection and the upgrade both live in `upgrade_with`, which
+    // `upgrade_if_needed` calls. The CLI uses that same function. The shipped
+    // build enables `migrate-to-strata`. `NoV3` means the probed file is not
+    // a v3 store.
+    #[cfg(feature = "migrate-to-strata")]
+    if let Err(err) = vestige_mcp::auto_upgrade::upgrade_if_needed(&db_path) {
+        eprintln!("{err}");
+        let _ = std::io::Write::flush(&mut io::stderr());
+        std::process::exit(1);
+    }
+    #[cfg(not(feature = "migrate-to-strata"))]
+    let _ = &db_path;
+
+    // Two servers must not open the same log. `File::lock` dies with this
+    // process, including SIGKILL. `log/strata.lock` is a pid file: while this
+    // process is alive it also stops a reader (`dump-migration` opens that
+    // same directory with `StrataLog::open`). Take the flock first, then drop
+    // the pid file so the reader can reopen the log this process is serving.
+    let _serve_lock = hold_serve_lock(&strata_dir);
     let storage = match vestige_mcp::strata_memory::open(&strata_dir) {
         Ok(s) => {
             info!("Strata log initialized at {}", strata_dir.display());
@@ -493,6 +526,7 @@ async fn serve() {
             std::process::exit(1);
         }
     };
+    let _ = fs::remove_file(strata_dir.join("log").join("strata.lock"));
 
     // Preserve the released Nomic default in the background so MCP clients can
     // finish their stdio handshake before a first-run model download. Optional

@@ -13,10 +13,11 @@ publish = false
 autobins = false
 
 [features]
-# The shipped binaries boot a Strata log. `legacy-sqlite` stays available for
-# the SQLite unit tests and the v3-engine harness. `migrate-to-strata` is the
-# only path that links rusqlite (the importer's read-only reader).
-default = ["connectors", "cloud-sync", "codebase-git"]
+# The shipped binaries boot a Strata log and upgrade a v3 file on first open.
+# `migrate-to-strata` is on in the default build. It is the only path that
+# enables `sqlite-reader` (bundled rusqlite). `legacy-sqlite` stays off the
+# shipped graph; unit tests and the v3-engine harness opt into it.
+default = ["connectors", "cloud-sync", "codebase-git", "migrate-to-strata"]
 # LEGACY SQLITE QUARANTINE (build/t5-legacy-isolation), mirroring
 # vestige-core. Gates every Storage/sqlite-touching module (server, tools,
 # dashboard, cognitive, resources, trace_recorder, autopilot,
@@ -24,17 +25,18 @@ default = ["connectors", "cloud-sync", "codebase-git"]
 # and forwards to vestige-core's `legacy-sqlite` + `bundled-sqlite`.
 # Off by default. Unit tests and the v3-engine harness opt in.
 legacy-sqlite = ["vestige-core/legacy-sqlite", "vestige-core/bundled-sqlite", "dep:rusqlite"]
-# Upgrade path only (`vestige migrate-to-strata`). Enables the importer's
-# read-only v3 reader. Not in the default feature set.
-migrate-to-strata = ["dep:strata-migrate", "strata-migrate/sqlite-reader"]
+# First-launch upgrade and `vestige migrate-to-strata`. On in the shipped
+# default build. `sqlite-reader` is the edge that links bundled rusqlite.
+# `strata-verify` stays a direct dependency and does not enable that reader.
+migrate-to-strata = ["dep:strata", "dep:strata-migrate", "strata-migrate/sqlite-reader"]
 # Raw engine test harness for THIS crate's own test builds (feature-gated
 # restart/creation tests). Never in default; the shipped binary keeps the
 # guard + creation block armed.
 v3-engine = ["legacy-sqlite", "vestige-core/v3-engine"]
 # w1b vector removal: `embeddings` and `vector-search` no longer select any
-# dependencies — they exist only as declared (always-off) stubs so legacy
-# `#[cfg(feature = ...)]` sites in this crate don't trip `unexpected_cfgs`.
-# Mirrors the stub in vestige-core's Cargo.toml. Do not gate new code on them.
+# dependencies. They stay declared so manifests that still forward the names
+# resolve. Code does not key off them (`vestige_embeddings_removed` is an
+# unset cfg), so `--all-features` does not compile the deleted paths.
 embeddings = []
 vector-search = []
 # Git history for the codebase tool (libgit2, OpenSSL, libssh2). On by default;
@@ -86,10 +88,11 @@ path = "src/bin/cli.rs"
 # always-off stubs (w1b).
 vestige-core = { version = "3.0.0", path = "../vestige-core", default-features = false }
 
+# Segment scan for `vestige stats` after the switch. No rusqlite of its own.
+# Optional so `--no-default-features` stays free of the upgrade stack.
+strata = { path = "../strata", optional = true }
 # One-shot SQLite -> STRATA migration. Optional, and without its default
-# features, so the v3 reader (`sqlite-reader` / rusqlite) stays off until
-# `migrate-to-strata`. Log and receipt types are always available through
-# strata-verify below.
+# features, so `sqlite-reader` / rusqlite stays off until `migrate-to-strata`.
 strata-migrate = { path = "../strata-migrate", optional = true, default-features = false }
 # Log and receipt verification. Does not enable `sqlite-reader`.
 strata-verify = { path = "../strata-verify" }
@@ -153,10 +156,14 @@ include_dir = "0.7"
 mime_guess = "2"
 
 tempfile = "3"
+libc = "0.2"
 
 [dev-dependencies]
 ctor = "0.4"
 rusqlite = { version = "0.40", features = ["bundled"] }
+sha2 = "0.11"
+tempfile = "3"
+strata = { path = "../strata" }
 strata-migrate = { path = "../strata-migrate" }
 strata-verify = { path = "../strata-verify" }
 
@@ -166,6 +173,10 @@ strata-verify = { path = "../strata-verify" }
 # the guard must be armed in test builds too (audit finding: a fresh install
 # created a SQLite store and then refused to open it, invisible while the
 # guard was test-disabled).
+[[test]]
+name = "auto_upgrade"
+required-features = ["migrate-to-strata"]
+
 [[test]]
 name = "backfill_trait_wall"
 required-features = ["legacy-sqlite"]
@@ -185,3 +196,6 @@ required-features = ["legacy-sqlite"]
 [[test]]
 name = "views_sized_store"
 required-features = ["legacy-sqlite"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(vestige_embeddings_removed)"] }

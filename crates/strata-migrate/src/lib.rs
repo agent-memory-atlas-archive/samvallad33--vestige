@@ -68,7 +68,6 @@ pub mod source;
 
 #[cfg(feature = "sqlite-reader")]
 use std::collections::HashMap;
-#[cfg(feature = "sqlite-reader")]
 use std::path::Path;
 use std::time::Duration;
 #[cfg(feature = "sqlite-reader")]
@@ -92,7 +91,7 @@ use vestige_core::storage::PortableArchive;
 use vestige_core::storage::PortableValue;
 
 pub use records::{
-    EdgeRecord, GenesisRecord, MigrationReceipt, NodeRecord, ParamsRecord, ReceiptBody,
+    EdgeRecord, GenesisRecord, MigrationReceipt, NodeRecord, ParamsRecord, ReceiptBody, SourceKey,
     SupersessionRecord, TombstoneRecord, KIND_MIGRATION_RECEIPT, RECEIPT_SIGNING_KEY_ID,
     RECORD_VERSION,
 };
@@ -137,8 +136,12 @@ pub const STRATA_EDGE_VOCABULARY: [&str; 8] = [
 /// was not an explicit declaration). Not a causal kind, and not a new field.
 pub const LEGACY_INFERRED_KIND: &str = "legacy_inferred";
 
+/// Hook invoked on the staging directory after the receipt is sealed and
+/// before the rename. Only the lock holder runs it.
+pub type BeforePublish = Box<dyn FnOnce(&Path) -> Result<(), String>>;
+
 /// Options for one migration run.
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct MigrateOptions {
     /// Read and verify the source, report counts, write nothing.
     pub dry_run: bool,
@@ -150,6 +153,32 @@ pub struct MigrateOptions {
     /// `None` derives the seed from the source BLAKE3, which already makes
     /// two runs over one source byte-identical.
     pub seed: Option<[u8; 32]>,
+    /// Runs after the staging lock is held and before any log is created.
+    /// Only the lock holder runs it. An error deletes staging and leaves
+    /// the destination untouched.
+    pub before_import: Option<BeforePublish>,
+    /// Runs on the staging directory after the receipt is sealed and before
+    /// the rename. Only the process holding the staging lock runs it. An
+    /// error deletes staging and leaves the destination untouched.
+    pub before_publish: Option<BeforePublish>,
+}
+
+impl std::fmt::Debug for MigrateOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MigrateOptions")
+            .field("dry_run", &self.dry_run)
+            .field("accept_wal_snapshot", &self.accept_wal_snapshot)
+            .field("seed", &self.seed)
+            .field(
+                "before_import",
+                &self.before_import.as_ref().map(|_| "Some"),
+            )
+            .field(
+                "before_publish",
+                &self.before_publish.as_ref().map(|_| "Some"),
+            )
+            .finish()
+    }
 }
 
 /// Everything that can stop a migration. Nothing is ever half-written: the
@@ -187,7 +216,9 @@ pub enum MigrationError {
     },
     /// The source's BLAKE3 changed while frames were being appended into
     /// the staging directory. Staging is removed; the destination is untouched.
-    #[error("source changed during migration (before {before}, after {after}); the destination log is incomplete and must not be trusted")]
+    #[error(
+        "source changed during migration (before {before}, after {after}); the destination log is incomplete and must not be trusted"
+    )]
     SourceTampered {
         /// BLAKE3 taken before the first read.
         before: String,
@@ -276,7 +307,17 @@ pub fn migrate_with_options(
         }
         // Portable archives have no source hash, so a finished log is not
         // treated as an idempotent re-run of "this" source.
-        return stage_import(strata_dir, options.seed, "", false, snapshot, started, None);
+        return stage_import(
+            strata_dir,
+            options.seed,
+            "",
+            false,
+            snapshot,
+            started,
+            None,
+            options.before_import,
+            options.before_publish,
+        );
     }
 
     // ---- hash BEFORE any SQL read --------------------------------------
@@ -300,15 +341,32 @@ pub fn migrate_with_options(
         snapshot,
         started,
         Some(files),
+        options.before_import,
+        options.before_publish,
     )
 }
 
-/// Sibling of `dest` that holds the log until the rename.
+/// Appended to the destination directory's file name. The first-launch
+/// destination is `<data-dir>/log`, so its staging directory is
+/// `<data-dir>/log.strata-staging`.
+pub const STAGING_SUFFIX: &str = ".strata-staging";
+
+/// Lock file inside the staging directory. A dotfile, so destination
+/// occupancy and the migrator ignore it. Held with `File::try_lock`.
+#[cfg(feature = "sqlite-reader")]
+const STAGING_LOCK_NAME: &str = ".upgrade.lock";
+
+/// How long a loser looks for the lock file after `create_dir` and before
+/// `try_lock`. This covers that gap only. A held lock is not abandoned on a timer.
+#[cfg(feature = "sqlite-reader")]
+const LOCK_FILE_APPEAR: Duration = Duration::from_millis(200);
+
+/// Sibling of `dest`: `<dest>`'s file name plus [`STAGING_SUFFIX`].
 #[cfg(feature = "sqlite-reader")]
 fn staging_path(dest: &Path) -> std::path::PathBuf {
     let name = dest.file_name().unwrap_or(std::ffi::OsStr::new("strata"));
     let mut staging_name = name.to_os_string();
-    staging_name.push(".strata-staging");
+    staging_name.push(STAGING_SUFFIX);
     dest.with_file_name(staging_name)
 }
 
@@ -374,13 +432,17 @@ fn receipt_matching(dir: &Path, source_blake3: &str) -> Option<records::Migratio
     None
 }
 
-/// Import into `dest` via `dest.strata-staging`, then rename.
+/// Import into `dest` via a sibling staging directory, then rename.
 ///
 /// `allow_idempotent` is set for SQLite sources, whose receipt is keyed by
 /// the source BLAKE3. Nothing is written to `dest` until every pre-check
-/// has passed. A leftover staging directory (SIGKILL) is removed and the
-/// import starts over.
+/// has passed. The winner is `create_dir` of the staging directory plus
+/// `File::try_lock` on a file inside it. The kernel drops that lock when
+/// the process dies, including SIGKILL. A later process that can take the
+/// lock wipes the staging directory and starts over. A process that finds
+/// the lock held waits until the rename publishes `dest`.
 #[cfg(feature = "sqlite-reader")]
+#[allow(clippy::too_many_arguments)]
 fn stage_import(
     dest: &Path,
     seed: Option<[u8; 32]>,
@@ -389,31 +451,85 @@ fn stage_import(
     snapshot: source::SourceSnapshot,
     started: Instant,
     files: Option<source::SourceFiles>,
+    mut before_import: Option<BeforePublish>,
+    mut before_publish: Option<BeforePublish>,
 ) -> Result<MigrationReport, MigrationError> {
-    if destination_occupied(dest)? {
-        if allow_idempotent {
-            if let Some(receipt) = receipt_matching(dest, source_blake3) {
-                return Ok(idempotent_report(&snapshot, &receipt, started));
-            }
-        }
-        return Err(MigrationError::DestinationNotEmpty {
-            path: dest.display().to_string(),
-        });
-    }
-
     let staging = staging_path(dest);
-    if staging.exists() {
-        std::fs::remove_dir_all(&staging)?;
+    if let Some(parent) = staging.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    std::fs::create_dir_all(&staging)?;
+    loop {
+        if destination_occupied(dest)? {
+            if allow_idempotent {
+                if let Some(receipt) = receipt_matching(dest, source_blake3) {
+                    return Ok(idempotent_report(&snapshot, &receipt, started));
+                }
+            }
+            return Err(MigrationError::DestinationNotEmpty {
+                path: dest.display().to_string(),
+            });
+        }
+        match std::fs::create_dir(&staging) {
+            Ok(()) => {
+                let lock = match lock_new_staging(&staging) {
+                    Ok(lock) => lock,
+                    Err(err) => {
+                        let _ = std::fs::remove_dir_all(&staging);
+                        return Err(err);
+                    }
+                };
+                return import_holding_lock(
+                    lock,
+                    &staging,
+                    dest,
+                    seed,
+                    source_blake3,
+                    snapshot,
+                    started,
+                    files,
+                    before_import.take(),
+                    before_publish.take(),
+                );
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                wait_or_reclaim(&staging, dest)?;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
 
-    let log = open_log(&staging, seed, source_blake3)?;
+#[allow(clippy::too_many_arguments)]
+fn import_holding_lock(
+    lock: std::fs::File,
+    staging: &Path,
+    dest: &Path,
+    seed: Option<[u8; 32]>,
+    source_blake3: &str,
+    snapshot: source::SourceSnapshot,
+    started: Instant,
+    files: Option<source::SourceFiles>,
+    before_import: Option<BeforePublish>,
+    before_publish: Option<BeforePublish>,
+) -> Result<MigrationReport, MigrationError> {
+    if let Some(hook) = before_import {
+        if let Err(detail) = hook(staging) {
+            return Err(discard_staging(
+                lock,
+                staging,
+                MigrationError::Strata(detail),
+            ));
+        }
+    }
+    let log = match open_log(staging, seed, source_blake3) {
+        Ok(log) => log,
+        Err(err) => return Err(discard_staging(lock, staging, err)),
+    };
     let outcome = match migrate_snapshot_into(&snapshot, &log, source_blake3) {
         Ok(outcome) => outcome,
         Err(err) => {
             drop(log);
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(err);
+            return Err(discard_staging(lock, staging, err));
         }
     };
 
@@ -424,29 +540,168 @@ fn stage_import(
     }
 
     let sealed_hash = if let Some(files) = &files {
-        let blake3_after = files.blake3_hex()?;
+        let blake3_after = match files.blake3_hex() {
+            Ok(hash) => hash,
+            Err(err) => {
+                drop(log);
+                return Err(discard_staging(lock, staging, err));
+            }
+        };
         if source_blake3 != blake3_after {
             drop(log);
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(MigrationError::SourceTampered {
-                before: source_blake3.to_string(),
-                after: blake3_after,
-            });
+            return Err(discard_staging(
+                lock,
+                staging,
+                MigrationError::SourceTampered {
+                    before: source_blake3.to_string(),
+                    after: blake3_after,
+                },
+            ));
         }
         blake3_after
     } else {
         source_blake3.to_string()
     };
 
-    let report = match finish(log, &staging, outcome, snapshot, &sealed_hash, started) {
+    let report = match finish(log, staging, outcome, snapshot, &sealed_hash, started) {
         Ok(report) => report,
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(err);
-        }
+        Err(err) => return Err(discard_staging(lock, staging, err)),
     };
-    publish(&staging, dest)?;
+    if !report.verify_passed {
+        return Err(discard_staging(
+            lock,
+            staging,
+            MigrationError::Strata("replay verification failed".into()),
+        ));
+    }
+    if let Some(hook) = before_publish {
+        if let Err(detail) = hook(staging) {
+            return Err(discard_staging(
+                lock,
+                staging,
+                MigrationError::Strata(detail),
+            ));
+        }
+    }
+    if let Err(err) = publish(staging, dest) {
+        return Err(discard_staging(lock, staging, err));
+    }
+    let _ = std::fs::remove_file(dest.join(STAGING_LOCK_NAME));
+    drop(lock);
     Ok(report)
+}
+
+#[cfg(feature = "sqlite-reader")]
+fn discard_staging(lock: std::fs::File, staging: &Path, err: MigrationError) -> MigrationError {
+    let _ = std::fs::remove_dir_all(staging);
+    drop(lock);
+    err
+}
+
+#[cfg(feature = "sqlite-reader")]
+fn lock_new_staging(staging: &Path) -> Result<std::fs::File, MigrationError> {
+    let path = staging.join(STAGING_LOCK_NAME);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(MigrationError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "staging lock already held",
+        ))),
+        Err(std::fs::TryLockError::Error(err)) => Err(err.into()),
+    }
+}
+
+#[cfg(feature = "sqlite-reader")]
+enum Held {
+    Acquired(std::fs::File),
+    Busy,
+    Missing,
+}
+
+#[cfg(feature = "sqlite-reader")]
+fn try_hold(staging: &Path) -> Result<Held, MigrationError> {
+    let path = staging.join(STAGING_LOCK_NAME);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Held::Missing),
+        Err(err) => return Err(err.into()),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(Held::Acquired(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(Held::Busy),
+        Err(std::fs::TryLockError::Error(err)) => Err(err.into()),
+    }
+}
+
+/// Staging already exists. Take the lock and wipe it when the owner is
+/// dead, or wait while a live owner still holds it.
+#[cfg(feature = "sqlite-reader")]
+fn wait_or_reclaim(staging: &Path, dest: &Path) -> Result<(), MigrationError> {
+    match try_hold(staging)? {
+        Held::Acquired(lock) => {
+            let _ = std::fs::remove_dir_all(staging);
+            drop(lock);
+            return Ok(());
+        }
+        Held::Missing if !lock_file_appears(staging, dest) => {
+            return reclaim_if_abandoned(staging, dest);
+        }
+        Held::Missing | Held::Busy => {}
+    }
+    loop {
+        if destination_occupied(dest)? || !staging.exists() {
+            return Ok(());
+        }
+        match try_hold(staging)? {
+            Held::Acquired(lock) => {
+                let _ = std::fs::remove_dir_all(staging);
+                drop(lock);
+                return Ok(());
+            }
+            Held::Busy => std::thread::sleep(Duration::from_millis(20)),
+            Held::Missing => {
+                if !lock_file_appears(staging, dest) {
+                    return reclaim_if_abandoned(staging, dest);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "sqlite-reader")]
+fn lock_file_appears(staging: &Path, dest: &Path) -> bool {
+    let path = staging.join(STAGING_LOCK_NAME);
+    let started = Instant::now();
+    while started.elapsed() < LOCK_FILE_APPEAR {
+        if path.exists() {
+            return true;
+        }
+        if !staging.exists() || destination_occupied(dest).unwrap_or(false) {
+            return path.exists();
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    path.exists()
+}
+
+#[cfg(feature = "sqlite-reader")]
+fn reclaim_if_abandoned(staging: &Path, dest: &Path) -> Result<(), MigrationError> {
+    if destination_occupied(dest)? || !staging.exists() {
+        return Ok(());
+    }
+    // The directory exists and nobody holds the lock file. The creator died
+    // between `create_dir` and `try_lock`, or the file never appeared.
+    let _ = std::fs::remove_dir_all(staging);
+    Ok(())
 }
 
 #[cfg(feature = "sqlite-reader")]
@@ -978,6 +1233,8 @@ fn extract_walk_receipts(
             updated_ms: row.created_ms,
             last_accessed_ms: row.created_ms,
             legacy: Vec::new(),
+            source: None,
+            source_updated_at_ms: None,
         })
         .collect();
     Ok(records)
@@ -1038,6 +1295,59 @@ type NodeSet = (
     Vec<SupersessionRecord>,
 );
 
+/// TEXT column, or `None` when the column is absent or empty.
+fn column_text<'a>(row: &source::Row<'a>, name: &str) -> Result<Option<&'a str>, MigrationError> {
+    if !row.columns().iter().any(|column| column == name) {
+        return Ok(None);
+    }
+    Ok(row.opt_text(name)?.filter(|text| !text.is_empty()))
+}
+
+/// Lift the v3 source onto the store provenance fields.
+///
+/// A `(source_system, source_id)` pair becomes a [`SourceKey`]. A free-form
+/// `source` string with no pair becomes `system = <text>`. `source_updated_at`
+/// is the timestamp when that column is set. The v3.1.1 fixture has no
+/// `source_updated_at` column, so a sourced row keeps its `updated_at`
+/// instead. A row with neither a source nor a source timestamp yields
+/// `(None, None)`.
+fn node_provenance(
+    row: &source::Row<'_>,
+) -> Result<(Option<SourceKey>, Option<i64>), MigrationError> {
+    let system = column_text(row, "source_system")?;
+    let project = column_text(row, "source_project")?.unwrap_or("");
+    let id = column_text(row, "source_id")?;
+    let label = column_text(row, "source")?;
+    let source = if let (Some(system), Some(id)) = (system, id) {
+        Some(SourceKey {
+            system: system.to_string(),
+            project: project.to_string(),
+            id: id.to_string(),
+        })
+    } else {
+        label.map(|label| SourceKey {
+            system: label.to_string(),
+            project: String::new(),
+            id: String::new(),
+        })
+    };
+    let source_updated_at_ms = if row
+        .columns()
+        .iter()
+        .any(|column| column == "source_updated_at")
+    {
+        match column_text(row, "source_updated_at")? {
+            Some(raw) => Some(source::timestamp_ms(raw)?),
+            None => None,
+        }
+    } else if source.is_some() {
+        Some(source::timestamp_ms(row.text("updated_at")?)?)
+    } else {
+        None
+    };
+    Ok((source, source_updated_at_ms))
+}
+
 /// Decode `knowledge_nodes` into node records, the legacy→kernel id map
 /// (dense, 1-based, source row order), and supersession pointers.
 #[cfg(feature = "sqlite-reader")]
@@ -1055,6 +1365,7 @@ fn extract_nodes(archive: &PortableArchive) -> Result<NodeSet, MigrationError> {
         let kernel_id = (index as u64) + 1;
         kernel_ids.insert(legacy_id.clone(), kernel_id);
         let legacy = capture_legacy("knowledge_nodes", &row, NODE_MAPPED_COLUMNS)?;
+        let (source, source_updated_at_ms) = node_provenance(&row)?;
         records.push(NodeRecord {
             record_version: RECORD_VERSION,
             kernel_id,
@@ -1066,6 +1377,8 @@ fn extract_nodes(archive: &PortableArchive) -> Result<NodeSet, MigrationError> {
             last_accessed_ms: source::timestamp_ms(row.text("last_accessed")?)?,
             legacy,
             legacy_id,
+            source,
+            source_updated_at_ms,
         });
     }
 

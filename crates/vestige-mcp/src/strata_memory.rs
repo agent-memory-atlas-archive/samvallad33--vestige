@@ -22,7 +22,7 @@ use vestige_core::storage::{
 };
 use vestige_core::{
     ConsolidationResult, DecayRisk, IngestInput, KnowledgeNode, MemoryStats, Rating, Receipt,
-    SecretPolicy, scan_secrets,
+    SecretPolicy, SourceEnvelope, scan_secrets,
 };
 
 const Q32_SCALE: f64 = 4294967296.0;
@@ -30,7 +30,7 @@ const RECEIPT_PREFIX: &str = "eff-";
 
 /// The durable directory this process opened is a Strata log, not a SQLite file.
 pub fn is_strata_backend(storage: &Storage) -> bool {
-    storage.db_path().file_name().and_then(|name| name.to_str()) == Some("log")
+    storage.is_strata()
 }
 
 /// Open (or create) a Strata log under `dir`. Creates no SQLite file.
@@ -114,6 +114,21 @@ fn is_memory_id(id: &str) -> bool {
     uuid::Uuid::parse_str(id).is_ok() || is_mem_id(id)
 }
 
+/// Namespaces are identifiers. Blank, oversized, and control-character values
+/// are refused before a frame is appended, the same gate v3 applied on write.
+fn normalize_scope(scope: &str) -> Result<&str, StorageError> {
+    let normalized = scope.trim();
+    if normalized.is_empty()
+        || normalized.len() > 200
+        || normalized.chars().any(char::is_control)
+    {
+        return Err(StorageError::InvalidScope(
+            "expected a non-empty identifier of at most 200 visible characters".into(),
+        ));
+    }
+    Ok(normalized)
+}
+
 fn ms_to_dt(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)
 }
@@ -139,9 +154,53 @@ fn blocking_secrets(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.filter(|text| !text.is_empty())
+}
+
+/// Map a vestige ingest onto the store provenance fields.
+///
+/// A connector envelope with `(source_system, source_id)` becomes a
+/// [`strata_store::SourceKey`]. A free-form `source` string with no key
+/// becomes `system = <text>`. `source_updated_at` is the timestamp. Both are
+/// `None` when the input has neither.
+fn store_provenance(input: &IngestInput) -> (Option<strata_store::SourceKey>, Option<i64>) {
+    let envelope = input.source_envelope.as_ref();
+    let updated = envelope.and_then(|env| env.source_updated_at.map(|time| time.timestamp_millis()));
+    if let Some(env) = envelope
+        && let (Some(system), Some(id)) = (
+            nonempty(env.source_system.as_deref()),
+            nonempty(env.source_id.as_deref()),
+        )
+    {
+        return (
+            Some(strata_store::SourceKey {
+                system: system.to_string(),
+                project: env.source_project.clone().unwrap_or_default(),
+                id: id.to_string(),
+            }),
+            updated,
+        );
+    }
+    if let Some(label) = nonempty(input.source.as_deref()) {
+        return (
+            Some(strata_store::SourceKey {
+                system: label.to_string(),
+                project: String::new(),
+                id: String::new(),
+            }),
+            updated,
+        );
+    }
+    (None, updated)
+}
+
 fn to_store_input(input: &IngestInput) -> strata_store::IngestInput {
+    let (source, source_updated_at_ms) = store_provenance(input);
     strata_store::IngestInput {
         content: input.content.clone(),
+        source,
+        source_updated_at_ms,
         node_type: input.node_type.clone(),
         tags: input.tags.clone(),
         created_at_ms: Some(Utc::now().timestamp_millis()),
@@ -180,7 +239,47 @@ fn project_node(
     node.retrieval_strength = retrieval;
     node.retention_strength = retrieval;
     node.has_embedding = Some(false);
+    apply_store_provenance(&mut node, record);
     node
+}
+
+fn envelope_with(
+    system: Option<String>,
+    project: Option<String>,
+    id: Option<String>,
+    updated: Option<DateTime<Utc>>,
+) -> SourceEnvelope {
+    let mut envelope = SourceEnvelope::default();
+    envelope.source_system = system;
+    envelope.source_project = project;
+    envelope.source_id = id;
+    envelope.source_updated_at = updated;
+    envelope
+}
+
+fn apply_store_provenance(node: &mut KnowledgeNode, record: &strata_store::NodeRecord) {
+    let updated = record
+        .source_updated_at_ms
+        .and_then(DateTime::from_timestamp_millis);
+    let Some(key) = &record.source else {
+        if updated.is_some() {
+            node.source_envelope = Some(envelope_with(None, None, None, updated));
+        }
+        return;
+    };
+    if key.id.is_empty() && key.project.is_empty() {
+        node.source = Some(key.system.clone());
+        if updated.is_some() {
+            node.source_envelope = Some(envelope_with(None, None, None, updated));
+        }
+        return;
+    }
+    node.source_envelope = Some(envelope_with(
+        Some(key.system.clone()),
+        (!key.project.is_empty()).then(|| key.project.clone()),
+        (!key.id.is_empty()).then(|| key.id.clone()),
+        updated,
+    ));
 }
 
 fn project_edge(edge: &strata_store::ConnectionRecord) -> VestigeEdge {
@@ -402,6 +501,10 @@ impl MemoryStoreSend for StrataMemory {
         &self.log_dir
     }
 
+    fn is_strata(&self) -> bool {
+        true
+    }
+
     fn last_backup_timestamp(&self) -> Option<DateTime<Utc>> {
         None
     }
@@ -569,6 +672,7 @@ impl MemoryStoreSend for StrataMemory {
         if input.content.trim().is_empty() {
             return Err(StorageError::Init("content must not be empty".into()));
         }
+        let scope = normalize_scope(scope)?;
         let mut store = self.lock();
         let id = store
             .ingest_in_scope(to_store_input(&input), scope)
@@ -1422,7 +1526,9 @@ fn lookup_origin(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vestige_core::IngestInput;
+    use chrono::{DateTime, Utc};
+    use vestige_core::storage::MemoryStoreSend;
+    use vestige_core::{IngestInput, SourceEnvelope};
 
     fn no_sqlite(dir: &Path) -> bool {
         let mut stack = vec![dir.to_path_buf()];
@@ -1479,5 +1585,72 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("similarity_disabled"), "{err}");
+        assert!(again.source.is_none());
+        assert!(again.source_envelope.is_none());
+    }
+
+    #[test]
+    fn ingest_keeps_source_and_source_updated_at() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let memory = StrataMemory::open(dir.path()).unwrap();
+        let updated = DateTime::parse_from_rfc3339("2026-02-20T11:30:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut label_envelope = SourceEnvelope::default();
+        label_envelope.source_updated_at = Some(updated);
+        let sourced = memory
+            .ingest(IngestInput {
+                content: "v3 source label".into(),
+                source: Some("fixture".into()),
+                source_envelope: Some(label_envelope),
+                ..IngestInput::default()
+            })
+            .unwrap();
+        assert_eq!(sourced.source.as_deref(), Some("fixture"));
+        assert_eq!(
+            sourced
+                .source_envelope
+                .as_ref()
+                .and_then(|env| env.source_updated_at),
+            Some(updated)
+        );
+
+        let mut keyed_envelope = SourceEnvelope::default();
+        keyed_envelope.source_system = Some("github".into());
+        keyed_envelope.source_project = Some("vestige".into());
+        keyed_envelope.source_id = Some("310".into());
+        keyed_envelope.source_updated_at = Some(updated);
+        let keyed = memory
+            .ingest(IngestInput {
+                content: "connector row".into(),
+                source_envelope: Some(keyed_envelope),
+                ..IngestInput::default()
+            })
+            .unwrap();
+        let envelope = keyed.source_envelope.expect("connector key dropped");
+        assert_eq!(envelope.source_system.as_deref(), Some("github"));
+        assert_eq!(envelope.source_project.as_deref(), Some("vestige"));
+        assert_eq!(envelope.source_id.as_deref(), Some("310"));
+        assert_eq!(envelope.source_updated_at, Some(updated));
+    }
+
+    #[test]
+    fn malformed_scopes_are_refused_and_a_padded_scope_is_trimmed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let memory = StrataMemory::open(dir.path()).unwrap();
+        let input = || IngestInput {
+            content: "scoped fixture memory".into(),
+            ..IngestInput::default()
+        };
+        for scope in ["", "   ", &"s".repeat(250), "bad\u{7}scope"] {
+            let err = memory.ingest_in_scope(input(), scope).unwrap_err();
+            assert!(
+                matches!(err, StorageError::InvalidScope(_)),
+                "{scope:?}: {err}"
+            );
+        }
+        let node = memory.ingest_in_scope(input(), "  user  ").unwrap();
+        let stored = memory.lock().get_node(&node.id).expect("stored node");
+        assert_eq!(stored.scope, "user");
     }
 }

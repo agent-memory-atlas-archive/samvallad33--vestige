@@ -333,7 +333,7 @@ impl SqliteMemoryStore {
         // subsystem is built in. This is vector STORAGE, not a similarity
         // decision — smart ingest's gating no longer reads it. Removed
         // together with the embeddings module.
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         if let Err(e) = self.generate_embedding_for_node(&id, &input.content) {
             tracing::warn!("Failed to generate embedding for {}: {}", id, e);
         }
@@ -349,7 +349,7 @@ impl SqliteMemoryStore {
     /// - Supersede a demoted/outdated memory (correction)
     ///
     /// This solves the "bad vs good similar memory" problem.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn smart_ingest(&self, input: IngestInput) -> Result<SmartIngestResult> {
         self.smart_ingest_in_scope_with_secret_policy(
             input,
@@ -359,7 +359,7 @@ impl SqliteMemoryStore {
     }
 
     /// Smart-ingest a memory while considering candidates only from the same namespace.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn smart_ingest_in_scope(
         &self,
         input: IngestInput,
@@ -369,7 +369,7 @@ impl SqliteMemoryStore {
     }
 
     /// Smart ingest with an explicit credential-storage policy.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn smart_ingest_with_secret_policy(
         &self,
         input: IngestInput,
@@ -379,7 +379,7 @@ impl SqliteMemoryStore {
     }
 
     /// Smart-ingest a memory into a named project namespace with an explicit secret policy.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn smart_ingest_in_scope_with_secret_policy(
         &self,
         input: IngestInput,
@@ -394,7 +394,7 @@ impl SqliteMemoryStore {
     /// the caller (the retrieval side owns the manager). A conflict or
     /// supersede against one of these is routed through a reconsolidation
     /// merge plan with explicit verdicts instead of mutating immediately.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn smart_ingest_in_scope_with_secret_policy_and_labile(
         &self,
         input: IngestInput,
@@ -416,7 +416,7 @@ impl SqliteMemoryStore {
     /// Batch callers use this to keep two new items from the same caller-curated
     /// batch from merging into each other while still allowing smart updates
     /// against memories that existed before the batch began.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn smart_ingest_excluding(
         &self,
         input: IngestInput,
@@ -433,7 +433,7 @@ impl SqliteMemoryStore {
     /// Smart ingest with exclusions and an explicit credential-storage policy.
     /// The credential preflight happens before embedding, candidate selection,
     /// or any possible supersede/demotion side effect.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn smart_ingest_excluding_with_secret_policy(
         &self,
         input: IngestInput,
@@ -451,7 +451,7 @@ impl SqliteMemoryStore {
     /// Scoped smart-ingest with candidate exclusions and an explicit secret policy.
     /// Candidate selection is scope-bound before the prediction-error gate runs,
     /// preventing similarly-worded memories in another project from merging.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn smart_ingest_excluding_in_scope_with_secret_policy(
         &self,
         input: IngestInput,
@@ -472,7 +472,7 @@ impl SqliteMemoryStore {
     /// reconsolidation windows (see
     /// [`Self::smart_ingest_in_scope_with_secret_policy_and_labile`]); an
     /// empty slice reproduces the classic behaviour exactly.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn smart_ingest_excluding_in_scope_with_secret_policy_and_labile(
         &self,
         input: IngestInput,
@@ -1038,7 +1038,7 @@ impl SqliteMemoryStore {
         Ok(())
     }
 
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub(super) fn close_node_validity(&self, id: &str, valid_until: DateTime<Utc>) -> Result<()> {
         let writer = self
             .writer
@@ -1068,7 +1068,7 @@ impl SqliteMemoryStore {
             // Every profile encodes the old content, so invalidate all of them.
             // (Vector cache hygiene for the still-present embeddings subsystem;
             // goes away with that module. No similarity decision happens here.)
-            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+            #[cfg(vestige_embeddings_removed)]
             {
                 tx.execute(
                     "DELETE FROM embedding_profile_vectors WHERE node_id = ?1",
@@ -1083,7 +1083,7 @@ impl SqliteMemoryStore {
         }
 
         // Regenerate the vector for the edited content (storage only).
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         {
             // Remove the old vector from the index.
             if let Some(index) = self.vector_index.as_ref()

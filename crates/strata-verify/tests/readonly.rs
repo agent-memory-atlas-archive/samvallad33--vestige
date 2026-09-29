@@ -114,6 +114,8 @@ fn live_store_root_is_unchanged_and_passes() {
         store
             .ingest(IngestInput {
                 content: "read-only verify must not mint a root segment".into(),
+                source: None,
+                source_updated_at_ms: None,
                 node_type: String::new(),
                 tags: Vec::new(),
                 created_at_ms: Some(1_700_000_000_000),

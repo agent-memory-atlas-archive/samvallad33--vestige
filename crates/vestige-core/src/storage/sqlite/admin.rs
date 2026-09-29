@@ -730,10 +730,10 @@ impl SqliteMemoryStore {
                 .to_string(),
         };
 
-        #[cfg(feature = "embeddings")]
+        #[cfg(vestige_embeddings_removed)]
         let embedding_service = EmbeddingService::new();
 
-        #[cfg(feature = "vector-search")]
+        #[cfg(vestige_embeddings_removed)]
         let vector_index = if Self::vector_search_enabled_by_cpu() {
             let vector_index = VectorIndex::new()
                 .map_err(|e| StorageError::Init(format!("Failed to create vector index: {}", e)))?;
@@ -746,7 +746,7 @@ impl SqliteMemoryStore {
             None
         };
 
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         let query_cache = if vector_index.is_some() {
             Some(Mutex::new(LruCache::new(
                 NonZeroUsize::new(100).expect("100 is non-zero"),
@@ -762,15 +762,15 @@ impl SqliteMemoryStore {
             writer: Mutex::new(writer_conn),
             reader: Mutex::new(reader_conn),
             scheduler: Mutex::new(FSRSScheduler::default()),
-            #[cfg(feature = "embeddings")]
+            #[cfg(vestige_embeddings_removed)]
             embedding_service,
-            #[cfg(feature = "vector-search")]
+            #[cfg(vestige_embeddings_removed)]
             vector_index,
-            #[cfg(feature = "vector-search")]
+            #[cfg(vestige_embeddings_removed)]
             vector_index_watermark: Mutex::new(VectorIndexWatermark::default()),
-            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+            #[cfg(vestige_embeddings_removed)]
             query_cache,
-            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+            #[cfg(vestige_embeddings_removed)]
             attached_profile_runtime: RwLock::new(None),
             registered_model: std::sync::RwLock::new(None),
         };
@@ -822,7 +822,7 @@ impl SqliteMemoryStore {
         // Resolve the active pointer before taking the shared reader lock.
         // `active_embedding_profile` reads through that same mutex; calling it
         // below after acquiring `reader` would self-deadlock every stats read.
-        #[cfg(feature = "embeddings")]
+        #[cfg(vestige_embeddings_removed)]
         let active_profile = self.active_embedding_profile()?;
 
         let reader = self
@@ -887,7 +887,7 @@ impl SqliteMemoryStore {
             )
             .optional()?;
 
-        #[cfg(feature = "embeddings")]
+        #[cfg(vestige_embeddings_removed)]
         let active_embedding_model = active_profile.as_ref().and_then(|active| {
             reader
                 .query_row(
@@ -897,10 +897,10 @@ impl SqliteMemoryStore {
                 )
                 .ok()
         });
-        #[cfg(not(feature = "embeddings"))]
+        #[cfg(not(vestige_embeddings_removed))]
         let active_embedding_model: Option<String> = None;
 
-        #[cfg(feature = "embeddings")]
+        #[cfg(vestige_embeddings_removed)]
         let (nodes_with_active_embeddings, nodes_with_mismatched_embeddings) = {
             let active_profile_id = active_profile
                 .as_ref()
@@ -943,7 +943,7 @@ impl SqliteMemoryStore {
             )?;
             (active_count, mismatched_count)
         };
-        #[cfg(not(feature = "embeddings"))]
+        #[cfg(not(vestige_embeddings_removed))]
         let (nodes_with_active_embeddings, nodes_with_mismatched_embeddings) =
             (nodes_with_embeddings, 0);
 
@@ -1114,7 +1114,7 @@ impl SqliteMemoryStore {
         // vector coverage stats removed with the vector subsystem
         let embedding_null_count: i64 = 0;
 
-        #[cfg(feature = "embeddings")]
+        #[cfg(vestige_embeddings_removed)]
         let active_embedding_model = active_profile_id.as_deref().and_then(|profile_id| {
             reader
                 .query_row(
@@ -1124,10 +1124,10 @@ impl SqliteMemoryStore {
                 )
                 .ok()
         });
-        #[cfg(not(feature = "embeddings"))]
+        #[cfg(not(vestige_embeddings_removed))]
         let active_embedding_model: Option<String> = None;
 
-        #[cfg(feature = "embeddings")]
+        #[cfg(vestige_embeddings_removed)]
         let active_embedding_dimensions: Option<u32> =
             active_profile_id.as_deref().and_then(|profile_id| {
                 reader
@@ -1139,7 +1139,7 @@ impl SqliteMemoryStore {
                     .ok()
                     .and_then(|dimension| u32::try_from(dimension).ok())
             });
-        #[cfg(not(feature = "embeddings"))]
+        #[cfg(not(vestige_embeddings_removed))]
         let active_embedding_dimensions: Option<u32> = None;
 
         Ok(crate::SchemaIntrospection {

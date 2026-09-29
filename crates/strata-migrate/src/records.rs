@@ -112,8 +112,35 @@ pub struct NodeRecord {
     /// EVERY other source column, verbatim (ints/floats/text as canonical
     /// strings, blobs hex). FSRS state, scope, source, suppression,
     /// sentiment, and the rest of the 52 columns ride here (blocker 4):
-    /// nothing a v3 row carried is silently dropped.
+    /// nothing a v3 row carried is silently dropped. `source` is also lifted
+    /// onto [`NodeRecord::source`] so the store provenance is not only a
+    /// legacy pair.
     pub legacy: Vec<(String, String)>,
+    /// v3 provenance. `None` when the row had no source. Mirrors
+    /// `strata_store::SourceKey`: a connector key is
+    /// `(source_system, source_project, source_id)`; a free-form `source`
+    /// text with no key is `system = <text>` and empty project/id.
+    pub source: Option<SourceKey>,
+    /// `source_updated_at` when that column is set. When the column is
+    /// absent and [`NodeRecord::source`] is set, this is the row's
+    /// `updated_at`. `None` when there is no source timestamp.
+    pub source_updated_at_ms: Option<i64>,
+}
+
+/// Provenance key `(source_system, source_project, source_id)`.
+///
+/// Field layout matches `strata_store::SourceKey` so an imported node can be
+/// re-ingested without renaming. A v3 free-form `source` string (no
+/// `source_system` / `source_id`) is stored in `system` with empty `project`
+/// and `id`.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct SourceKey {
+    /// Connector/system name, or the free-form v3 `source` text.
+    pub system: String,
+    /// Project namespace within the system. Empty when the row had none.
+    pub project: String,
+    /// The source row id. Empty when the row only had free-form `source`.
+    pub id: String,
 }
 
 /// A migrated typed edge. A declared v3 `link_type` (the 8-type vocabulary)
