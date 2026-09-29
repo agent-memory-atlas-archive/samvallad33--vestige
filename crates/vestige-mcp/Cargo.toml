@@ -25,7 +25,7 @@ default = ["connectors", "cloud-sync", "codebase-git"]
 legacy-sqlite = ["vestige-core/legacy-sqlite", "vestige-core/bundled-sqlite", "dep:rusqlite"]
 # Upgrade path only (`vestige migrate-to-strata`). Not in the default
 # feature set: it is the dependency that links bundled rusqlite.
-migrate-to-strata = ["dep:strata-migrate"]
+migrate-to-strata = ["dep:strata-migrate", "dep:strata-verify"]
 # Raw engine test harness for THIS crate's own test builds (feature-gated
 # restart/creation tests). Never in default; the shipped binary keeps the
 # guard + creation block armed.
@@ -90,6 +90,9 @@ vestige-core = { version = "3.0.0", path = "../vestige-core", default-features =
 # `--features migrate-to-strata`. The standalone `strata-verify` crate is
 # tested from its own manifest; depending on it here pulled rusqlite in.
 strata-migrate = { path = "../strata-migrate", optional = true }
+# Read-only verifier. Same feature as migration: it depends on strata-migrate
+# and therefore bundled rusqlite. Not in the default binaries.
+strata-verify = { path = "../strata-verify", optional = true }
 
 # Strata log the shipped MCP server boots. Workspace-excluded; path dep only.
 strata-store = { path = "../strata-store" }

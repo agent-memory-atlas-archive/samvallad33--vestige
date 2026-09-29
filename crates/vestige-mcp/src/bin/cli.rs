@@ -2428,17 +2428,27 @@ fn get_default_db_path() -> anyhow::Result<PathBuf> {
 /// Verify a STRATA directory. Same report as the `strata-verify` binary.
 /// Creates nothing in `dir`.
 fn run_strata_verify(dir: PathBuf) -> anyhow::Result<()> {
-    let report = strata_verify::verify_path(&dir);
-    println!("{}", report.json);
-    if report.ok {
-        println!("OK");
-        return Ok(());
+    #[cfg(not(feature = "migrate-to-strata"))]
+    {
+        let _ = dir;
+        anyhow::bail!(
+            "strata-verify is not linked into this binary; rebuild with --features migrate-to-strata"
+        );
     }
-    println!("FAILED");
-    for failure in &report.failures {
-        eprintln!("  {failure}");
+    #[cfg(feature = "migrate-to-strata")]
+    {
+        let report = strata_verify::verify_path(&dir);
+        println!("{}", report.json);
+        if report.ok {
+            println!("OK");
+            return Ok(());
+        }
+        println!("FAILED");
+        for failure in &report.failures {
+            eprintln!("  {failure}");
+        }
+        std::process::exit(1);
     }
-    std::process::exit(1);
 }
 
 /// Open storage using the CLI-selected data directory, if one was provided.
