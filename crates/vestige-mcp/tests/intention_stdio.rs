@@ -3,7 +3,7 @@
 //! v3.1.1 fixture. The verify half needs `--features migrate-to-strata`.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
@@ -221,8 +221,10 @@ fn intention_set_over_stdio_admits_a_receipt_and_survives_restart() {
     again.shutdown();
     assert!(no_sqlite(dir.path()));
 
+    // The store root has no store.meta until a checkpoint is sealed. The
+    // stdio log is `log/*.seg`; that is the directory strata-verify checks.
     #[cfg(feature = "migrate-to-strata")]
-    strata_verify(dir.path());
+    strata_verify(&dir.path().join("log"));
 }
 
 #[cfg(feature = "migrate-to-strata")]
@@ -246,7 +248,7 @@ fn strata_verify(dir: &Path) {
 fn strata_verify_accepts_a_migrated_v3_1_1_store() {
     let tmp = tempfile::tempdir().expect("temp");
     let source = tmp.path().join("v3.1.1-sample.sqlite");
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../strata-migrate/tests/fixtures/v3.1.1-sample.sqlite");
     std::fs::copy(&fixture, &source).expect("copy fixture");
     let before = std::fs::read(&source).expect("read fixture");
