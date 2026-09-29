@@ -776,15 +776,26 @@ fn type_error(table: &str, column: &str, wanted: &str, got: &PortableValue) -> M
     ))
 }
 
-/// Parse a legacy RFC3339 timestamp into Unix epoch milliseconds.
+/// Parse a legacy timestamp into Unix epoch milliseconds.
 ///
-/// Vestige writes `DateTime<Utc>::to_rfc3339()` everywhere, but be liberal
-/// about the exact offset spelling (`Z` vs `+00:00` both parse with
-/// `parse_from_rfc3339`).
+/// Vestige writes `DateTime<Utc>::to_rfc3339()` for memory rows, and either
+/// offset spelling (`Z` or `+00:00`) parses. Rows that SQLite stamped itself
+/// (`DEFAULT CURRENT_TIMESTAMP`, `datetime('now')`, e.g. `sync_tombstones.
+/// deleted_at` on real stores) use `YYYY-MM-DD HH:MM:SS[.fff]` with no offset,
+/// which SQLite defines as UTC; those parse as UTC too. Anything else is
+/// corrupt, as before.
 pub fn timestamp_ms(raw: &str) -> Result<i64, MigrationError> {
-    DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.timestamp_millis())
-        .map_err(|e| MigrationError::Corrupt(format!("timestamp {raw:?} is not RFC3339: {e}")))
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return Ok(dt.timestamp_millis());
+    }
+    for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, format) {
+            return Ok(naive.and_utc().timestamp_millis());
+        }
+    }
+    Err(MigrationError::Corrupt(format!(
+        "timestamp {raw:?} is neither RFC3339 nor a SQLite UTC datetime"
+    )))
 }
 
 /// Parse a legacy JSON tag array (`'[]'`, `'["a","b"]'`). Tolerant: a NULL,
@@ -793,4 +804,32 @@ pub fn timestamp_ms(raw: &str) -> Result<i64, MigrationError> {
 pub fn parse_tags(raw: Option<&str>) -> Vec<String> {
     let Some(raw) = raw else { return Vec::new() };
     serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::timestamp_ms;
+
+    #[test]
+    fn sqlite_utc_timestamps_parse_as_utc() {
+        let rfc = timestamp_ms("2026-05-02T08:09:18+00:00").unwrap();
+        assert_eq!(timestamp_ms("2026-05-02T08:09:18Z").unwrap(), rfc);
+        // SQLite CURRENT_TIMESTAMP / datetime('now'): UTC, no offset.
+        assert_eq!(timestamp_ms("2026-05-02 08:09:18").unwrap(), rfc);
+        assert_eq!(timestamp_ms("2026-05-02T08:09:18").unwrap(), rfc);
+        assert_eq!(timestamp_ms("2026-05-02 08:09:18.250").unwrap(), rfc + 250);
+    }
+
+    #[test]
+    fn non_timestamps_stay_corrupt() {
+        for raw in [
+            "",
+            "yesterday",
+            "2026-05-02",
+            "2026-13-02 08:09:18",
+            "08:09:18",
+        ] {
+            assert!(timestamp_ms(raw).is_err(), "{raw:?} must not parse");
+        }
+    }
 }
