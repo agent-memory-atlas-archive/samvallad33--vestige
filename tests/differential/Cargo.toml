@@ -5,8 +5,19 @@ edition = "2024"
 publish = false
 description = "Cross-engine differential harness: replays seeded operation scripts against vestige-core SQLite Storage AND strata (kernel + gate directly), asserting parity and per-engine byte-identical reruns. Gates the SQLite->STRATA default flip."
 
+[features]
+# The harness replays scripts through legacy SQLite Storage. Off by default
+# so a workspace build does not unify rusqlite into the 4.0 binaries.
+# Opt in with `--features legacy-sqlite`.
+default = []
+legacy-sqlite = [
+    "vestige-core/legacy-sqlite",
+    "vestige-core/bundled-sqlite",
+    "vestige-core/v3-engine",
+]
+
 [dependencies]
-vestige-core = { path = "../../crates/vestige-core", features = ["v3-engine"] }
+vestige-core = { path = "../../crates/vestige-core", default-features = false }
 strata-kernel = { path = "../../crates/strata-kernel" }
 strata-gate = { path = "../../crates/strata-gate" }
 strata-verify = { path = "../../crates/strata-verify" }
@@ -20,3 +31,9 @@ tempfile = "3"
 [[bin]]
 name = "differential"
 path = "src/bin/differential.rs"
+required-features = ["legacy-sqlite"]
+
+[[test]]
+name = "differential"
+path = "tests/differential.rs"
+required-features = ["legacy-sqlite"]
