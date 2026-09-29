@@ -27,6 +27,9 @@ use vestige_core::{
 
 const Q32_SCALE: f64 = 4294967296.0;
 const RECEIPT_PREFIX: &str = "eff-";
+/// Side file for the Fellegi-Sunter thresholds. Not a log frame: `StoreOp`
+/// has no policy variant, and this file is not read by replay.
+const MERGE_POLICY_FILE: &str = "merge-policy.json";
 
 /// The durable directory this process opened is a Strata log, not a SQLite file.
 pub fn is_strata_backend(storage: &Storage) -> bool {
@@ -43,6 +46,9 @@ pub struct StrataMemory {
     log_dir: PathBuf,
     store: Mutex<strata_store::StrataStore>,
     actor: Mutex<Option<String>>,
+    /// `Some` only after `set_merge_policy`. A get with `None` reads the side
+    /// file, then env, then the built-in defaults.
+    merge_policy: Mutex<Option<vestige_core::MergePolicy>>,
 }
 
 impl StrataMemory {
@@ -55,6 +61,7 @@ impl StrataMemory {
             data_dir,
             store: Mutex::new(store),
             actor: Mutex::new(None),
+            merge_policy: Mutex::new(None),
         })
     }
 
@@ -414,6 +421,36 @@ impl MemoryStoreSend for StrataMemory {
             .actor
             .lock()
             .unwrap_or_else(|err| panic!("strata actor lock poisoned: {err}")) = Some(did.to_string());
+        Ok(())
+    }
+
+    fn get_merge_policy(&self) -> Result<vestige_core::MergePolicy, StorageError> {
+        let mut slot = self
+            .merge_policy
+            .lock()
+            .unwrap_or_else(|err| panic!("strata merge policy lock poisoned: {err}"));
+        if let Some(policy) = *slot {
+            return Ok(policy);
+        }
+        if let Some(policy) = read_merge_policy_file(&self.data_dir)? {
+            *slot = Some(policy);
+            return Ok(policy);
+        }
+        Ok(merge_policy_from_env())
+    }
+
+    fn set_merge_policy(&self, policy: vestige_core::MergePolicy) -> Result<(), StorageError> {
+        let policy = vestige_core::MergePolicy::new(
+            policy.match_threshold,
+            policy.possible_threshold,
+            policy.auto_apply,
+        );
+        write_merge_policy_file(&self.data_dir, &policy)?;
+        *self
+            .merge_policy
+            .lock()
+            .unwrap_or_else(|err| panic!("strata merge policy lock poisoned: {err}")) =
+            Some(policy);
         Ok(())
     }
 
@@ -1258,6 +1295,66 @@ impl StrataMemory {
     }
 }
 
+fn merge_policy_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(MERGE_POLICY_FILE)
+}
+
+/// Same precedence as the SQLite `fsrs_config` read when no row is stored:
+/// env, then [`vestige_core::MergePolicy::default`], then `MergePolicy::new`
+/// (clamp, and `possible <= match`).
+fn merge_policy_from_env() -> vestige_core::MergePolicy {
+    let default = vestige_core::MergePolicy::default();
+    let env_f32 = |name: &str, fallback: f32| -> f32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(fallback)
+    };
+    let auto_apply = std::env::var("VESTIGE_MERGE_AUTO_APPLY")
+        .ok()
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(default.auto_apply);
+    vestige_core::MergePolicy::new(
+        env_f32("VESTIGE_MERGE_MATCH_THRESHOLD", default.match_threshold),
+        env_f32(
+            "VESTIGE_MERGE_POSSIBLE_THRESHOLD",
+            default.possible_threshold,
+        ),
+        auto_apply,
+    )
+}
+
+fn read_merge_policy_file(
+    data_dir: &Path,
+) -> Result<Option<vestige_core::MergePolicy>, StorageError> {
+    let path = merge_policy_path(data_dir);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(StorageError::Io(err)),
+    };
+    let policy: vestige_core::MergePolicy = serde_json::from_slice(&bytes)
+        .map_err(|err| StorageError::Init(format!("merge policy file is not readable: {err}")))?;
+    Ok(Some(vestige_core::MergePolicy::new(
+        policy.match_threshold,
+        policy.possible_threshold,
+        policy.auto_apply,
+    )))
+}
+
+fn write_merge_policy_file(
+    data_dir: &Path,
+    policy: &vestige_core::MergePolicy,
+) -> Result<(), StorageError> {
+    let bytes = serde_json::to_vec(policy)
+        .map_err(|err| StorageError::Init(format!("merge policy encode failed: {err}")))?;
+    let path = merge_policy_path(data_dir);
+    let tmp = data_dir.join(format!("{MERGE_POLICY_FILE}.tmp"));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 fn lookup_origin(store: &strata_store::StrataStore, receipt_or_node: &str) -> Option<(String, u64)> {
     if let Some(seq) = parse_receipt_seq(receipt_or_node) {
         return store
@@ -1330,5 +1427,29 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("similarity_disabled"), "{err}");
+    }
+
+    #[test]
+    fn merge_policy_roundtrip_survives_reopen_without_sqlite() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let first = StrataMemory::open(dir.path()).unwrap();
+        let unset = first.get_merge_policy().unwrap();
+        assert!(unset.possible_threshold <= unset.match_threshold);
+        assert!(!merge_policy_path(dir.path()).exists());
+        let saved = vestige_core::MergePolicy::new(0.91, 0.99, true);
+        first.set_merge_policy(saved).unwrap();
+        let got = first.get_merge_policy().unwrap();
+        assert!((got.match_threshold - 0.91).abs() < 1e-6);
+        assert!((got.possible_threshold - 0.91).abs() < 1e-6);
+        assert!(got.auto_apply);
+        drop(first);
+
+        let second = StrataMemory::open(dir.path()).unwrap();
+        let again = second.get_merge_policy().unwrap();
+        assert!((again.match_threshold - got.match_threshold).abs() < 1e-6);
+        assert!((again.possible_threshold - got.possible_threshold).abs() < 1e-6);
+        assert!(again.auto_apply);
+        assert!(no_sqlite(dir.path()));
+        assert_eq!(second.lock().node_count(), 0);
     }
 }
