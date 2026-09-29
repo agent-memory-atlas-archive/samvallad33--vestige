@@ -1677,10 +1677,7 @@ mod tests {
 
         let storage = crate::strata_memory::open(dir.path()).unwrap();
         assert!(
-            storage
-                .superseded_node_ids()
-                .unwrap()
-                .contains(&doomed),
+            storage.superseded_node_ids().unwrap().contains(&doomed),
             "the retired node must be on the log before the stdio call"
         );
         let server = McpServer::new(storage, Arc::new(Mutex::new(CognitiveEngine::new())));
@@ -1767,9 +1764,15 @@ mod tests {
         };
         let graph = |response: &Value| {
             assert!(response.get("error").is_none(), "{response}");
-            assert_eq!(response["result"]["resultType"], json!("complete"), "{response}");
+            assert_eq!(
+                response["result"]["resultType"],
+                json!("complete"),
+                "{response}"
+            );
             assert_eq!(response["result"]["isError"], json!(false), "{response}");
-            let text = response["result"]["content"][0]["text"].as_str().unwrap_or("");
+            let text = response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("");
             assert!(!text.contains("pending_strata"), "{text}");
             assert!(!text.contains("not implemented"), "{text}");
             response["result"]["structuredContent"].clone()
@@ -1800,12 +1803,7 @@ mod tests {
 
         let full = graph(&by_id(1));
         let again = graph(&by_id(2));
-        let expected_nodes = vec![
-            center.clone(),
-            near_b.clone(),
-            near_a.clone(),
-            hop.clone(),
-        ];
+        let expected_nodes = vec![center.clone(), near_b.clone(), near_a.clone(), hop.clone()];
         let expected_edges = vec![
             (center.clone(), near_b.clone()),
             (center.clone(), near_a.clone()),
@@ -1840,7 +1838,10 @@ mod tests {
         );
         assert_eq!(
             edges_of(&shallow),
-            vec![(center.clone(), near_b.clone()), (center.clone(), near_a.clone())]
+            vec![
+                (center.clone(), near_b.clone()),
+                (center.clone(), near_a.clone())
+            ]
         );
 
         let capped = graph(&by_id(4));
@@ -1852,7 +1853,11 @@ mod tests {
         assert_eq!(edges_of(&capped), vec![(center.clone(), near_b.clone())]);
 
         let refused = by_id(5);
-        assert_eq!(refused["result"]["resultType"], json!("complete"), "{refused}");
+        assert_eq!(
+            refused["result"]["resultType"],
+            json!("complete"),
+            "{refused}"
+        );
         assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
         let message = refused["result"]["structuredContent"]["error"]
             .as_str()

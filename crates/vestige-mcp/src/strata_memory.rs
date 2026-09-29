@@ -232,7 +232,11 @@ impl StrataMemory {
     }
 
     fn nodes(&self) -> Vec<strata_store::NodeRecord> {
-        self.lock().nodes()
+        self.lock()
+            .nodes()
+            .into_iter()
+            .filter(|record| record.is_live())
+            .collect()
     }
 }
 
@@ -1238,10 +1242,7 @@ impl MemoryStoreSend for StrataMemory {
             .map(|(id, _)| id)
             .collect();
         let live = |id: &str| {
-            !superseded.contains(id)
-                && store
-                    .get_node(id)
-                    .is_some_and(|record| record.is_live())
+            !superseded.contains(id) && store.get_node(id).is_some_and(|record| record.is_live())
         };
         if !live(center_id) {
             return Ok((Vec::new(), Vec::new()));
@@ -1895,6 +1896,7 @@ impl MemoryStoreSend for StrataMemory {
         let mut nodes: Vec<KnowledgeNode> = store
             .nodes()
             .iter()
+            .filter(|record| record.is_live())
             .filter(|record| {
                 if !retrievable(record) {
                     return false;
@@ -1963,6 +1965,47 @@ impl MemoryStoreSend for StrataMemory {
         _scope: Option<&str>,
     ) -> Result<Vec<vestige_core::advanced::MergeOperation>, StorageError> {
         Ok(Vec::new())
+    }
+
+    fn list_merge_operations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<vestige_core::advanced::MergeOperation>, StorageError> {
+        let mut writes = self.lock().node_writes();
+        writes.sort_by_key(|write| std::cmp::Reverse(write.frame_seq));
+        writes.truncate(limit);
+        Ok(writes.into_iter().map(merge_operation).collect())
+    }
+
+    fn get_merge_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<vestige_core::advanced::MergeOperation>, StorageError> {
+        let Some(frame) = parse_op_frame(operation_id) else {
+            return Ok(None);
+        };
+        Ok(self
+            .lock()
+            .node_writes()
+            .into_iter()
+            .find(|write| write.frame_seq == frame)
+            .map(merge_operation))
+    }
+
+    fn merge_undo(
+        &self,
+        op_id: &str,
+    ) -> Result<vestige_core::advanced::MergeOperation, StorageError> {
+        let frame = parse_op_frame(op_id)
+            .ok_or_else(|| StorageError::NotFound(format!("operation {op_id}")))?;
+        let mut store = self.lock();
+        let new_seq = store.undo_node_write(frame).map_err(map_store)?;
+        store
+            .node_writes()
+            .into_iter()
+            .find(|write| write.frame_seq == new_seq)
+            .map(merge_operation)
+            .ok_or_else(|| StorageError::Init("compensating record vanished after append".into()))
     }
 
     fn get_consolidation_history(
@@ -2410,7 +2453,11 @@ impl StrataMemory {
         };
         let limit = usize::try_from(limit).unwrap_or(0);
         let store = self.lock();
-        let records = store.nodes();
+        let records: Vec<_> = store
+            .nodes()
+            .into_iter()
+            .filter(|record| record.is_live())
+            .collect();
         let pairs = store.get_never_composed(scope, limit.saturating_mul(4).max(limit));
         let mut out = Vec::new();
         for (first, second) in pairs {
@@ -2520,6 +2567,41 @@ fn write_merge_policy_file(
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+fn parse_op_frame(operation_id: &str) -> Option<u64> {
+    let rest = operation_id.strip_prefix("op-")?;
+    if rest.len() != 16 || !rest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(rest, 16).ok()
+}
+
+fn merge_operation(write: strata_store::NodeWrite) -> vestige_core::advanced::MergeOperation {
+    let reverts = write.reverts_frame_seq.map(|seq| format!("op-{seq:016x}"));
+    let created_at = ms_to_dt(write.record.created_at_ms).to_rfc3339();
+    let reason = if write.op_type == "undo" {
+        Some(format!(
+            "Reverted {} by appending a compensating record",
+            reverts.as_deref().unwrap_or("the prior write")
+        ))
+    } else {
+        Some("admitted node write".into())
+    };
+    vestige_core::advanced::MergeOperation {
+        id: format!("op-{:016x}", write.frame_seq),
+        plan_id: None,
+        op_type: write.op_type.to_string(),
+        status: write.status.to_string(),
+        created_at: created_at.clone(),
+        reverted_at: (write.status == "reverted").then_some(created_at),
+        reverts_op_id: reverts,
+        survivor_id: Some(write.record.id.clone()),
+        affected_ids: vec![write.record.id],
+        confidence: None,
+        signals: None,
+        reason,
+    }
 }
 
 fn lookup_origin(
@@ -3402,5 +3484,46 @@ mod tests {
         assert!(again.auto_apply);
         assert!(no_sqlite(dir.path()));
         assert_eq!(second.lock().node_count(), 0);
+    }
+
+    #[test]
+    fn undo_appends_a_compensating_record_and_hides_it_from_reads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = super::open(dir.path()).unwrap();
+        let node = storage
+            .ingest_in_scope(
+                IngestInput {
+                    content: "undo me please".into(),
+                    ..IngestInput::default()
+                },
+                "user",
+            )
+            .unwrap();
+        assert_eq!(
+            storage.get_node(&node.id).unwrap().unwrap().content,
+            "undo me please"
+        );
+        let ops = storage.list_merge_operations(10).unwrap();
+        let op = ops
+            .iter()
+            .find(|op| op.survivor_id.as_deref() == Some(node.id.as_str()))
+            .expect("ingest is an undoable write");
+        assert_eq!(op.op_type, "write");
+        assert_eq!(op.status, "applied");
+        let undone = storage.merge_undo(&op.id).unwrap();
+        assert_eq!(undone.op_type, "undo");
+        assert_eq!(undone.reverts_op_id.as_deref(), Some(op.id.as_str()));
+        assert!(storage.get_node(&node.id).unwrap().is_none());
+        assert!(
+            storage
+                .get_all_nodes(50, 0)
+                .unwrap()
+                .iter()
+                .all(|listed| listed.content != "undo me please")
+        );
+        drop(storage);
+        let reopened = super::open(dir.path()).unwrap();
+        assert!(reopened.get_node(&node.id).unwrap().is_none());
+        assert!(no_sqlite(dir.path()));
     }
 }

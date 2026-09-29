@@ -21,14 +21,14 @@
 //! FSRS retrievability, lowest first, each with the edge path that reached it.
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use vestige_core::advanced::retroactive_backfill::extract_entities;
-use vestige_core::fsrs::retrievability;
 use vestige_core::KnowledgeNode;
 use vestige_core::Storage;
+use vestige_core::advanced::retroactive_backfill::extract_entities;
+use vestige_core::fsrs::retrievability;
 
 /// Retrievability at failure time below this marks the lesson as forgotten.
 /// 0.5 is the midpoint of the FSRS probability-of-recall scale.
@@ -611,12 +611,14 @@ mod tests {
         );
 
         // Scope + validation contract mirrors backfill.
-        assert!(execute(
-            &storage,
-            Some(json!({"failure_id": failure.id, "scope": " "}))
-        )
-        .await
-        .is_err());
+        assert!(
+            execute(
+                &storage,
+                Some(json!({"failure_id": failure.id, "scope": " "}))
+            )
+            .await
+            .is_err()
+        );
         assert!(
             execute(&storage, Some(json!({}))).await.is_err(),
             "failure_id is required"
@@ -825,12 +827,14 @@ mod strata_walk_tests {
         assert_eq!(lesson_path[0]["link_type"], "evidence_of");
         assert_eq!(lesson_path[1]["target_id"], json!(failure.id));
 
-        assert!(execute(
-            &storage,
-            Some(json!({"failure_id": failure.id, "scope": " "}))
-        )
-        .await
-        .is_err());
+        assert!(
+            execute(
+                &storage,
+                Some(json!({"failure_id": failure.id, "scope": " "}))
+            )
+            .await
+            .is_err()
+        );
         assert!(execute(&storage, Some(json!({}))).await.is_err());
     }
 
