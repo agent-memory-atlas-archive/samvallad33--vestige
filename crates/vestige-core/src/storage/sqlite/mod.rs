@@ -36,7 +36,6 @@ use crate::storage::portable::{
 // Phase 4 wall: types referenced by the MemoryStoreSend forwarding seam below.
 use crate::SchemaIntrospection;
 use crate::actor::{ActorPolicySnapshot, RoleResolution};
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use crate::advanced::reconsolidation::LabileCandidate;
 use crate::advanced::{MergeCandidate, MergeOperation, MergePlan, MergePolicy};
 use crate::codebase::anchor::{AnchorStatus, CodeAnchor};
@@ -2946,6 +2945,7 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn suppress_memory(&self, id: &str) -> Result<KnowledgeNode> {
         SqliteMemoryStore::suppress_memory(self, id)
     }
+    #[cfg(feature = "cloud-sync")]
     fn sync_portable_archive_cloud(
         &self,
         endpoint: &str,
@@ -2953,6 +2953,20 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
         encryption_key: Option<String>,
     ) -> Result<PortableSyncReport> {
         SqliteMemoryStore::sync_portable_archive_cloud(self, endpoint, sync_key, encryption_key)
+    }
+    // The inherent method only exists with cloud-sync. Without it the call
+    // above resolved back to THIS trait method (infinite recursion,
+    // clippy-found). Fail loud instead.
+    #[cfg(not(feature = "cloud-sync"))]
+    fn sync_portable_archive_cloud(
+        &self,
+        _endpoint: &str,
+        _sync_key: &str,
+        _encryption_key: Option<String>,
+    ) -> Result<PortableSyncReport> {
+        Err(StorageError::Init(
+            "cloud sync requires the cloud-sync feature, which this build omits".to_string(),
+        ))
     }
     fn sync_portable_archive_file(&self, path: &Path) -> Result<PortableSyncReport> {
         SqliteMemoryStore::sync_portable_archive_file(self, path)
