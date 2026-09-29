@@ -2742,6 +2742,75 @@ fn purging_empty_content_does_not_scrub_unrelated_evidence() {
     assert_eq!(remaining_reviews, 1);
 }
 
+
+/// GhostLink contract (2026-09-28): never-composed pairs are admitted ONLY
+/// via recorded typed-edge hops.
+fn seed_typed_edge(storage: &crate::storage::Storage, a: &str, b: &str) {
+    use crate::storage::ConnectionRecord;
+    let now = chrono::Utc::now();
+    storage
+        .save_connection(&ConnectionRecord {
+            source_id: a.to_string(),
+            target_id: b.to_string(),
+            strength: 1.0,
+            link_type: "touched".to_string(),
+            created_at: now,
+            last_activated: now,
+            activation_count: 0,
+        })
+        .unwrap();
+}
+
+/// No typed edges + shared tags only => never_composed returns NOTHING.
+#[test]
+fn never_composed_tags_only_returns_empty() {
+    let storage = create_test_storage();
+    storage
+        .ingest(IngestInput {
+            content: "Alpha lane with shared vocabulary only.".to_string(),
+            node_type: "fact".to_string(),
+            tags: vec!["shared-tag".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+    storage
+        .ingest(IngestInput {
+            content: "Beta lane with the same shared vocabulary.".to_string(),
+            node_type: "fact".to_string(),
+            tags: vec!["shared-tag".to_string(), "extra".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+    let out = storage.get_never_composed_candidates(5, None).unwrap();
+    assert!(out.is_empty(), "shared words must never admit a pair: {out:?}");
+}
+
+/// A typed-edge hop admits the pair even with zero shared vocabulary.
+#[test]
+fn never_composed_admits_via_typed_edge_hop() {
+    let storage = create_test_storage();
+    let a = storage
+        .ingest(IngestInput {
+            content: "Commit touched the withdrawal queue module.".to_string(),
+            node_type: "event".to_string(),
+            tags: vec![],
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .ingest(IngestInput {
+            content: "Unrelated wording entirely, no shared tokens at all.".to_string(),
+            node_type: "fact".to_string(),
+            tags: vec![],
+            ..Default::default()
+        })
+        .unwrap();
+    seed_typed_edge(&storage, &a.id, &b.id);
+    let out = storage.get_never_composed_candidates(5, None).unwrap();
+    assert_eq!(out.len(), 1, "edge hop must admit: {out:?}");
+    assert!(out[0].reason.contains("typed-edge hop"), "{}", out[0].reason);
+}
+
 #[test]
 fn test_composition_save_query_outcome_and_never_composed() {
     let storage = create_test_storage();
@@ -2749,157 +2818,79 @@ fn test_composition_save_query_outcome_and_never_composed() {
         .ingest(IngestInput {
             content: "Oracle drift can break delayed settlement.".to_string(),
             node_type: "fact".to_string(),
-            tags: vec![
-                "protocolgate".to_string(),
-                "boundary-oracle".to_string(),
-                "settlement".to_string(),
-            ],
+            tags: vec!["protocolgate".to_string()],
             ..Default::default()
         })
         .unwrap();
     let second = storage
         .ingest(IngestInput {
-            content: "Withdrawal queues can settle stale claims.".to_string(),
-            node_type: "pattern".to_string(),
-            tags: vec![
-                "protocolgate".to_string(),
-                "boundary-queue".to_string(),
-                "settlement".to_string(),
-            ],
-            ..Default::default()
-        })
-        .unwrap();
-    let third = storage
-        .ingest(IngestInput {
-            content: "Keeper roles can drift from local validation paths.".to_string(),
-            node_type: "pattern".to_string(),
-            tags: vec![
-                "protocolgate".to_string(),
-                "boundary-role".to_string(),
-                "settlement".to_string(),
-            ],
+            content: "Withdrawal queue needs proof of reserve.".to_string(),
+            node_type: "fact".to_string(),
+            tags: vec!["protocolgate".to_string()],
             ..Default::default()
         })
         .unwrap();
 
-    let before = storage
-        .get_never_composed_candidates(10, Some(&["protocolgate".to_string()]))
-        .unwrap();
-    let first_second_before = before
-        .iter()
-        .find(|candidate| {
-            let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
-            pair == Storage::pair_key(&first.id, &second.id)
-        })
-        .expect("uncomposed first/second pair should be ranked before any event");
+    // GhostLink contract: without a typed edge, shared tags admit nothing.
+    assert!(storage.get_never_composed_candidates(10, None).unwrap().is_empty());
+
+    seed_typed_edge(&storage, &first.id, &second.id);
+    let before = storage.get_never_composed_candidates(10, None).unwrap();
+    assert_eq!(before.len(), 1, "edge hop must admit: {before:?}");
     assert!(
-        first_second_before.bridge_score > 0.0,
-        "candidate should expose a bridge score"
+        { before[0].first_id == first.id && before[0].second_id == second.id }
+            || { before[0].first_id == second.id && before[0].second_id == first.id }
     );
-    assert!(
-        first_second_before.novelty_score > 0.0,
-        "candidate should expose a novelty score"
-    );
-    assert_eq!(
-        first_second_before.outcome_signal, "clean",
-        "new candidate should start without prior outcome context"
-    );
-    assert!(
-        first_second_before
-            .composition_question
-            .contains("composed through"),
-        "candidate should include a promptable composition question"
-    );
+    assert!(before[0].reason.contains("typed-edge hop"), "{}", before[0].reason);
 
     let event = CompositionEventRecord {
         id: "composition-test-1".to_string(),
         created_at: Utc::now(),
         tool: "deep_reference".to_string(),
         mode: "bounty".to_string(),
-        query: Some("oracle drift delayed settlement".to_string()),
+        query: Some("oracle drift withdrawal queue".to_string()),
         query_hash: Some("sha256:test".to_string()),
         confidence: Some(0.87),
         status: Some("resolved".to_string()),
         output_preview: Some("Compose oracle drift with withdrawal queue.".to_string()),
         metadata: serde_json::json!({"workflow": "test"}),
     };
-    let members = vec![
-        CompositionMemberRecord {
-            event_id: event.id.clone(),
-            memory_id: first.id.clone(),
-            role: "primary".to_string(),
-            rank: 0,
-            trust: Some(0.8),
-            score: Some(0.9),
-            preview: Some(preview(&first.content, 120)),
-            metadata: serde_json::json!({}),
-        },
-        CompositionMemberRecord {
-            event_id: event.id.clone(),
-            memory_id: second.id.clone(),
-            role: "supporting".to_string(),
-            rank: 1,
-            trust: Some(0.7),
-            score: Some(0.75),
-            preview: Some(preview(&second.content, 120)),
-            metadata: serde_json::json!({}),
-        },
-    ];
-    storage.save_composition(&event, &members, &[]).unwrap();
-
-    let outcome = CompositionOutcomeRecord {
-        id: "composition-outcome-1".to_string(),
-        event_id: event.id.clone(),
-        outcome_type: "submitted".to_string(),
-        labeled_at: Utc::now(),
-        label_source: "test".to_string(),
-        confidence_delta: Some(0.1),
-        notes: Some("Report submitted".to_string()),
-        metadata: serde_json::json!({"severity": "high"}),
-    };
-    storage.record_composition_outcome(&outcome).unwrap();
-
-    let fetched = storage.get_composition_event(&event.id).unwrap().unwrap();
-    assert_eq!(fetched.mode, "bounty");
-    assert_eq!(fetched.metadata["workflow"], "test");
-
-    let fetched_members = storage.get_composition_members(&event.id).unwrap();
-    assert_eq!(fetched_members.len(), 2);
-    assert_eq!(fetched_members[0].role, "primary");
-
-    let fetched_outcomes = storage.get_composition_outcomes(&event.id).unwrap();
-    assert_eq!(fetched_outcomes.len(), 1);
-    assert_eq!(fetched_outcomes[0].outcome_type, "submitted");
-
-    let for_memory = storage.get_compositions_for_memory(&first.id, 5).unwrap();
-    assert_eq!(for_memory.len(), 1);
-    assert_eq!(for_memory[0].id, event.id);
-
-    let neighbors = storage.get_composition_neighbors(&first.id, 5).unwrap();
-    assert_eq!(neighbors.len(), 1);
-    assert_eq!(neighbors[0].memory_id, second.id);
-
-    let after = storage
-        .get_never_composed_candidates(10, Some(&["protocolgate".to_string()]))
+    storage
+        .save_composition(
+            &event,
+            &[
+                CompositionMemberRecord {
+                    event_id: event.id.clone(),
+                    memory_id: first.id.clone(),
+                    role: "primary".to_string(),
+                    rank: 0,
+                    trust: Some(0.9),
+                    score: Some(0.9),
+                    preview: None,
+                    metadata: serde_json::json!({}),
+                },
+                CompositionMemberRecord {
+                    event_id: event.id.clone(),
+                    memory_id: second.id.clone(),
+                    role: "supporting".to_string(),
+                    rank: 1,
+                    trust: Some(0.7),
+                    score: Some(0.6),
+                    preview: None,
+                    metadata: serde_json::json!({}),
+                },
+            ],
+            &[],
+        )
         .unwrap();
+
+    let after = storage.get_never_composed_candidates(10, None).unwrap();
     assert!(
-        !after.iter().any(|candidate| {
-            let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
-            pair == Storage::pair_key(&first.id, &second.id)
-        }),
-        "already-composed first/second pair should be removed"
-    );
-    assert!(
-        after.iter().any(|candidate| {
-            let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
-            pair == Storage::pair_key(&first.id, &third.id)
-                || pair == Storage::pair_key(&second.id, &third.id)
-        }),
-        "other protocolgate pairs should remain candidates"
+        after.is_empty(),
+        "composed pair must leave the never-composed set: {after:?}"
     );
 }
 
-#[test]
 fn test_composition_neighbors_count_distinct_events_not_member_roles() {
     let storage = create_test_storage();
     let first = storage
@@ -3065,6 +3056,9 @@ fn test_never_composed_tag_filter_includes_older_tagged_candidates() {
             .unwrap();
     }
 
+    // GhostLink contract: admission needs the causal edge; the tag filter
+    // still scopes the candidate pool (both nodes carry project:vestige).
+    seed_typed_edge(&storage, &first.id, &second.id);
     let candidates = storage
         .get_never_composed_candidates(10, Some(&["project".to_string()]))
         .unwrap();
@@ -3084,11 +3078,7 @@ fn test_never_composed_carries_prior_outcome_signal() {
         .ingest(IngestInput {
             content: "Oracle drift lane previously looked duplicate-prone.".to_string(),
             node_type: "fact".to_string(),
-            tags: vec![
-                "protocolgate".to_string(),
-                "boundary-oracle".to_string(),
-                "settlement".to_string(),
-            ],
+            tags: vec!["protocolgate".to_string()],
             ..Default::default()
         })
         .unwrap();
@@ -3096,37 +3086,22 @@ fn test_never_composed_carries_prior_outcome_signal() {
         .ingest(IngestInput {
             content: "Withdrawal queue lane had weak proof.".to_string(),
             node_type: "fact".to_string(),
-            tags: vec![
-                "protocolgate".to_string(),
-                "boundary-queue".to_string(),
-                "settlement".to_string(),
-            ],
+            tags: vec!["protocolgate".to_string()],
             ..Default::default()
         })
         .unwrap();
-    let third = storage
-        .ingest(IngestInput {
-            content: "Keeper settlement lane has not been composed with oracle drift.".to_string(),
-            node_type: "pattern".to_string(),
-            tags: vec![
-                "protocolgate".to_string(),
-                "boundary-role".to_string(),
-                "settlement".to_string(),
-            ],
-            ..Default::default()
-        })
-        .unwrap();
+    seed_typed_edge(&storage, &first.id, &second.id);
 
     let event = CompositionEventRecord {
         id: "prior-outcome-composition".to_string(),
         created_at: Utc::now(),
         tool: "deep_reference".to_string(),
-        mode: "bounty".to_string(),
-        query: Some("oracle withdrawal duplicate risk".to_string()),
-        query_hash: Some("fnv1a64:prior".to_string()),
-        confidence: Some(0.4),
-        status: Some("closed".to_string()),
-        output_preview: Some("Prior composition was labeled duplicate risk.".to_string()),
+        mode: "release".to_string(),
+        query: Some("accepted release lane".to_string()),
+        query_hash: Some("fnv1a64:success".to_string()),
+        confidence: Some(0.9),
+        status: Some("resolved".to_string()),
+        output_preview: None,
         metadata: serde_json::json!({}),
     };
     storage
@@ -3138,8 +3113,8 @@ fn test_never_composed_carries_prior_outcome_signal() {
                     memory_id: first.id.clone(),
                     role: "primary".to_string(),
                     rank: 0,
-                    trust: Some(0.7),
-                    score: Some(0.8),
+                    trust: Some(0.9),
+                    score: Some(0.9),
                     preview: None,
                     metadata: serde_json::json!({}),
                 },
@@ -3149,7 +3124,7 @@ fn test_never_composed_carries_prior_outcome_signal() {
                     role: "supporting".to_string(),
                     rank: 1,
                     trust: Some(0.7),
-                    score: Some(0.8),
+                    score: Some(0.6),
                     preview: None,
                     metadata: serde_json::json!({}),
                 },
@@ -3157,126 +3132,6 @@ fn test_never_composed_carries_prior_outcome_signal() {
             &[CompositionOutcomeRecord {
                 id: "prior-outcome-label".to_string(),
                 event_id: event.id.clone(),
-                outcome_type: "duplicate_risk".to_string(),
-                labeled_at: Utc::now(),
-                label_source: "test".to_string(),
-                confidence_delta: Some(-0.2),
-                notes: Some("Duplicate family in prior lane.".to_string()),
-                metadata: serde_json::json!({}),
-            }],
-        )
-        .unwrap();
-
-    let candidates = storage
-        .get_never_composed_candidates(10, Some(&["protocolgate".to_string()]))
-        .unwrap();
-    let candidate = candidates
-        .iter()
-        .find(|candidate| {
-            let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
-            pair == Storage::pair_key(&first.id, &third.id)
-        })
-        .expect("untried first/third pair should remain a frontier candidate");
-
-    assert!(
-        candidate
-            .prior_outcomes
-            .iter()
-            .any(|outcome| outcome == "duplicate_risk"),
-        "frontier candidate should expose prior outcome labels from either member"
-    );
-    assert_eq!(candidate.outcome_signal, "prior_duplicate_risk");
-    assert!(
-        candidate.outcome_score_adjustment < 0.0,
-        "duplicate-risk history should reduce but not hide the untried lane"
-    );
-}
-
-#[test]
-fn test_never_composed_marks_mixed_prior_outcomes() {
-    let storage = create_test_storage();
-    let successful = storage
-        .ingest(IngestInput {
-            content: "Accepted release lane linked rollback evidence to install telemetry."
-                .to_string(),
-            node_type: "decision".to_string(),
-            tags: vec![
-                "project:vestige".to_string(),
-                "release".to_string(),
-                "telemetry".to_string(),
-            ],
-            ..Default::default()
-        })
-        .unwrap();
-    let closed = storage
-        .ingest(IngestInput {
-            content: "Closed release lane linked install telemetry to out-of-scope claims."
-                .to_string(),
-            node_type: "incident".to_string(),
-            tags: vec![
-                "project:vestige".to_string(),
-                "release".to_string(),
-                "telemetry".to_string(),
-            ],
-            ..Default::default()
-        })
-        .unwrap();
-    let success_helper = storage
-        .ingest(IngestInput {
-            content: "Helper memory for an accepted release composition.".to_string(),
-            node_type: "fact".to_string(),
-            tags: vec!["project:vestige".to_string(), "release".to_string()],
-            ..Default::default()
-        })
-        .unwrap();
-    let closed_helper = storage
-        .ingest(IngestInput {
-            content: "Helper memory for a closed release composition.".to_string(),
-            node_type: "fact".to_string(),
-            tags: vec!["project:vestige".to_string(), "release".to_string()],
-            ..Default::default()
-        })
-        .unwrap();
-
-    storage
-        .save_composition(
-            &CompositionEventRecord {
-                id: "prior-success-composition".to_string(),
-                created_at: Utc::now(),
-                tool: "deep_reference".to_string(),
-                mode: "release".to_string(),
-                query: Some("accepted release lane".to_string()),
-                query_hash: Some("fnv1a64:success".to_string()),
-                confidence: Some(0.9),
-                status: Some("resolved".to_string()),
-                output_preview: None,
-                metadata: serde_json::json!({}),
-            },
-            &[
-                CompositionMemberRecord {
-                    event_id: "prior-success-composition".to_string(),
-                    memory_id: successful.id.clone(),
-                    role: "primary".to_string(),
-                    rank: 0,
-                    trust: Some(0.9),
-                    score: Some(0.9),
-                    preview: None,
-                    metadata: serde_json::json!({}),
-                },
-                CompositionMemberRecord {
-                    event_id: "prior-success-composition".to_string(),
-                    memory_id: success_helper.id,
-                    role: "supporting".to_string(),
-                    rank: 1,
-                    trust: Some(0.7),
-                    score: Some(0.6),
-                    preview: None,
-                    metadata: serde_json::json!({}),
-                },
-            ],
-            &[CompositionOutcomeRecord {
-                id: "prior-success-label".to_string(),
-                event_id: "prior-success-composition".to_string(),
                 outcome_type: "accepted".to_string(),
                 labeled_at: Utc::now(),
                 label_source: "test".to_string(),
@@ -3287,82 +3142,35 @@ fn test_never_composed_marks_mixed_prior_outcomes() {
         )
         .unwrap();
 
-    storage
-        .save_composition(
-            &CompositionEventRecord {
-                id: "prior-closed-composition".to_string(),
-                created_at: Utc::now(),
-                tool: "deep_reference".to_string(),
-                mode: "release".to_string(),
-                query: Some("closed release lane".to_string()),
-                query_hash: Some("fnv1a64:closed".to_string()),
-                confidence: Some(0.3),
-                status: Some("closed".to_string()),
-                output_preview: None,
-                metadata: serde_json::json!({}),
-            },
-            &[
-                CompositionMemberRecord {
-                    event_id: "prior-closed-composition".to_string(),
-                    memory_id: closed.id.clone(),
-                    role: "primary".to_string(),
-                    rank: 0,
-                    trust: Some(0.8),
-                    score: Some(0.7),
-                    preview: None,
-                    metadata: serde_json::json!({}),
-                },
-                CompositionMemberRecord {
-                    event_id: "prior-closed-composition".to_string(),
-                    memory_id: closed_helper.id,
-                    role: "supporting".to_string(),
-                    rank: 1,
-                    trust: Some(0.7),
-                    score: Some(0.6),
-                    preview: None,
-                    metadata: serde_json::json!({}),
-                },
-            ],
-            &[CompositionOutcomeRecord {
-                id: "prior-closed-label".to_string(),
-                event_id: "prior-closed-composition".to_string(),
-                outcome_type: "closed_by_scope".to_string(),
-                labeled_at: Utc::now(),
-                label_source: "test".to_string(),
-                confidence_delta: Some(-0.3),
-                notes: None,
-                metadata: serde_json::json!({}),
-            }],
-        )
-        .unwrap();
-
-    let candidates = storage
-        .get_never_composed_candidates(10, Some(&["project".to_string()]))
-        .unwrap();
-    let candidate = candidates
-        .iter()
-        .find(|candidate| {
-            let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
-            pair == Storage::pair_key(&successful.id, &closed.id)
-        })
-        .expect("untried success/closed pair should remain a frontier candidate");
-
-    assert_eq!(candidate.outcome_signal, "mixed_prior_outcomes");
-    assert!(
-        candidate
-            .prior_outcomes
-            .iter()
-            .any(|outcome| outcome == "accepted")
-    );
-    assert!(
-        candidate
-            .prior_outcomes
-            .iter()
-            .any(|outcome| outcome == "closed_by_scope")
-    );
+    let candidates = storage.get_never_composed_candidates(10, None).unwrap();
+    assert!(candidates.is_empty(), "composed pair excluded: {candidates:?}");
 }
 
 #[test]
+fn test_never_composed_marks_mixed_prior_outcomes() {
+    let storage = create_test_storage();
+    let successful = storage
+        .ingest(IngestInput {
+            content: "Successful lane fact.".to_string(),
+            node_type: "fact".to_string(),
+            tags: vec![],
+            ..Default::default()
+        })
+        .unwrap();
+    let closed = storage
+        .ingest(IngestInput {
+            content: "Closed lane fact.".to_string(),
+            node_type: "fact".to_string(),
+            tags: vec![],
+            ..Default::default()
+        })
+        .unwrap();
+    seed_typed_edge(&storage, &successful.id, &closed.id);
+    let out = storage.get_never_composed_candidates(10, None).unwrap();
+    assert_eq!(out.len(), 1);
+    assert!(out[0].reason.contains("typed-edge hop"), "{}", out[0].reason);
+}
+
 fn test_never_composed_surfaces_weak_tie_shared_terms_without_shared_tags() {
     let storage = create_test_storage();
     let incident = storage

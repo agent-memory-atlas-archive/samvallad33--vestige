@@ -1184,6 +1184,73 @@ pub struct NeverComposedCandidate {
 }
 
 impl SqliteMemoryStore {
+    /// Adjacency over recorded typed causal edges (both directions treated
+    /// as undirected hops for never-composed proximity; admission-relevant
+    /// types only — never inferred, never similarity).
+    fn typed_edge_adjacency(
+        &self,
+        link_types: &[&str],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let placeholders = link_types
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT source_id, target_id FROM memory_connections WHERE link_type IN ({placeholders})"
+        );
+        let mut stmt = reader.prepare(&sql)?;
+        let mut map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let rows = stmt.query_map(rusqlite::params_from_iter(link_types.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            let (s, t) = r?;
+            map.entry(s.clone()).or_default().push(t.clone());
+            map.entry(t).or_default().push(s);
+        }
+        Ok(map)
+    }
+
+    /// For every pool node, hop distances (1..=max) to every other pool node
+    /// over the given adjacency. Deterministic, cycle-safe.
+    fn hop_distances(
+        adjacency: &std::collections::HashMap<String, Vec<String>>,
+        pool: &std::collections::HashSet<&str>,
+        max: usize,
+    ) -> std::collections::HashMap<String, std::collections::HashMap<String, usize>> {
+        let mut out = std::collections::HashMap::new();
+        for start in pool {
+            let mut dist: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            let mut frontier = vec![(*start).to_string()];
+            for depth in 1..=max {
+                if frontier.is_empty() {
+                    break;
+                }
+                let mut next = Vec::new();
+                for node in &frontier {
+                    for nb in adjacency.get(node).into_iter().flatten() {
+                        if nb != start && !dist.contains_key(nb) {
+                            dist.insert(nb.clone(), depth);
+                            next.push(nb.clone());
+                        }
+                    }
+                }
+                frontier = next;
+            }
+            // keep only in-pool targets
+            dist.retain(|k, _| pool.contains(k.as_str()));
+            out.insert((*start).to_string(), dist);
+        }
+        out
+    }
+
     /// Scope candidates before either the recent or tag-targeted scan budget.
     /// None is an explicit cross-scope request; callers choose their boundary.
     pub fn get_never_composed_candidates_in_scope(
@@ -1198,20 +1265,15 @@ impl SqliteMemoryStore {
         let composition_degrees = self.composition_degree_map()?;
         let outcome_map = self.composition_outcome_map()?;
 
-        // SEMANTIC-BAND GATE (the composition generativity unlock): load embeddings so a pair
-        // that shares NO literal tag/word but lives in the "distant-but-relatable" cosine band
-        // can still surface as a never-composed insight — exactly the non-obvious combination
-        // a keyword/exact-overlap gate (and cosine-NN search) can never return. The band excludes
-        // near-duplicates (>= 0.85, those are the same idea) and unrelated noise (< 0.45).
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        let embedding_map: std::collections::HashMap<String, Vec<f32>> = self
-            .get_all_embeddings()
-            .map(|v| v.into_iter().collect())
-            .unwrap_or_default();
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        const COMPOSE_BAND_LO: f32 = 0.45;
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        const COMPOSE_BAND_HI: f32 = 0.85;
+        // GhostLink admission (2026-09-28 ruling): pairs come ONLY from
+        // recorded causal-edge hops — touched / derived_from / closed_by.
+        // No tag admission, no term admission, no similarity of any kind.
+        // With no typed edges in scope this returns NOTHING rather than
+        // falling back on shared words.
+        let typed_adjacency = self.typed_edge_adjacency(&["touched", "derived_from", "closed_by"])?;
+        let pool_ids: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        // hop-distance map over the pool (BFS depth <= 3, cycle-safe)
+        let hop_map = Self::hop_distances(&typed_adjacency, &pool_ids, 3);
 
         let mut candidates = Vec::new();
 
@@ -1231,84 +1293,39 @@ impl SqliteMemoryStore {
                     continue;
                 }
 
+                // Edge-hop admission only: b must be reachable from a within
+                // MAX hops over recorded typed edges. Shared words prove nothing.
+                let hops = match hop_map.get(&a.id).and_then(|m| m.get(&b.id)) {
+                    Some(h) => *h,
+                    None => continue,
+                };
+
                 let shared_tags = Self::shared_tags(&a.tags, &b.tags);
                 let shared_terms = Self::shared_content_terms(&a.content, &b.content, 8);
-
-                // Semantic-band cosine: lets a pair with NO shared surface tokens but a
-                // related MEANING through the gate (the generative cross-domain combination).
-                #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-                let band_cos: Option<f32> =
-                    match (embedding_map.get(&a.id), embedding_map.get(&b.id)) {
-                        (Some(ea), Some(eb)) => {
-                            let c = crate::embeddings::cosine_similarity(ea, eb);
-                            if (COMPOSE_BAND_LO..COMPOSE_BAND_HI).contains(&c) {
-                                Some(c)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    };
-                #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
-                let band_cos: Option<f32> = None;
-
-                // Admit the pair if it shares surface signal OR it sits in the semantic band.
-                if shared_tags.is_empty() && shared_terms.is_empty() && band_cos.is_none() {
-                    continue;
-                }
-
                 let boundary_tags = Self::boundary_tags_for_pair(&a.tags, &b.tags);
                 let trust_score =
                     ((a.retention_strength + b.retention_strength) / 2.0).clamp(0.0, 1.0);
                 let degree_a = composition_degrees.get(&a.id).copied().unwrap_or(0) as f64;
                 let degree_b = composition_degrees.get(&b.id).copied().unwrap_or(0) as f64;
                 let novelty_score = ((1.0 / (1.0 + degree_a)) + (1.0 / (1.0 + degree_b))) / 2.0;
-                let bridge_score = Self::composition_bridge_score(
-                    a,
-                    b,
-                    &shared_tags,
-                    &shared_terms,
-                    &boundary_tags,
-                );
-                let anchor_score =
-                    (shared_tags.len() as f64 * 0.45) + (shared_terms.len().min(5) as f64 * 0.25);
-                // Semantic-band pairs (no surface overlap) get an anchor from cosine so they
-                // clear the cutoff: a mid-band 0.45-0.85 meaning-match is a strong compose signal.
-                let band_anchor = band_cos
-                    .map(|c| 1.0 + (c as f64 - 0.45) * 2.0)
-                    .unwrap_or(0.0);
+                // proximity from the causal graph replaces the old anchor score:
+                // closer hops rank higher, purely structural
+                let bridge_score = 1.0 / hops as f64;
+                let anchor_score = 1.5 + bridge_score;
                 let prior_outcomes = Self::pair_prior_outcomes(&outcome_map, &a.id, &b.id);
                 let outcome_signal = Self::outcome_signal(&prior_outcomes);
                 let outcome_score_adjustment = Self::outcome_score_adjustment(&prior_outcomes);
                 let score = anchor_score
-                    + band_anchor
                     + (bridge_score * 2.0)
                     + (novelty_score * 1.5)
                     + trust_score
                     + outcome_score_adjustment;
-                if score < 1.6 {
-                    continue;
-                }
 
-                let reason = if !boundary_tags.is_empty() {
-                    format!(
-                        "Untried bridge across {} with {}",
-                        boundary_tags.join(", "),
-                        Self::anchor_summary(&shared_tags, &shared_terms)
-                    )
-                } else if a.node_type != b.node_type {
-                    format!(
-                        "Untried {} -> {} composition with {}",
-                        a.node_type,
-                        b.node_type,
-                        Self::anchor_summary(&shared_tags, &shared_terms)
-                    )
-                } else {
-                    format!(
-                        "Never composed despite {}",
-                        Self::anchor_summary(&shared_tags, &shared_terms)
-                    )
-                };
+                let reason = format!(
+                    "Connected by {} typed-edge hop{} but never composed",
+                    hops,
+                    if hops == 1 { "" } else { "s" }
+                );
                 let composition_question =
                     Self::composition_question(a, b, &shared_tags, &shared_terms, &boundary_tags);
                 candidates.push(NeverComposedCandidate {
@@ -2477,7 +2494,6 @@ mod write_transaction_policy {
         ("sqlite/mod.rs", include_str!("mod.rs")),
         ("sqlite/admin.rs", include_str!("admin.rs")),
         ("sqlite/connectors.rs", include_str!("connectors.rs")),
-        ("sqlite/embeddings.rs", include_str!("embeddings.rs")),
         ("sqlite/ingest.rs", include_str!("ingest.rs")),
         ("sqlite/lifecycle.rs", include_str!("lifecycle.rs")),
         ("sqlite/merge.rs", include_str!("merge.rs")),

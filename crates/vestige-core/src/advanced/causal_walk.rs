@@ -1157,6 +1157,9 @@ mod tests {
             extra_files: 0,
             symbols: symbols.iter().map(|s| s.to_string()).collect(),
             mentions: mentions.iter().map(|m| m.to_string()).collect(),
+                hunks: vec![],
+                extra_hunks: 0,
+                imports: vec![],
         });
         seed(storage, &content, vec![git_records::COMMIT_TAG], days_ago)
     }
@@ -1585,6 +1588,9 @@ mod tests {
             extra_files: 2,
             symbols: vec!["src/f0.rs/handler_0".into()],
             mentions: vec!["API_TIMEOUT".into()],
+                hunks: vec![],
+                extra_hunks: 0,
+                imports: vec![],
         });
         assert_eq!(commit_sha_of(&content), Some(sha_of('1')));
         assert_eq!(commit_sha_of("not a commit record"), None);
