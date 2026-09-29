@@ -1294,7 +1294,7 @@ impl StrataStore {
     pub(crate) fn review_events(&self) -> Vec<ReviewEvent> {
         self.review_events
             .iter()
-            .map(|(_, _, event)| event.clone())
+            .map(|(_, _, event)| *event)
             .collect()
     }
 
