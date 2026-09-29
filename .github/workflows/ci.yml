@@ -106,6 +106,9 @@ jobs:
       - name: Clippy strata-migrate (all features, warnings are errors)
         run: cargo clippy --manifest-path crates/strata-migrate/Cargo.toml -p strata-migrate --all-features -- -D warnings
 
+      - name: Clippy strata-migrate without sqlite-reader (how strata-verify links it)
+        run: cargo clippy --manifest-path crates/strata-migrate/Cargo.toml -p strata-migrate --no-default-features -- -D warnings
+
       - name: Test
         run: cargo test --workspace
 
@@ -125,6 +128,18 @@ jobs:
         run: cargo test --manifest-path crates/strata-verify/Cargo.toml
       - name: Test strata-store
         run: cargo test --manifest-path crates/strata-store/Cargo.toml
+
+      - name: Test the strata log, kernel and gate crates (workspace-excluded)
+        run: |
+          cargo test --manifest-path crates/strata/Cargo.toml
+          cargo test --manifest-path crates/strata-kernel/Cargo.toml
+          cargo test --manifest-path crates/strata-gate/Cargo.toml
+
+      - name: Clippy every workspace-excluded strata crate (warnings are errors)
+        run: |
+          for crate in strata strata-kernel strata-gate strata-store strata-verify; do
+            cargo clippy --manifest-path "crates/$crate/Cargo.toml" --all-targets -- -D warnings
+          done
 
       - name: Test paid cloud-sync path
         # `cloud_sync` is cfg'd on cloud-sync AND legacy-sqlite. The sqlite
