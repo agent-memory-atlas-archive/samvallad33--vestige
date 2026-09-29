@@ -462,7 +462,12 @@ mod tests {
     /// contents trivially share their full token set.
     #[test]
     fn score_pair_identical_content_untagged() {
-        let s = score_pair(&[], &[], "deploy the gateway before Friday", "deploy the gateway before Friday");
+        let s = score_pair(
+            &[],
+            &[],
+            "deploy the gateway before Friday",
+            "deploy the gateway before Friday",
+        );
         assert!((s.token_overlap - 1.0).abs() < 1e-6);
         assert!((s.combined_score - W_TOKENS).abs() < 1e-6);
         // Tag overlap contributes nothing when neither side is tagged.

@@ -54,27 +54,74 @@ pub const MIN_SHARED_ENTITIES: usize = 1;
 /// Words that mark a memory as a failure/"aversive" event when auto-detecting.
 /// Lowercased substring match against content + tags.
 pub const FAILURE_MARKERS: &[&str] = &[
-    "error", "bug", "crash", "crashed", "regression", "broke", "broken",
-    "failure", "failed", "panic", "exception", "fault", "outage", "incident",
+    "error",
+    "bug",
+    "crash",
+    "crashed",
+    "regression",
+    "broke",
+    "broken",
+    "failure",
+    "failed",
+    "panic",
+    "exception",
+    "fault",
+    "outage",
+    "incident",
     // NOTE: bare "500" was removed — it matched benign content like "$500",
     // "500 users", or "line 500" and wrongly flagged a quiet CAUSE memory as a
     // failure, excluding it from the backward reach. The specific HTTP error
     // codes 502/503/504 below stay; a genuine "HTTP 500" is still caught by
     // "error"/"failed"/"exception" in any real incident note.
-    "timeout", "deadlock", "leak", "corrupt", "stack overflow",
+    "timeout",
+    "deadlock",
+    "leak",
+    "corrupt",
+    "stack overflow",
     // performance/degradation failures (an agent should backfill from these too)
-    "spiked", "latency", "degraded", "slow", "hang", "hung", "throttled",
-    "oom", "502", "503", "504", "rejected", "denied", "flaky",
+    "spiked",
+    "latency",
+    "degraded",
+    "slow",
+    "hang",
+    "hung",
+    "throttled",
+    "oom",
+    "502",
+    "503",
+    "504",
+    "rejected",
+    "denied",
+    "flaky",
     // real-incident vocabulary (CauseBench found these missing — postmortems often
     // describe failures without the classic crash words above)
     // NOTE: bare "pinned" was removed — dependency pinning ("pinned rails to
     // 5.2") is classic quiet-CAUSE vocabulary; flagging such notes as failures
     // excludes them from the backward reach, the same failure mode that got
     // bare "500" removed above.
-    "saturated", "saturation", "stalled", "exhausted", "exhaustion",
-    "overload", "overloaded", "backlog", "fell behind", "lag", "lagging",
-    "unavailable", "down", "dropped", "reset", "refused", "stampede",
-    "thrashing", "starved", "starvation", "expired", "expiry", "overflow",
+    "saturated",
+    "saturation",
+    "stalled",
+    "exhausted",
+    "exhaustion",
+    "overload",
+    "overloaded",
+    "backlog",
+    "fell behind",
+    "lag",
+    "lagging",
+    "unavailable",
+    "down",
+    "dropped",
+    "reset",
+    "refused",
+    "stampede",
+    "thrashing",
+    "starved",
+    "starvation",
+    "expired",
+    "expiry",
+    "overflow",
 ];
 
 /// How strongly to promote the backfilled cause: multiply its stability by this
@@ -226,7 +273,11 @@ pub fn identifier_tier(tok: &str) -> Option<IdentifierTier> {
         let is_path = segs.len() >= 2
             && segs.iter().any(|x| x.len() >= 3)
             && tok.chars().any(|c| c.is_ascii_alphabetic());
-        return if is_path { Some(IdentifierTier::Path) } else { None };
+        return if is_path {
+            Some(IdentifierTier::Path)
+        } else {
+            None
+        };
     }
     // UPPER_SNAKE env var: underscore REQUIRED so emphasis (VERIFIED, SHIPPED)
     // is not harvested as an env var.
@@ -285,14 +336,24 @@ pub fn extract_entities(content: &str, tags: &[String]) -> Vec<String> {
         .iter()
         .map(|t| t.trim())
         .filter(|t| is_identifier_shaped(t))
-        .map(|t| if is_camel_token(t) { camel_to_snake(t) } else { t.to_lowercase() })
+        .map(|t| {
+            if is_camel_token(t) {
+                camel_to_snake(t)
+            } else {
+                t.to_lowercase()
+            }
+        })
         .collect();
-    for raw in content.split(|c: char| {
-        !(c.is_alphanumeric() || c == '_' || c == '.' || c == '/' || c == '-')
-    }) {
+    for raw in content
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '/' || c == '-'))
+    {
         let tok = raw.trim_matches(|c: char| c == '.' || c == '/' || c == '-');
         if is_identifier_shaped(tok) {
-            set.insert(if is_camel_token(tok) { camel_to_snake(tok) } else { tok.to_lowercase() });
+            set.insert(if is_camel_token(tok) {
+                camel_to_snake(tok)
+            } else {
+                tok.to_lowercase()
+            });
         }
     }
     set.into_iter().collect()
@@ -335,7 +396,10 @@ fn contains_marker_word(hay: &str, marker: &str) -> bool {
 /// Shared by every caller so failure detection never drifts.
 pub fn looks_like_failure(content: &str, tags: &[String]) -> bool {
     let hay = content.to_lowercase();
-    if FAILURE_MARKERS.iter().any(|m| contains_marker_word(&hay, m)) {
+    if FAILURE_MARKERS
+        .iter()
+        .any(|m| contains_marker_word(&hay, m))
+    {
         return true;
     }
     tags.iter().any(|t| {
@@ -491,8 +555,7 @@ impl RetroactiveBackfill {
             };
         }
 
-        let failure_entities: HashSet<&str> =
-            failure.entities.iter().map(|s| s.as_str()).collect();
+        let failure_entities: HashSet<&str> = failure.entities.iter().map(|s| s.as_str()).collect();
 
         // Inverse document frequency over the IN-WINDOW pool: an entity that
         // nearly every record carries (issue-template paths, the product's own
@@ -523,15 +586,13 @@ impl RetroactiveBackfill {
             ((1.0 + n as f64) / (1.0 + d)).ln().max(0.0) * normalized_tier(e).weight()
         };
 
-
         let mut rejected: Vec<RejectedCandidate> = Vec::new();
-        let note_supersession =
-            |c: &BackfillCandidate, reason: String| -> String {
-                match &c.via_supersession_of {
-                    Some(orig) => format!("{reason} Trail followed the supersession of {orig}."),
-                    None => reason,
-                }
-            };
+        let note_supersession = |c: &BackfillCandidate, reason: String| -> String {
+            match &c.via_supersession_of {
+                Some(orig) => format!("{reason} Trail followed the supersession of {orig}."),
+                None => reason,
+            }
+        };
 
         let mut scored: Vec<BackfilledCause> = candidates
             .iter()
@@ -617,15 +678,21 @@ impl RetroactiveBackfill {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 // near-ties: the change, not the newest report about it
                 .then(b.is_change_record.cmp(&a.is_change_record))
-                .then(a.age_days.partial_cmp(&b.age_days).unwrap_or(std::cmp::Ordering::Equal))
+                .then(
+                    a.age_days
+                        .partial_cmp(&b.age_days)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
         });
         scored.truncate(self.max_causes);
 
         // strongest rejections first: most shared entities, then most recent
         rejected.sort_by(|a, b| {
-            b.shared_entities
-                .cmp(&a.shared_entities)
-                .then(a.age_days.partial_cmp(&b.age_days).unwrap_or(std::cmp::Ordering::Equal))
+            b.shared_entities.cmp(&a.shared_entities).then(
+                a.age_days
+                    .partial_cmp(&b.age_days)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
         });
         rejected.truncate(self.max_rejections);
 
@@ -657,13 +724,22 @@ impl RetroactiveBackfill {
                     .filter(|e| !window_entities.contains(e.as_str()))
                     .cloned()
                     .collect();
-                let shown = missing.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                let shown = missing
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 Some(BackfillGap {
                     missing_entities: missing,
                     note: format!(
                         "No record within {}d shares any of the failure's entities ({}). A commit or note touching one of those inside the window would close this trail.",
                         self.lookback_days,
-                        if shown.is_empty() { "(the failure names no entities)" } else { &shown }
+                        if shown.is_empty() {
+                            "(the failure names no entities)"
+                        } else {
+                            &shown
+                        }
                     ),
                 })
             }
@@ -686,17 +762,16 @@ impl RetroactiveBackfill {
     /// weak recency term, and the change-record bonus. Embedding similarity is
     /// NOT an input — not to pull lookalikes in, and not to push them away: a
     /// dissimilarity bonus would make this vector search with the sign flipped.
-    fn score(
-        &self,
-        c: &BackfillCandidate,
-        shared: &[String],
-        idf: &impl Fn(&str) -> f64,
-    ) -> f64 {
+    fn score(&self, c: &BackfillCandidate, shared: &[String], idf: &impl Fn(&str) -> f64) -> f64 {
         let entity_term: f64 = shared.iter().map(|e| idf(e)).sum();
         // gentle recency-in-the-past: 1.0 at the failure, fading with age
         let recency_term =
             0.3 * (1.0 / (1.0 + c.age_days_before_failure / self.lookback_days as f64));
-        let change_term = if c.is_change_record { CHANGE_RECORD_BONUS } else { 0.0 };
+        let change_term = if c.is_change_record {
+            CHANGE_RECORD_BONUS
+        } else {
+            0.0
+        };
         entity_term + recency_term + change_term
     }
 }
@@ -735,7 +810,7 @@ mod tests {
                 age_days_before_failure: 3.0,
                 stability: 5.0,
                 via_supersession_of: None,
-            is_change_record: false,
+                is_change_record: false,
             },
             // a noisy distractor: semantically similar to the crash, but NOT causal
             // (shares no entity with the failure).
@@ -746,7 +821,7 @@ mod tests {
                 age_days_before_failure: 20.0,
                 stability: 3.0,
                 via_supersession_of: None,
-            is_change_record: false,
+                is_change_record: false,
             },
             // a future memory — must never be backfilled (backward-only).
             BackfillCandidate {
@@ -756,18 +831,24 @@ mod tests {
                 age_days_before_failure: -1.0,
                 stability: 2.0,
                 via_supersession_of: None,
-            is_change_record: false,
+                is_change_record: false,
             },
         ];
 
         let result = RetroactiveBackfill::new().run(&failure(), &candidates);
 
-        assert!(result.triggered, "high-PE failure with markers must trigger");
+        assert!(
+            result.triggered,
+            "high-PE failure with markers must trigger"
+        );
         assert!(!result.causes.is_empty(), "must surface at least one cause");
 
         let top = &result.causes[0];
         // the promoted memory is the real cause, not the similar distractor
-        assert_eq!(top.memory_id, "cause-mon", "must promote the causal env-var note");
+        assert_eq!(
+            top.memory_id, "cause-mon",
+            "must promote the causal env-var note"
+        );
         assert!(top.shared_entities.contains(&"API_TIMEOUT".to_string()));
         // the similar distractor must not be surfaced at all: it shares no anchor
         assert!(
@@ -780,7 +861,10 @@ mod tests {
             "backward-only: a future memory must never be backfilled"
         );
         // it gets a real stability boost (stops decaying, will surface next time)
-        assert!(top.promoted_stability > 5.0, "the cause must be promoted (boosted stability)");
+        assert!(
+            top.promoted_stability > 5.0,
+            "the cause must be promoted (boosted stability)"
+        );
     }
 
     /// extract_entities had NO test exercising it on realistic prose -- every
@@ -813,7 +897,10 @@ mod tests {
             "com.vestige.core/backups",
             "sqlite.rs",
         ] {
-            assert!(ents.iter().any(|e| e == want), "missing entity {want:?}: {ents:?}");
+            assert!(
+                ents.iter().any(|e| e == want),
+                "missing entity {want:?}: {ents:?}"
+            );
         }
         // Bare words >= 4 chars ARE now join keys (Word tier, 0.3x weight +
         // rarity-weighted): a named suspect like `purge` must never be
@@ -852,7 +939,10 @@ mod tests {
             manual: false,
         };
         let result = RetroactiveBackfill::new().run(&calm, &[]);
-        assert!(!result.triggered, "a calm, low-surprise note must not fire a backfill");
+        assert!(
+            !result.triggered,
+            "a calm, low-surprise note must not fire a backfill"
+        );
     }
 
     #[test]
@@ -872,11 +962,14 @@ mod tests {
             entities: vec!["checkout".into()],
             age_days_before_failure: 2.0,
             stability: 4.0,
-                via_supersession_of: None,
+            via_supersession_of: None,
             is_change_record: false,
         }];
         let result = RetroactiveBackfill::new().run(&manual, &candidates);
-        assert!(result.triggered, "manual override must trigger regardless of markers/PE");
+        assert!(
+            result.triggered,
+            "manual override must trigger regardless of markers/PE"
+        );
         assert_eq!(result.causes[0].memory_id, "cause");
     }
 
@@ -890,7 +983,7 @@ mod tests {
             entities: vec!["README".into()],
             age_days_before_failure: 1.0,
             stability: 4.0,
-                via_supersession_of: None,
+            via_supersession_of: None,
             is_change_record: false,
         }];
         let result = RetroactiveBackfill::new().run(&failure(), &candidates);
@@ -925,7 +1018,7 @@ mod tests {
                 age_days_before_failure: -2.0,
                 stability: 4.0,
                 via_supersession_of: None,
-            is_change_record: false,
+                is_change_record: false,
             },
             // too old for the window
             BackfillCandidate {
@@ -935,7 +1028,7 @@ mod tests {
                 age_days_before_failure: 90.0,
                 stability: 4.0,
                 via_supersession_of: None,
-            is_change_record: false,
+                is_change_record: false,
             },
             // in-window but shares nothing
             BackfillCandidate {
@@ -945,7 +1038,7 @@ mod tests {
                 age_days_before_failure: 1.0,
                 stability: 4.0,
                 via_supersession_of: None,
-            is_change_record: false,
+                is_change_record: false,
             },
         ];
         let result =
@@ -957,7 +1050,11 @@ mod tests {
             .map(|r| (r.memory_id.as_str(), r.reason.as_str()))
             .collect();
         assert!(reasons.contains(&("later-fix", "record is newer than the failure")));
-        assert!(reasons.iter().any(|(id, r)| *id == "ancient" && r.contains("lookback")));
+        assert!(
+            reasons
+                .iter()
+                .any(|(id, r)| *id == "ancient" && r.contains("lookback"))
+        );
         assert!(reasons.contains(&("unrelated", "shares no entity with the failure")));
         // the skeptic's first question gets the direct answer: the entity-sharing
         // record outranks the truly unrelated one in the why-not list
@@ -979,8 +1076,15 @@ mod tests {
         let result =
             RetroactiveBackfill::new().run_trail(&failure_with_entities(), &candidates, &[]);
         let gap = result.gap.expect("empty causes must produce a gap report");
-        assert!(gap.missing_entities.contains(&"events/local.py".to_string()));
-        assert!(gap.note.contains("local.py"), "note names the entity: {}", gap.note);
+        assert!(
+            gap.missing_entities
+                .contains(&"events/local.py".to_string())
+        );
+        assert!(
+            gap.note.contains("local.py"),
+            "note names the entity: {}",
+            gap.note
+        );
         assert!(gap.note.contains("would close this trail"));
     }
 
@@ -1024,8 +1128,10 @@ mod tests {
         });
 
         let result = RetroactiveBackfill::new().run(&failure, &candidates);
-        assert_eq!(result.causes[0].memory_id, "cause",
-            "the rare shared identifier must outrank two boilerplate matches");
+        assert_eq!(
+            result.causes[0].memory_id, "cause",
+            "the rare shared identifier must outrank two boilerplate matches"
+        );
         assert!(result.causes[0].is_change_record);
     }
 
@@ -1167,7 +1273,10 @@ mod tests {
     fn dependency_pinning_is_not_a_failure_marker() {
         // "pinned" was removed from FAILURE_MARKERS: pinning a dependency is
         // quiet-CAUSE vocabulary and must stay reachable by the backward reach.
-        assert!(!looks_like_failure("pinned rails to 5.2 for the tz workaround", &[]));
+        assert!(!looks_like_failure(
+            "pinned rails to 5.2 for the tz workaround",
+            &[]
+        ));
         // real incident vocabulary still detected
         assert!(looks_like_failure("connection pool saturated at 100%", &[]));
     }
@@ -1187,14 +1296,18 @@ mod tests {
             candidate,
             reason: "outside version range 1.41.0..1.42.1".into(),
         }];
-        let result =
-            RetroactiveBackfill::new().run_trail(&failure_with_entities(), &[], &excluded);
+        let result = RetroactiveBackfill::new().run_trail(&failure_with_entities(), &[], &excluded);
         assert!(result.causes.is_empty());
         assert_eq!(result.rejected.len(), 1);
         assert_eq!(result.rejected[0].memory_id, "commit-x");
-        assert_eq!(result.rejected[0].reason, "outside version range 1.41.0..1.42.1");
+        assert_eq!(
+            result.rejected[0].reason,
+            "outside version range 1.41.0..1.42.1"
+        );
         // a match existed but was excluded: the gap says so instead of "missing"
-        let gap = result.gap.expect("excluded match must still report the break");
+        let gap = result
+            .gap
+            .expect("excluded match must still report the break");
         assert!(gap.missing_entities.is_empty());
         assert!(gap.note.contains("excluded"), "{}", gap.note);
     }

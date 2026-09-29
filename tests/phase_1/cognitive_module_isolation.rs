@@ -77,7 +77,10 @@ async fn all_modules_compile_against_dyn_store() {
     let count = store.count().await.expect("count via dyn trait");
     assert!(count >= 2);
 
-    let stats = store.get_store_stats().await.expect("get_stats via dyn trait");
+    let stats = store
+        .get_store_stats()
+        .await
+        .expect("get_stats via dyn trait");
     assert!(stats.total_memories >= 2);
 }
 

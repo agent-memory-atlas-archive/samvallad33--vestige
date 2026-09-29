@@ -8,9 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::log::{EventLog, hash32};
-use crate::record::{
-    ActionKindCode, EffectRecord, GateError, Propose, RecordKind,
-};
+use crate::record::{ActionKindCode, EffectRecord, GateError, Propose, RecordKind};
 
 /// Lessons with retention (ms) below this floor count as forgotten and enter
 /// `GateInputs.forgotten_lessons` (30 days in milliseconds).
@@ -96,7 +94,10 @@ pub fn compute_inputs(log: &dyn EventLog, propose_seq: u64) -> Result<GateInputs
     Ok(GateInputs {
         live_facts_digest: digest_ids(&live_ids),
         retired_facts_digest: digest_ids(&retired_ids),
-        blast_radius: BlastRadius { closure_size, tiers },
+        blast_radius: BlastRadius {
+            closure_size,
+            tiers,
+        },
         forgotten_lessons: lessons.into_iter().collect(),
         canary_hits,
     })

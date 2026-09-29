@@ -64,15 +64,16 @@ impl SqliteMemoryStore {
                 .reader
                 .lock()
                 .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
-            reader.prepare(
-                "SELECT id FROM knowledge_nodes
+            reader
+                .prepare(
+                    "SELECT id FROM knowledge_nodes
                  WHERE COALESCE(NULLIF(trim(scope),''),'user') = ?1
                    AND COALESCE(suppression_count,0) = 0
                    AND superseded_by IS NULL
                  ORDER BY retention_strength DESC, id ASC LIMIT ?2",
-            )?
-            .query_map(params![scope, limit as i64], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?
+                )?
+                .query_map(params![scope, limit as i64], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
         };
         let mut nodes = Vec::with_capacity(ids.len());
         for id in ids {

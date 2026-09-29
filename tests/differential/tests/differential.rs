@@ -10,7 +10,12 @@ use vestige_differential_tests::{Op, Script, gen_script, run_sqlite, run_strata}
 fn fixed_script() -> Script {
     let ingest = |i: usize| Op::Ingest {
         content: format!("fixed differential node {i}"),
-        node_type: if i.is_multiple_of(2) { "fact" } else { "decision" }.to_string(),
+        node_type: if i.is_multiple_of(2) {
+            "fact"
+        } else {
+            "decision"
+        }
+        .to_string(),
         tags: vec!["fixed".to_string(), format!("n{i}")],
     };
     Script {

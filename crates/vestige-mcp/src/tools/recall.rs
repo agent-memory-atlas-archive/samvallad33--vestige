@@ -294,9 +294,9 @@ fn handle_resolution_payload(
     }
     // Nothing matched. The resolver's own message is more specific than the
     // generic detail when it was a too-short sha, so prefer it when present.
-    let detail = resolution.handle_required.unwrap_or_else(|| {
-        vestige_core::storage::HANDLE_REQUIRED_DETAIL.to_string()
-    });
+    let detail = resolution
+        .handle_required
+        .unwrap_or_else(|| vestige_core::storage::HANDLE_REQUIRED_DETAIL.to_string());
     serde_json::json!({
         "error": "handle_required",
         "detail": detail,
@@ -313,9 +313,11 @@ fn handle_required_payload(storage: &Arc<Storage>, free_text: &str) -> Value {
         // Whole string first, then each identifier-shaped token (bounded).
         let mut queries: Vec<&str> = vec![text];
         queries.extend(
-            text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '/' || c == '-'))
-                .filter(|t| t.len() >= 3)
-                .take(8),
+            text.split(|c: char| {
+                !(c.is_alphanumeric() || c == '_' || c == '.' || c == '/' || c == '-')
+            })
+            .filter(|t| t.len() >= 3)
+            .take(8),
         );
         for q in queries {
             let r = storage.resolve_handle(q);
@@ -527,7 +529,10 @@ mod tests {
         // Strongest edge first (causal 0.9 before temporal 0.4).
         assert_eq!(neighbors[0]["link_type"], "causal");
         assert_eq!(neighbors[0]["direction"], "outgoing");
-        assert!(neighbors[0]["node"].is_object(), "neighbor node payload included");
+        assert!(
+            neighbors[0]["node"].is_object(),
+            "neighbor node payload included"
+        );
         assert_eq!(neighbors[1]["link_type"], "temporal");
         assert_eq!(neighbors[1]["direction"], "incoming");
     }
@@ -585,8 +590,15 @@ mod tests {
             "detail must be the canonical guidance: {out}"
         );
         let candidates = out["candidates"].as_array().unwrap();
-        assert!(!candidates.is_empty(), "identifier token must yield candidates: {out}");
-        assert!(candidates.iter().all(|c| c["kind"] == "symbol" || c["kind"] == "memory"));
+        assert!(
+            !candidates.is_empty(),
+            "identifier token must yield candidates: {out}"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c["kind"] == "symbol" || c["kind"] == "memory")
+        );
         // Pure prose with no identifiers: the same error, empty candidates.
         let out = execute(
             &storage,

@@ -14,7 +14,7 @@
 //! bytes and therefore identical digests and receipt ids.
 
 use chrono::Utc;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
 use super::sqlite::{Result, SqliteMemoryStore, StorageError};
@@ -74,8 +74,9 @@ impl SqliteMemoryStore {
         }
         // The parsed envelope must round-trip to the same bytes; this also
         // rejects a canonical_json that is not valid JSON.
-        let parsed: Value = serde_json::from_str(canonical_json)
-            .map_err(|error| StorageError::Init(format!("canonical_json is not valid JSON: {error}")))?;
+        let parsed: Value = serde_json::from_str(canonical_json).map_err(|error| {
+            StorageError::Init(format!("canonical_json is not valid JSON: {error}"))
+        })?;
         if parsed != *params {
             return Err(StorageError::Init(
                 "canonical_json and params must encode the same value".into(),
@@ -168,9 +169,8 @@ impl SqliteMemoryStore {
             .reader
             .lock()
             .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
-        let total_nodes: i64 = reader.query_row("SELECT COUNT(*) FROM knowledge_nodes", [], |row| {
-            row.get(0)
-        })?;
+        let total_nodes: i64 =
+            reader.query_row("SELECT COUNT(*) FROM knowledge_nodes", [], |row| row.get(0))?;
         let anchored_nodes: i64 = reader.query_row(
             "SELECT COUNT(DISTINCT node_id) FROM code_memory_anchors",
             [],
@@ -182,7 +182,9 @@ impl SqliteMemoryStore {
              GROUP BY link_type ORDER BY link_type ASC",
         )?;
         let edge_counts: Vec<(String, u64)> = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
 
@@ -267,12 +269,18 @@ mod tests {
             "scope": "user"
         });
         let third = canonical_walk_json(&shuffled).unwrap();
-        assert_eq!(first, third, "key-order shuffle must not change the digest input");
+        assert_eq!(
+            first, third,
+            "key-order shuffle must not change the digest input"
+        );
         assert_eq!(walk_digest(&first), walk_digest(&third));
 
         // A genuinely different envelope must digest differently.
         let changed = json!({"scope": "user", "lookback_days": 31});
-        assert_ne!(walk_digest(&first), walk_digest(&canonical_walk_json(&changed).unwrap()));
+        assert_ne!(
+            walk_digest(&first),
+            walk_digest(&canonical_walk_json(&changed).unwrap())
+        );
 
         // Non-object envelopes are refused.
         assert!(canonical_walk_json(&json!([1, 2])).is_err());
@@ -301,9 +309,7 @@ mod tests {
 
         // A mismatched (canonical_json, params) pair is rejected.
         let other = json!({"scope": "other"});
-        assert!(store
-            .save_walk_receipt(&canonical, &other)
-            .is_err());
+        assert!(store.save_walk_receipt(&canonical, &other).is_err());
         // Non-canonical bytes are rejected even when they encode params.
         let pretty = serde_json::to_string_pretty(&params).unwrap();
         assert!(store.save_walk_receipt(&pretty, &params).is_err());
@@ -420,10 +426,16 @@ mod tests {
         let age_days = snapshot
             .newest_git_commit_record_age_days
             .expect("git-commit record exists");
-        assert!(age_days <= 1, "seeded commit is seconds old, got {age_days}");
+        assert!(
+            age_days <= 1,
+            "seeded commit is seconds old, got {age_days}"
+        );
         let age_hours = snapshot
             .newest_agent_trace_age_hours
             .expect("ingest traces exist");
-        assert!(age_hours < 1.0, "seeded traces are seconds old, got {age_hours}");
+        assert!(
+            age_hours < 1.0,
+            "seeded traces are seconds old, got {age_hours}"
+        );
     }
 }

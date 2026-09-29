@@ -2742,7 +2742,6 @@ fn purging_empty_content_does_not_scrub_unrelated_evidence() {
     assert_eq!(remaining_reviews, 1);
 }
 
-
 /// GhostLink contract (2026-09-28): never-composed pairs are admitted ONLY
 /// via recorded typed-edge hops.
 fn seed_typed_edge(storage: &crate::storage::Storage, a: &str, b: &str) {
@@ -2782,7 +2781,10 @@ fn never_composed_tags_only_returns_empty() {
         })
         .unwrap();
     let out = storage.get_never_composed_candidates(5, None).unwrap();
-    assert!(out.is_empty(), "shared words must never admit a pair: {out:?}");
+    assert!(
+        out.is_empty(),
+        "shared words must never admit a pair: {out:?}"
+    );
 }
 
 /// A typed-edge hop admits the pair even with zero shared vocabulary.
@@ -2808,7 +2810,11 @@ fn never_composed_admits_via_typed_edge_hop() {
     seed_typed_edge(&storage, &a.id, &b.id);
     let out = storage.get_never_composed_candidates(5, None).unwrap();
     assert_eq!(out.len(), 1, "edge hop must admit: {out:?}");
-    assert!(out[0].reason.contains("typed-edge hop"), "{}", out[0].reason);
+    assert!(
+        out[0].reason.contains("typed-edge hop"),
+        "{}",
+        out[0].reason
+    );
 }
 
 #[test]
@@ -2832,16 +2838,26 @@ fn test_composition_save_query_outcome_and_never_composed() {
         .unwrap();
 
     // GhostLink contract: without a typed edge, shared tags admit nothing.
-    assert!(storage.get_never_composed_candidates(10, None).unwrap().is_empty());
+    assert!(
+        storage
+            .get_never_composed_candidates(10, None)
+            .unwrap()
+            .is_empty()
+    );
 
     seed_typed_edge(&storage, &first.id, &second.id);
     let before = storage.get_never_composed_candidates(10, None).unwrap();
     assert_eq!(before.len(), 1, "edge hop must admit: {before:?}");
     assert!(
-        { before[0].first_id == first.id && before[0].second_id == second.id }
-            || { before[0].first_id == second.id && before[0].second_id == first.id }
+        { before[0].first_id == first.id && before[0].second_id == second.id } || {
+            before[0].first_id == second.id && before[0].second_id == first.id
+        }
     );
-    assert!(before[0].reason.contains("typed-edge hop"), "{}", before[0].reason);
+    assert!(
+        before[0].reason.contains("typed-edge hop"),
+        "{}",
+        before[0].reason
+    );
 
     let event = CompositionEventRecord {
         id: "composition-test-1".to_string(),
@@ -3144,7 +3160,10 @@ fn test_never_composed_carries_prior_outcome_signal() {
         .unwrap();
 
     let candidates = storage.get_never_composed_candidates(10, None).unwrap();
-    assert!(candidates.is_empty(), "composed pair excluded: {candidates:?}");
+    assert!(
+        candidates.is_empty(),
+        "composed pair excluded: {candidates:?}"
+    );
 }
 
 #[test]
@@ -3169,9 +3188,12 @@ fn test_never_composed_marks_mixed_prior_outcomes() {
     seed_typed_edge(&storage, &successful.id, &closed.id);
     let out = storage.get_never_composed_candidates(10, None).unwrap();
     assert_eq!(out.len(), 1);
-    assert!(out[0].reason.contains("typed-edge hop"), "{}", out[0].reason);
+    assert!(
+        out[0].reason.contains("typed-edge hop"),
+        "{}",
+        out[0].reason
+    );
 }
-
 
 #[test]
 fn test_dream_history_save_and_get_last() {
@@ -4614,7 +4636,12 @@ fn purge_fails_closed_when_a_referencing_row_cannot_be_read() {
 /// Ingest a node and seed it with a controllable embedding under the active
 /// model so similarity is deterministic in tests.
 #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-fn seed_node(storage: &SqliteMemoryStore, content: &str, tags: &[&str], vector: Vec<f32>) -> String {
+fn seed_node(
+    storage: &SqliteMemoryStore,
+    content: &str,
+    tags: &[&str],
+    vector: Vec<f32>,
+) -> String {
     let node = storage
         .ingest(IngestInput {
             content: content.to_string(),
@@ -6966,10 +6993,10 @@ fn narrative_seed(store: &Storage, n: usize) -> Vec<String> {
         .map(|i| {
             store
                 .ingest(IngestInput {
-                        content: format!("narrative fixture {i}: co-retrieval check"),
-                        node_type: "fact".to_string(),
-                        ..Default::default()
-                    })
+                    content: format!("narrative fixture {i}: co-retrieval check"),
+                    node_type: "fact".to_string(),
+                    ..Default::default()
+                })
                 .unwrap()
                 .id
                 .to_string()
@@ -7011,7 +7038,10 @@ fn one_retrieval_links_the_top_pairs_only() {
         edges.len()
     );
     for (_, _, strength, count) in &edges {
-        assert!(*strength <= 0.2 + 1e-9, "first co-retrieval is a hairline, got {strength}");
+        assert!(
+            *strength <= 0.2 + 1e-9,
+            "first co-retrieval is a hairline, got {strength}"
+        );
         assert_eq!(*count, 1);
     }
 }
@@ -7028,7 +7058,10 @@ fn repeated_co_retrieval_grows_strength_to_a_cap() {
     assert_eq!(edges.len(), 1);
     let (_, _, strength, count) = &edges[0];
     assert_eq!(*count, 10);
-    assert!((*strength - 0.6).abs() < 1e-9, "capped at 0.6, got {strength}");
+    assert!(
+        (*strength - 0.6).abs() < 1e-9,
+        "capped at 0.6, got {strength}"
+    );
 }
 
 #[test]
@@ -7137,8 +7170,18 @@ fn contradiction_during_live_window_creates_reconsolidation_plan_with_snapshot()
 #[test]
 fn approve_verdict_applies_the_plan_and_undo_reverses_it() {
     let storage = create_test_storage();
-    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
-    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    let target = seed_node(
+        &storage,
+        "Fact A about caching",
+        &["perf"],
+        axis_vector(5, 0.02),
+    );
+    let incoming = seed_node(
+        &storage,
+        "Fact B about caching fresh",
+        &["perf"],
+        axis_vector(9, 0.01),
+    );
     let candidate = reconsolidation_candidate(&storage, &target, 300);
 
     let plan = storage
@@ -7156,14 +7199,26 @@ fn approve_verdict_applies_the_plan_and_undo_reverses_it() {
     let node = storage.get_node(&target).unwrap().unwrap();
     assert!(!node.is_currently_valid());
     assert_eq!(node.suppression_count, 0);
-    assert_eq!(storage.plan_status(&plan.id).unwrap().as_deref(), Some("applied"));
+    assert_eq!(
+        storage.plan_status(&plan.id).unwrap().as_deref(),
+        Some("applied")
+    );
 
     // Snapshot-based rollback through the existing undo path.
     let undone = storage.merge_undo(&op.id).unwrap();
     assert_eq!(undone.op_type, "undo");
     let (vu2, sb2) = storage.read_bitemporal(&target).unwrap();
-    assert!(vu2.is_none() && sb2.is_none(), "undo restores the validity window");
-    assert!(storage.get_node(&target).unwrap().unwrap().is_currently_valid());
+    assert!(
+        vu2.is_none() && sb2.is_none(),
+        "undo restores the validity window"
+    );
+    assert!(
+        storage
+            .get_node(&target)
+            .unwrap()
+            .unwrap()
+            .is_currently_valid()
+    );
 }
 
 /// Scenario 3: reject → the plan is discarded and the target memory stays
@@ -7172,8 +7227,18 @@ fn approve_verdict_applies_the_plan_and_undo_reverses_it() {
 #[test]
 fn reject_verdict_leaves_the_memory_byte_identical_to_its_snapshot() {
     let storage = create_test_storage();
-    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
-    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    let target = seed_node(
+        &storage,
+        "Fact A about caching",
+        &["perf"],
+        axis_vector(5, 0.02),
+    );
+    let incoming = seed_node(
+        &storage,
+        "Fact B about caching fresh",
+        &["perf"],
+        axis_vector(9, 0.01),
+    );
     let candidate = reconsolidation_candidate(&storage, &target, 300);
     let plan = storage
         .plan_reconsolidation(&target, &incoming, &candidate, "supersede_deferred")
@@ -7195,9 +7260,15 @@ fn reject_verdict_leaves_the_memory_byte_identical_to_its_snapshot() {
     assert_eq!(after.content, candidate.snapshot.content);
     assert_eq!(after.content, before.content);
     assert_eq!(after.tags, candidate.snapshot.tags);
-    assert_eq!(after.retention_strength, candidate.snapshot.retention_strength);
+    assert_eq!(
+        after.retention_strength,
+        candidate.snapshot.retention_strength
+    );
     assert_eq!(after.storage_strength, candidate.snapshot.storage_strength);
-    assert_eq!(after.retrieval_strength, candidate.snapshot.retrieval_strength);
+    assert_eq!(
+        after.retrieval_strength,
+        candidate.snapshot.retrieval_strength
+    );
     let (vu, sb) = storage.read_bitemporal(&target).unwrap();
     assert!(vu.is_none() && sb.is_none());
     assert_eq!(after.suppression_count, 0);
@@ -7210,8 +7281,18 @@ fn reject_verdict_leaves_the_memory_byte_identical_to_its_snapshot() {
 #[test]
 fn quarantine_verdict_suppresses_the_target_and_closes_the_plan() {
     let storage = create_test_storage();
-    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
-    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    let target = seed_node(
+        &storage,
+        "Fact A about caching",
+        &["perf"],
+        axis_vector(5, 0.02),
+    );
+    let incoming = seed_node(
+        &storage,
+        "Fact B about caching fresh",
+        &["perf"],
+        axis_vector(9, 0.01),
+    );
     let candidate = reconsolidation_candidate(&storage, &target, 300);
     let plan = storage
         .plan_reconsolidation(&target, &incoming, &candidate, "contradiction")
@@ -7241,8 +7322,18 @@ fn quarantine_verdict_suppresses_the_target_and_closes_the_plan() {
 #[test]
 fn expired_window_auto_closes_the_plan() {
     let storage = create_test_storage();
-    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
-    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    let target = seed_node(
+        &storage,
+        "Fact A about caching",
+        &["perf"],
+        axis_vector(5, 0.02),
+    );
+    let incoming = seed_node(
+        &storage,
+        "Fact B about caching fresh",
+        &["perf"],
+        axis_vector(9, 0.01),
+    );
     // One plan left to expire by the sweep, one fed straight to apply_plan.
     let candidate = reconsolidation_candidate(&storage, &target, 1);
     let plan_swept = storage
@@ -7255,16 +7346,20 @@ fn expired_window_auto_closes_the_plan() {
 
     // The sweep auto-closes the stale plan and records it in the reflog.
     let closed = storage.expire_stale_reconsolidation_plans().unwrap();
-    assert!(closed.contains(&plan_swept.id), "sweep must close the stale plan");
+    assert!(
+        closed.contains(&plan_swept.id),
+        "sweep must close the stale plan"
+    );
     assert_eq!(
         storage.plan_status(&plan_swept.id).unwrap().as_deref(),
         Some("expired")
     );
     let ops = storage.list_merge_operations(10).unwrap();
     assert!(
-        ops.iter().any(|op| op.plan_id.as_deref() == Some(plan_swept.id.as_str())
-            && op.op_type == "reconsolidation"
-            && op.status == "expired"),
+        ops.iter()
+            .any(|op| op.plan_id.as_deref() == Some(plan_swept.id.as_str())
+                && op.op_type == "reconsolidation"
+                && op.status == "expired"),
         "the auto-close must be recorded, got {ops:?}"
     );
 
@@ -7301,8 +7396,18 @@ fn expired_window_auto_closes_the_plan() {
 #[test]
 fn pending_reconsolidation_plans_are_listed_for_the_verdict_surface() {
     let storage = create_test_storage();
-    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
-    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    let target = seed_node(
+        &storage,
+        "Fact A about caching",
+        &["perf"],
+        axis_vector(5, 0.02),
+    );
+    let incoming = seed_node(
+        &storage,
+        "Fact B about caching fresh",
+        &["perf"],
+        axis_vector(9, 0.01),
+    );
     let candidate = reconsolidation_candidate(&storage, &target, 300);
     let plan = storage
         .plan_reconsolidation(&target, &incoming, &candidate, "supersede_deferred")
@@ -7451,7 +7556,11 @@ fn retention_distribution_reports_out_of_range_values_explicitly() {
             .map(|(_, count)| *count)
             .unwrap_or(0)
     };
-    assert_eq!(bucket_of("unknown"), 1, "NULL retention gets its own bucket");
+    assert_eq!(
+        bucket_of("unknown"),
+        1,
+        "NULL retention gets its own bucket"
+    );
     assert_eq!(bucket_of("below0"), 1);
     assert_eq!(bucket_of("above100%"), 1);
     assert_eq!(bucket_of("40-60%"), 1);

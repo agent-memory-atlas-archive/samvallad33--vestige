@@ -1319,7 +1319,7 @@ impl SqliteMemoryStore {
                                 age_days_before_failure: age,
                                 stability: c.stability,
                                 via_supersession_of: None,
-                                    is_change_record: false,
+                                is_change_record: false,
                             })
                         })
                         .collect();

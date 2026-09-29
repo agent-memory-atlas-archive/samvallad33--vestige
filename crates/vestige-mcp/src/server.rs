@@ -18,8 +18,8 @@ use crate::protocol::messages::{
     ServerCapabilities, ServerInfo, ToolAnnotations, ToolDescription,
 };
 use crate::protocol::types::{
-    JsonRpcError, JsonRpcRequest, JsonRpcResponse, LEGACY_PROTOCOL_VERSIONS,
-    SUPPORTED_PROTOCOL_VERSIONS, MCP_VERSION,
+    JsonRpcError, JsonRpcRequest, JsonRpcResponse, LEGACY_PROTOCOL_VERSIONS, MCP_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::resources;
 use crate::tools;
@@ -225,14 +225,12 @@ fn decorate_modern_result(result: &mut serde_json::Value) {
         // id comes from the structured payload the receipt attach step wrote;
         // no additional lookup, no memory content added to the wire.
         if let Some(receipt_id) = receipt_id {
-            meta_object
-                .entry("ui".to_string())
-                .or_insert_with(|| {
-                    serde_json::json!({
-                        "resourceUri":
-                            crate::resources::receipt_card::resource_uri(&receipt_id),
-                    })
-                });
+            meta_object.entry("ui".to_string()).or_insert_with(|| {
+                serde_json::json!({
+                    "resourceUri":
+                        crate::resources::receipt_card::resource_uri(&receipt_id),
+                })
+            });
         }
     }
 }
@@ -427,8 +425,7 @@ impl McpServer {
     /// claims provenance.
     fn bound_actor_did(&self) -> Option<String> {
         let did = self.actor.did();
-        (self.storage.process_actor_did().as_deref() == Some(did))
-            .then(|| did.to_string())
+        (self.storage.process_actor_did().as_deref() == Some(did)).then(|| did.to_string())
     }
 
     /// Resolve the actor provenance for one tool call: the process identity
@@ -541,7 +538,10 @@ impl McpServer {
             )),
             "tools/list" => self.handle_tools_list(request.params.as_ref(), era).await,
             "tools/call" => self.handle_tools_call(request.params).await,
-            "resources/list" => self.handle_resources_list(request.params.as_ref(), era).await,
+            "resources/list" => {
+                self.handle_resources_list(request.params.as_ref(), era)
+                    .await
+            }
             "resources/templates/list" => {
                 self.handle_resources_templates_list(request.params.as_ref(), era)
             }
@@ -732,13 +732,13 @@ impl McpServer {
         self.initialized.load(Ordering::Acquire)
     }
 
-/// The advertised tool catalog. Single source of the full schemas:
-/// `handle_tools_list` compacts it for the wire (#212), and
-/// `tools::compact::full_schema` serves the same schemas in full through
-/// `memory_status` `view='tools'`. The parity guard test keeps this
-/// function and that registry name-for-name identical.
-fn tool_catalog() -> Vec<ToolDescription> {
-    vec![
+    /// The advertised tool catalog. Single source of the full schemas:
+    /// `handle_tools_list` compacts it for the wire (#212), and
+    /// `tools::compact::full_schema` serves the same schemas in full through
+    /// `memory_status` `view='tools'`. The parity guard test keeps this
+    /// function and that registry name-for-name identical.
+    fn tool_catalog() -> Vec<ToolDescription> {
+        vec![
             // ================================================================
             // RECALL — unified retrieval tool (v2.2). HOT PATH.
             // Folds search + deep_reference + cross_reference + contradictions.
@@ -1104,8 +1104,7 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
                 ..Default::default()
             },
             ]
-
-}
+    }
 
     /// Handle tools/list request
     async fn handle_tools_list(
@@ -1349,11 +1348,11 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
                             .map(str::trim)
                             .filter(|role| !role.is_empty())
                     });
-                let actor_provenance = self
-                    .resolve_actor_provenance(claimed_role)
-                    .map(|(did, resolution)| {
-                        vestige_core::trace::ActorProvenance::from_resolution(&did, &resolution)
-                    });
+                let actor_provenance =
+                    self.resolve_actor_provenance(claimed_role)
+                        .map(|(did, resolution)| {
+                            vestige_core::trace::ActorProvenance::from_resolution(&did, &resolution)
+                        });
                 if let Some(receipt) = crate::trace_recorder::build_and_save_receipt(
                     &self.storage,
                     &trace_run_id,
@@ -2376,8 +2375,8 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
         ];
 
         let result = ListResourcesResult { resources };
-        let mut value =
-            serde_json::to_value(result).map_err(|e| JsonRpcError::internal_error(&e.to_string()))?;
+        let mut value = serde_json::to_value(result)
+            .map_err(|e| JsonRpcError::internal_error(&e.to_string()))?;
         // Cache hints (`CacheableResult`): the list of advertised resources is
         // compile-time constant per binary, an hour is conservative;
         // `private` because feature flags can differ per install. Suppressed
@@ -2479,8 +2478,8 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
                         blob: None,
                     }],
                 };
-                let mut value =
-                    serde_json::to_value(result).map_err(|e| JsonRpcError::internal_error(&e.to_string()))?;
+                let mut value = serde_json::to_value(result)
+                    .map_err(|e| JsonRpcError::internal_error(&e.to_string()))?;
                 // Cache hints (`CacheableResult`). Resource content is
                 // user-data backed and can change on any write, so the honest
                 // hint is one second and `private` — the field pair is
@@ -2969,10 +2968,7 @@ mod tests {
     /// `method_params` must be an object (or null); `_meta` is inserted into
     /// it alongside the caller's own fields.
     fn modern_params(method_params: serde_json::Value) -> serde_json::Value {
-        let mut map = method_params
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
+        let mut map = method_params.as_object().cloned().unwrap_or_default();
         map.insert(
             "_meta".to_string(),
             serde_json::json!({
@@ -3004,8 +3000,14 @@ mod tests {
         let versions = result["supportedVersions"].as_array().unwrap();
         let versions: Vec<&str> = versions.iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(versions.first(), Some(&MODERN_PROTOCOL_VERSION));
-        assert!(versions.contains(&MCP_VERSION), "legacy clients negotiate down to {MCP_VERSION}");
-        assert_eq!(result["capabilities"]["tools"], serde_json::json!({ "listChanged": false }));
+        assert!(
+            versions.contains(&MCP_VERSION),
+            "legacy clients negotiate down to {MCP_VERSION}"
+        );
+        assert_eq!(
+            result["capabilities"]["tools"],
+            serde_json::json!({ "listChanged": false })
+        );
     }
 
     /// A modern client never shakes hands. A `ping` with per-request `_meta`
@@ -3015,7 +3017,10 @@ mod tests {
     async fn modern_ping_serves_statelessly_with_result_type() {
         let (server, _dir) = test_server().await;
         let response = server
-            .handle_request(make_request("ping", Some(modern_params(serde_json::json!({})))))
+            .handle_request(make_request(
+                "ping",
+                Some(modern_params(serde_json::json!({}))),
+            ))
             .await
             .unwrap();
         assert!(response.error.is_none(), "{:?}", response.error);
@@ -3130,7 +3135,10 @@ mod tests {
             .await
             .unwrap();
         let error = response.error.expect("must reject");
-        assert_eq!(error.code, -32022, "spec-defined UnsupportedProtocolVersion");
+        assert_eq!(
+            error.code, -32022,
+            "spec-defined UnsupportedProtocolVersion"
+        );
         let error_data = error.data.expect("-32022 carries data");
         assert_eq!(error_data["requested"], "1900-01-01");
         let supported = error_data["supported"].as_array().unwrap();
@@ -3152,7 +3160,10 @@ mod tests {
             .await
             .unwrap();
         let result = response.result.unwrap();
-        assert!(result.get("resultType").is_none(), "legacy envelope must not grow");
+        assert!(
+            result.get("resultType").is_none(),
+            "legacy envelope must not grow"
+        );
         assert_eq!(result["ttlMs"], 3_600_000);
     }
 
@@ -3242,9 +3253,10 @@ mod tests {
         // Legacy era: handshake first, no modern _meta.
         let legacy_server = make_server(true).await;
         let legacy_result = legacy_server
-            .handle_request(
-                make_request("resources/read", Some(serde_json::json!({ "uri": uri }))),
-            )
+            .handle_request(make_request(
+                "resources/read",
+                Some(serde_json::json!({ "uri": uri })),
+            ))
             .await
             .unwrap()
             .result
@@ -3325,10 +3337,7 @@ mod tests {
             .find(|t| t.name == "recall")
             .expect("recall in catalog");
         let meta = recall.meta.expect("recall carries _meta");
-        assert_eq!(
-            meta["ui"]["resourceUri"],
-            "ui://vestige/receipt/{id}"
-        );
+        assert_eq!(meta["ui"]["resourceUri"], "ui://vestige/receipt/{id}");
     }
 
     // ========================================================================
@@ -4218,7 +4227,11 @@ mod tests {
     #[test]
     fn full_schema_registry_matches_the_advertised_catalog() {
         let catalog = McpServer::tool_catalog();
-        assert_eq!(catalog.len(), 18, "catalog size changed; update the registry");
+        assert_eq!(
+            catalog.len(),
+            18,
+            "catalog size changed; update the registry"
+        );
         for tool in &catalog {
             assert!(
                 tools::compact::full_schema(&tool.name).is_some(),
@@ -4322,7 +4335,9 @@ mod tests {
                 serde_json::to_value(&full).unwrap()
             );
             assert!(
-                detail["structuredContent"]["tools"][0]["inputSchema"].to_string().len()
+                detail["structuredContent"]["tools"][0]["inputSchema"]
+                    .to_string()
+                    .len()
                     >= definition["inputSchema"].to_string().len(),
                 "full schema must not be smaller than the compact catalog schema"
             );
@@ -4450,13 +4465,25 @@ mod tests {
         // (pure query) join the read-only set.
         assert_eq!(
             read_only,
-            ["forgotten_lesson", "memory_status", "selftest", "session_start"]
+            [
+                "forgotten_lesson",
+                "memory_status",
+                "selftest",
+                "session_start"
+            ]
         );
         // Reanchoring replaces existing evidence, so the mixed codebase tool
         // must advertise its destructive action conservatively.
         assert_eq!(
             destructive,
-            ["codebase", "dedup", "intention", "maintain", "memory", "purge"]
+            [
+                "codebase",
+                "dedup",
+                "intention",
+                "maintain",
+                "memory",
+                "purge"
+            ]
         );
         assert_eq!(
             open_world,
@@ -5373,11 +5400,15 @@ mod tests {
         // Construction loads-or-mints the did:key from <data_dir>/actor.key
         // and binds it to the store.
         let did = server.bound_actor_did().expect("process actor bound");
-        assert!(did.starts_with("did:key:z6Mk"), "Ed25519 did:key shape: {did}");
+        assert!(
+            did.starts_with("did:key:z6Mk"),
+            "Ed25519 did:key shape: {did}"
+        );
 
         // Gate 1: a claimed privileged role never self-grants authority.
-        let (resolved_did, resolution) =
-            server.resolve_actor_provenance(Some("operator")).expect("resolve");
+        let (resolved_did, resolution) = server
+            .resolve_actor_provenance(Some("operator"))
+            .expect("resolve");
         assert_eq!(resolved_did, did, "identity comes from the process");
         assert_eq!(resolution.effective_role, "unattributed");
         assert_eq!(resolution.resolved_weight, 1.0);
@@ -5399,11 +5430,12 @@ mod tests {
         let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
         let server = McpServer::new(storage.clone(), cognitive);
         let claimed = "operator";
-        let actor_provenance = server
-            .resolve_actor_provenance(Some(claimed))
-            .map(|(did, resolution)| {
-                vestige_core::trace::ActorProvenance::from_resolution(&did, &resolution)
-            });
+        let actor_provenance =
+            server
+                .resolve_actor_provenance(Some(claimed))
+                .map(|(did, resolution)| {
+                    vestige_core::trace::ActorProvenance::from_resolution(&did, &resolution)
+                });
         let result = serde_json::json!({
             "results": [
                 { "id": "mem-1", "trustScore": 0.9 },
@@ -5419,7 +5451,12 @@ mod tests {
         )
         .expect("receipt built");
         let actor = receipt["actor"].as_object().expect("provenance block");
-        assert!(actor["actor_id"].as_str().unwrap().starts_with("did:key:z6Mk"));
+        assert!(
+            actor["actor_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("did:key:z6Mk")
+        );
         assert_eq!(actor["claimed_role"], "operator");
         assert_eq!(actor["effective_role"], "unattributed");
         assert_eq!(actor["resolved_weight"], 1.0);
@@ -5427,10 +5464,7 @@ mod tests {
         assert_eq!(actor["policy_version"], 1);
         // The persisted row round-trips the provenance.
         let receipt_id = receipt["receipt_id"].as_str().unwrap();
-        let stored = storage
-            .get_receipt(receipt_id)
-            .unwrap()
-            .expect("persisted");
+        let stored = storage.get_receipt(receipt_id).unwrap().expect("persisted");
         let stored_actor = stored.actor.expect("persisted provenance");
         assert_eq!(stored_actor.claimed_role.as_deref(), Some("operator"));
         assert_eq!(stored_actor.resolution_disposition, "unregistered_claim");

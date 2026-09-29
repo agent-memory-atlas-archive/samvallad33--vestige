@@ -177,7 +177,9 @@ impl SqliteMemoryStore {
         let nodes: Vec<KnowledgeNode> = nodes
             .into_iter()
             .filter(|node| !superseded.contains(&node.id))
-            .filter(|node| tag_filter.is_empty() || tag_filter.iter().any(|t| node.tags.contains(t)))
+            .filter(|node| {
+                tag_filter.is_empty() || tag_filter.iter().any(|t| node.tags.contains(t))
+            })
             .collect();
         if nodes.len() < 2 {
             return Ok(vec![]);
@@ -398,8 +400,9 @@ impl SqliteMemoryStore {
             .reader
             .lock()
             .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
-        let mut stmt = reader
-            .prepare("SELECT id, superseded_by FROM knowledge_nodes WHERE superseded_by IS NOT NULL")?;
+        let mut stmt = reader.prepare(
+            "SELECT id, superseded_by FROM knowledge_nodes WHERE superseded_by IS NOT NULL",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -1015,8 +1018,7 @@ impl SqliteMemoryStore {
                     .writer
                     .lock()
                     .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
-                let tx =
-                    Self::begin_write_transaction(&writer, "quarantine_reconsolidation_plan")?;
+                let tx = Self::begin_write_transaction(&writer, "quarantine_reconsolidation_plan")?;
                 let op = self.record_reconsolidation_verdict_op(
                     &tx,
                     &plan,
@@ -1739,9 +1741,7 @@ mod exact_nomination_tests {
         }
     }
 
-    fn candidate_members(
-        storage: &Storage,
-    ) -> Vec<Vec<String>> {
+    fn candidate_members(storage: &Storage) -> Vec<Vec<String>> {
         storage
             .merge_candidates(crate::advanced::MergePolicy::default(), 20, &[])
             .unwrap()
@@ -1793,7 +1793,9 @@ mod exact_nomination_tests {
         // dropping the index for the duration of the test.
         {
             let writer = storage.writer.lock().unwrap();
-            writer.execute_batch("DROP INDEX idx_nodes_source_key").unwrap();
+            writer
+                .execute_batch("DROP INDEX idx_nodes_source_key")
+                .unwrap();
         }
         let a = ingest_with_envelope(
             &storage,
@@ -1826,7 +1828,11 @@ mod exact_nomination_tests {
         // sets differ (services vs service), so exact-equality nomination
         // must NOT offer it.
         ingest(&storage, "Use tokio runtime for async Rust services", &[]);
-        ingest(&storage, "Use the tokio runtime for async Rust service", &[]);
+        ingest(
+            &storage,
+            "Use the tokio runtime for async Rust service",
+            &[],
+        );
 
         let clusters = candidate_members(&storage);
         assert!(

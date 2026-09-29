@@ -10,7 +10,7 @@ use crate::inputs::compute_inputs;
 use crate::log::{EventLog, SeqAck};
 use crate::policy::{Policy, gate_verdict};
 use crate::record::{
-    CanaryRecord, EffectRecord, GateError, GateRecord, GateEvent, LessonAlarmRecord, Propose,
+    CanaryRecord, EffectRecord, GateError, GateEvent, GateRecord, LessonAlarmRecord, Propose,
     RecordKind, Verdict,
 };
 
@@ -66,12 +66,19 @@ impl<L: EventLog> GateRuntime<L> {
             .filter(|e| e.kind == RecordKind::Canary)
             .filter_map(|e| e.canary().map(|c| c.canary_id))
             .collect();
-        let tripped: BTreeSet<u64> =
-            propose.context.iter().copied().filter(|id| planted.contains(id)).collect();
+        let tripped: BTreeSet<u64> = propose
+            .context
+            .iter()
+            .copied()
+            .filter(|id| planted.contains(id))
+            .collect();
 
         let ack = self.log.append(RecordKind::Propose, to_vec(&propose));
         for canary_id in tripped {
-            let alert = crate::record::AlertRecord { canary_id, reader_seq: ack.seq };
+            let alert = crate::record::AlertRecord {
+                canary_id,
+                reader_seq: ack.seq,
+            };
             self.log.append(RecordKind::Alert, to_vec(&alert));
         }
         ack
@@ -122,11 +129,11 @@ impl<L: EventLog> GateRuntime<L> {
 
     /// Convenience: the latest recorded gate verdict for a proposal, if any.
     pub fn latest_gate(&self, propose_seq: u64) -> Option<(u64, Verdict)> {
-        self.log
-            .events_before(u64::MAX)
-            .iter()
-            .rev()
-            .find_map(|e| e.gate().filter(|g| g.propose_seq == propose_seq).map(|g| (e.seq, g.verdict)))
+        self.log.events_before(u64::MAX).iter().rev().find_map(|e| {
+            e.gate()
+                .filter(|g| g.propose_seq == propose_seq)
+                .map(|g| (e.seq, g.verdict))
+        })
     }
 
     /// Re-derive every GATE's verdict under the pinned policy (see
