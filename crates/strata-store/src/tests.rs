@@ -344,6 +344,30 @@ fn checkpoint_chain_verifies_and_tamper_detected() {
 }
 
 #[test]
+fn missing_store_meta_on_populated_store_fails_open() {
+    let dir = temp_dir("missing-meta");
+    {
+        let mut store = StrataStore::open(&dir).expect("open");
+        let id = store.ingest(input("populated fact", &[])).expect("ingest");
+        store.review(&id, 3).expect("review");
+        store.seal_checkpoint().expect("seal writes store.meta");
+        assert!(dir.join("store.meta").is_file());
+        assert_eq!(store.node_count(), 1);
+    }
+    std::fs::remove_file(dir.join("store.meta")).expect("delete store.meta");
+    let opened = StrataStore::open(&dir);
+    let msg = match opened {
+        Ok(_) => panic!("open must fail"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        msg.contains("store.meta is missing") && msg.contains("log has frames"),
+        "{msg}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn backup_roundtrip_opens_and_matches() {
     let dir = temp_dir("backup-src");
     let dest = temp_dir("backup-dest");

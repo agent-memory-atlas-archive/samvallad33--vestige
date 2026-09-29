@@ -677,8 +677,8 @@ impl StrataStore {
     }
 
     /// Verify the checkpoint chain (and the folded roots it commits) with the
-    /// strata-kernel verifier, anchored by the externally persisted head hash
-    /// when `store.meta` exists. Runs on every open.
+    /// strata-kernel verifier, anchored by `store.meta`. Runs on every open.
+    /// A log that already has frames and no anchor file is an error.
     pub fn verify_checkpoint_chain(&self) -> Result<(), StoreError> {
         let anchor = match (self.checkpoints.last(), self.read_meta()) {
             (None, None) => return Ok(()),
@@ -687,7 +687,11 @@ impl StrataStore {
                     "store.meta exists but the log carries no checkpoint".into(),
                 ));
             }
-            (Some(_), None) => None,
+            (Some(_), None) => {
+                return Err(StoreError::Verify(
+                    "store.meta is missing but the log has frames".into(),
+                ));
+            }
             (Some(head), Some(meta)) => {
                 if meta.head_log_seq != head.log_seq {
                     return Err(StoreError::Verify(format!(
