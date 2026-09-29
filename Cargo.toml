@@ -9,6 +9,14 @@ members = [
 ]
 exclude = [
     "fastembed-rs",
+    # Standalone strata crates (own empty [workspace] tables, parallel-agent
+    # builds). Excluded so root members can path-depend on them (e.g.
+    # vestige-mcp -> strata-migrate) without cargo seeing multiple workspace
+    # roots. Re-parent deliberately at strata integration time.
+    "crates/strata",
+    "crates/strata-gate",
+    "crates/strata-kernel",
+    "crates/strata-migrate",
 ]
 
 [workspace.package]

@@ -206,6 +206,14 @@ enum Commands {
         merge: bool,
     },
 
+    /// One-shot migration: empty the SQLite store (or a portable archive) into a STRATA log
+    MigrateToStrata {
+        /// Source: vestige.portable.v1 archive JSON, SQLite db file, or data dir containing vestige.db
+        source: PathBuf,
+        /// Destination directory for the STRATA log
+        dest: PathBuf,
+    },
+
     /// Two-way sync with a file-backed portable archive, or Vestige Cloud
     Sync {
         /// Sync archive path, often in Dropbox/iCloud/Syncthing/Git.
@@ -520,6 +528,7 @@ fn main() -> anyhow::Result<()> {
         } => run_export(output, format, tags, since),
         Commands::PortableExport { output } => run_portable_export(output),
         Commands::PortableImport { input, merge } => run_portable_import(input, merge),
+        Commands::MigrateToStrata { source, dest } => run_migrate_to_strata(source, dest),
         Commands::Sync {
             archive,
             cloud,
@@ -2723,6 +2732,65 @@ fn run_portable_import(input: PathBuf, merge: bool) -> anyhow::Result<()> {
     }
     println!();
     println!("{}", "Portable import complete.".green().bold());
+
+    Ok(())
+}
+
+// ---- strata-migrate (one self-contained block; everything else lives in
+// ---- crates/strata-migrate) ----------------------------------------------
+/// Run the one-shot SQLite -> STRATA migration (`vestige migrate-to-strata`).
+fn run_migrate_to_strata(source: PathBuf, dest: PathBuf) -> anyhow::Result<()> {
+    println!("{}", "=== Vestige -> STRATA Migration ===".cyan().bold());
+    println!();
+
+    if !source.exists() {
+        anyhow::bail!("Source not found: {}", source.display());
+    }
+    std::fs::create_dir_all(&dest)?;
+
+    println!("{}: {}", "Source".white().bold(), source.display());
+    println!("{}: {}", "Strata dir".white().bold(), dest.display());
+    println!();
+
+    let report = strata_migrate::migrate(&source, &dest)
+        .map_err(|e| anyhow::anyhow!("migration failed: {e}"))?;
+
+    println!("{}: {}", "Nodes".white().bold(), report.nodes);
+    println!("{}: {}", "Edges".white().bold(), report.edges);
+    println!("{}: {}", "FSRS events".white().bold(), report.fsrs_events);
+    println!("{}: {}", "Skipped tables".white().bold(), report.skipped_tables.len());
+    for table in &report.skipped_tables {
+        println!("  {} {}", "-".dimmed(), table.yellow());
+    }
+    if report.verify_passed {
+        println!("{}: {}", "Verify".white().bold(), "kernel replay + log tail PASSED".green());
+    } else {
+        println!("{}: {}", "Verify".white().bold(), "FAILED (see stderr)".red().bold());
+    }
+    println!(
+        "{}: {:.3}s",
+        "Duration".white().bold(),
+        report.duration.as_secs_f64()
+    );
+    println!();
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    println!();
+    if report.verify_passed {
+        println!(
+            "{}",
+            format!(
+                "Migration complete: {} nodes, {} edges, {} fsrs events -> {}",
+                report.nodes,
+                report.edges,
+                report.fsrs_events,
+                dest.display()
+            )
+            .green()
+            .bold()
+        );
+    } else {
+        anyhow::bail!("migration finished but verification FAILED; do not adopt this log");
+    }
 
     Ok(())
 }

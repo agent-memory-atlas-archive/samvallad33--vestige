@@ -1,0 +1,35 @@
+[package]
+name = "strata-migrate"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "One-shot migration tool: empties the Vestige SQLite store into a STRATA log"
+publish = false
+
+# Standalone on purpose: the empty [workspace] table keeps this crate out of
+# the root vestige workspace while the strata crates are being integrated by
+# parallel agents (same pattern as crates/strata, crates/strata-kernel, and
+# crates/strata-gate). Drop this table when the integration lands.
+[workspace]
+
+[dependencies]
+borsh = { version = "1", features = ["derive"] }
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+
+strata = { path = "../strata" }
+strata-kernel = { path = "../strata-kernel" }
+# Same dependency shape vestige-mcp uses: no default features so the git2 /
+# OpenSSL-heavy codebase-git feature never enters this build. Path B (direct
+# SQLite walk) reuses vestige-core's own export code.
+vestige-core = { path = "../vestige-core", default-features = false, features = ["bundled-sqlite"] }
+
+[dev-dependencies]
+tempfile = "3"
+# Test-only direct SQL to plant fsrs_cards rows (the public ingest API does
+# not create review history). Same version/features as vestige-core uses, so
+# cargo unifies to a single bundled SQLite build.
+rusqlite = { version = "0.40", features = ["bundled"] }

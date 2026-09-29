@@ -67,6 +67,9 @@ path = "src/bin/cli.rs"
 # actually works (previously hardcoded here, which silently defeated the flag).
 vestige-core = { version = "3.0.0", path = "../vestige-core", default-features = false, features = ["bundled-sqlite"] }
 
+# One-shot SQLite -> STRATA migration (standalone crate; `migrate-to-strata` CLI).
+strata-migrate = { path = "../strata-migrate" }
+
 # ============================================================================
 # MCP Server Dependencies
 # ============================================================================
