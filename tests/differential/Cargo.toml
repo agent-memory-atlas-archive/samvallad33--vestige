@@ -1,0 +1,22 @@
+[package]
+name = "vestige-differential-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Cross-engine differential harness: replays seeded operation scripts against vestige-core SQLite Storage AND strata (kernel + gate directly), asserting parity and per-engine byte-identical reruns. Gates the SQLite->STRATA default flip."
+
+[dependencies]
+vestige-core = { path = "../../crates/vestige-core", features = [] }
+strata-kernel = { path = "../../crates/strata-kernel" }
+strata-gate = { path = "../../crates/strata-gate" }
+strata-verify = { path = "../../crates/strata-verify" }
+borsh = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+tempfile = "3"
+
+[[bin]]
+name = "differential"
+path = "src/bin/differential.rs"
