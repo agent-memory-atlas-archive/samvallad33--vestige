@@ -103,6 +103,9 @@ strata-verify = { path = "../strata-verify" }
 
 # Strata log the shipped MCP server boots. Workspace-excluded; path dep only.
 strata-store = { path = "../strata-store" }
+# Gate policy type for projection admission. No SQLite.
+strata-gate = { path = "../strata-gate" }
+blake3 = "1"
 
 # ============================================================================
 # MCP Server Dependencies
@@ -163,6 +166,7 @@ tempfile = "3"
 libc = "0.2"
 
 [dev-dependencies]
+blake3 = "1"
 ctor = "0.4"
 # rusqlite is the optional normal dependency above. `legacy-sqlite` enables it,
 # and the sqlite integration tests require that feature. A dev-dependency would

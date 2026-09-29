@@ -864,7 +864,7 @@ impl StrataStore {
 
     /// Append one typed edge (vocabulary-validated; the source node must
     /// exist — targets may point at non-memory artifacts like file anchors).
-    pub fn save_connection(&mut self, connection: &ConnectionRecord) -> Result<(), StoreError> {
+    pub fn save_connection(&mut self, connection: &ConnectionRecord) -> Result<u64, StoreError> {
         if EdgeKind::parse(&connection.link_type).is_none() {
             return Err(StoreError::InvalidInput(format!(
                 "link_type '{}' is not in the typed-edge vocabulary",
@@ -883,14 +883,14 @@ impl StrataStore {
         }
         context.sort_unstable();
         context.dedup();
-        self.admit_write(
+        let (effect_seq, _) = self.admit_write(
             StoreOp::SaveEdge {
                 edge: connection.clone(),
             },
             action_kind::WRITE,
             context,
         )?;
-        Ok(())
+        Ok(effect_seq)
     }
 
     /// All edges touching a memory: outgoing first, then incoming.
@@ -1224,6 +1224,94 @@ impl StrataStore {
         hash32(&borsh_vec(&digest).expect("state digest serialization is infallible"))
     }
 
+    /// Re-read the log, refuse a broken frame, and fold a fresh copy of the
+    /// derived maps. Does not append, truncate, or seal. The fold is the same
+    /// `replay` live admits use, so intentions, review clocks, and imported
+    /// frames stay in the digest.
+    pub fn refold(&self) -> Result<Refold, StoreError> {
+        self.verify_segments()?;
+        self.log.verify_tail()?;
+        let frames = self.log.read_frames(1)?;
+        let frame_count = frames.len() as u64;
+        let gate_mismatches = gate_verdict_mismatches(self, &frames)?;
+        let mut scratch = Self {
+            dir: self.dir.clone(),
+            log: self.log.clone(),
+            gate_log: self.gate_log.clone(),
+            policy: self.policy.clone(),
+            nodes: BTreeMap::new(),
+            origins: BTreeMap::new(),
+            intentions: BTreeMap::new(),
+            edges: Vec::new(),
+            forward: BTreeMap::new(),
+            reverse: BTreeMap::new(),
+            fsrs: State::default(),
+            review_events: Vec::new(),
+            reviewed_at: BTreeMap::new(),
+            checkpoints: Vec::new(),
+            orphan_writes: 0,
+        };
+        scratch.replay()?;
+        let mut retrievability = BTreeMap::new();
+        for id in scratch.nodes.keys() {
+            if let Some(score) = scratch.retrievability(id)? {
+                retrievability.insert(id.clone(), score);
+            }
+        }
+        let gaps = self.sweep().iter().map(gap_label).collect::<Vec<_>>();
+        Ok(Refold {
+            frames: frame_count,
+            state_digest: scratch.state_digest(),
+            nodes: scratch.nodes,
+            origins: scratch.origins,
+            retrievability,
+            gate_mismatches,
+            gaps,
+        })
+    }
+
+    /// Strict read of every segment. A torn frame, blake3 miss, or broken
+    /// chain is an error — unlike [`StrataLog::read_frames`], which stops at
+    /// the first bad frame and returns the prefix.
+    fn verify_segments(&self) -> Result<(), StoreError> {
+        let dir = self.dir.join(LOG_DIR);
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("seg") {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        if paths.is_empty() {
+            return Err(StoreError::Verify("log has no segments".into()));
+        }
+        let mut expected_prev = strata::GENESIS_PREV_SEGMENT_HASH;
+        for (i, path) in paths.iter().enumerate() {
+            let is_last = i + 1 == paths.len();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("segment");
+            let bytes = std::fs::read(path)?;
+            let scanned = scan_segment(&bytes, name)?;
+            if scanned.header.prev_segment_hash != expected_prev {
+                return Err(StoreError::Verify(format!(
+                    "{name}: segment chain link mismatch"
+                )));
+            }
+            if !is_last && scanned.trailer.is_none() {
+                return Err(StoreError::Verify(format!(
+                    "{name}: sealed segment is missing its trailer"
+                )));
+            }
+            if !is_last {
+                expected_prev = hash32(&bytes);
+            }
+        }
+        Ok(())
+    }
+
     /// The pinned policy.
     pub fn policy(&self) -> &Policy {
         &self.policy
@@ -1290,4 +1378,138 @@ fn supersede_component(hops: &[SupersedeHop], id: &str) -> Vec<SupersedeHop> {
         .filter(|hop| ids.contains(&hop.id) && ids.contains(&hop.superseded_by))
         .cloned()
         .collect()
+}
+
+/// Fresh fold of one log. Receipt replay compares this to the live maps.
+pub struct Refold {
+    pub frames: u64,
+    pub state_digest: [u8; 32],
+    pub nodes: BTreeMap<String, NodeRecord>,
+    pub origins: BTreeMap<String, u64>,
+    pub retrievability: BTreeMap<String, f64>,
+    pub gate_mismatches: Vec<String>,
+    pub gaps: Vec<String>,
+}
+
+struct ScannedSegment {
+    header: strata::SegmentHeader,
+    trailer: Option<strata::SegmentTrailer>,
+}
+
+fn scan_segment(bytes: &[u8], name: &str) -> Result<ScannedSegment, StoreError> {
+    if bytes.len() < strata::HEADER_WIRE_SIZE {
+        return Err(StoreError::Verify(format!(
+            "{name}: segment header unreadable"
+        )));
+    }
+    let header: strata::SegmentHeader = borsh::from_slice(&bytes[..strata::HEADER_WIRE_SIZE])
+        .map_err(|_| StoreError::Verify(format!("{name}: segment header unreadable")))?;
+    if header.magic != strata::SEGMENT_MAGIC || header.version != strata::SEGMENT_VERSION {
+        return Err(StoreError::Verify(format!(
+            "{name}: segment header unreadable"
+        )));
+    }
+    let mut prev = strata::header_hash(&header);
+    let mut off = strata::HEADER_WIRE_SIZE;
+    let mut leaves = Vec::new();
+    let mut frames = 0u64;
+    loop {
+        let rem = bytes.len() - off;
+        if rem == 0 {
+            return Ok(ScannedSegment {
+                header,
+                trailer: None,
+            });
+        }
+        if rem == strata::TRAILER_WIRE_SIZE {
+            let trailer: strata::SegmentTrailer = borsh::from_slice(&bytes[off..]).map_err(|_| {
+                StoreError::Verify(format!("{name}: trailer-sized tail failed to parse"))
+            })?;
+            if trailer.frame_count != frames {
+                return Err(StoreError::Verify(format!(
+                    "{name}: trailer frame_count {} != scanned {frames}",
+                    trailer.frame_count
+                )));
+            }
+            if trailer.merkle_root != strata::merkle_root(&leaves) {
+                return Err(StoreError::Verify(format!(
+                    "{name}: trailer merkle root mismatch"
+                )));
+            }
+            return Ok(ScannedSegment {
+                header,
+                trailer: Some(trailer),
+            });
+        }
+        if rem < strata::FRAME_FIXED_WIRE_SIZE {
+            return Err(StoreError::Verify(format!(
+                "{name}: short frame header at offset {off}"
+            )));
+        }
+        let (frame, used) = strata::parse_frame(&bytes[off..]).map_err(|e| {
+            StoreError::Verify(format!("{name}: frame parse failed at offset {off}: {e}"))
+        })?;
+        if frame.payload_blake3 != strata::payload_blake3(frame.kind, &frame.payload) {
+            return Err(StoreError::Verify(format!(
+                "{name}: payload blake3 mismatch at offset {off}"
+            )));
+        }
+        if frame.prev_frame_hash != prev {
+            return Err(StoreError::Verify(format!(
+                "{name}: frame chain link mismatch at offset {off}"
+            )));
+        }
+        prev = strata::frame_hash(&frame);
+        leaves.push(frame.payload_blake3);
+        frames += 1;
+        off += used;
+    }
+}
+
+fn gate_verdict_mismatches(
+    store: &StrataStore,
+    frames: &[strata::FrameRecord],
+) -> Result<Vec<String>, StoreError> {
+    let recomputed = store.rederive_verdicts()?;
+    let mut stored = Vec::new();
+    let mut gate_seq = 0u64;
+    for frame in frames {
+        let Some(kind) = RecordKind::from_u8(frame.kind) else {
+            continue;
+        };
+        let gseq = gate_seq;
+        gate_seq += 1;
+        if kind != RecordKind::Gate {
+            continue;
+        }
+        let gate = GateRecord::try_from_slice(&frame.payload).map_err(|error| {
+            StoreError::Verify(format!("malformed gate record at seq {gseq}: {error}"))
+        })?;
+        stored.push((gseq, gate.verdict));
+    }
+    let mut out = Vec::new();
+    if stored.len() != recomputed.len() {
+        out.push("gate:count".into());
+    }
+    for (left, right) in stored.iter().zip(recomputed.iter()) {
+        if left != right {
+            out.push(format!("gate:{}", left.0));
+        }
+    }
+    Ok(out)
+}
+
+fn gap_label(gap: &strata_gate::record::GapRecord) -> String {
+    use strata_gate::record::GapDetail;
+    match &gap.detail {
+        GapDetail::OrphanEffect { effect_seq, .. } => format!("gap:orphan_effect:{effect_seq}"),
+        GapDetail::ReadNoReceipt { reader_seq, .. } => {
+            format!("gap:read_no_receipt:{reader_seq}")
+        }
+        GapDetail::DutySeqGap {
+            source,
+            expected,
+            found,
+        } => format!("gap:duty_seq_gap:{source}:{expected}:{found}"),
+    }
 }
