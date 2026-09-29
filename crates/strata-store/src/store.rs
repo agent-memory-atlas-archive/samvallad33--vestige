@@ -186,7 +186,7 @@ pub fn default_policy() -> Policy {
     }
 }
 
-/// What an admitted node effect did. Derived by replaying the log.
+/// What an admitted node or intention effect did. Derived by replaying the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectAction {
     /// First upsert of a node (ingest). Folds one Good review.
@@ -198,17 +198,20 @@ pub enum EffectAction {
     Edit,
     /// Explicit FSRS review. `rating` is 1..=4.
     Review,
+    /// Intention row inserted or replaced by `UpsertIntentions`. A batch
+    /// proves one effect per row, all citing the same EFFECT. Not a card.
+    Intention,
 }
 
-/// One node effect proved from the log: covering propose, Allow gate, and a
-/// data frame whose blake3 matches the effect's payload digest.
+/// One node or intention effect proved from the log: covering propose, Allow
+/// gate, and a data frame whose blake3 matches the effect's payload digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectProof {
     /// Gate-space seq of the EFFECT record (`eff-` receipt id).
     pub effect_seq: u64,
     /// Log seq of the STORE_WRITE frame (FSRS `event_seq` for reviews).
     pub data_seq: u64,
-    /// Node the effect names.
+    /// Node (or intention, for [`EffectAction::Intention`]) the effect names.
     pub node_id: String,
     /// Which mutation landed.
     pub action: EffectAction,
@@ -1298,7 +1301,7 @@ impl StrataStore {
             .collect()
     }
 
-    /// Every node effect proved from the log, in effect-seq order.
+    /// Every node and intention effect proved from the log, in effect-seq order.
     ///
     /// `verify_tail` checks the active segment's hash chain (and the trailer
     /// signature when the segment is sealed). Each effect must cite an Allow
@@ -1422,9 +1425,19 @@ impl StrataStore {
                             rating: Some(rating),
                         }
                     }
-                    StoreOp::SaveEdge { .. }
-                    | StoreOp::SupersedeNode { .. }
-                    | StoreOp::UpsertIntentions { .. } => continue,
+                    StoreOp::UpsertIntentions { records } => {
+                        // One admitted batch: every row cites this effect.
+                        proofs.extend(records.into_iter().map(|record| EffectProof {
+                            effect_seq,
+                            data_seq: frame.seq,
+                            node_id: record.id,
+                            action: EffectAction::Intention,
+                            payload_digest: digest,
+                            rating: None,
+                        }));
+                        continue;
+                    }
+                    StoreOp::SaveEdge { .. } | StoreOp::SupersedeNode { .. } => continue,
                 };
                 proofs.push(proof);
             }
@@ -1440,7 +1453,7 @@ impl StrataStore {
             .find(|proof| proof.effect_seq == effect_seq))
     }
 
-    /// The latest proved node effect for `node_id`.
+    /// The latest proved effect for `node_id` (a node or an intention id).
     pub fn latest_effect(&self, node_id: &str) -> Result<Option<EffectProof>, StoreError> {
         Ok(self
             .prove_effects()?

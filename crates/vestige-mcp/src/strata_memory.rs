@@ -506,6 +506,7 @@ fn mutation_kind(proof: &strata_store::EffectProof) -> &'static str {
         (strata_store::EffectAction::Review, Some(PROMOTE_RATING)) => "promoted",
         (strata_store::EffectAction::Review, Some(DEMOTE_RATING)) => "demoted",
         (strata_store::EffectAction::Review, _) => "reviewed",
+        (strata_store::EffectAction::Intention, _) => "intention_upserted",
     }
 }
 
@@ -680,9 +681,12 @@ fn retrievable(record: &strata_store::NodeRecord) -> bool {
     record.superseded_by.is_none()
 }
 
-/// A node-id lookup of a missing or retired node. `eff-` ids still resolve.
+/// A node-id lookup of a missing or retired node. `eff-` ids and intention ids
+/// still resolve.
 fn node_lookup_hidden(store: &strata_store::StrataStore, key: &str) -> bool {
-    parse_receipt_seq(key).is_none() && !store.get_node(key).as_ref().is_some_and(retrievable)
+    parse_receipt_seq(key).is_none()
+        && store.get_intention(key).is_none()
+        && !store.get_node(key).as_ref().is_some_and(retrievable)
 }
 
 fn endpoint_retired(store: &strata_store::StrataStore, id: &str) -> bool {

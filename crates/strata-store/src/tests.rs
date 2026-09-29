@@ -1135,6 +1135,33 @@ fn intention_batch_is_one_admitted_write_and_a_bad_batch_writes_nothing() {
 }
 
 #[test]
+fn intention_batch_proves_one_effect_per_row_across_reopen() {
+    let dir = temp_dir("intention-proof");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let effect = store
+        .upsert_intentions(vec![intention("a", "one"), intention("b", "two")])
+        .expect("admit");
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    let proof = reopened
+        .effect_by_seq(effect)
+        .expect("prove")
+        .expect("intention effect is proved");
+    assert_eq!(proof.action, EffectAction::Intention);
+    assert_eq!(proof.node_id, "a");
+    for id in ["a", "b"] {
+        let latest = reopened
+            .latest_effect(id)
+            .expect("prove")
+            .expect("row cites the batch effect");
+        assert_eq!(latest.effect_seq, effect);
+        assert_eq!(latest.payload_digest, proof.payload_digest);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn recorded_origin_reads_the_creating_frame_and_supersede_chain() {
     let dir = temp_dir("origin");
     let mut store = StrataStore::open_with_policy(&dir, permissive_policy()).expect("open");
