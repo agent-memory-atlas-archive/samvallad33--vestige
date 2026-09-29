@@ -7,8 +7,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use chrono::DateTime;
+use strata_kernel::event::ReviewEvent;
+use strata_kernel::fsrs::{FsrsFold, ALGO_V1};
+use strata_kernel::kernel::Kernel;
 use strata_migrate::records::KIND_MIGRATION_RECEIPT;
-use strata_migrate::{migrate_with_options, read_snapshot, MigrateOptions, MigrationError};
+use strata_migrate::{
+    migrate, migrate_with_options, read_snapshot, MigrateOptions, MigrationError,
+};
 
 /// Committed synthetic fixture (schema_version 38, 4 nodes, 3 edges,
 /// 1 fsrs card, 2 tombstones, 2 embeddings, 2-envelope chain, 1 walk
@@ -503,6 +509,77 @@ fn migration_receipt_verifies_on_replay() {
         .unwrap();
     let last = frames.last().expect("frames");
     assert_eq!(last.kind, KIND_MIGRATION_RECEIPT);
+}
+
+const FIXTURE_MEMORY: &str = "11111111-1111-4111-8111-111111111111";
+const FIXTURE_LAST_REVIEW: &str = "2026-03-01T09:00:00+00:00";
+
+#[test]
+fn v3_last_review_becomes_reviewed_at_ms_not_import_time() {
+    let (dir, db) = copy_fixture("reviewed-at");
+    let dest = dir.path().join("strata");
+    let report = migrate(&db, &dest).expect("migrate fixture");
+    assert!(report.verify_passed, "{report:?}");
+
+    let reviewed_at = DateTime::parse_from_rfc3339(FIXTURE_LAST_REVIEW)
+        .unwrap()
+        .timestamp_millis();
+    let log = strata::StrataLog::open(&dest).unwrap();
+    let snapshot = read_snapshot(&log).unwrap();
+    let node = snapshot
+        .nodes
+        .iter()
+        .find(|node| node.legacy_id == FIXTURE_MEMORY)
+        .expect("fixture memory");
+    let times: Vec<Option<i64>> = snapshot
+        .reviews
+        .iter()
+        .zip(snapshot.review_times.iter())
+        .filter(|(event, _)| event.card_id == node.kernel_id)
+        .map(|(_, at)| *at)
+        .collect();
+    assert!(times.len() > 1, "synthetic series: {times:?}");
+    assert!(
+        times[..times.len() - 1].iter().all(|at| at.is_none()),
+        "only the latest review carries the v3 clock: {times:?}"
+    );
+    assert_eq!(times.last().copied().flatten(), Some(reviewed_at));
+
+    let kernel = Kernel::<ReviewEvent>::for_version(ALGO_V1).unwrap();
+    let mut state = strata_kernel::state::State::default();
+    kernel.apply_all(&mut state, snapshot.reviews.iter());
+    let card = state.cards.get(&node.kernel_id).expect("card");
+    let head = log.head().last_acked_seq;
+    let as_of = DateTime::parse_from_rfc3339("2026-09-29T00:00:00+00:00")
+        .unwrap()
+        .timestamp_millis();
+    let from_review =
+        FsrsFold::retrievability_at_review(card, Some(reviewed_at), as_of, head, ALGO_V1).unwrap();
+    let from_import = FsrsFold::retrievability_at_review(card, None, as_of, head, ALGO_V1).unwrap();
+    assert!(head - card.last_seq < 20);
+    assert!(FsrsFold::elapsed_review_days(reviewed_at, as_of) > 180);
+    assert!(
+        from_review < from_import,
+        "retrievability must use the v3 review clock, not the import seq: {from_review} vs {from_import}"
+    );
+}
+
+#[test]
+fn missing_last_review_leaves_reviewed_at_unset() {
+    let (dir, db) = copy_fixture("no-last-review");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("UPDATE fsrs_cards SET last_review = NULL", [])
+        .unwrap();
+    drop(conn);
+
+    let dest = dir.path().join("strata");
+    migrate(&db, &dest).expect("migrate");
+    let snapshot = read_snapshot(&strata::StrataLog::open(&dest).unwrap()).unwrap();
+    assert!(
+        snapshot.review_times.iter().all(|at| at.is_none()),
+        "absent last_review stays unset: {:?}",
+        snapshot.review_times
+    );
 }
 
 // ---------------------------------------------------------------------------

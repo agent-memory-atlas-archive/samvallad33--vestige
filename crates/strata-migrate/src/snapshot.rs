@@ -19,6 +19,8 @@ pub struct Snapshot {
     pub nodes: Vec<NodeRecord>,
     pub edges: Vec<EdgeRecord>,
     pub reviews: Vec<ReviewEvent>,
+    /// Parallel to `reviews`: `reviewed_at_ms` from the required option suffix.
+    pub review_times: Vec<Option<i64>>,
     pub tombstones: Vec<TombstoneRecord>,
     pub supersessions: Vec<SupersessionRecord>,
     pub checkpoints: Vec<Checkpoint>,
@@ -54,9 +56,14 @@ pub fn read_snapshot(log: &StrataLog) -> Result<Snapshot, MigrationError> {
             KIND_EDGE => snapshot
                 .edges
                 .push(decode_edge(&frame.payload).map_err(decode)?),
-            KIND_FSRS_REVIEW => snapshot
-                .reviews
-                .push(decode_review(&frame.payload).map_err(decode)?),
+            KIND_FSRS_REVIEW => {
+                snapshot
+                    .reviews
+                    .push(decode_review(&frame.payload).map_err(decode)?);
+                snapshot
+                    .review_times
+                    .push(decode_reviewed_at_ms(&frame.payload).map_err(decode)?);
+            }
             KIND_TOMBSTONE => snapshot
                 .tombstones
                 .push(decode_tombstone(&frame.payload).map_err(decode)?),

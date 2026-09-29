@@ -21,8 +21,8 @@ use vestige_core::storage::{
     WalCheckpointMode, WalCheckpointStatus, HANDLE_REQUIRED_DETAIL, MAX_CANDIDATES,
 };
 use vestige_core::{
-    scan_secrets, ConsolidationResult, DecayRisk, IngestInput, KnowledgeNode, MemoryStats, Receipt,
-    SecretPolicy,
+    scan_secrets, ConsolidationResult, DecayRisk, IngestInput, KnowledgeNode, MemoryStats, Rating,
+    Receipt, SecretPolicy,
 };
 
 const Q32_SCALE: f64 = 4294967296.0;
@@ -630,6 +630,17 @@ impl MemoryStoreSend for StrataMemory {
         let record = store
             .get_node(&id)
             .ok_or_else(|| StorageError::NotFound(id.clone()))?;
+        Ok(project_node(&store, &record))
+    }
+
+    fn mark_reviewed(&self, id: &str, rating: Rating) -> Result<KnowledgeNode, StorageError> {
+        let mut store = self.lock();
+        store
+            .review(id, u8::try_from(rating.as_i32()).unwrap_or(0))
+            .map_err(map_store)?;
+        let record = store
+            .get_node(id)
+            .ok_or_else(|| StorageError::NotFound(id.to_string()))?;
         Ok(project_node(&store, &record))
     }
 

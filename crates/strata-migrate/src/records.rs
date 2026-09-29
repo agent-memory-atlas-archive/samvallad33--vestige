@@ -10,11 +10,10 @@
 //! future migration format can evolve without kind renegotiation. Version 1
 //! is the layout documented here.
 //!
-//! The `FSRS_REVIEW` payload is NOT a bespoke struct: it is the kernel's own
-//! `strata_kernel::event::ReviewEvent` borsh encoding, and the `CHECKPOINT`
-//! payload is `strata_kernel::checkpoint::Checkpoint` verbatim. Migration
-//! records reuse kernel wire types wherever one exists — one encoding per
-//! concept, forever.
+//! The `FSRS_REVIEW` payload is the kernel's `ReviewEvent` followed by
+//! `borsh(Option<i64>)` `reviewed_at_ms`. The `CHECKPOINT` payload is
+//! `strata_kernel::checkpoint::Checkpoint` verbatim. Migration records reuse
+//! kernel wire types wherever one exists — one encoding per concept.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::Signer;
@@ -326,9 +325,33 @@ pub fn decode_edge(payload: &[u8]) -> Result<EdgeRecord, borsh::io::Error> {
     EdgeRecord::try_from_slice(payload)
 }
 
-/// Decode a `KIND_FSRS_REVIEW` payload (kernel wire type).
+/// `ReviewEvent` borsh size: `card_id u64 || rating u8 || event_seq u64`.
+const REVIEW_EVENT_WIRE_LEN: usize = 8 + 1 + 8;
+
+/// Decode a `KIND_FSRS_REVIEW` payload.
+///
+/// The prefix is the kernel `ReviewEvent` (unchanged, so checkpoint hashes
+/// stay valid). It is always followed by `borsh(Option<i64>)`
+/// `reviewed_at_ms`. A bare `ReviewEvent` does not decode.
 pub fn decode_review(payload: &[u8]) -> Result<ReviewEvent, borsh::io::Error> {
-    ReviewEvent::try_from_slice(payload)
+    Ok(split_review(payload)?.0)
+}
+
+/// `reviewed_at_ms` after the kernel `ReviewEvent`.
+pub fn decode_reviewed_at_ms(payload: &[u8]) -> Result<Option<i64>, borsh::io::Error> {
+    Ok(split_review(payload)?.1)
+}
+
+fn split_review(payload: &[u8]) -> Result<(ReviewEvent, Option<i64>), borsh::io::Error> {
+    if payload.len() < REVIEW_EVENT_WIRE_LEN + 1 {
+        return Err(borsh::io::Error::new(
+            borsh::io::ErrorKind::InvalidData,
+            "FSRS review is missing reviewed_at_ms",
+        ));
+    }
+    let event = ReviewEvent::try_from_slice(&payload[..REVIEW_EVENT_WIRE_LEN])?;
+    let reviewed_at_ms = Option::<i64>::try_from_slice(&payload[REVIEW_EVENT_WIRE_LEN..])?;
+    Ok((event, reviewed_at_ms))
 }
 
 /// Decode a `KIND_TOMBSTONE` payload.
