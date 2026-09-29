@@ -147,11 +147,6 @@ pub use unlearning_store::{
     V25_UNLEARNING_STORAGE_SCHEMA_VERSION,
 };
 
-/// Backwards-compatibility alias. Retained until Phase 4 completes so every
-/// existing `Arc<Storage>` call site keeps compiling. Scheduled for removal
-/// once no downstream source file references it.
-#[cfg(feature = "legacy-sqlite")]
-
 /// Error returned by [`open_storage`] when the binary was built without the
 /// `legacy-sqlite` feature. Exists in every build so callers can name it
 /// (and print it) regardless of feature state.
