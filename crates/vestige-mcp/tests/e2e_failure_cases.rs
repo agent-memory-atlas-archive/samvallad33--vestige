@@ -369,17 +369,16 @@ fn missing_required_arguments_error_per_tool() {
         );
     }
 
-    // Strata has not admitted `projection_candidates`. An argument-free
-    // `project` call names that pending admission. The refusals above are
-    // missing required subjects.
+    // `project` has no required subject: an argument-free call is a
+    // read-only preview (#338 admitted projection on Strata), not an error.
+    // The refusals above are missing required subjects.
     let defaults = server.call_tool("project", json!({}));
-    let text = defaults["error"]
-        .as_str()
-        .unwrap_or_else(|| panic!("project preview must name the pending admission: {defaults}"));
     assert!(
-        text.contains("pending_strata") && text.contains("projection_candidates"),
-        "project preview must name the pending admission: {text}"
+        defaults.get("error").is_none(),
+        "argument-free project must preview: {defaults}"
     );
+    assert_eq!(defaults["action"], "preview", "{defaults}");
+    assert_eq!(defaults["itemCount"], 0, "{defaults}");
 
     // The dispatch table survived every refusal.
     assert_eq!(server.result("ping", None), json!({}));
@@ -613,43 +612,35 @@ fn array_frames_and_null_id_frames_do_not_kill_the_server() {
 // D. Maintain / destructive failures
 // ============================================================================
 
-/// The standalone purge tool advertises `anthropic/requiresUserInteraction`
-/// (the host prompts on every call) and refuses unconfirmed calls while the
-/// memory survives.
+/// 4.0 withholds purge on a Strata store: it is not advertised, a confirmed
+/// call is refused with `unavailable_in_4_0`, and the memory survives.
 #[test]
-fn purge_tool_requires_user_interaction_and_refuses_unconfirmed_calls() {
+fn purge_is_withheld_on_strata_and_the_memory_survives() {
     let dir = data_dir();
     let mut server = Server::spawn(dir.path());
     server.handshake();
 
     let list = server.result("tools/list", None);
-    let purge = list["tools"]
+    let advertised = list["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|t| t["name"] == json!("purge"))
-        .expect("purge tool advertised")
-        .clone();
-    assert_eq!(
-        purge["_meta"]["anthropic/requiresUserInteraction"],
-        json!(true),
-        "the one irreversible call must request host-side prompting: {purge}"
-    );
+        .any(|t| t["name"] == json!("purge"));
+    assert!(!advertised, "purge is withheld on Strata: {list}");
 
-    let id = server.ingest_keyword_only("A memory that must survive an unconfirmed purge", &[]);
-    let refused = server.call_tool("purge", json!({ "id": id }));
-    let refused_text = refused.to_string();
+    let id = server.ingest_keyword_only("A memory that must survive a withheld purge", &[]);
+    let refused = server.call_tool("purge", json!({ "id": id, "confirm": true }));
     assert!(
         refused.get("error").is_some() || refused["isError"] == json!(true),
-        "unconfirmed purge must be refused: {refused}"
+        "purge must be refused on Strata: {refused}"
     );
     assert!(
-        refused_text.contains("confirm"),
-        "the refusal must say what was missing: {refused}"
+        refused.to_string().contains("unavailable_in_4_0"),
+        "the refusal must say why: {refused}"
     );
     assert!(
         server.memory_found(&id),
-        "a refused purge must not have removed anything"
+        "a withheld purge must not have removed anything"
     );
     server.shutdown();
 }

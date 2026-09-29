@@ -320,7 +320,14 @@ fn tools_list_is_deterministic_across_restarts_and_carries_cache_hints() {
             "duplicate tool advertised: {name}"
         );
     }
-    for required in ["recall", "smart_ingest", "memory", "suppress"] {
+    // suppress and purge are withheld on Strata in 4.0 (not advertised).
+    for withheld in ["suppress", "purge"] {
+        assert!(
+            !names.contains(&withheld.to_string()),
+            "withheld tool advertised on Strata: {names:?}"
+        );
+    }
+    for required in ["recall", "smart_ingest", "memory"] {
         assert!(
             names.contains(&required.to_string()),
             "advertised surface lost {required}: {names:?}"
