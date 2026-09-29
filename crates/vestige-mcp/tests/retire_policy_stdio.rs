@@ -10,14 +10,14 @@ use std::time::{Duration, Instant};
 
 use strata_store::{AdmissionContext, RULE_SUPPRESS, StrataStore};
 
-struct Stdio {
+struct McpSession {
     child: Child,
     stdin: ChildStdin,
     lines: Receiver<String>,
     seq: u64,
 }
 
-fn spawn(bin: &str, data_dir: &Path) -> Stdio {
+fn spawn(bin: &str, data_dir: &Path) -> McpSession {
     let mut cmd = Command::new(bin);
     cmd.arg("--no-http").arg("--data-dir").arg(data_dir);
     cmd.env_clear();
@@ -51,7 +51,7 @@ fn spawn(bin: &str, data_dir: &Path) -> Stdio {
         }
     });
     let stdin = child.stdin.take().expect("stdin");
-    Stdio {
+    McpSession {
         child,
         stdin,
         lines,
@@ -59,7 +59,7 @@ fn spawn(bin: &str, data_dir: &Path) -> Stdio {
     }
 }
 
-impl Stdio {
+impl McpSession {
     fn rpc(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
         self.seq += 1;
         let id = self.seq;
@@ -131,7 +131,7 @@ impl Stdio {
     }
 }
 
-fn ingest(mcp: &mut Stdio, content: &str) -> String {
+fn ingest(mcp: &mut McpSession, content: &str) -> String {
     let created = mcp.tool(
         "smart_ingest",
         serde_json::json!({ "content": content, "forceCreate": true }),
@@ -173,7 +173,7 @@ fn stdio_allows_one_retire_and_holds_another_then_strata_verify() {
         );
         writeln!(
             mcp.stdin,
-            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
+            r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
         )
         .unwrap();
         mcp.stdin.flush().unwrap();
@@ -183,6 +183,11 @@ fn stdio_allows_one_retire_and_holds_another_then_strata_verify() {
         mcp.close();
         (allowed_id, held_id, successor_id)
     };
+
+    // The stdio process writes `log/*.seg` and no `store.meta`. That log is
+    // the fresh store.
+    let log_dir = dir.join("log");
+    vestige_ok(&["strata-verify", log_dir.to_str().expect("utf8 log")]);
 
     {
         let mut store = StrataStore::open(&dir).expect("open stdio store");
@@ -224,6 +229,8 @@ fn stdio_allows_one_retire_and_holds_another_then_strata_verify() {
                 .superseded_by
                 .is_none()
         );
+        // `store.meta` is what makes the data dir a live store for strata-verify.
+        store.seal_checkpoint().expect("seal");
     }
 
     vestige_ok(&["strata-verify", dir.to_str().expect("utf8 dir")]);
