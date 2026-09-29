@@ -95,7 +95,8 @@ def run(binary, output):
             handshake()
             catalog = rpc("tools/list", {})["tools"]
             names = [x["name"] for x in catalog]
-            assert len(names) == 18, names
+            assert len(names) == 17, names
+            assert "source_sync" not in names, names
             guide = tool("memory_status", {"view": "tools"})["tools"]
             assert [x["name"] for x in guide] == names
             for entry, definition in zip(guide, catalog):
@@ -169,7 +170,28 @@ def run(binary, output):
             typed("project", {"action": "preview"}, "pending_strata")
             typed("intention", {"action": "set", "description": "Synthetic reminder",
                                 "trigger": {"type": "time", "at": "2020-01-01T00:00:00Z"}}, "pending_strata")
-            tool("source_sync", {"source": "gitlab", "repo": "a/b"}, error=True)
+            # connectors is off in a default build: source_sync is not a tool.
+            seq += 1
+            request = {
+                "jsonrpc": "2.0", "id": seq, "method": "tools/call",
+                "params": {"name": "source_sync", "arguments": {"source": "gitlab", "repo": "a/b"}},
+            }
+            proc.stdin.write(json.dumps(request) + "\n")
+            proc.stdin.flush()
+            while True:
+                if not select.select([proc.stdout], [], [], 60)[0]:
+                    raise TimeoutError("source_sync")
+                line = proc.stdout.readline()
+                if not line:
+                    raise RuntimeError("MCP process exited")
+                response = json.loads(line)
+                if response.get("id") == seq:
+                    transcript.append({"request": request, "response": response})
+                    assert "result" not in response, response
+                    assert response["error"]["code"] == -32602, response
+                    assert "Unknown tool" in response["error"]["message"], response
+                    assert "source_sync" in response["error"]["message"], response
+                    break
             for view in ("health", "retention", "timeline", "changelog", "stats", "coverage"):
                 tool("memory_status", {"view": view})
             score = tool("maintain", {"action": "importance_score", "content": "Synthetic fixture design decision"})
@@ -192,7 +214,7 @@ def run(binary, output):
             missing = [name for name in names if name not in called]
             assert not missing, missing
             assert_no_sqlite()
-            passed("all 18 tools answered on Strata: real writes, or a typed error")
+            passed("all 17 tools answered on Strata: real writes, or a typed error")
         finally:
             if proc and proc.poll() is None:
                 proc.terminate()

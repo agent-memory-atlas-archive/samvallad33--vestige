@@ -15,7 +15,7 @@ publish = false
 # The shipped binaries boot a Strata log. `legacy-sqlite` stays available for
 # the SQLite unit tests and the v3-engine harness. `migrate-to-strata` is the
 # only path that links strata-migrate (and its bundled rusqlite).
-default = ["connectors", "codebase-git"]
+default = ["codebase-git"]
 # LEGACY SQLITE QUARANTINE (build/t5-legacy-isolation), mirroring
 # vestige-core. Gates every Storage/sqlite-touching module (server, tools,
 # dashboard, cognitive, resources, trace_recorder, autopilot,
@@ -41,8 +41,8 @@ vector-search = []
 # unavailable instead of the build failing on those C libraries.
 codebase-git = ["vestige-core/codebase-git"]
 # External-source connectors (#57): GitHub Issues / Redmine indexing via the
-# `source_sync` MCP tool. On by default so the tool works out of the box; turn
-# off for a build with no HTTP client.
+# `source_sync` MCP tool. Not a 4.0 default. Enable with `--features connectors`.
+# Off, `source_sync` is absent from tools/list and dispatch.
 connectors = ["vestige-core/connectors"]
 # Hosted managed-sync (Vestige Cloud): `vestige sync --cloud` pushes/pulls the
 # portable archive to the hosted blob service. Not a 4.0 default. Enable with

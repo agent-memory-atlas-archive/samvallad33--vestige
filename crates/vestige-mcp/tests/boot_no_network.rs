@@ -146,6 +146,11 @@ fn default_boot_opens_no_outbound_socket_or_dns() {
         names.contains(&"memory_status"),
         "tools/list missing memory_status: {names:?}"
     );
+    assert!(
+        !names.contains(&"source_sync"),
+        "source_sync is absent unless --features connectors: {names:?}"
+    );
+    assert_eq!(names.len(), 17, "default tools/list: {names:?}");
 
     let called = session.result(
         "tools/call",
@@ -167,8 +172,26 @@ fn default_boot_opens_no_outbound_socket_or_dns() {
     );
     assert_eq!(
         body["compiledFeatures"]["connectors"],
-        json!(true),
-        "connectors stays a default feature: {body}"
+        json!(false),
+        "4.0 default features must not compile connectors: {body}"
+    );
+
+    let unknown = session.exchange(
+        "tools/call",
+        Some(json!({
+            "name": "source_sync",
+            "arguments": { "source": "gitlab", "repo": "a/b" },
+        })),
+    );
+    assert!(
+        unknown.get("result").is_none(),
+        "source_sync must not produce a result body: {unknown}"
+    );
+    assert_eq!(unknown["error"]["code"], json!(-32602), "{unknown}");
+    let message = unknown["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("Unknown tool") && message.contains("source_sync"),
+        "{unknown}"
     );
 
     for (label, value) in [
@@ -386,7 +409,7 @@ impl Session {
         self.write_line(&json!({ "jsonrpc": "2.0", "method": method }).to_string());
     }
 
-    fn result(&mut self, method: &str, params: Option<Value>) -> Value {
+    fn exchange(&mut self, method: &str, params: Option<Value>) -> Value {
         self.next_id += 1;
         let id = self.next_id;
         let mut message = json!({ "jsonrpc": "2.0", "id": id, "method": method });
@@ -399,12 +422,7 @@ impl Session {
             let value: Value = serde_json::from_str(&line)
                 .unwrap_or_else(|error| panic!("non-JSON from vestige-mcp ({error}): {line}"));
             if value.get("id").and_then(Value::as_u64) == Some(id) {
-                assert!(
-                    value.get("error").is_none(),
-                    "{method} returned an error: {value}. stderr: {:?}",
-                    self.stderr_lines()
-                );
-                return value["result"].clone();
+                return value;
             }
             if value.get("id").is_none() && value.get("method").is_some() {
                 self.notifications.push(value);
@@ -412,6 +430,16 @@ impl Session {
             }
             panic!("unexpected stdout line: {line}");
         }
+    }
+
+    fn result(&mut self, method: &str, params: Option<Value>) -> Value {
+        let value = self.exchange(method, params);
+        assert!(
+            value.get("error").is_none(),
+            "{method} returned an error: {value}. stderr: {:?}",
+            self.stderr_lines()
+        );
+        value["result"].clone()
     }
 
     fn drain_notifications(&mut self) {
