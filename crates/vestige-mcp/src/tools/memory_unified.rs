@@ -394,6 +394,32 @@ async fn execute_state(storage: &Arc<Storage>, id: &str) -> Result<Value, String
     }))
 }
 
+fn change_delta(before: f64, after: f64, legacy: &str, strata: bool) -> String {
+    if strata {
+        format!("{:+.4}", after - before)
+    } else {
+        legacy.to_string()
+    }
+}
+
+fn change_multiplier(before: f64, after: f64, legacy: &str, strata: bool) -> String {
+    if !strata {
+        return legacy.to_string();
+    }
+    if before.abs() < f64::EPSILON {
+        return "fsrs-6".to_string();
+    }
+    format!("{:.4}x", after / before)
+}
+
+fn strata_receipt_id(storage: &Arc<Storage>, id: &str) -> Result<String, String> {
+    storage
+        .get_receipt(id)
+        .map_err(|err| err.to_string())?
+        .map(|receipt| receipt.receipt_id)
+        .ok_or_else(|| format!("write receipt missing for {id}"))
+}
+
 /// Promote a memory (thumbs up) — increases retrieval strength with cognitive feedback pipeline
 async fn execute_promote(
     storage: &Arc<Storage>,
@@ -440,6 +466,7 @@ async fn execute_promote(
         }
     }
 
+    let strata = crate::strata_memory::is_strata_backend(storage.as_ref());
     let mut result = serde_json::json!({
         "success": true,
         "action": "promoted",
@@ -449,22 +476,45 @@ async fn execute_promote(
             "retrievalStrength": {
                 "before": before.retrieval_strength,
                 "after": node.retrieval_strength,
-                "delta": "+0.20"
+                "delta": change_delta(before.retrieval_strength, node.retrieval_strength, "+0.20", strata)
             },
             "retentionStrength": {
                 "before": before.retention_strength,
                 "after": node.retention_strength,
-                "delta": "+0.10"
+                "delta": change_delta(before.retention_strength, node.retention_strength, "+0.10", strata)
             },
             "stability": {
                 "before": before.stability,
                 "after": node.stability,
-                "multiplier": "1.5x"
+                "multiplier": change_multiplier(before.stability, node.stability, "1.5x", strata)
             }
         },
-        "message": format!("Memory promoted. It will now surface more often in searches. Retrieval: {:.2} -> {:.2}",
-            before.retrieval_strength, node.retrieval_strength),
+        "message": if strata {
+            format!(
+                "Memory promoted under FSRS-6 (Easy). Stability {:.4} -> {:.4}. Reps {} -> {}. Lapses {} -> {}.",
+                before.stability, node.stability, before.reps, node.reps, before.lapses, node.lapses
+            )
+        } else {
+            format!(
+                "Memory promoted. It will now surface more often in searches. Retrieval: {:.2} -> {:.2}",
+                before.retrieval_strength, node.retrieval_strength
+            )
+        },
     });
+    if strata {
+        let receipt_id = match &endorsement {
+            Some(outcome) => outcome.receipt.receipt_id.clone(),
+            None => strata_receipt_id(storage, id)?,
+        };
+        result["receiptId"] = serde_json::json!(receipt_id);
+        result["changes"]["reps"] = serde_json::json!({"before": before.reps, "after": node.reps});
+        result["changes"]["lapses"] =
+            serde_json::json!({"before": before.lapses, "after": node.lapses});
+        result["changes"]["difficulty"] = serde_json::json!({
+            "before": before.difficulty,
+            "after": node.difficulty
+        });
+    }
     if let Some(outcome) = &endorsement {
         result["actor"] = crate::actor_surface::actor_block(&outcome.endorsement);
         result["endorsement"] = crate::actor_surface::endorsement_block(outcome);
@@ -516,6 +566,7 @@ async fn execute_demote(
         }
     }
 
+    let strata = crate::strata_memory::is_strata_backend(storage.as_ref());
     let mut result = serde_json::json!({
         "success": true,
         "action": "demoted",
@@ -525,23 +576,46 @@ async fn execute_demote(
             "retrievalStrength": {
                 "before": before.retrieval_strength,
                 "after": node.retrieval_strength,
-                "delta": "-0.30"
+                "delta": change_delta(before.retrieval_strength, node.retrieval_strength, "-0.30", strata)
             },
             "retentionStrength": {
                 "before": before.retention_strength,
                 "after": node.retention_strength,
-                "delta": "-0.15"
+                "delta": change_delta(before.retention_strength, node.retention_strength, "-0.15", strata)
             },
             "stability": {
                 "before": before.stability,
                 "after": node.stability,
-                "multiplier": "0.5x"
+                "multiplier": change_multiplier(before.stability, node.stability, "0.5x", strata)
             }
         },
-        "message": format!("Memory demoted. Better alternatives will now surface instead. Retrieval: {:.2} -> {:.2}",
-            before.retrieval_strength, node.retrieval_strength),
+        "message": if strata {
+            format!(
+                "Memory demoted under FSRS-6 (Again). Stability {:.4} -> {:.4}. Reps {} -> {}. Lapses {} -> {}. Not deleted.",
+                before.stability, node.stability, before.reps, node.reps, before.lapses, node.lapses
+            )
+        } else {
+            format!(
+                "Memory demoted. Better alternatives will now surface instead. Retrieval: {:.2} -> {:.2}",
+                before.retrieval_strength, node.retrieval_strength
+            )
+        },
         "note": "Memory is NOT deleted - it remains searchable but ranks lower."
     });
+    if strata {
+        let receipt_id = match &endorsement {
+            Some(outcome) => outcome.receipt.receipt_id.clone(),
+            None => strata_receipt_id(storage, id)?,
+        };
+        result["receiptId"] = serde_json::json!(receipt_id);
+        result["changes"]["reps"] = serde_json::json!({"before": before.reps, "after": node.reps});
+        result["changes"]["lapses"] =
+            serde_json::json!({"before": before.lapses, "after": node.lapses});
+        result["changes"]["difficulty"] = serde_json::json!({
+            "before": before.difficulty,
+            "after": node.difficulty
+        });
+    }
     if let Some(outcome) = &endorsement {
         result["actor"] = crate::actor_surface::actor_block(&outcome.endorsement);
         result["endorsement"] = crate::actor_surface::endorsement_block(outcome);
@@ -549,7 +623,7 @@ async fn execute_demote(
     Ok(result)
 }
 
-/// Edit a memory's content in-place — preserves FSRS state, regenerates embedding
+/// Edit content. Strata admits a new event; the SQLite path updates the row.
 async fn execute_edit(
     storage: &Arc<Storage>,
     id: &str,
@@ -586,15 +660,35 @@ async fn execute_edit(
         new_content.clone()
     };
 
-    Ok(serde_json::json!({
+    let strata = crate::strata_memory::is_strata_backend(storage.as_ref());
+    let embedding_status = if strata {
+        "refused"
+    } else if storage
+        .get_node(id)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|node| node.has_embedding == Some(true))
+    {
+        "available"
+    } else {
+        "pending"
+    };
+    let mut result = serde_json::json!({
         "success": true,
         "action": "edit",
         "nodeId": id,
         "oldContentPreview": old_preview,
         "newContentPreview": new_preview,
-        "embeddingStatus": if storage.get_node(id).map_err(|e| e.to_string())?.is_some_and(|node| node.has_embedding == Some(true)) { "available" } else { "pending" },
-        "note": "FSRS state preserved (stability, difficulty, reps, lapses unchanged). Embedding state was invalidated with the content update; regeneration may complete now or in maintenance. Inspect embeddingStatus."
-    }))
+        "embeddingStatus": embedding_status,
+        "note": if strata {
+            "FSRS state preserved (stability, difficulty, reps, lapses unchanged). Admitted as a new event; the previous content stays in the log."
+        } else {
+            "FSRS state preserved (stability, difficulty, reps, lapses unchanged). Embedding state was invalidated with the content update; regeneration may complete now or in maintenance. Inspect embeddingStatus."
+        }
+    });
+    if strata {
+        result["receiptId"] = serde_json::json!(strata_receipt_id(storage, id)?);
+    }
+    Ok(result)
 }
 
 #[cfg(all(test, feature = "legacy-sqlite"))]
@@ -1181,11 +1275,16 @@ mod tests {
         // Gate 1: claiming a privileged role without operator membership
         // leaves the actor neutral at 1.0 — the claim never self-grants.
         let args = serde_json::json!({ "action": "promote", "id": id, "role": "operator" });
-        let value = execute(&storage, &test_cognitive(), Some(args)).await.unwrap();
+        let value = execute(&storage, &test_cognitive(), Some(args))
+            .await
+            .unwrap();
         assert_eq!(value["actor"]["claimedRole"], "operator");
         assert_eq!(value["actor"]["effectiveRole"], "unattributed");
         assert_eq!(value["actor"]["resolvedWeight"], 1.0);
-        assert_eq!(value["actor"]["resolutionDisposition"], "unregistered_claim");
+        assert_eq!(
+            value["actor"]["resolutionDisposition"],
+            "unregistered_claim"
+        );
         assert_eq!(value["actor"]["policyVersion"], 1);
         assert_eq!(value["endorsement"]["kind"], "support");
         assert!(value["endorsement"]["eventId"].as_str().is_some());
@@ -1194,7 +1293,9 @@ mod tests {
         // Gate 2: the same actor retrying — even under a different hat —
         // does not create a second vote.
         let retry = serde_json::json!({ "action": "promote", "id": id, "role": "qa" });
-        let value = execute(&storage, &test_cognitive(), Some(retry)).await.unwrap();
+        let value = execute(&storage, &test_cognitive(), Some(retry))
+            .await
+            .unwrap();
         assert_eq!(value["endorsement"]["alreadyRecorded"], true);
         let events = storage
             .list_endorsement_events(Some(&id), None, 50)
@@ -1216,9 +1317,16 @@ mod tests {
             .unwrap();
         let id = ingest_memory(&storage).await;
         let args = serde_json::json!({ "action": "demote", "id": id });
-        let value = execute(&storage, &test_cognitive(), Some(args)).await.unwrap();
+        let value = execute(&storage, &test_cognitive(), Some(args))
+            .await
+            .unwrap();
         assert_eq!(value["endorsement"]["kind"], "oppose");
-        assert!(value["actor"]["id"].as_str().unwrap().starts_with("did:key:z6Mk"));
+        assert!(
+            value["actor"]["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("did:key:z6Mk")
+        );
     }
 
     #[tokio::test]
@@ -1226,11 +1334,21 @@ mod tests {
         let (storage, _dir) = test_storage().await;
         let id = ingest_memory(&storage).await;
         let args = serde_json::json!({ "action": "promote", "id": id });
-        let value = execute(&storage, &test_cognitive(), Some(args)).await.unwrap();
+        let value = execute(&storage, &test_cognitive(), Some(args))
+            .await
+            .unwrap();
         assert_eq!(value["success"], true);
-        assert!(value.get("actor").is_none(), "no bound actor, no provenance claim");
+        assert!(
+            value.get("actor").is_none(),
+            "no bound actor, no provenance claim"
+        );
         assert!(value.get("endorsement").is_none());
-        assert!(storage.list_endorsement_events(Some(&id), None, 10).unwrap().is_empty());
+        assert!(
+            storage
+                .list_endorsement_events(Some(&id), None, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1240,12 +1358,264 @@ mod tests {
         let did = vestige_core::actor::ProcessActor::mint().did().to_string();
         storage.set_process_actor(&did).unwrap();
         // Operator grants qa through the store (never through a tool call).
-        storage.grant_actor_role(&did, "qa", Some("operator reviewed")).unwrap();
+        storage
+            .grant_actor_role(&did, "qa", Some("operator reviewed"))
+            .unwrap();
         let args = serde_json::json!({ "action": "promote", "id": id, "role": "qa" });
-        let value = execute(&storage, &test_cognitive(), Some(args)).await.unwrap();
+        let value = execute(&storage, &test_cognitive(), Some(args))
+            .await
+            .unwrap();
         assert_eq!(value["actor"]["effectiveRole"], "qa");
         assert_eq!(value["actor"]["resolutionDisposition"], "granted");
         assert!((value["actor"]["resolvedWeight"].as_f64().unwrap() - 1.10).abs() < 1e-9);
         assert_eq!(value["endorsement"]["independentPrior"], 1.10);
+    }
+}
+
+#[cfg(test)]
+mod strata_tests {
+    use super::*;
+    use crate::strata_memory::StrataMemory;
+    use crate::tools::receipt;
+    use std::path::Path;
+    use vestige_core::MemoryStore;
+
+    fn open() -> (Arc<StrataMemory>, Arc<Storage>, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mem = Arc::new(StrataMemory::open(dir.path()).unwrap());
+        let storage: Arc<Storage> = mem.clone();
+        (mem, storage, dir)
+    }
+
+    fn cognitive() -> Arc<Mutex<CognitiveEngine>> {
+        Arc::new(Mutex::new(CognitiveEngine::new()))
+    }
+
+    fn ingest(storage: &Arc<Storage>, content: &str) -> String {
+        storage
+            .ingest(vestige_core::IngestInput {
+                content: content.to_string(),
+                ..vestige_core::IngestInput::default()
+            })
+            .unwrap()
+            .id
+    }
+
+    fn log_contains(dir: &Path, needle: &str) -> bool {
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if std::fs::read(&path)
+                    .unwrap_or_default()
+                    .windows(needle.len())
+                    .any(|window| window == needle.as_bytes())
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    async fn proved(storage: &Arc<Storage>, receipt_id: &str, node_id: &str, kind: &str) {
+        let got = receipt::execute(
+            storage,
+            Some(serde_json::json!({"action": "get", "receipt_id": receipt_id})),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("receipt get failed: {err}"));
+        assert_eq!(got["receipt"]["receipt_id"], receipt_id);
+        assert_eq!(got["receipt"]["retrieved"][0], node_id);
+        assert_eq!(got["receipt"]["mutations"][0]["kind"], kind);
+        assert_eq!(got["receipt"]["mutations"][0]["id"], node_id);
+        assert_eq!(got["attestation"]["verification"]["locallyVerified"], true);
+        assert_eq!(got["attestation"]["verification"]["chainValid"], true);
+        assert_eq!(got["attestation"]["verification"]["gateAllowed"], true);
+        let digest = got["attestation"]["verification"]["payloadDigest"]
+            .as_str()
+            .unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(
+            got["receipt"]["mutations"][0]["note"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("digest={digest}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_demote_and_edit_admit_proved_receipts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (receipts, cards) = {
+            let mem = Arc::new(StrataMemory::open(dir.path()).unwrap());
+            mem.set_process_actor("did:key:z6Mkstratafixture").unwrap();
+            let storage: Arc<Storage> = mem.clone();
+            let id = ingest(&storage, "original cause text");
+            let before = mem.card_q(&id).unwrap();
+
+            let promoted = execute(
+                &storage,
+                &cognitive(),
+                Some(serde_json::json!({
+                    "action": "promote",
+                    "id": id,
+                    "reason": "it held",
+                    "role": "operator"
+                })),
+            )
+            .await
+            .unwrap();
+            assert_eq!(promoted["action"], "promoted");
+            assert_eq!(promoted["success"], true);
+            let promote_receipt = promoted["receiptId"].as_str().unwrap().to_string();
+            proved(&storage, &promote_receipt, &id, "promoted").await;
+            assert_eq!(
+                promoted["actor"]["resolutionDisposition"],
+                "unregistered_claim"
+            );
+            assert_eq!(promoted["actor"]["resolvedWeight"], 1.0);
+            let after_promote = mem.card_q(&id).unwrap();
+            assert_eq!(after_promote.3, before.3 + 1, "promote folds one review");
+            assert_eq!(after_promote.4, before.4, "Easy is not a lapse");
+            assert_ne!(after_promote.0, before.0, "Easy changes stability");
+
+            let demoted = execute(
+                &storage,
+                &cognitive(),
+                Some(serde_json::json!({
+                    "action": "demote",
+                    "id": id,
+                    "reason": "it failed"
+                })),
+            )
+            .await
+            .unwrap();
+            assert_eq!(demoted["action"], "demoted");
+            assert!(demoted["note"].as_str().unwrap().contains("NOT deleted"));
+            let demote_receipt = demoted["receiptId"].as_str().unwrap().to_string();
+            assert_ne!(demote_receipt, promote_receipt);
+            proved(&storage, &demote_receipt, &id, "demoted").await;
+            let after_demote = mem.card_q(&id).unwrap();
+            assert_eq!(after_demote.3, after_promote.3 + 1);
+            assert_eq!(after_demote.4, after_promote.4 + 1, "Again records a lapse");
+            assert!(storage.get_node(&id).unwrap().is_some());
+
+            let edited = execute(
+                &storage,
+                &cognitive(),
+                Some(serde_json::json!({
+                    "action": "edit",
+                    "id": id,
+                    "content": "replacement cause text"
+                })),
+            )
+            .await
+            .unwrap();
+            assert_eq!(edited["action"], "edit");
+            assert_eq!(edited["embeddingStatus"], "refused");
+            assert!(
+                edited["note"]
+                    .as_str()
+                    .unwrap()
+                    .contains("FSRS state preserved")
+            );
+            let edit_receipt = edited["receiptId"].as_str().unwrap().to_string();
+            proved(&storage, &edit_receipt, &id, "edited").await;
+            let after_edit = mem.card_q(&id).unwrap();
+            assert_eq!(after_edit, after_demote, "edit does not fold a review");
+            assert_eq!(
+                storage.get_node(&id).unwrap().unwrap().content,
+                "replacement cause text"
+            );
+            assert!(log_contains(dir.path(), "original cause text"));
+            assert!(log_contains(dir.path(), "replacement cause text"));
+            (
+                (promote_receipt, demote_receipt, edit_receipt, id),
+                after_edit,
+            )
+        };
+
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        let (promote_receipt, demote_receipt, edit_receipt, id) = receipts;
+        proved(&storage, &promote_receipt, &id, "promoted").await;
+        proved(&storage, &demote_receipt, &id, "demoted").await;
+        proved(&storage, &edit_receipt, &id, "edited").await;
+        let node = storage.get_node(&id).unwrap().unwrap();
+        assert_eq!(node.content, "replacement cause text");
+        assert_eq!(node.reps, i32::try_from(cards.3).unwrap());
+        assert_eq!(node.lapses, i32::try_from(cards.4).unwrap());
+    }
+
+    #[tokio::test]
+    async fn invalid_and_unknown_handles_are_explicit_errors() {
+        let (_mem, storage, _dir) = open();
+        let cog = cognitive();
+        for action in ["promote", "demote", "edit"] {
+            let mut args = serde_json::json!({"action": action, "id": "not-a-handle"});
+            if action == "edit" {
+                args["content"] = serde_json::json!("text");
+            }
+            let err = execute(&storage, &cog, Some(args)).await.unwrap_err();
+            assert!(err.contains("Invalid memory ID format"), "{action}: {err}");
+        }
+
+        let unknown = "mem-ffffffffffffffff";
+        for (action, extra) in [
+            ("promote", serde_json::json!({})),
+            ("demote", serde_json::json!({})),
+            ("edit", serde_json::json!({"content": "next"})),
+        ] {
+            let mut args = serde_json::json!({"action": action, "id": unknown});
+            if let Some(obj) = extra.as_object() {
+                for (key, value) in obj {
+                    args[key] = value.clone();
+                }
+            }
+            let err = execute(&storage, &cog, Some(args)).await.unwrap_err();
+            assert!(
+                err.to_ascii_lowercase().contains("not found"),
+                "{action}: {err}"
+            );
+        }
+
+        let id = ingest(&storage, "stays");
+        let missing = execute(
+            &storage,
+            &cog,
+            Some(serde_json::json!({"action": "edit", "id": id})),
+        )
+        .await
+        .unwrap_err();
+        assert!(missing.contains("content"), "{missing}");
+        let empty = execute(
+            &storage,
+            &cog,
+            Some(serde_json::json!({"action": "edit", "id": id, "content": "   "})),
+        )
+        .await
+        .unwrap_err();
+        assert!(empty.contains("empty"), "{empty}");
+        let secret = format!("ghp_{}", "A".repeat(36));
+        let refused = execute(
+            &storage,
+            &cog,
+            Some(serde_json::json!({"action": "edit", "id": id, "content": secret})),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused.contains("Refused to store probable credential"),
+            "{refused}"
+        );
+        assert_eq!(storage.get_node(&id).unwrap().unwrap().content, "stays");
     }
 }

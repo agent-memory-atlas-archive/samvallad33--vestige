@@ -14,19 +14,23 @@ use serde_json::{Value, json};
 use strata_store::VALID_FOREVER_MS;
 use vestige_core::storage::{
     CompositionEventRecord, ConnectionRecord as VestigeEdge, ConsolidationHistoryRecord,
-    CoverageSnapshot, HandleKind, HandleResolution, HealthStatus, HygieneNodeSummary,
-    HygieneSnapshot, MemoryEdge, MemoryRecord, MemoryStoreError, MemoryStoreResult,
-    MemoryStoreSend, ModelSignature, NeverComposedCandidate, ReceiptAttestationStatus,
-    SchedulingState, SearchQuery, StateTransitionRecord, Storage, StorageError, StoreStats,
-    WalCheckpointMode, WalCheckpointStatus, HANDLE_REQUIRED_DETAIL, MAX_CANDIDATES,
+    CoverageSnapshot, HANDLE_REQUIRED_DETAIL, HandleKind, HandleResolution, HealthStatus,
+    HygieneNodeSummary, HygieneSnapshot, MAX_CANDIDATES, MemoryEdge, MemoryRecord,
+    MemoryStoreError, MemoryStoreResult, MemoryStoreSend, ModelSignature, NeverComposedCandidate,
+    ReceiptAttestationStatus, SchedulingState, SearchQuery, StateTransitionRecord, Storage,
+    StorageError, StoreStats, WalCheckpointMode, WalCheckpointStatus,
 };
 use vestige_core::{
-    scan_secrets, ConsolidationResult, DecayRisk, IngestInput, KnowledgeNode, MemoryStats, Receipt,
-    SecretPolicy,
+    ConsolidationResult, DecayRisk, IngestInput, KnowledgeNode, MemoryStats, Receipt, SecretPolicy,
+    scan_secrets,
 };
 
 const Q32_SCALE: f64 = 4294967296.0;
 const RECEIPT_PREFIX: &str = "eff-";
+/// FSRS-6 Easy. Explicit "this helped" review; the kernel's recall update.
+const PROMOTE_RATING: u8 = 4;
+/// FSRS-6 Again. Explicit "this failed" review; the kernel's forget update.
+const DEMOTE_RATING: u8 = 1;
 
 /// The durable directory this process opened is a Strata log, not a SQLite file.
 pub fn is_strata_backend(storage: &Storage) -> bool {
@@ -131,6 +135,64 @@ fn parse_receipt_seq(receipt_id: &str) -> Option<u64> {
     u64::from_str_radix(rest, 16).ok()
 }
 
+fn hex32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn resolve_proof(
+    store: &strata_store::StrataStore,
+    receipt_or_node: &str,
+) -> Result<Option<strata_store::EffectProof>, strata_store::StoreError> {
+    if let Some(seq) = parse_receipt_seq(receipt_or_node) {
+        return store.effect_by_seq(seq);
+    }
+    store.latest_effect(receipt_or_node)
+}
+
+fn mutation_kind(proof: &strata_store::EffectProof) -> &'static str {
+    match (proof.action, proof.rating) {
+        (strata_store::EffectAction::Create, _) => "created",
+        (strata_store::EffectAction::Rewrite, _) => "rewritten",
+        (strata_store::EffectAction::Edit, _) => "edited",
+        (strata_store::EffectAction::Review, Some(PROMOTE_RATING)) => "promoted",
+        (strata_store::EffectAction::Review, Some(DEMOTE_RATING)) => "demoted",
+        (strata_store::EffectAction::Review, _) => "reviewed",
+    }
+}
+
+fn receipt_from_proof(proof: &strata_store::EffectProof, trust: f64) -> Receipt {
+    let mut note = format!(
+        "digest={} event_seq={} effect_seq={}",
+        hex32(&proof.payload_digest),
+        proof.data_seq,
+        proof.effect_seq
+    );
+    if let Some(rating) = proof.rating {
+        note.push_str(&format!(" rating={rating}"));
+    }
+    Receipt {
+        receipt_id: receipt_id_for(proof.effect_seq),
+        retrieved: vec![proof.node_id.clone()],
+        suppressed: Vec::new(),
+        activation_path: Vec::new(),
+        trust_floor: trust,
+        decay_risk: DecayRisk::from_trust_floor(trust),
+        mutations: vec![vestige_core::ReceiptMutation {
+            id: proof.node_id.clone(),
+            kind: mutation_kind(proof).to_string(),
+            note: Some(note),
+        }],
+        evidence: None,
+        actor: None,
+    }
+}
+
 fn blocking_secrets(text: &str) -> Vec<String> {
     scan_secrets(text)
         .into_iter()
@@ -150,9 +212,16 @@ fn to_store_input(input: &IngestInput) -> strata_store::IngestInput {
     }
 }
 
-fn project_node(store: &strata_store::StrataStore, record: &strata_store::NodeRecord) -> KnowledgeNode {
+fn project_node(
+    store: &strata_store::StrataStore,
+    record: &strata_store::NodeRecord,
+) -> KnowledgeNode {
     let card = store.card_state(&record.id);
-    let retrieval = store.retrievability(&record.id).ok().flatten().unwrap_or(0.0);
+    let retrieval = store
+        .retrievability(&record.id)
+        .ok()
+        .flatten()
+        .unwrap_or(0.0);
     let mut node = KnowledgeNode::default();
     node.id = record.id.clone();
     node.content = record.content.clone();
@@ -162,7 +231,8 @@ fn project_node(store: &strata_store::StrataStore, record: &strata_store::NodeRe
     node.last_accessed = node.created_at;
     node.tags = record.tags.clone();
     node.valid_from = Some(ms_to_dt(record.valid_from_ms));
-    node.valid_until = (record.valid_until_ms != VALID_FOREVER_MS).then(|| ms_to_dt(record.valid_until_ms));
+    node.valid_until =
+        (record.valid_until_ms != VALID_FOREVER_MS).then(|| ms_to_dt(record.valid_until_ms));
     // Kernel retrievability is the only strength the log can justify.
     node.stability = card.as_ref().map(|c| q32(c.stability_q)).unwrap_or(0.0);
     node.difficulty = card.as_ref().map(|c| q32(c.difficulty_q)).unwrap_or(0.0);
@@ -328,11 +398,7 @@ impl MemoryStoreSend for StrataMemory {
         Err(pending_async("get_edges"))
     }
 
-    async fn remove_edge(
-        &self,
-        _source: uuid::Uuid,
-        _target: uuid::Uuid,
-    ) -> MemoryStoreResult<()> {
+    async fn remove_edge(&self, _source: uuid::Uuid, _target: uuid::Uuid) -> MemoryStoreResult<()> {
         Err(pending_async("remove_edge"))
     }
 
@@ -413,7 +479,8 @@ impl MemoryStoreSend for StrataMemory {
         *self
             .actor
             .lock()
-            .unwrap_or_else(|err| panic!("strata actor lock poisoned: {err}")) = Some(did.to_string());
+            .unwrap_or_else(|err| panic!("strata actor lock poisoned: {err}")) =
+            Some(did.to_string());
         Ok(())
     }
 
@@ -425,7 +492,12 @@ impl MemoryStoreSend for StrataMemory {
 
     fn resolve_handle(&self, query: &str) -> HandleResolution {
         let query = query.trim();
-        let ids: Vec<String> = self.lock().origins().into_iter().map(|(id, _)| id).collect();
+        let ids: Vec<String> = self
+            .lock()
+            .origins()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         if query.is_empty() {
             return HandleResolution {
                 kind: HandleKind::Unknown,
@@ -497,7 +569,10 @@ impl MemoryStoreSend for StrataMemory {
         self.lock().backup_to(path).map_err(map_store)
     }
 
-    fn checkpoint_wal(&self, _mode: WalCheckpointMode) -> Result<WalCheckpointStatus, StorageError> {
+    fn checkpoint_wal(
+        &self,
+        _mode: WalCheckpointMode,
+    ) -> Result<WalCheckpointStatus, StorageError> {
         Ok(WalCheckpointStatus {
             busy: 0,
             log_frames: 0,
@@ -518,7 +593,11 @@ impl MemoryStoreSend for StrataMemory {
     }
 
     fn ingest(&self, input: IngestInput) -> Result<KnowledgeNode, StorageError> {
-        self.ingest_in_scope_with_secret_policy(input, vestige_core::DEFAULT_MEMORY_SCOPE, SecretPolicy::Reject)
+        self.ingest_in_scope_with_secret_policy(
+            input,
+            vestige_core::DEFAULT_MEMORY_SCOPE,
+            SecretPolicy::Reject,
+        )
     }
 
     fn ingest_in_scope(
@@ -564,7 +643,10 @@ impl MemoryStoreSend for StrataMemory {
 
     fn get_node(&self, id: &str) -> Result<Option<KnowledgeNode>, StorageError> {
         let store = self.lock();
-        Ok(store.get_node(id).as_ref().map(|record| project_node(&store, record)))
+        Ok(store
+            .get_node(id)
+            .as_ref()
+            .map(|record| project_node(&store, record)))
     }
 
     fn get_all_nodes(&self, limit: i32, offset: i32) -> Result<Vec<KnowledgeNode>, StorageError> {
@@ -626,7 +708,13 @@ impl MemoryStoreSend for StrataMemory {
         let nodes = store.nodes();
         let strengths: Vec<f64> = nodes
             .iter()
-            .map(|record| store.retrievability(&record.id).ok().flatten().unwrap_or(0.0))
+            .map(|record| {
+                store
+                    .retrievability(&record.id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0.0)
+            })
             .collect();
         let total = strengths.len() as i64;
         let average = if strengths.is_empty() {
@@ -713,21 +801,15 @@ impl MemoryStoreSend for StrataMemory {
 
     fn get_receipt(&self, receipt_id: &str) -> Result<Option<Receipt>, StorageError> {
         let store = self.lock();
-        let Some((id, seq)) = lookup_origin(&store, receipt_id) else {
+        let Some(proof) = resolve_proof(&store, receipt_id).map_err(map_store)? else {
             return Ok(None);
         };
-        let trust = store.retrievability(&id).ok().flatten().unwrap_or(0.0);
-        Ok(Some(Receipt {
-            receipt_id: receipt_id_for(seq),
-            retrieved: vec![id],
-            suppressed: Vec::new(),
-            activation_path: Vec::new(),
-            trust_floor: trust,
-            decay_risk: DecayRisk::from_trust_floor(trust),
-            mutations: Vec::new(),
-            evidence: None,
-            actor: None,
-        }))
+        let trust = store
+            .retrievability(&proof.node_id)
+            .ok()
+            .flatten()
+            .unwrap_or(0.0);
+        Ok(Some(receipt_from_proof(&proof, trust)))
     }
 
     fn get_retrieval_replay_capsule(
@@ -742,7 +824,11 @@ impl MemoryStoreSend for StrataMemory {
         receipt_id: &str,
     ) -> Result<Option<ReceiptAttestationStatus>, StorageError> {
         let store = self.lock();
-        Ok(lookup_origin(&store, receipt_id).map(|_| ReceiptAttestationStatus::LegacyUnsigned))
+        // The receipt tool replaces this with the log proof. LegacyUnsigned
+        // only means "no DSSE envelope"; the effect itself is checked in get_receipt.
+        Ok(resolve_proof(&store, receipt_id)
+            .map_err(map_store)?
+            .map(|_| ReceiptAttestationStatus::LegacyUnsigned))
     }
 
     fn create_context_ablation_replay(
@@ -781,8 +867,10 @@ impl MemoryStoreSend for StrataMemory {
     fn code_anchors_for_nodes(
         &self,
         _node_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, Vec<vestige_core::codebase::CodeAnchor>>, StorageError>
-    {
+    ) -> Result<
+        std::collections::HashMap<String, Vec<vestige_core::codebase::CodeAnchor>>,
+        StorageError,
+    > {
         // Anchors are not admitted on this log, so the recorded set is empty.
         Ok(std::collections::HashMap::new())
     }
@@ -977,7 +1065,11 @@ impl MemoryStoreSend for StrataMemory {
         tag_filter: Option<&[String]>,
         scope: Option<&str>,
     ) -> Result<Vec<NeverComposedCandidate>, StorageError> {
-        self.never_composed(scope.or(Some(vestige_core::DEFAULT_MEMORY_SCOPE)), limit, tag_filter)
+        self.never_composed(
+            scope.or(Some(vestige_core::DEFAULT_MEMORY_SCOPE)),
+            limit,
+            tag_filter,
+        )
     }
 
     fn get_recent_composition_events(
@@ -1014,7 +1106,9 @@ impl MemoryStoreSend for StrataMemory {
                     && node_type.is_none_or(|kind| record.node_type == kind)
                     && tags.is_none_or(|tags| {
                         tags.is_empty()
-                            || tags.iter().any(|tag| record.tags.iter().any(|stored| stored == tag))
+                            || tags
+                                .iter()
+                                .any(|tag| record.tags.iter().any(|stored| stored == tag))
                     })
             })
             .map(|record| project_node(&store, record))
@@ -1110,30 +1204,30 @@ impl MemoryStoreSend for StrataMemory {
         Ok(Vec::new())
     }
 
-    fn promote_memory(&self, _id: &str) -> Result<KnowledgeNode, StorageError> {
-        Err(pending("promote_memory"))
+    fn promote_memory(&self, id: &str) -> Result<KnowledgeNode, StorageError> {
+        self.review_memory(id, PROMOTE_RATING)
     }
 
     fn promote_memory_as_actor(
         &self,
-        _id: &str,
-        _claimed_role: Option<&str>,
-        _tool: &str,
+        id: &str,
+        claimed_role: Option<&str>,
+        tool: &str,
     ) -> Result<vestige_core::storage::ActorMutationOutcome, StorageError> {
-        Err(pending("promote_memory_as_actor"))
+        self.actor_review(id, claimed_role, tool, PROMOTE_RATING, "support")
     }
 
-    fn demote_memory(&self, _id: &str) -> Result<KnowledgeNode, StorageError> {
-        Err(pending("demote_memory"))
+    fn demote_memory(&self, id: &str) -> Result<KnowledgeNode, StorageError> {
+        self.review_memory(id, DEMOTE_RATING)
     }
 
     fn demote_memory_as_actor(
         &self,
-        _id: &str,
-        _claimed_role: Option<&str>,
-        _tool: &str,
+        id: &str,
+        claimed_role: Option<&str>,
+        tool: &str,
     ) -> Result<vestige_core::storage::ActorMutationOutcome, StorageError> {
-        Err(pending("demote_memory_as_actor"))
+        self.actor_review(id, claimed_role, tool, DEMOTE_RATING, "oppose")
     }
 
     fn purge_node(
@@ -1172,12 +1266,103 @@ impl MemoryStoreSend for StrataMemory {
         Err(pending("suppress_memory"))
     }
 
-    fn update_node_content(&self, _id: &str, _new_content: &str) -> Result<(), StorageError> {
-        Err(pending("update_node_content"))
+    fn update_node_content(&self, id: &str, new_content: &str) -> Result<(), StorageError> {
+        if new_content.trim().is_empty() {
+            return Err(StorageError::Init("content must not be empty".into()));
+        }
+        let kinds = blocking_secrets(new_content);
+        if !kinds.is_empty() {
+            return Err(StorageError::SecretDetected { kinds });
+        }
+        let mut store = self.lock();
+        if store.get_node(id).is_none() {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        store.edit_content(id, new_content).map_err(map_store)?;
+        Ok(())
     }
 }
 
 impl StrataMemory {
+    fn review_memory(&self, id: &str, rating: u8) -> Result<KnowledgeNode, StorageError> {
+        let mut store = self.lock();
+        if store.get_node(id).is_none() {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        store.review(id, rating).map_err(map_store)?;
+        let record = store
+            .get_node(id)
+            .ok_or_else(|| StorageError::NotFound(id.to_string()))?;
+        Ok(project_node(&store, &record))
+    }
+
+    /// Bound-actor path. The admitted fact is the FSRS review. The endorsement
+    /// block quotes this call; it is not a second log vote.
+    fn actor_review(
+        &self,
+        id: &str,
+        claimed_role: Option<&str>,
+        tool: &str,
+        rating: u8,
+        endorsement_kind: &str,
+    ) -> Result<vestige_core::storage::ActorMutationOutcome, StorageError> {
+        let actor_did = self
+            .process_actor_did()
+            .ok_or_else(|| StorageError::Init("no process actor is bound to this store".into()))?;
+        let before = self
+            .get_node(id)?
+            .ok_or_else(|| StorageError::NotFound(id.to_string()))?;
+        let node = self.review_memory(id, rating)?;
+        let mut receipt = self
+            .get_receipt(id)?
+            .ok_or_else(|| StorageError::Init(format!("write receipt missing for {id}")))?;
+        let resolution =
+            vestige_core::ActorPolicySnapshot::flat_v1().resolve(&actor_did, claimed_role);
+        receipt.actor = Some(vestige_core::ActorProvenance::from_resolution(
+            &actor_did,
+            &resolution,
+        ));
+        let digest = vestige_core::revision_digest(&before.content);
+        let event_id =
+            vestige_core::endorsement_event_id(&actor_did, id, &digest, endorsement_kind);
+        let receipt_id = receipt.receipt_id.clone();
+        Ok(vestige_core::storage::ActorMutationOutcome {
+            before,
+            node,
+            receipt,
+            endorsement: vestige_core::storage::EndorsementEventRecord {
+                event_id,
+                memory_id: id.to_string(),
+                actor_did,
+                claimed_role: resolution.claimed_role.clone(),
+                effective_role: resolution.effective_role,
+                resolved_weight: resolution.resolved_weight,
+                resolution_disposition: resolution.disposition.as_str().to_string(),
+                policy_version: resolution.policy_version,
+                endorsement_kind: endorsement_kind.to_string(),
+                revision_digest: digest,
+                independent_prior: resolution.resolved_weight,
+                tool: tool.to_string(),
+                receipt_id: Some(receipt_id),
+                created_at: Utc::now().to_rfc3339(),
+            },
+            already_recorded: false,
+        })
+    }
+
+    /// Quantized FSRS card: stability, difficulty, last_seq, reps, lapses.
+    pub fn card_q(&self, id: &str) -> Option<(i64, i64, u64, u32, u32)> {
+        self.lock().card_state(id).map(|card| {
+            (
+                card.stability_q,
+                card.difficulty_q,
+                card.last_seq,
+                card.review_count,
+                card.lapse_count,
+            )
+        })
+    }
+
     fn page_nodes(
         &self,
         scope: Option<&str>,
@@ -1224,7 +1409,10 @@ impl StrataMemory {
             };
             if let Some(tags) = tag_filter.filter(|tags| !tags.is_empty()) {
                 let has = |record: &strata_store::NodeRecord| {
-                    record.tags.iter().any(|tag| tags.iter().any(|want| want == tag))
+                    record
+                        .tags
+                        .iter()
+                        .any(|tag| tags.iter().any(|want| want == tag))
                 };
                 if !has(a) || !has(b) {
                     continue;
@@ -1256,18 +1444,6 @@ impl StrataMemory {
         }
         Ok(out)
     }
-}
-
-fn lookup_origin(store: &strata_store::StrataStore, receipt_or_node: &str) -> Option<(String, u64)> {
-    if let Some(seq) = parse_receipt_seq(receipt_or_node) {
-        return store
-            .origins()
-            .into_iter()
-            .find(|(_, origin)| *origin == seq);
-    }
-    store
-        .origin_seq(receipt_or_node)
-        .map(|seq| (receipt_or_node.to_string(), seq))
 }
 
 #[cfg(test)]

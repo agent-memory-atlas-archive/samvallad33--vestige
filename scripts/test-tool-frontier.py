@@ -161,8 +161,25 @@ def run(binary, output):
             typed("recall", {"mode": "reason", "query": marker}, "similarity_disabled")
             typed("recall", {"mode": "contradictions"}, "similarity_disabled")
             typed("receipt", {"action": "replay", "receipt_id": node_id, "withheld_slots": []}, "pending_strata")
-            typed("memory", {"action": "promote", "id": node_id, "reason": "fixture"}, "pending_strata")
-            typed("memory", {"action": "edit", "id": node_id, "content": "edited"}, "pending_strata")
+            promoted = tool("memory", {"action": "promote", "id": node_id, "reason": "fixture"})
+            assert promoted["action"] == "promoted" and promoted["success"] is True
+            promote_receipt = promoted["receiptId"]
+            assert promote_receipt.startswith("eff-")
+            proved = tool("receipt", {"action": "get", "receipt_id": promote_receipt})
+            assert proved["attestation"]["verification"]["locallyVerified"] is True
+            assert proved["receipt"]["mutations"][0]["kind"] == "promoted"
+            assert node_id in proved["receipt"]["retrieved"]
+            demoted = tool("memory", {"action": "demote", "id": node_id, "reason": "fixture"})
+            assert demoted["action"] == "demoted" and "NOT deleted" in demoted["note"]
+            assert demoted["receiptId"].startswith("eff-") and demoted["receiptId"] != promote_receipt
+            edited = tool("memory", {"action": "edit", "id": node_id, "content": "edited fixture"})
+            assert edited["action"] == "edit" and edited["embeddingStatus"] == "refused"
+            edit_receipt = tool("receipt", {"action": "get", "receipt_id": edited["receiptId"]})
+            assert edit_receipt["attestation"]["verification"]["locallyVerified"] is True
+            assert edit_receipt["receipt"]["mutations"][0]["kind"] == "edited"
+            assert "edited fixture" in json.dumps(tool("memory", {"action": "get", "id": node_id}))
+            typed("memory", {"action": "promote", "id": "not-a-handle"}, "Invalid memory ID")
+            typed("memory", {"action": "edit", "id": "mem-ffffffffffffffff", "content": "nope"}, "not found")
             typed("purge", {"id": node_id, "confirm": True}, "pending_strata")
             context = tool("codebase", {"action": "get_context", "codebase": "fixture"})
             assert marker not in json.dumps(context)

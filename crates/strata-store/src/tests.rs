@@ -497,3 +497,86 @@ fn node_ids_are_log_derived_and_handle_is_stable() {
     assert_eq!(store.card_state(&a).map(|c| c.review_count), Some(1));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn review_card_matches_independent_fsrs6_fold() {
+    let dir = temp_dir("fsrs-fold");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let id = store.ingest(input("fsrs fixture", &[])).expect("ingest");
+    store.review(&id, 4).expect("easy");
+    store.review(&id, 1).expect("again");
+    let mut state = strata_kernel::state::State::default();
+    let kernel = strata_kernel::kernel::Kernel::<strata_kernel::event::ReviewEvent>::for_version(
+        strata_kernel::fsrs::ALGO_V2,
+    )
+    .expect("v2 kernel");
+    for event in store.review_events() {
+        kernel.apply(&mut state, &event);
+    }
+    let card = store.card_state(&id).expect("card");
+    assert_eq!(card, state.cards[&handle_of(&id)]);
+    assert_eq!(card.review_count, 3);
+    assert_eq!(card.lapse_count, 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn edit_keeps_prior_bytes_and_does_not_fold_a_review() {
+    let dir = temp_dir("edit-bytes");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let id = store
+        .ingest(input("original strata edit bytes", &[]))
+        .expect("ingest");
+    let before = store.card_state(&id).expect("card");
+    let reviews = store.review_events().len();
+    store
+        .edit_content(&id, "replacement strata edit bytes")
+        .expect("edit");
+    assert_eq!(
+        store.get_node(&id).expect("node").content,
+        "replacement strata edit bytes"
+    );
+    assert_eq!(store.card_state(&id).expect("card"), before);
+    assert_eq!(store.review_events().len(), reviews);
+    drop(store);
+    let mut blob = Vec::new();
+    for entry in std::fs::read_dir(dir.join("log")).expect("log dir") {
+        let path = entry.expect("entry").path();
+        if path.is_file() {
+            blob.extend(std::fs::read(&path).expect("read"));
+        }
+    }
+    assert!(blob
+        .windows(b"original strata edit bytes".len())
+        .any(|w| w == b"original strata edit bytes"));
+    assert!(blob
+        .windows(b"replacement strata edit bytes".len())
+        .any(|w| w == b"replacement strata edit bytes"));
+    let store = StrataStore::open(&dir).expect("reopen");
+    assert_eq!(
+        store.get_node(&id).expect("node").content,
+        "replacement strata edit bytes"
+    );
+    let card = store.card_state(&id).expect("card");
+    assert_eq!(card.stability_q, before.stability_q);
+    assert_eq!(card.review_count, before.review_count);
+    assert_eq!(card.lapse_count, before.lapse_count);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn empty_policy_denies_review_without_changing_the_card() {
+    let dir = temp_dir("deny-review");
+    let id = {
+        let mut store = StrataStore::open(&dir).expect("open");
+        store.ingest(input("held out", &[])).expect("ingest")
+    };
+    let mut store =
+        StrataStore::open_with_policy(&dir, Policy { rules: Vec::new() }).expect("reopen denied");
+    let before = store.card_state(&id).expect("card");
+    let err = store.review(&id, 4).expect_err("deny");
+    assert!(matches!(err, StoreError::Denied { .. }), "{err}");
+    assert_eq!(store.card_state(&id).expect("card"), before);
+    assert_eq!(store.get_node(&id).expect("node").content, "held out");
+    std::fs::remove_dir_all(&dir).ok();
+}

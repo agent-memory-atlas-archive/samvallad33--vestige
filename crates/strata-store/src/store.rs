@@ -72,6 +72,37 @@ pub fn default_policy() -> Policy {
     }
 }
 
+/// What an admitted node effect did. Derived by replaying the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectAction {
+    /// First upsert of a node (ingest). Folds one Good review.
+    Create,
+    /// Later upsert of an existing node (`set_created_at`). No new review.
+    Rewrite,
+    /// Content replacement. No new review.
+    Edit,
+    /// Explicit FSRS review. `rating` is 1..=4.
+    Review,
+}
+
+/// One node effect proved from the log: covering propose, Allow gate, and a
+/// data frame whose blake3 matches the effect's payload digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectProof {
+    /// Gate-space seq of the EFFECT record (`eff-` receipt id).
+    pub effect_seq: u64,
+    /// Log seq of the STORE_WRITE frame (FSRS `event_seq` for reviews).
+    pub data_seq: u64,
+    /// Node the effect names.
+    pub node_id: String,
+    /// Which mutation landed.
+    pub action: EffectAction,
+    /// blake3 of the `StoreOp` payload. Equals `EFFECT.payload_digest`.
+    pub payload_digest: [u8; 32],
+    /// Review rating when `action` is [`EffectAction::Review`].
+    pub rating: Option<u8>,
+}
+
 /// Stable u64 card handle for a node id: first 8 bytes of blake3(id),
 /// little-endian. Collision probability is negligible (documented, not
 /// guarded: 2^-64 birthday bound per pair).
@@ -282,6 +313,13 @@ impl StrataStore {
             }
             StoreOp::ReviewNode { card_id, rating } => {
                 self.fold_review(*card_id, *rating, ALGO_V2, frame_seq)?;
+            }
+            StoreOp::EditContent { id, content } => {
+                let record = self
+                    .nodes
+                    .get_mut(id)
+                    .ok_or_else(|| StoreError::NotFound(format!("edit target {id}")))?;
+                record.content = content.clone();
             }
         }
         Ok(())
@@ -569,13 +607,15 @@ impl StrataStore {
     }
 
     /// Fold an explicit FSRS review for a node (rating 1..=4).
-    pub fn review(&mut self, id: &str, rating: u8) -> Result<(), StoreError> {
+    ///
+    /// Returns the gate-space effect seq of the admitted review.
+    pub fn review(&mut self, id: &str, rating: u8) -> Result<u64, StoreError> {
         self.require_node(id)?;
         if !(1..=4).contains(&rating) {
             return Err(StoreError::InvalidInput("rating must be 1..=4".into()));
         }
         let context = self.context_for(&[id]);
-        self.admit_write(
+        let (effect_seq, _) = self.admit_write(
             StoreOp::ReviewNode {
                 card_id: handle_of(id),
                 rating,
@@ -583,7 +623,174 @@ impl StrataStore {
             action_kind::WRITE,
             context,
         )?;
-        Ok(())
+        Ok(effect_seq)
+    }
+
+    /// Admit a content edit. The previous content remains in the earlier frame.
+    /// No review is folded.
+    pub fn edit_content(&mut self, id: &str, content: &str) -> Result<u64, StoreError> {
+        if content.trim().is_empty() {
+            return Err(StoreError::InvalidInput("content must not be empty".into()));
+        }
+        self.require_node(id)?;
+        let context = self.context_for(&[id]);
+        let (effect_seq, _) = self.admit_write(
+            StoreOp::EditContent {
+                id: id.to_string(),
+                content: content.to_string(),
+            },
+            action_kind::WRITE,
+            context,
+        )?;
+        Ok(effect_seq)
+    }
+
+    /// Review events in fold order. The kernel test replays these independently.
+    #[cfg(test)]
+    pub(crate) fn review_events(&self) -> Vec<ReviewEvent> {
+        self.review_events
+            .iter()
+            .map(|(_, _, event)| event.clone())
+            .collect()
+    }
+
+    /// Every node effect proved from the log, in effect-seq order.
+    ///
+    /// `verify_tail` checks the active segment's hash chain (and the trailer
+    /// signature when the segment is sealed). Each effect must cite an Allow
+    /// gate and a data frame with the same payload digest.
+    pub fn prove_effects(&self) -> Result<Vec<EffectProof>, StoreError> {
+        self.log.verify_tail()?;
+        let frames = self.log.read_frames(1)?;
+        let mut propose_at: HashMap<u64, Propose> = HashMap::new();
+        let mut gates_for: HashMap<u64, Vec<(u64, GateRecord)>> = HashMap::new();
+        let mut pending: HashMap<[u8; 32], VecDeque<u64>> = HashMap::new();
+        let mut handles: HashMap<u64, String> = HashMap::new();
+        let mut proofs = Vec::new();
+        let mut gate_seq_counter: u64 = 0;
+
+        for frame in frames {
+            if frame.payload_blake3 != strata::payload_blake3(frame.kind, &frame.payload) {
+                return Err(StoreError::Verify(format!(
+                    "frame {} payload blake3 does not match its bytes",
+                    frame.seq
+                )));
+            }
+            if let Some(kind) = RecordKind::from_u8(frame.kind) {
+                let gseq = gate_seq_counter;
+                gate_seq_counter += 1;
+                match kind {
+                    RecordKind::Propose => {
+                        if let Ok(propose) = Propose::try_from_slice(&frame.payload) {
+                            propose_at.insert(gseq, propose);
+                        }
+                    }
+                    RecordKind::Gate => {
+                        if let Ok(gate) = GateRecord::try_from_slice(&frame.payload) {
+                            gates_for
+                                .entry(gate.propose_seq)
+                                .or_default()
+                                .push((gseq, gate));
+                        }
+                    }
+                    RecordKind::Effect => {
+                        if let Ok(effect) = EffectRecord::try_from_slice(&frame.payload) {
+                            let covering = propose_at
+                                .get(&effect.propose_seq)
+                                .is_some_and(|propose| propose.action_hash == effect.action_hash);
+                            let allowed = gates_for.get(&effect.propose_seq).is_some_and(|gates| {
+                                gates.iter().any(|(gate_seq, gate)| {
+                                    *gate_seq == effect.gate_seq
+                                        && gate.verdict == Verdict::Allow
+                                        && *gate_seq < gseq
+                                })
+                            });
+                            if covering && allowed && effect.action_hash == effect.payload_digest {
+                                pending
+                                    .entry(effect.payload_digest)
+                                    .or_default()
+                                    .push_back(gseq);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else if frame.kind == KIND_STORE_WRITE {
+                let digest = hash32(&frame.payload);
+                let Some(effect_seq) = pending.get_mut(&digest).and_then(|queue| queue.pop_front())
+                else {
+                    continue;
+                };
+                let Some(op) = StoreOp::try_from_slice(&frame.payload).ok() else {
+                    return Err(StoreError::Verify(format!(
+                        "admitted frame {} is not a StoreOp",
+                        frame.seq
+                    )));
+                };
+                let proof = match op {
+                    StoreOp::UpsertNode { record } => {
+                        let handle = handle_of(&record.id);
+                        let action = if handles.contains_key(&handle) {
+                            EffectAction::Rewrite
+                        } else {
+                            EffectAction::Create
+                        };
+                        handles.insert(handle, record.id.clone());
+                        EffectProof {
+                            effect_seq,
+                            data_seq: frame.seq,
+                            node_id: record.id,
+                            action,
+                            payload_digest: digest,
+                            rating: None,
+                        }
+                    }
+                    StoreOp::EditContent { id, content: _ } => EffectProof {
+                        effect_seq,
+                        data_seq: frame.seq,
+                        node_id: id,
+                        action: EffectAction::Edit,
+                        payload_digest: digest,
+                        rating: None,
+                    },
+                    StoreOp::ReviewNode { card_id, rating } => {
+                        let Some(node_id) = handles.get(&card_id).cloned() else {
+                            return Err(StoreError::Verify(format!(
+                                "review effect {effect_seq} names an unknown card"
+                            )));
+                        };
+                        EffectProof {
+                            effect_seq,
+                            data_seq: frame.seq,
+                            node_id,
+                            action: EffectAction::Review,
+                            payload_digest: digest,
+                            rating: Some(rating),
+                        }
+                    }
+                    StoreOp::SaveEdge { .. } | StoreOp::SupersedeNode { .. } => continue,
+                };
+                proofs.push(proof);
+            }
+        }
+        Ok(proofs)
+    }
+
+    /// The proved effect at `effect_seq`, if the log admits one.
+    pub fn effect_by_seq(&self, effect_seq: u64) -> Result<Option<EffectProof>, StoreError> {
+        Ok(self
+            .prove_effects()?
+            .into_iter()
+            .find(|proof| proof.effect_seq == effect_seq))
+    }
+
+    /// The latest proved node effect for `node_id`.
+    pub fn latest_effect(&self, node_id: &str) -> Result<Option<EffectProof>, StoreError> {
+        Ok(self
+            .prove_effects()?
+            .into_iter()
+            .filter(|proof| proof.node_id == node_id)
+            .max_by_key(|proof| proof.effect_seq))
     }
 
     /// Current FSRS scheduling card for a node (derived state, cloned).
