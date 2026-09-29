@@ -53,7 +53,9 @@ impl StrataMemory {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StorageError> {
         let data_dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
-        let store = strata_store::StrataStore::open(&data_dir).map_err(map_store)?;
+        let store =
+            strata_store::StrataStore::open_with_policy(&data_dir, strata_store::server_policy())
+                .map_err(map_store)?;
         Ok(Self {
             log_dir: data_dir.join("log"),
             data_dir,
@@ -1278,7 +1280,7 @@ impl MemoryStoreSend for StrataMemory {
         if store.get_node(id).is_none() {
             return Err(StorageError::NotFound(id.to_string()));
         }
-        store.edit_content(id, new_content).map_err(map_store)?;
+        store.edit(id, new_content).map_err(map_store)?;
         Ok(())
     }
 }

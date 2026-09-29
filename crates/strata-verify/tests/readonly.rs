@@ -201,3 +201,50 @@ fn wrong_key_fails_without_replacing_it() {
     );
     assert_ne!(before_key, [3u8; 32]);
 }
+
+#[test]
+fn an_edit_store_verifies_and_is_left_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("store");
+    {
+        let mut store =
+            StrataStore::open_with_policy(&dir, strata_store::server_policy()).expect("open");
+        let id = store
+            .ingest(IngestInput {
+                content: "original verify edit".into(),
+                node_type: String::new(),
+                tags: Vec::new(),
+                created_at_ms: Some(1_700_000_000_000),
+                valid_from_ms: None,
+                valid_until_ms: None,
+            })
+            .expect("ingest");
+        let (successor, _) = store.edit(&id, "replacement verify edit").expect("edit");
+        assert_eq!(
+            store.get_node(&successor).expect("successor").content,
+            "replacement verify edit"
+        );
+        assert_eq!(
+            store.get_node(&id).expect("old").superseded_by.as_deref(),
+            Some(successor.as_str())
+        );
+        store.seal_checkpoint().expect("seal");
+    }
+    let before = snapshot(&dir);
+    let report = strata_verify::verify_path(&dir);
+    assert!(report.ok, "edit store must verify: {}", report.json);
+    assert_eq!(snapshot(&dir), before, "verify wrote the store");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_strata-verify"))
+        .arg(&dir)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("\"ok\": true"), "{stdout}");
+    assert_eq!(snapshot(&dir), before, "the binary wrote the store");
+}
