@@ -177,10 +177,6 @@ tempfile = "3"
 # created a SQLite store and then refused to open it, invisible while the
 # guard was test-disabled).
 [[test]]
-name = "auto_upgrade"
-required-features = ["migrate-to-strata"]
-
-[[test]]
 name = "backfill_trait_wall"
 required-features = ["legacy-sqlite"]
 
