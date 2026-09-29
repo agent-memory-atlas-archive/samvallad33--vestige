@@ -23,6 +23,70 @@ fn build_log(dir: &Path) {
     .expect("migration for the verify fixture");
 }
 
+/// v3.1.1 fixture: inferred links are `legacy_inferred`, counts match the
+/// source, the fixture sha256 is unchanged, and `verify_path` passes.
+#[test]
+fn v3_fixture_inferred_edges_are_legacy_inferred() {
+    let sha_before = sha256_file(Path::new(FIXTURE));
+    assert_eq!(
+        sha_before,
+        "961f12d1750dbd2f6e6a8fc365c4a4bb42dd1b7e49cbf465985a36b665e10479"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let log_dir = dir.path().join("strata");
+    build_log(&log_dir);
+    assert_eq!(sha256_file(Path::new(FIXTURE)), sha_before);
+
+    let report = strata_verify::verify_path(&log_dir);
+    assert!(
+        report.ok,
+        "strata-verify must pass: {}",
+        report.failures.join("; ")
+    );
+
+    let snapshot =
+        strata_migrate::read_snapshot(&strata::StrataLog::open(&log_dir).unwrap()).unwrap();
+    let source_edges = snapshot
+        .receipt
+        .as_ref()
+        .expect("receipt")
+        .body
+        .counts
+        .iter()
+        .find(|(name, _)| name == "memory_connections")
+        .expect("memory_connections count")
+        .1;
+    assert_eq!(snapshot.edges.len() as u64, source_edges);
+    assert_eq!(source_edges, 3);
+    let causal = strata_migrate::STRATA_EDGE_VOCABULARY;
+    for edge in &snapshot.edges {
+        if edge.legacy_inferred {
+            assert_eq!(edge.link_type, strata_migrate::LEGACY_INFERRED_KIND);
+            assert!(!causal.contains(&edge.link_type.as_str()));
+        } else {
+            assert!(causal.contains(&edge.link_type.as_str()));
+        }
+    }
+    assert_eq!(
+        snapshot.edges.iter().filter(|e| e.legacy_inferred).count(),
+        2
+    );
+}
+
+fn sha256_file(path: &Path) -> String {
+    let output = std::process::Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .expect("sha256sum");
+    assert!(output.status.success(), "sha256sum failed");
+    String::from_utf8(output.stdout)
+        .expect("sha256sum utf8")
+        .split_whitespace()
+        .next()
+        .expect("sha256 digest")
+        .to_string()
+}
+
 /// Untouched log: chain + receipt checksum + signature + counts all pass.
 #[test]
 fn migrated_log_untouched_passes() {

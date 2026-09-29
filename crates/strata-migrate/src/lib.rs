@@ -15,8 +15,8 @@
 //! | `knowledge_nodes` rows           | `NODE` frames (kernel_id v1 + legacy UUID)      |
 //! | V40 `walk_receipts` rows         | reference `NODE` frames tagged migrated_from_v4 |
 //! | `knowledge_nodes.superseded_by`  | `SUPERSESSION` frames                           |
-//! | `memory_connections` rows        | `EDGE` frames (8-type vocabulary; legacy types  |
-//! |                                  | become `derived_from{legacy_inferred=1}`)       |
+//! | `memory_connections` rows        | `EDGE` frames (declared 8-type vocabulary;      |
+//! |                                  | inferred types become `legacy_inferred`)        |
 //! | `fsrs_cards` rows                | `FSRS_REVIEW` frames (kernel `ReviewEvent`)     |
 //! | `sync_tombstones` / `deletion_tombstones` | `TOMBSTONE` frames                     |
 //! | everything else with rows        | counted in `MigrationReport::skipped_tables`    |
@@ -94,8 +94,9 @@ const MAPPED_TABLES: &[&str] = &[
     "deletion_tombstones",
 ];
 
-/// The only edge vocabulary STRATA carries (H4). Any legacy `link_type`
-/// outside this set migrates as `derived_from` with `legacy_inferred = 1`.
+/// Declared edge kinds: the 8 types a user or tool writes through the typed
+/// edge API. Anything else on a v3 `memory_connections` row is inferred
+/// history and migrates as [`LEGACY_INFERRED_KIND`], never as one of these.
 pub const STRATA_EDGE_VOCABULARY: [&str; 8] = [
     "touched",
     "anchored_to",
@@ -106,6 +107,11 @@ pub const STRATA_EDGE_VOCABULARY: [&str; 8] = [
     "projected_to",
     "evidence_of",
 ];
+
+/// Kind stored in the existing `EdgeRecord.link_type` string for every
+/// inferred v3 link (similarity, entity, keyword, or any other type that
+/// was not an explicit declaration). Not a causal kind, and not a new field.
+pub const LEGACY_INFERRED_KIND: &str = "legacy_inferred";
 
 /// Options for one migration run.
 #[derive(Debug, Clone, Default)]
@@ -1013,9 +1019,11 @@ fn extract_nodes(archive: &PortableArchive) -> Result<NodeSet, MigrationError> {
 /// edges impossible in a consistent store; a dangling edge in an archive is
 /// corruption and stops the migration (fail-stop, never silently dropped).
 ///
-/// Legacy link types are folded into the 8-type STRATA vocabulary: anything
-/// outside [`STRATA_EDGE_VOCABULARY`] becomes `derived_from` with
-/// `legacy_inferred = 1` and the original type kept for provenance.
+/// A v3 `link_type` in [`STRATA_EDGE_VOCABULARY`] is a declared edge and
+/// passes through. Every other type is inferred: the existing `link_type`
+/// field becomes [`LEGACY_INFERRED_KIND`] (never `derived_from` or another
+/// causal kind), `legacy_inferred` is set, and the original type is kept
+/// for provenance.
 fn extract_edges(
     archive: &PortableArchive,
     kernel_ids: &HashMap<String, u64>,
@@ -1043,7 +1051,7 @@ fn extract_edges(
             if STRATA_EDGE_VOCABULARY.contains(&legacy_link_type.as_str()) {
                 (legacy_link_type.clone(), false)
             } else {
-                ("derived_from".to_string(), true)
+                (LEGACY_INFERRED_KIND.to_string(), true)
             };
         let legacy = capture_legacy(
             "memory_connections",
@@ -1192,12 +1200,16 @@ mod tests {
     }
 
     #[test]
-    fn legacy_link_types_fold_into_derived_from() {
-        // Out-of-vocabulary legacy types rewrite to derived_from + flag.
+    fn inferred_link_types_are_outside_the_causal_vocabulary() {
+        // Similarity, entity, and keyword products, plus the rest of the
+        // free-form v3 graph, are not declared causal kinds.
         for legacy in ["causal", "semantic", "temporal", "user_defined", "pattern"] {
             assert!(!STRATA_EDGE_VOCABULARY.contains(&legacy));
         }
-        // The 8 vocabulary types pass through untouched.
+        assert!(
+            !STRATA_EDGE_VOCABULARY.contains(&LEGACY_INFERRED_KIND),
+            "legacy_inferred is not a causal kind"
+        );
         assert_eq!(STRATA_EDGE_VOCABULARY.len(), 8);
     }
 

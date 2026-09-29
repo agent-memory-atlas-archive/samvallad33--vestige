@@ -202,9 +202,9 @@ fn path_a_archive_end_to_end() {
     let edge = &snapshot.edges[0];
     assert_eq!(edge.source_legacy_id, ids[0]);
     assert_eq!(edge.target_legacy_id, ids[1]);
-    // `semantic` is legacy vocabulary: it folds to derived_from with the
-    // legacy type kept for provenance only.
-    assert_eq!(edge.link_type, "derived_from");
+    // `semantic` is inferred (keyword/similarity), not a declared causal kind.
+    assert_eq!(edge.link_type, "legacy_inferred");
+    assert!(!strata_migrate::STRATA_EDGE_VOCABULARY.contains(&edge.link_type.as_str()));
     assert!(edge.legacy_inferred);
     assert_eq!(edge.legacy_link_type, "semantic");
     assert_eq!(edge.activation_count, 3);
