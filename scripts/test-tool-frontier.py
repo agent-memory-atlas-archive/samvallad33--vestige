@@ -160,19 +160,48 @@ def run(binary, output):
 
             typed("recall", {"mode": "reason", "query": marker}, "similarity_disabled")
             typed("recall", {"mode": "contradictions"}, "similarity_disabled")
-            replayed = tool("receipt", {"action": "replay", "receipt_id": node_id, "withheld_slots": []})
+            replay_args = {"action": "replay", "receipt_id": node_id, "withheld_slots": []}
+            replayed = tool("receipt", replay_args)
+            repeated = tool("receipt", replay_args)
+            assert repeated == replayed
             assert replayed["kind"] == "strata" and replayed["matched"] is True
             assert replayed["mismatches"] == [] and replayed["readOnly"] is True
             assert replayed["nodeId"] == node_id and replayed["stateDigest"] == replayed["replayedDigest"]
+            passed("receipt replay matches the log and repeats")
             typed("memory", {"action": "promote", "id": node_id, "reason": "fixture"}, "pending_strata")
             typed("memory", {"action": "edit", "id": node_id, "content": "edited"}, "pending_strata")
             typed("purge", {"id": node_id, "confirm": True}, "pending_strata")
             context = tool("codebase", {"action": "get_context", "codebase": "fixture"})
             assert marker not in json.dumps(context)
             preview = tool("project", {"action": "preview"})
+            defaults = tool("project", {})
+            again = tool("project", {"action": "preview"})
+            assert defaults == preview == again
             assert preview["action"] == "preview" and preview["scope"] == "user"
             assert preview["itemCount"] == 0 and marker not in json.dumps(preview["region"])
-            passed("project preview reads the log; an untagged fact is not projected")
+            target_root = root / "projection"
+            target_root.mkdir()
+            write_args = {
+                "action": "write",
+                "path": "CLAUDE.md",
+                "root": str(target_root),
+                "confirm": True,
+            }
+            written = tool("project", write_args)
+            assert written["action"] == "write" and written["written"] is True
+            assert written.get("refused") is not True
+            assert written["receipt"]["receiptId"].startswith("eff-")
+            assert written["receipt"]["hash"]
+            target = target_root / "CLAUDE.md"
+            first_bytes = target.read_bytes()
+            assert b"vestige:projection:begin" in first_bytes
+            assert marker.encode() not in first_bytes
+            second = tool("project", write_args)
+            assert second["written"] is False and second["receipt"]["hash"] == written["receipt"]["hash"]
+            assert target.read_bytes() == first_bytes
+            after = tool("project", {})
+            assert after["region"] == preview["region"] and after["itemCount"] == 0
+            passed("project {}, preview, and write complete; an untagged fact is not projected")
             typed("intention", {"action": "set", "description": "Synthetic reminder",
                                 "trigger": {"type": "time", "at": "2020-01-01T00:00:00Z"}}, "pending_strata")
             tool("source_sync", {"source": "gitlab", "repo": "a/b"}, error=True)
