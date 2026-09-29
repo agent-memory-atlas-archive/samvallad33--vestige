@@ -1,0 +1,16 @@
+[package]
+name = "strata-gate"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Strata gate runtime: the model proposes, the deterministic checker decides; change+verdict land as one signed record"
+publish = false
+
+# Standalone crate by design: it must NOT join the vestige root workspace.
+# Integration re-parents it deliberately, never implicitly.
+[workspace]
+
+[dependencies]
+# borsh >= 1.8 no longer enables `derive` by default.
+borsh = { version = "1", features = ["derive"] }
+blake3 = "1"
