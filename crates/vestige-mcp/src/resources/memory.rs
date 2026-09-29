@@ -75,7 +75,8 @@ async fn read_stats(storage: &Arc<Storage>) -> Result<String, String> {
         "nodesWithEmbeddings": stats.nodes_with_embeddings,
         "embeddingCoverage": format!("{:.1}%", embedding_coverage),
         "embeddingModel": stats.embedding_model,
-        "embeddingServiceReady": storage.is_embedding_ready(),
+        // w1b: vector code removed; there is no embedding service to be ready.
+        "embeddingServiceReady": false,
     });
 
     serde_json::to_string_pretty(&result).map_err(|e| e.to_string())

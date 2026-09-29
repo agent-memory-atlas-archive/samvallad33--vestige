@@ -155,32 +155,6 @@ fn build_router_inner(state: AppState, port: u16) -> (Router, AppState) {
         // Stats & health
         .route("/api/stats", get(handlers::get_stats))
         .route("/api/health", get(handlers::health_check))
-        // Embedding Profiles — catalog visibility is safe; each lifecycle
-        // stage remains separately confirmed and local-only.
-        .route(
-            "/api/embeddings/profiles",
-            get(handlers::list_embedding_profiles),
-        )
-        .route(
-            "/api/embeddings/install",
-            post(handlers::install_embedding_profile),
-        )
-        .route(
-            "/api/embeddings/evaluate",
-            post(handlers::evaluate_embedding_profile),
-        )
-        .route(
-            "/api/embeddings/migrate",
-            post(handlers::migrate_embedding_profile),
-        )
-        .route(
-            "/api/embeddings/activate",
-            post(handlers::activate_embedding_profile),
-        )
-        .route(
-            "/api/embeddings/rollback",
-            post(handlers::rollback_embedding_profile),
-        )
         // Timeline
         .route("/api/timeline", get(handlers::get_timeline))
         .route("/api/changelog", get(handlers::get_changelog))

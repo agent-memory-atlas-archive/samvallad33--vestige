@@ -13,7 +13,6 @@ use vestige_core::{
     // Neuroscience modules
     ActivationNetwork,
     ActivityTracker,
-    AdaptiveEmbedder,
     ArousalSignal,
     AttentionSignal,
     CompetitionManager,
@@ -39,20 +38,16 @@ use vestige_core::{
     Storage,
     SynapticTaggingSystem,
 };
-#[cfg(feature = "vector-search")]
-use vestige_core::{Reranker, RerankerConfig};
 
 /// Number of cognitive modules held by [`CognitiveEngine`] in this build.
 /// These are in-process Rust structs with no runtime failure channel, so the
 /// health view reports this as the compiled-in module count, not a runtime
-/// probe. The previous hardcode said 28 while the struct actually holds 27
-/// base fields plus 2 search modules — exactly the drift this constant now
-/// prevents. When you add a module field, update the matching arm here and
+/// probe. When you add a module field, update the matching arm here and
 /// `cognitive_module_count_is_maintained`.
 #[cfg(feature = "vector-search")]
-pub const COGNITIVE_MODULE_COUNT: usize = 16 + 11 + 2;
+pub const COGNITIVE_MODULE_COUNT: usize = 16 + 10 + 1;
 #[cfg(not(feature = "vector-search"))]
-pub const COGNITIVE_MODULE_COUNT: usize = 16 + 11;
+pub const COGNITIVE_MODULE_COUNT: usize = 16 + 10;
 
 /// Stateful cognitive engine holding all neuroscience modules.
 ///
@@ -87,13 +82,10 @@ pub struct CognitiveEngine {
     pub chain_builder: MemoryChainBuilder,
     pub compressor: MemoryCompressor,
     pub cross_project: CrossProjectLearner,
-    pub adaptive_embedder: AdaptiveEmbedder,
     pub speculative_retriever: SpeculativeRetriever,
     pub consolidation_scheduler: ConsolidationScheduler,
 
     // -- Search --
-    #[cfg(feature = "vector-search")]
-    pub reranker: Reranker,
     #[cfg(feature = "vector-search")]
     pub temporal_searcher: TemporalSearcher,
 }
@@ -183,13 +175,10 @@ impl CognitiveEngine {
             chain_builder: MemoryChainBuilder::new(),
             compressor: MemoryCompressor::new(),
             cross_project: CrossProjectLearner::new(),
-            adaptive_embedder: AdaptiveEmbedder::new(),
             speculative_retriever: SpeculativeRetriever::new(),
             consolidation_scheduler: ConsolidationScheduler::new(),
 
             // Search
-            #[cfg(feature = "vector-search")]
-            reranker: Reranker::new(RerankerConfig::default()),
             #[cfg(feature = "vector-search")]
             temporal_searcher: TemporalSearcher::new(),
         }
@@ -205,12 +194,12 @@ mod tests {
 
     /// The health view reports `modulesActive` from `COGNITIVE_MODULE_COUNT`.
     /// Rust cannot reflect over struct fields, so this test pins the counting
-    /// convention: 16 neuroscience + 11 advanced + 2 cfg-gated search modules.
+    /// convention: 16 neuroscience + 10 advanced + 1 cfg-gated search module.
     /// If a module field is added to `CognitiveEngine`, update the constant
     /// arms and this expression together.
     #[test]
     fn cognitive_module_count_is_maintained() {
-        let expected = 16 + 11 + if cfg!(feature = "vector-search") { 2 } else { 0 };
+        let expected = 16 + 10 + if cfg!(feature = "vector-search") { 1 } else { 0 };
         assert_eq!(COGNITIVE_MODULE_COUNT, expected);
     }
 

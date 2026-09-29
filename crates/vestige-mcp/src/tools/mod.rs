@@ -96,7 +96,6 @@ pub mod backfill;
 // ingest, intentions, knowledge, recall, search, stats) were removed in the
 // post-v2.0.8 dead-code sweep — all nine had zero callers after the
 // unification work landed `*_unified` + `maintenance::*` replacements.
-pub mod context;
 pub mod feedback;
 pub mod memory_states;
 pub mod review;
@@ -104,7 +103,5 @@ pub mod tagging;
 
 /// Evidence-aware intention command adapter.
 pub mod intention_graph;
-
-pub mod warming;
 
 pub mod project;

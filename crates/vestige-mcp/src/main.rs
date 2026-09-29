@@ -7,9 +7,7 @@
 //! Core Features:
 //! - FSRS-6 spaced repetition algorithm (21 parameters, 30% more efficient than SM-2)
 //! - Bjork dual-strength memory model
-//! - Local semantic embeddings (768-dim BGE, no external API)
-//! - HNSW vector search (20x faster than FAISS)
-//! - Hybrid search (BM25 + semantic + RRF fusion)
+//! - Keyword retrieval (FTS5/BM25; the vector/embedding runtime was removed in w1b)
 //!
 //! Neuroscience Features:
 //! - Synaptic Tagging & Capture (retroactive importance)
@@ -319,11 +317,12 @@ fn join_runtime(runtime: tokio::runtime::Runtime, timeout: Duration) -> bool {
 /// Returning from `main` reaches libc `exit()`, and so does
 /// `std::process::exit`. Both run atexit handlers and the static destructors of
 /// everything linked in, including the statically linked ONNX Runtime's
-/// `onnx::OpSchemaRegistry` op-schema map. `serve` warms embeddings and the
-/// cross-encoder reranker on `spawn_blocking` threads, and each spends seconds
-/// inside `OrtApis::CreateSession`. When [`join_runtime`] reports the runtime
-/// threads unjoined, one of those threads can still be inside ONNX Runtime, and
-/// running its destructors underneath it reads freed memory.
+/// `onnx::OpSchemaRegistry` op-schema map from the era when `serve` warmed
+/// embeddings and the cross-encoder reranker on `spawn_blocking` threads, and
+/// each spent seconds inside `OrtApis::CreateSession`. When [`join_runtime`]
+/// reports the runtime threads unjoined, one of those threads can still be
+/// inside ONNX Runtime, and running its destructors underneath it reads freed
+/// memory.
 ///
 /// Measured on this branch before this call existed: `cargo test -p vestige-mcp
 /// --test e2e_real_binary` raised `stdin EOF must be a clean shutdown, got
@@ -485,56 +484,9 @@ async fn serve() {
             }
         });
     }
-    // In builds without an embedding runtime nothing warms up, so the notifier
-    // has no sender beyond this scope; dropping it parks the channel.
+    // Nothing warms up at startup anymore (the embedding runtime was removed),
+    // so the notifier has no sender beyond this scope; dropping it parks the channel.
     let _notifier: Notifier = notifier.clone();
-
-    #[cfg(feature = "embeddings")]
-    {
-        let storage_clone = Arc::clone(&storage);
-        let notifier = notifier.clone();
-        tokio::task::spawn_blocking(move || {
-            let first_run = !vestige_core::embeddings::embedding_model_cached();
-            notifier.log(
-                "info",
-                "vestige.embeddings",
-                serde_json::json!({
-                    "event": if first_run { "model_download_started" } else { "model_loading" },
-                    "model": "nomic-ai/nomic-embed-text-v1.5",
-                    "approxBytes": if first_run { Some(130_000_000u64) } else { None },
-                    "effect": "recall answers by keyword and smart_ingest stores without a vector until the runtime is ready; those responses carry a `warming` block meanwhile",
-                    "milestone": if first_run { Some("first run: ~130 MB download, then keyword search works immediately; semantic ranking joins when ready") } else { None },
-                }),
-            );
-            if let Err(error) = storage_clone.init_embeddings() {
-                tracing::debug!(%error, "No legacy Nomic embedding runtime started");
-                notifier.log(
-                    "warning",
-                    "vestige.embeddings",
-                    serde_json::json!({ "event": "embedding_runtime_unavailable", "error": error.to_string() }),
-                );
-                return;
-            }
-            info!("Legacy Nomic embedding service initialized successfully");
-            notifier.log(
-                "info",
-                "vestige.embeddings",
-                serde_json::json!({ "event": "embedding_runtime_ready" }),
-            );
-
-            #[cfg(feature = "vector-search")]
-            match storage_clone.generate_embeddings(None, false) {
-                Ok(result) if result.successful > 0 || result.failed > 0 => info!(
-                    embeddings_generated = result.successful,
-                    embeddings_failed = result.failed,
-                    embeddings_skipped = result.skipped,
-                    "Background legacy Nomic embedding backfill complete"
-                ),
-                Ok(_) => {}
-                Err(error) => warn!(%error, "Background legacy Nomic embedding backfill failed"),
-            }
-        });
-    }
 
     // Startup hygiene: sweep Black Box traces past VESTIGE_TRACE_RETENTION_DAYS
     // now, not only when the consolidation cycle next runs. Best-effort.
@@ -799,53 +751,6 @@ async fn serve() {
         info!("HTTP MCP transport disabled; set VESTIGE_HTTP_ENABLED=1 or pass --http to enable");
     }
 
-    // Load cross-encoder reranker in the background (downloads ~150MB on first run)
-    #[cfg(all(feature = "vector-search", feature = "embeddings"))]
-    {
-        let cog_clone = Arc::clone(&cognitive);
-        let notifier = notifier.clone();
-        tokio::spawn(async move {
-            // Small delay so we don't block the stdio handshake
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            notifier.log(
-                "info",
-                "vestige.reranker",
-                serde_json::json!({
-                    "event": "reranker_loading",
-                    "note": "a first run downloads about 150 MB; recall ranks by BM25 until it is ready",
-                }),
-            );
-            // The model load is synchronous and downloads ~150MB on a fresh
-            // install. Doing it under the CognitiveEngine mutex stalled every
-            // tool that shares that lock (explore, predict, session_context,
-            // memory_unified, dream, and the rest) for the whole download, on
-            // every startup rather than on demand, and it blocked a tokio
-            // worker thread while it ran. Load on the blocking pool holding
-            // nothing, then take the lock only to install the result.
-            let loaded = tokio::task::spawn_blocking(
-                vestige_core::search::Reranker::load_cross_encoder,
-            )
-            .await;
-            match loaded {
-                Ok(Some(model)) => {
-                    let mut cog = cog_clone.lock().await;
-                    cog.reranker.install_cross_encoder(model);
-                    notifier.log(
-                        "info",
-                        "vestige.reranker",
-                        serde_json::json!({ "event": "reranker_ready" }),
-                    );
-                }
-                // `None` already logged its reason; BM25 fallback stands.
-                Ok(None) => notifier.log(
-                    "warning",
-                    "vestige.reranker",
-                    serde_json::json!({ "event": "reranker_unavailable", "effect": "BM25 ranking stands" }),
-                ),
-                Err(e) => warn!("Cross-encoder load task failed: {e}"),
-            }
-        });
-    }
 
     // Create MCP server with shared event channel for dashboard broadcasts
     let server = McpServer::new_with_events(storage, cognitive, event_tx);

@@ -40,10 +40,10 @@ pub fn consolidate_schema() -> Value {
         "type": "object",
         "properties": {
             "budgetMs": {"type":"integer", "minimum":1,"maximum":10000,"default":1000},
-            "phase": {"type": "string", "enum": ["all", "embeddings", "lifecycle", "logs"], "default": "all"},
+            "phase": {"type": "string", "enum": ["all", "lifecycle", "logs"], "default": "all"},
             "batchSize": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 10,
-                "description": "Bounded phases: selected memories or log rows per call; embeddings accepts at most 100."},
-            "after": {"type": "string", "description": "Embeddings or lifecycle phase: nextCursor from the previous page. Omit after a sweep to retry failures and discover earlier inserts."},
+                "description": "Bounded phases: selected memories or log rows per call."},
+            "after": {"type": "string", "description": "Lifecycle phase: nextCursor from the previous page. Omit after a sweep to retry failures and discover earlier inserts."},
             "dry_run": {"type": "boolean", "default": true, "description": "Bounded phases: preview the selected batch without inference or mutation."}
         }
     })
@@ -177,7 +177,8 @@ pub async fn execute_system_status(
         0.0
     };
 
-    let embedding_ready = storage.is_embedding_ready();
+    // w1b: vector code removed; there is no embedding runtime to be ready.
+    let embedding_ready = false;
     let embeddings_compiled_in = crate::embeddings_compiled_in();
 
     let mut warnings = Vec::new();
@@ -528,22 +529,8 @@ pub async fn execute_consolidate(
     let parsed: Args = serde_json::from_value(args.unwrap_or_else(|| serde_json::json!({})))
         .map_err(|error| error.to_string())?;
     match parsed.phase.as_deref().unwrap_or("all") {
-        "embeddings" => {
-            if parsed.budget_ms.is_some() {
-                return Err("embedding inference supports a row bound, not budgetMs".into());
-            }
-            let storage = Arc::clone(storage);
-            return tokio::task::spawn_blocking(move || {
-                storage.maintain_embedding_batch(
-                    parsed.batch_size.unwrap_or(10),
-                    parsed.after.as_deref(),
-                    parsed.dry_run.unwrap_or(true),
-                )
-            })
-            .await
-            .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string());
-        }
+        // w1b: the "embeddings" phase was removed with the vector runtime;
+        // only lifecycle/log row batches and the full sweep remain.
         "lifecycle" | "logs" => {
             let storage = Arc::clone(storage);
             return tokio::task::spawn_blocking(move || {
@@ -580,7 +567,7 @@ pub async fn execute_consolidate(
                 return Err("batchSize, after and dry_run require a bounded phase".into());
             }
         }
-        _ => return Err("phase must be all, embeddings, lifecycle or logs".into()),
+        _ => return Err("phase must be all, lifecycle or logs".into()),
     }
     let result = storage.run_consolidation().map_err(|e| e.to_string())?;
 

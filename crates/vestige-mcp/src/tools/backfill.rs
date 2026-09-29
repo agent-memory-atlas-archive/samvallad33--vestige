@@ -722,14 +722,19 @@ mod tests {
             .set_created_at(&cause.id, chrono::Utc::now() - chrono::Duration::days(3))
             .unwrap();
 
-        // 2) A semantic distractor: looks like the crash, but shares NO entity.
+        // 2) A semantic distractor: looks like a crash report, but shares NO
+        //    entity with the failure. Wording matters under the tiered
+        //    extractor (w1c): reusing the failure's own words ("service",
+        //    "internal", "server", "error") would hand the distractor four
+        //    word-tier shared entities, and four rare-ish words can outscore
+        //    one code-tier join. "Outage/billing/system" keep the resemblance
+        //    for a human while joining on nothing.
         //    Backdated 20 days (also in the past, so only the entity link decides).
         let distractor = storage
             .ingest(IngestInput {
-                content: "A 500 Internal Server Error happened in the billing service last month"
-                    .to_string(),
+                content: "An outage hit the billing system last month".to_string(),
                 node_type: "event".to_string(),
-                tags: vec!["billing-service".to_string()],
+                tags: vec!["billing-system".to_string()],
                 ..Default::default()
             })
             .unwrap();
