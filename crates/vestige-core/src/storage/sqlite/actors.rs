@@ -311,7 +311,7 @@ impl SqliteMemoryStore {
             (None, None) => stmt.query_map([], map_row)?,
         };
         rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| e.into())
+            .map_err(Into::into)
     }
 
     /// The bounded aggregate independent prior for one memory revision:
@@ -575,9 +575,11 @@ impl SqliteMemoryStore {
     /// Read one node through an open write transaction (the writer's own
     /// uncommitted view — the reader connection cannot see it).
     fn read_node_in_tx(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<KnowledgeNode> {
-        tx.query_row("SELECT * FROM knowledge_nodes WHERE id = ?1", params![id], |row| {
-            Self::row_to_node(row)
-        })
+        tx.query_row(
+            "SELECT * FROM knowledge_nodes WHERE id = ?1",
+            params![id],
+            Self::row_to_node,
+        )
         .map_err(|error| match error {
             rusqlite::Error::QueryReturnedNoRows => StorageError::NotFound(id.to_string()),
             other => other.into(),
