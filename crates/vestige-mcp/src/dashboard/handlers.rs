@@ -3214,7 +3214,7 @@ fn audit_action_for(reason_type: &str, from_state: &str, to_state: &str) -> Opti
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use chrono::Utc;

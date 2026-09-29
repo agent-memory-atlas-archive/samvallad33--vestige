@@ -13,7 +13,7 @@ keywords = ["memory", "spaced-repetition", "fsrs", "knowledge-graph"]
 categories = ["science", "database"]
 
 [features]
-default = ["legacy-sqlite", "bundled-sqlite", "codebase-git"]
+default = ["codebase-git"]
 
 # LEGACY SQLITE QUARANTINE (build/t5-legacy-isolation).
 #

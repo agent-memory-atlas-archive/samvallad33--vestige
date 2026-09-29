@@ -12,7 +12,7 @@ repository = "https://github.com/samvallad33/vestige"
 publish = false
 
 [features]
-default = ["legacy-sqlite", "connectors", "cloud-sync", "codebase-git"]
+default = ["connectors", "cloud-sync", "codebase-git"]
 # LEGACY SQLITE QUARANTINE (build/t5-legacy-isolation), mirroring
 # vestige-core. Gates every Storage/sqlite-touching module (server, tools,
 # dashboard, cognitive, resources, trace_recorder, autopilot,

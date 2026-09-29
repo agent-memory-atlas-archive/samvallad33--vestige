@@ -128,3 +128,7 @@ path = "tests/extreme/research_validation_tests.rs"
 name = "proof_of_superiority"
 required-features = ["legacy-sqlite"]
 path = "tests/extreme/proof_of_superiority.rs"
+
+[lib]
+path = "src/lib.rs"
+required-features = ["legacy-sqlite"]

@@ -2050,6 +2050,7 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
     // modify the source; it is the same mechanism `vestige-cli backup` uses,
     // minus opening the source through Storage (which would run the very
     // migrations we are rehearsing).
+    #[cfg(feature = "legacy-sqlite")]
     {
         let snapshot = rusqlite::Connection::open_with_flags(
             &source,
@@ -2066,6 +2067,7 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
 
     // Preflight reads the copy raw, before any migration runs, so the report
     // describes the store exactly as it sits on disk today.
+    #[cfg(feature = "legacy-sqlite")]
     {
         let preflight = rusqlite::Connection::open(&copy)?;
         let schema_version: Option<i64> = preflight

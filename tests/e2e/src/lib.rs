@@ -1,3 +1,6 @@
+//! E2E harness: legacy-sqlite bound (SQLite-era expectations).
+#![cfg(feature = "legacy-sqlite")]
+
 //! E2E Test Infrastructure for Vestige
 //!
 //! Provides comprehensive testing utilities for 250+ end-to-end tests:

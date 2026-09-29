@@ -9,23 +9,15 @@
 //! storage through `vestige_core::open_storage()` and exit with its clear
 //! `LegacySqliteDisabled` error at runtime.
 
-#[cfg(feature = "legacy-sqlite")]
 pub mod actor_surface;
 
-#[cfg(feature = "legacy-sqlite")]
 pub mod autopilot;
-#[cfg(feature = "legacy-sqlite")]
 pub mod cognitive;
-#[cfg(feature = "legacy-sqlite")]
 pub mod dashboard;
 pub mod protocol;
-#[cfg(feature = "legacy-sqlite")]
 pub mod resources;
-#[cfg(feature = "legacy-sqlite")]
 pub mod server;
-#[cfg(feature = "legacy-sqlite")]
 pub mod tools;
-#[cfg(feature = "legacy-sqlite")]
 pub mod trace_recorder;
 
 /// Whether this binary was compiled with an embedding runtime and a vector
