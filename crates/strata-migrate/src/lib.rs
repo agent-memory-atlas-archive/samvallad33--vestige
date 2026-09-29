@@ -54,19 +54,33 @@
 
 pub mod records;
 pub mod snapshot;
+// v3 comparison against a source SQLite store. Absent unless `sqlite-reader`.
+#[cfg(feature = "sqlite-reader")]
 pub mod source;
 
+#[cfg(feature = "sqlite-reader")]
 use std::collections::HashMap;
+#[cfg(feature = "sqlite-reader")]
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "sqlite-reader")]
+use std::time::Instant;
 
+#[cfg(feature = "sqlite-reader")]
 use strata::StrataLog;
-use strata_kernel::checkpoint::{checkpoint_hash, Checkpoint};
+#[cfg(feature = "sqlite-reader")]
+use strata_kernel::checkpoint::{Checkpoint, checkpoint_hash};
+#[cfg(any(feature = "sqlite-reader", test))]
 use strata_kernel::event::ReviewEvent;
+#[cfg(any(feature = "sqlite-reader", test))]
 use strata_kernel::fsrs::ALGO_V1;
+#[cfg(any(feature = "sqlite-reader", test))]
 use strata_kernel::kernel::Kernel;
+#[cfg(feature = "sqlite-reader")]
 use strata_kernel::verify::verify_with_head;
+#[cfg(feature = "sqlite-reader")]
 use vestige_core::storage::PortableArchive;
+#[cfg(feature = "sqlite-reader")]
 use vestige_core::storage::PortableValue;
 
 pub use records::{
@@ -82,10 +96,12 @@ pub const PARAMS_ID: &str = "v4-migrate/1";
 
 /// Frames per `append_batch` call: bounds peak memory on huge stores while
 /// staying far above the log's own 64-frame group-commit cap.
+#[cfg(feature = "sqlite-reader")]
 const BATCH_FRAMES: usize = 1024;
 
 /// Tables this migration maps into STRATA records. Every other source table
 /// that contains rows is reported in `skipped_tables`.
+#[cfg(feature = "sqlite-reader")]
 const MAPPED_TABLES: &[&str] = &[
     "knowledge_nodes",
     "memory_connections",
@@ -221,11 +237,13 @@ fn ser_duration_secs<S: serde::Serializer>(
 /// Migrate from `<src>` (portable archive JSON, SQLite db file, or data
 /// directory containing `vestige.db`) into a STRATA log at `<dst>`, with
 /// default options.
+#[cfg(feature = "sqlite-reader")]
 pub fn migrate(source: &Path, strata_dir: &Path) -> Result<MigrationReport, MigrationError> {
     migrate_with_options(source, strata_dir, MigrateOptions::default())
 }
 
 /// Migrate with explicit options. See [`MigrateOptions`].
+#[cfg(feature = "sqlite-reader")]
 pub fn migrate_with_options(
     source: &Path,
     strata_dir: &Path,
@@ -272,6 +290,7 @@ pub fn migrate_with_options(
 }
 
 /// Sibling of `dest` that holds the log until the rename.
+#[cfg(feature = "sqlite-reader")]
 fn staging_path(dest: &Path) -> std::path::PathBuf {
     let name = dest.file_name().unwrap_or(std::ffi::OsStr::new("strata"));
     let mut staging_name = name.to_os_string();
@@ -281,6 +300,7 @@ fn staging_path(dest: &Path) -> std::path::PathBuf {
 
 /// True when `dir` contains anything other than dotfiles. A missing path
 /// is empty. A non-directory is occupied.
+#[cfg(feature = "sqlite-reader")]
 fn destination_occupied(dir: &Path) -> Result<bool, MigrationError> {
     if !dir.exists() {
         return Ok(false);
@@ -299,6 +319,7 @@ fn destination_occupied(dir: &Path) -> Result<bool, MigrationError> {
 
 /// Read a MIGRATION_RECEIPT for `source_blake3` without opening the log.
 /// Opening would create `strata.key` and, on a sealed tail, a new segment.
+#[cfg(feature = "sqlite-reader")]
 fn receipt_matching(dir: &Path, source_blake3: &str) -> Option<records::MigrationReceipt> {
     use borsh::BorshDeserialize;
 
@@ -345,6 +366,7 @@ fn receipt_matching(dir: &Path, source_blake3: &str) -> Option<records::Migratio
 /// the source BLAKE3. Nothing is written to `dest` until every pre-check
 /// has passed. A leftover staging directory (SIGKILL) is removed and the
 /// import starts over.
+#[cfg(feature = "sqlite-reader")]
 fn stage_import(
     dest: &Path,
     seed: Option<[u8; 32]>,
@@ -413,6 +435,7 @@ fn stage_import(
     Ok(report)
 }
 
+#[cfg(feature = "sqlite-reader")]
 fn publish(staging: &Path, dest: &Path) -> Result<(), MigrationError> {
     if dest.exists() {
         // Occupancy ignores dotfiles. Keep them; the rename replaces the shell.
@@ -429,6 +452,7 @@ fn publish(staging: &Path, dest: &Path) -> Result<(), MigrationError> {
     Ok(())
 }
 
+#[cfg(feature = "sqlite-reader")]
 #[allow(clippy::too_many_arguments)]
 fn idempotent_report(
     snapshot: &source::SourceSnapshot,
@@ -451,6 +475,7 @@ fn idempotent_report(
     }
 }
 
+#[cfg(feature = "sqlite-reader")]
 fn open_log(
     strata_dir: &Path,
     pinned_seed: Option<[u8; 32]>,
@@ -482,6 +507,7 @@ fn open_log(
     StrataLog::open_seeded(strata_dir, seed).map_err(|e| MigrationError::Strata(e.to_string()))
 }
 
+#[cfg(feature = "sqlite-reader")]
 fn dry_run_report(
     snapshot: &source::SourceSnapshot,
     source_blake3: &str,
@@ -505,12 +531,14 @@ fn dry_run_report(
     }
 }
 
+#[cfg(feature = "sqlite-reader")]
 fn table_rows(snapshot: &source::SourceSnapshot, table: &str) -> u64 {
     source::table(&snapshot.archive, table)
         .map(|t| t.rows.len() as u64)
         .unwrap_or(0)
 }
 
+#[cfg(feature = "sqlite-reader")]
 fn skipped_tables_for(snapshot: &source::SourceSnapshot) -> Vec<String> {
     // Driven by sqlite_master (audit finding): every nonempty table without
     // a STRATA mapping is named, so the receipt never overclaims.
@@ -523,6 +551,7 @@ fn skipped_tables_for(snapshot: &source::SourceSnapshot) -> Vec<String> {
 }
 
 /// Everything produced during one replay.
+#[cfg(feature = "sqlite-reader")]
 struct ReplayOutcome {
     nodes: u64,
     edges: u64,
@@ -537,6 +566,7 @@ struct ReplayOutcome {
 /// supersessions, FSRS folds, and the fold checkpoint. The
 /// MIGRATION_RECEIPT is appended by [`finish`] once the source re-hash has
 /// been confirmed.
+#[cfg(feature = "sqlite-reader")]
 fn migrate_snapshot_into(
     snapshot: &source::SourceSnapshot,
     log: &StrataLog,
@@ -660,6 +690,7 @@ fn migrate_snapshot_into(
 
 /// Append the sealed MIGRATION_RECEIPT, close the segment, verify the log,
 /// and assemble the report.
+#[cfg(feature = "sqlite-reader")]
 fn finish(
     log: StrataLog,
     strata_dir: &Path,
@@ -733,16 +764,19 @@ fn finish(
 /// The receipt-signing key lives NEXT TO the destination log, never inside
 /// the log: `<parent-of---to>/receipt-signing.key`. The log carries only
 /// the verifying key.
+#[cfg(feature = "sqlite-reader")]
 fn receipt_key_dir_of(strata_dir: &Path) -> std::path::PathBuf {
     strata_dir.parent().unwrap_or(strata_dir).to_path_buf()
 }
 
+#[cfg(feature = "sqlite-reader")]
 fn hex32(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Batched append helper: predicts frame seqs from the log head, asserts the
 /// returned acks match, and never holds more than `BATCH_FRAMES` frames.
+#[cfg(feature = "sqlite-reader")]
 struct Writer<'a> {
     log: &'a StrataLog,
     batch: Vec<(u8, Vec<u8>)>,
@@ -754,6 +788,7 @@ struct Writer<'a> {
     last_frame_seq: u64,
 }
 
+#[cfg(feature = "sqlite-reader")]
 impl<'a> Writer<'a> {
     fn new(log: &'a StrataLog) -> Self {
         Self {
@@ -811,6 +846,7 @@ impl<'a> Writer<'a> {
 }
 
 /// Kernel replay + log tail verification over the finished log.
+#[cfg(feature = "sqlite-reader")]
 fn verify_migrated(log: &StrataLog, anchor: [u8; 32]) -> Result<bool, MigrationError> {
     let tail_ok = log.verify_tail().is_ok();
     let snapshot = read_snapshot(log)?;
@@ -835,6 +871,7 @@ fn verify_migrated(log: &StrataLog, anchor: [u8; 32]) -> Result<bool, MigrationE
 /// `reps - lapses` good (3) reviews, then `lapses` again (1) reviews. The
 /// fold yields `review_count == reps` and `lapse_count == lapses`; the final
 /// phase is Relearning iff the card ever lapsed, else Review.
+#[cfg(any(feature = "sqlite-reader", test))]
 fn fsrs_ratings_for(reps: i64, lapses: i64) -> Vec<u8> {
     if reps <= 0 {
         return Vec::new();
@@ -848,10 +885,12 @@ fn fsrs_ratings_for(reps: i64, lapses: i64) -> Vec<u8> {
     ratings
 }
 
+#[cfg(feature = "sqlite-reader")]
 const FSRS_MAPPED_COLUMNS: &[&str] = &["memory_id", "reps", "lapses"];
 
 /// FSRS final state the fold cannot reproduce (stability/difficulty floats,
 /// due dates, phase) rides on the node's legacy capture (blocker 4).
+#[cfg(feature = "sqlite-reader")]
 fn attach_fsrs_legacy(
     archive: &PortableArchive,
     kernel_ids: &HashMap<String, u64>,
@@ -877,6 +916,7 @@ fn attach_fsrs_legacy(
 /// V40 `walk_receipts` rows become reference nodes tagged `migrated_from_v4`
 /// (PR-0a spec 4d). Kernel ids continue after the knowledge nodes so the
 /// dense identity space stays total.
+#[cfg(feature = "sqlite-reader")]
 fn extract_walk_receipts(
     snapshot: &source::SourceSnapshot,
     kernel_ids: &HashMap<String, u64>,
@@ -904,6 +944,7 @@ fn extract_walk_receipts(
 
 /// Canonical string form of a snapshot value for legacy column capture:
 /// ints/floats/text verbatim (floats are Display'd, deterministic), blobs hex.
+#[cfg(feature = "sqlite-reader")]
 fn legacy_value(value: &source::PortableValue) -> String {
     match value {
         PortableValue::Null => String::new(),
@@ -916,6 +957,7 @@ fn legacy_value(value: &source::PortableValue) -> String {
 
 /// Columns with dedicated fields on the record (everything else is captured
 /// verbatim in `legacy`).
+#[cfg(feature = "sqlite-reader")]
 const NODE_MAPPED_COLUMNS: &[&str] = &[
     "id",
     "content",
@@ -927,6 +969,7 @@ const NODE_MAPPED_COLUMNS: &[&str] = &[
     "superseded_by",
 ];
 
+#[cfg(feature = "sqlite-reader")]
 fn capture_legacy(
     table: &str,
     row: &source::Row<'_>,
@@ -947,6 +990,7 @@ fn capture_legacy(
 
 /// Decoded `knowledge_nodes`: node records, the legacy→kernel id map (dense,
 /// 1-based, source row order), and supersession pointers.
+#[cfg(feature = "sqlite-reader")]
 type NodeSet = (
     Vec<NodeRecord>,
     HashMap<String, u64>,
@@ -955,6 +999,7 @@ type NodeSet = (
 
 /// Decode `knowledge_nodes` into node records, the legacy→kernel id map
 /// (dense, 1-based, source row order), and supersession pointers.
+#[cfg(feature = "sqlite-reader")]
 fn extract_nodes(archive: &PortableArchive) -> Result<NodeSet, MigrationError> {
     let Some(table) = source::table(archive, "knowledge_nodes") else {
         return Ok((Vec::new(), HashMap::new(), Vec::new()));
@@ -1016,6 +1061,7 @@ fn extract_nodes(archive: &PortableArchive) -> Result<NodeSet, MigrationError> {
 /// Legacy link types are folded into the 8-type STRATA vocabulary: anything
 /// outside [`STRATA_EDGE_VOCABULARY`] becomes `derived_from` with
 /// `legacy_inferred = 1` and the original type kept for provenance.
+#[cfg(feature = "sqlite-reader")]
 fn extract_edges(
     archive: &PortableArchive,
     kernel_ids: &HashMap<String, u64>,
@@ -1078,6 +1124,7 @@ fn extract_edges(
 }
 
 /// Decode `sync_tombstones` and `deletion_tombstones`.
+#[cfg(feature = "sqlite-reader")]
 fn extract_tombstones(archive: &PortableArchive) -> Result<Vec<TombstoneRecord>, MigrationError> {
     let mut records = Vec::new();
     if let Some(table) = source::table(archive, "sync_tombstones") {
@@ -1169,6 +1216,7 @@ mod tests {
         assert_eq!(card.phase, strata_kernel::fsrs::CardPhase::Review);
     }
 
+    #[cfg(feature = "sqlite-reader")]
     #[test]
     fn timestamps_parse_from_rfc3339_variants() {
         assert_eq!(
@@ -1179,6 +1227,7 @@ mod tests {
         assert!(source::timestamp_ms("not a date").is_err());
     }
 
+    #[cfg(feature = "sqlite-reader")]
     #[test]
     fn tags_parse_tolerantly() {
         assert_eq!(source::parse_tags(None), Vec::<String>::new());

@@ -699,6 +699,12 @@ pub fn verify_path(dir: &Path) -> PathReport {
         let failures = report.failures.clone();
         return path_from(report.ok, &report, failures);
     }
+    // Fresh strata-store: `log/*.seg` exists before the first checkpoint
+    // writes `store.meta`. Check that log; do not fall through to kernel.log.
+    let nested_log = dir.join("log");
+    if readonly::dir_has_segments(&nested_log) {
+        return verify_segment_dir(&nested_log);
+    }
     let report = verify_store(dir);
     let failures = report.failures.iter().map(|f| f.to_string()).collect();
     path_from(report.ok(), &report, failures)

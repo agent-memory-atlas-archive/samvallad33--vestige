@@ -2421,29 +2421,20 @@ fn get_default_db_path() -> anyhow::Result<PathBuf> {
 }
 
 /// Verify a STRATA directory. Same report as the `strata-verify` binary.
-/// Creates nothing in `dir`.
+/// Creates nothing in `dir`. Log and receipt checks only — the v3 SQLite
+/// comparison is `sqlite-reader`, which this path does not enable.
 fn run_strata_verify(dir: PathBuf) -> anyhow::Result<()> {
-    #[cfg(not(feature = "migrate-to-strata"))]
-    {
-        let _ = dir;
-        anyhow::bail!(
-            "strata-verify is not linked into this binary; rebuild with --features migrate-to-strata"
-        );
+    let report = strata_verify::verify_path(&dir);
+    println!("{}", report.json);
+    if report.ok {
+        println!("OK");
+        return Ok(());
     }
-    #[cfg(feature = "migrate-to-strata")]
-    {
-        let report = strata_verify::verify_path(&dir);
-        println!("{}", report.json);
-        if report.ok {
-            println!("OK");
-            return Ok(());
-        }
-        println!("FAILED");
-        for failure in &report.failures {
-            eprintln!("  {failure}");
-        }
-        std::process::exit(1);
+    println!("FAILED");
+    for failure in &report.failures {
+        eprintln!("  {failure}");
     }
+    std::process::exit(1);
 }
 
 /// Open storage using the CLI-selected data directory, if one was provided.
