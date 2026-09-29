@@ -89,9 +89,17 @@ pub struct StrataMemory {
 
 impl StrataMemory {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_with_policy(dir, strata_store::default_policy())
+    }
+
+    pub fn open_with_policy(
+        dir: impl AsRef<Path>,
+        policy: strata_gate::Policy,
+    ) -> Result<Self, StorageError> {
         let data_dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
-        let store = strata_store::StrataStore::open(&data_dir).map_err(map_store)?;
+        let store =
+            strata_store::StrataStore::open_with_policy(&data_dir, policy).map_err(map_store)?;
         Ok(Self {
             log_dir: data_dir.join("log"),
             data_dir,
@@ -135,6 +143,41 @@ fn pending(op: &str) -> StorageError {
     StorageError::Init(format!(
         "pending_strata: {op} is not admitted on the Strata log yet"
     ))
+}
+
+/// Reject a blank, huge, or control-character scope. Matching stays exact,
+/// the same compare `node_is_in_scope` uses.
+fn projection_scope(scope: &str) -> Result<&str, StorageError> {
+    if scope.is_empty()
+        || scope.len() > 200
+        || scope.chars().any(char::is_control)
+        || scope.trim().is_empty()
+    {
+        return Err(StorageError::InvalidScope(
+            "expected a non-empty identifier of at most 200 visible characters".into(),
+        ));
+    }
+    Ok(scope)
+}
+
+/// Decision and pattern always. Fact and note only with an exact durable tag.
+fn projection_durable(record: &strata_store::NodeRecord) -> bool {
+    matches!(record.node_type.as_str(), "decision" | "pattern")
+        || (matches!(record.node_type.as_str(), "fact" | "note")
+            && record.tags.iter().any(|tag| {
+                matches!(
+                    tag.to_ascii_lowercase().as_str(),
+                    "rule" | "preference" | "convention"
+                )
+            }))
+}
+
+fn projection_rank(node_type: &str) -> u8 {
+    match node_type {
+        "decision" => 0,
+        "pattern" => 1,
+        _ => 2,
+    }
 }
 
 fn sim_async(op: &str) -> MemoryStoreError {
@@ -667,7 +710,56 @@ impl MemoryStoreSend for StrataMemory {
 
     fn save_connection(&self, connection: &VestigeEdge) -> Result<(), StorageError> {
         let edge = to_strata_edge(connection);
-        self.lock().save_connection(&edge).map_err(map_store)
+        self.lock().save_connection(&edge).map_err(map_store).map(|_| ())
+    }
+
+    fn admit_projection(
+        &self,
+        memory_ids: &[String],
+        target: &str,
+        region: &[u8],
+    ) -> Result<(String, String), StorageError> {
+        let hash = blake3::hash(region).to_hex().to_string();
+        let mut store = self.lock();
+        for id in memory_ids {
+            if store.get_node(id).is_none() {
+                return Err(StorageError::NotFound(id.clone()));
+            }
+        }
+        let mut sources: Vec<String> = memory_ids.to_vec();
+        if sources.is_empty() {
+            // No memory to point from. A projection record is the source of
+            // the one projected_to edge. It is not a decision, pattern, or
+            // durable tag, so a later preview does not select it.
+            let id = store
+                .ingest_in_scope(
+                    strata_store::IngestInput {
+                        content: target.to_string(),
+                        node_type: "projection".into(),
+                        tags: Vec::new(),
+                        created_at_ms: Some(0),
+                        valid_from_ms: None,
+                        valid_until_ms: None,
+                    },
+                    "projection",
+                )
+                .map_err(map_store)?;
+            sources.push(id);
+        }
+        let mut effect_seq = 0u64;
+        for source in &sources {
+            let edge = strata_store::ConnectionRecord {
+                source_id: source.clone(),
+                target_id: target.to_string(),
+                strength_milli: 1000,
+                link_type: strata_store::EdgeKind::ProjectedTo.as_str().to_string(),
+                meta_sha: Some(hash.clone()),
+                created_at_ms: 0,
+                activation_count: 0,
+            };
+            effect_seq = store.save_connection(&edge).map_err(map_store)?;
+        }
+        Ok((receipt_id_for(effect_seq), hash))
     }
 
     fn superseded_node_ids(&self) -> Result<HashSet<String>, StorageError> {
@@ -907,11 +999,48 @@ impl MemoryStoreSend for StrataMemory {
 
     fn projection_candidates(
         &self,
-        _scope: &str,
-        _min_retention: f64,
-        _limit: i32,
+        scope: &str,
+        min_retention: f64,
+        limit: i32,
     ) -> Result<Vec<KnowledgeNode>, StorageError> {
-        Err(pending("projection_candidates"))
+        // Same predicate as the SQLite projection query. Content is not scanned.
+        // The log has no suppression record, so that filter is empty. Read-only.
+        let scope = projection_scope(scope)?;
+        let store = self.lock();
+        let now_ms = Utc::now().timestamp_millis();
+        let cap = usize::try_from(limit.max(0)).unwrap_or(0);
+        let nodes = store.nodes();
+        let mut matched: Vec<strata_store::NodeRecord> = nodes
+            .into_iter()
+            .filter(|record| {
+                if record.scope != scope || record.superseded_by.is_some() {
+                    return false;
+                }
+                if record.valid_from_ms > now_ms || record.valid_until_ms <= now_ms {
+                    return false;
+                }
+                if !projection_durable(record) {
+                    return false;
+                }
+                let retention = store
+                    .retrievability(&record.id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0.0);
+                retention >= min_retention
+            })
+            .collect();
+        matched.sort_by(|a, b| {
+            projection_rank(&a.node_type)
+                .cmp(&projection_rank(&b.node_type))
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        matched.truncate(cap);
+        Ok(matched
+            .iter()
+            .map(|record| project_node(&store, record))
+            .collect())
     }
 
     fn get_walk_receipt(

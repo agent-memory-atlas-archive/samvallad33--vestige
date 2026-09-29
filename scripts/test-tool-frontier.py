@@ -169,7 +169,10 @@ def run(binary, output):
             typed("purge", {"id": node_id, "confirm": True}, "pending_strata")
             context = tool("codebase", {"action": "get_context", "codebase": "fixture"})
             assert marker not in json.dumps(context)
-            typed("project", {"action": "preview"}, "pending_strata")
+            preview = tool("project", {"action": "preview"})
+            assert preview["action"] == "preview" and preview["scope"] == "user"
+            assert preview["itemCount"] == 0 and marker not in json.dumps(preview["region"])
+            passed("project preview reads the log; an untagged fact is not projected")
             typed("intention", {"action": "set", "description": "Synthetic reminder",
                                 "trigger": {"type": "time", "at": "2020-01-01T00:00:00Z"}}, "pending_strata")
             tool("source_sync", {"source": "gitlab", "repo": "a/b"}, error=True)

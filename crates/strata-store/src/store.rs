@@ -578,7 +578,8 @@ impl StrataStore {
 
     /// Append one typed edge (vocabulary-validated; the source node must
     /// exist — targets may point at non-memory artifacts like file anchors).
-    pub fn save_connection(&mut self, connection: &ConnectionRecord) -> Result<(), StoreError> {
+    /// Returns the admitting effect seq.
+    pub fn save_connection(&mut self, connection: &ConnectionRecord) -> Result<u64, StoreError> {
         if EdgeKind::parse(&connection.link_type).is_none() {
             return Err(StoreError::InvalidInput(format!(
                 "link_type '{}' is not in the typed-edge vocabulary",
@@ -597,14 +598,14 @@ impl StrataStore {
         }
         context.sort_unstable();
         context.dedup();
-        self.admit_write(
+        let (effect_seq, _) = self.admit_write(
             StoreOp::SaveEdge {
                 edge: connection.clone(),
             },
             action_kind::WRITE,
             context,
         )?;
-        Ok(())
+        Ok(effect_seq)
     }
 
     /// All edges touching a memory: outgoing first, then incoming.

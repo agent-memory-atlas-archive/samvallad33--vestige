@@ -325,6 +325,25 @@ pub trait LocalMemoryStore: Sync + 'static {
     // can never silently succeed.
     // ------------------------------------------------------------------------
 
+    /// Admit `projected_to` edges for a confirmed projection.
+    ///
+    /// Returns `(receipt_id, blake3_hex)` of `region`. The file write happens
+    /// only after this returns `Ok`. Default backends refuse.
+    fn admit_projection(
+        &self,
+        _memory_ids: &[String],
+        _target: &str,
+        _region: &[u8],
+    ) -> StoreResult<(String, String)> {
+        Err(StorageError::Init(
+            concat!(
+                stringify!(admit_projection),
+                " is not implemented by this backend"
+            )
+            .into(),
+        ))
+    }
+
     /// Snapshot of actor policy state.
     fn actor_policy_snapshot(&self) -> StoreResult<ActorPolicySnapshot> {
         Err(StorageError::Init(
@@ -2696,6 +2715,12 @@ pub trait MemoryStore: Send + Sync + 'static {
     fn vacuum<'a>(&'a self) -> BoxedStoreFuture<'a, ()>;
 
     // --- Phase 4 product seam (sync; dyn-compatible, forwarded from MemoryStoreSend) ---
+    fn admit_projection(
+        &self,
+        memory_ids: &[String],
+        target: &str,
+        region: &[u8],
+    ) -> StoreResult<(String, String)>;
     fn actor_policy_snapshot(&self) -> StoreResult<ActorPolicySnapshot>;
     fn append_mcp_call_outcome(
         &self,
@@ -3317,6 +3342,14 @@ where
         Box::pin(<T as MemoryStoreSend>::vacuum(self))
     }
 
+    fn admit_projection(
+        &self,
+        memory_ids: &[String],
+        target: &str,
+        region: &[u8],
+    ) -> StoreResult<(String, String)> {
+        <T as MemoryStoreSend>::admit_projection(self, memory_ids, target, region)
+    }
     fn actor_policy_snapshot(&self) -> StoreResult<ActorPolicySnapshot> {
         <T as MemoryStoreSend>::actor_policy_snapshot(self)
     }
