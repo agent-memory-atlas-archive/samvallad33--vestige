@@ -753,7 +753,7 @@ fn tool_catalog() -> Vec<ToolDescription> {
                     idempotent_hint: false,
                     open_world_hint: false,
                 }),
-description: Some("Retrieve from memory. mode 'lookup' (default): fast hybrid keyword and semantic search. 'reason': deep pass with trust scoring, spreading activation, supersession, and contradictions; needs 'query', use when accuracy matters; its text is assembled from computed values, not written by a model. 'contradictions': disagreement pairs for a 'topic'. Reason mode records composition evidence; retrieval never changes strength; promote what helped via memory.".to_string()),
+description: Some("Retrieve from memory. mode 'lookup': keyword search. 'reason': deep pass: trust scoring, spreading activation, supersession, contradictions. 'contradictions': disagreement pairs for a 'topic'. Reason mode records composition evidence; retrieval never changes strength; promote what helped via memory.".to_string()),
                 input_schema: tools::compact::of(&tools::recall::schema()),
                 output_schema: Some(serde_json::json!({
                     "type": "object",
@@ -970,7 +970,7 @@ description: Some("Lifecycle: 'consolidate', 'dream', 'gc' (dry_run default true
                     idempotent_hint: false,
                     open_world_hint: false,
                 }),
-description: Some("Duplicates, merges, supersession, and exact tag maintenance. Actions: 'scan' (default, read-only: duplicate clusters and merge candidates), 'plan_merge' (member_ids to plan_id), 'plan_supersede' (old_id, new_id to plan_id), 'apply' (run a plan_id; confirm=true is required unless the current policy explicitly allows auto-applying strong matches), 'undo' (reverse an operation_id, or omit to list the reflog), 'tag_rename' and 'tag_merge' (preview-token gated), 'protect' (pin against auto-merge), 'policy' (get or set match thresholds). Merged memories are invalidated, never deleted.".to_string()),
+description: Some("Duplicates, merges, supersession, exact tag maintenance. Actions: scan (default, read-only), plan_merge, plan_supersede, apply (confirm=true or policy-allowed), undo, tag_rename, tag_merge (preview-token gated), protect, policy. Merged memories are invalidated, never deleted.".to_string()),
                 input_schema: tools::compact::of(&tools::dedup::unified_schema()),
                 ..Default::default()
             },

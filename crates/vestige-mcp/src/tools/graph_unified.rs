@@ -157,6 +157,37 @@ mod tests {
                 );
             }
         }
+        // GhostLink contract: seed typed edges so the pairs are admitted
+        {
+            let now = chrono::Utc::now();
+            storage
+                .save_connection(&vestige_core::ConnectionRecord {
+                    source_id: own[0].clone(),
+                    target_id: other[0].clone(),
+                    strength: 1.0,
+                    link_type: "touched".to_string(),
+                    created_at: now,
+                    last_activated: now,
+                    activation_count: 0,
+                })
+                .unwrap();
+        }
+        for ids in [&own, &other] {
+            if ids.len() >= 2 {
+                let now = chrono::Utc::now();
+                storage
+                    .save_connection(&vestige_core::ConnectionRecord {
+                        source_id: ids[0].clone(),
+                        target_id: ids[1].clone(),
+                        strength: 1.0,
+                        link_type: "touched".to_string(),
+                        created_at: now,
+                        last_activated: now,
+                        activation_count: 0,
+                    })
+                    .unwrap();
+            }
+        }
         for scope in [None, Some("other-project")] {
             let mut args = serde_json::json!({"action": "never_composed", "tags": ["fixture"]});
             if let Some(scope) = scope {

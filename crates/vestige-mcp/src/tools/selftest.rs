@@ -180,6 +180,7 @@ pub async fn execute(storage: &Arc<Storage>, _args: Option<Value>) -> Result<Val
                 .collect()
         })
         .unwrap_or_default();
+    let mut missing = missing; missing.sort();
     let named_missing_anchor = missing.iter().find(|e| *e == "planted_cause_6").cloned();
     let gap_calibration = gap_fired && named_missing_anchor.is_some();
 
