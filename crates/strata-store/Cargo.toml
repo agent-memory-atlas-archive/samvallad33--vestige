@@ -17,5 +17,8 @@ publish = false
 strata = { path = "../strata" }
 strata-kernel = { path = "../strata-kernel" }
 strata-gate = { path = "../strata-gate" }
+# Migration frames share kind bytes 0x20/0x21 with store writes. Replay
+# decodes the existing migration records; it does not invent a StoreOp.
+strata-migrate = { path = "../strata-migrate" }
 borsh = { version = "1", features = ["derive"] }
 blake3 = "1"

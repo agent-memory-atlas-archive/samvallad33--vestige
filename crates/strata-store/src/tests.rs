@@ -483,6 +483,35 @@ fn failure_marker_port_matches_vestige_semantics() {
 }
 
 #[test]
+fn replay_loads_imported_nodes_and_keeps_edge_kinds() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../strata-migrate/tests/fixtures/v3.1.1-sample.sqlite");
+    let dir = temp_dir("import");
+    let log = dir.join("log");
+    strata_migrate::migrate(&fixture, &log).expect("migrate");
+    let store = StrataStore::open(&dir).expect("replay imported log");
+    let ids: BTreeSet<_> = store.nodes().into_iter().map(|node| node.id).collect();
+    assert!(ids.contains("11111111-1111-4111-8111-111111111111"));
+    assert!(ids.contains("22222222-2222-4222-8222-222222222222"));
+    assert!(ids.contains("33333333-3333-4333-8333-333333333333"));
+    let edges = store.edges();
+    assert_eq!(edges.len(), 3);
+    assert!(edges.iter().any(|edge| edge.link_type == "touched"));
+    assert!(edges.iter().any(|edge| {
+        edge.link_type == "legacy_inferred" && EdgeKind::parse(&edge.link_type).is_none()
+    }));
+    assert!(edges.iter().all(|edge| edge.link_type != "derived_from"));
+    let touched = store.get_edges_for(
+        "11111111-1111-4111-8111-111111111111",
+        EdgeDirection::Outgoing,
+        Some(EdgeKind::Touched),
+    );
+    assert_eq!(touched.len(), 1);
+    assert_eq!(touched[0].target_id, "33333333-3333-4333-8333-333333333333");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn node_ids_are_log_derived_and_handle_is_stable() {
     let dir = temp_dir("ids");
     let mut store = StrataStore::open(&dir).expect("open");
