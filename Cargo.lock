@@ -2325,6 +2325,7 @@ dependencies = [
  "blake3",
  "borsh",
  "ed25519-dalek",
+ "getrandom 0.4.3",
  "libc",
 ]
 
@@ -2355,6 +2356,7 @@ dependencies = [
  "borsh",
  "chrono",
  "ed25519-dalek",
+ "getrandom 0.4.3",
  "rusqlite",
  "serde",
  "serde_json",
