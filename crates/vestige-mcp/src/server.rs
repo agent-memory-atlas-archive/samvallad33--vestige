@@ -1306,6 +1306,22 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
             Err(protocol_error) => return Err(protocol_error),
         };
 
+        // Purge rebuilds this cache inside the tool. Suppress retires through
+        // the same read filter, so the in-process graph has to drop the id too.
+        if tool_name == "suppress"
+            && crate::strata_memory::is_strata_backend(self.storage.as_ref())
+            && result
+                .as_ref()
+                .ok()
+                .and_then(|content| content.get("success"))
+                .and_then(|value| value.as_bool())
+                == Some(true)
+        {
+            let mut rebuilt = CognitiveEngine::new();
+            rebuilt.hydrate(&self.storage);
+            *self.cognitive.lock().await = rebuilt;
+        }
+
         // ================================================================
         // DASHBOARD EVENT EMISSION (v2.0)
         // Emit real-time events to WebSocket clients after successful tool calls.
