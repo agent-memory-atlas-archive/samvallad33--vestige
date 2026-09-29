@@ -173,11 +173,19 @@ def run(binary, output):
             assert demoted["action"] == "demoted" and "NOT deleted" in demoted["note"]
             assert demoted["receiptId"].startswith("eff-") and demoted["receiptId"] != promote_receipt
             edited = tool("memory", {"action": "edit", "id": node_id, "content": "edited fixture"})
+            successor = edited["nodeId"]
             assert edited["action"] == "edit" and edited["embeddingStatus"] == "refused"
+            assert successor != node_id and edited["rule"] == "edit" and edited["supersedes"] == node_id
             edit_receipt = tool("receipt", {"action": "get", "receipt_id": edited["receiptId"]})
             assert edit_receipt["attestation"]["verification"]["locallyVerified"] is True
             assert edit_receipt["receipt"]["mutations"][0]["kind"] == "edited"
-            assert "edited fixture" in json.dumps(tool("memory", {"action": "get", "id": node_id}))
+            assert "rule=edit" in edit_receipt["receipt"]["mutations"][0]["note"]
+            assert "edited fixture" in json.dumps(tool("memory", {"action": "get", "id": successor}))
+            assert "edited fixture" not in json.dumps(tool("memory", {"action": "get", "id": node_id}))
+            retired = tool("recall", {"handle": node_id})
+            assert "edited fixture" not in json.dumps(retired) and node_id not in json.dumps(retired.get("nodes", []))
+            live = tool("recall", {"handle": successor})
+            assert "edited fixture" in json.dumps(live)
             typed("memory", {"action": "promote", "id": "not-a-handle"}, "Invalid memory ID")
             typed("memory", {"action": "edit", "id": "mem-ffffffffffffffff", "content": "nope"}, "not found")
             typed("purge", {"id": node_id, "confirm": True}, "pending_strata")

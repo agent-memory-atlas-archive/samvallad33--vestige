@@ -14,7 +14,8 @@ use crate::store::handle_of;
 use crate::types::{ConnectionRecord, EdgeDirection, EdgeKind, IngestInput};
 use crate::{
     default_policy, effect_receipt_id, looks_like_failure, retire_rule_id, AdmissionContext,
-    RetireReceipt, StoreError, StrataStore, RULE_EDIT, RULE_INTENTIONS, RULE_PURGE, RULE_SUPPRESS,
+    EffectAction, RetireReceipt, StoreError, StrataStore, RULE_EDIT, RULE_INTENTIONS, RULE_PURGE,
+    RULE_SUPPRESS,
 };
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -524,23 +525,53 @@ fn review_card_matches_independent_fsrs6_fold() {
 }
 
 #[test]
-fn edit_keeps_prior_bytes_and_does_not_fold_a_review() {
+fn edit_returns_successor_and_receipt_naming_edit() {
     let dir = temp_dir("edit-bytes");
     let mut store = StrataStore::open(&dir).expect("open");
     let id = store
-        .ingest(input("original strata edit bytes", &[]))
+        .ingest(input("original strata edit bytes", &["kept"]))
         .expect("ingest");
+    store.review(&id, 4).expect("easy");
+    store.review(&id, 1).expect("again");
     let before = store.card_state(&id).expect("card");
-    let reviews = store.review_events().len();
-    store
-        .edit_content(&id, "replacement strata edit bytes")
+    let old_reviews = store.review_events().len();
+    let (successor, receipt) = store
+        .edit(
+            &id,
+            "replacement strata edit bytes",
+            &AdmissionContext {
+                rule_id: Some(RULE_EDIT.to_string()),
+                confirm: false,
+            },
+        )
         .expect("edit");
+    assert_ne!(successor, id);
+    assert_eq!(receipt.rule_id, Some(RULE_EDIT));
+    assert_eq!(receipt.receipt_id, effect_receipt_id(receipt.effect_seq));
     assert_eq!(
-        store.get_node(&id).expect("node").content,
-        "replacement strata edit bytes"
+        store.get_node(&id).expect("old").superseded_by.as_deref(),
+        Some(successor.as_str())
     );
-    assert_eq!(store.card_state(&id).expect("card"), before);
-    assert_eq!(store.review_events().len(), reviews);
+    assert_eq!(
+        store.get_node(&id).expect("old").content,
+        "original strata edit bytes"
+    );
+    let live = store.get_all_nodes_in_scope("");
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].id, successor);
+    assert_eq!(live[0].content, "replacement strata edit bytes");
+    assert_eq!(live[0].tags, vec!["kept".to_string()]);
+    assert_eq!(store.card_state(&id).expect("old card"), before);
+    let successor_card = store.card_state(&successor).expect("successor card");
+    assert_eq!(successor_card.review_count, 1);
+    assert_eq!(successor_card.lapse_count, 0);
+    assert_eq!(store.review_events().len(), old_reviews + 1);
+    let proof = store
+        .effect_by_seq(receipt.effect_seq)
+        .expect("prove")
+        .expect("edit effect");
+    assert_eq!(proof.action, EffectAction::Edit);
+    assert_eq!(proof.node_id, successor);
     drop(store);
     let mut blob = Vec::new();
     for entry in std::fs::read_dir(dir.join("log")).expect("log dir") {
@@ -556,14 +587,54 @@ fn edit_keeps_prior_bytes_and_does_not_fold_a_review() {
         .windows(b"replacement strata edit bytes".len())
         .any(|w| w == b"replacement strata edit bytes"));
     let store = StrataStore::open(&dir).expect("reopen");
+    let again = store
+        .retire_receipt(receipt.effect_seq)
+        .expect("replayed receipt");
+    assert_eq!(again.rule_id, Some(RULE_EDIT));
+    assert_eq!(again.receipt_id, receipt.receipt_id);
     assert_eq!(
-        store.get_node(&id).expect("node").content,
-        "replacement strata edit bytes"
+        store.get_node(&id).expect("old").content,
+        "original strata edit bytes"
     );
-    let card = store.card_state(&id).expect("card");
-    assert_eq!(card.stability_q, before.stability_q);
-    assert_eq!(card.review_count, before.review_count);
-    assert_eq!(card.lapse_count, before.lapse_count);
+    assert_eq!(store.card_state(&id).expect("old card"), before);
+    assert_eq!(
+        store
+            .card_state(&successor)
+            .expect("successor")
+            .review_count,
+        1
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn held_edit_without_rule_id_leaves_no_live_duplicate() {
+    let dir = temp_dir("edit-held-dup");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let id = store.ingest(input("stays live", &[])).expect("ingest");
+    let live = store.get_all_nodes_in_scope("").len();
+    let total = store.node_count();
+    let err = store
+        .edit(&id, "would duplicate", &AdmissionContext::default())
+        .expect_err("no rule id");
+    assert!(matches!(err, StoreError::Held { .. }), "{err}");
+    assert_eq!(store.node_count(), total);
+    assert_eq!(store.get_all_nodes_in_scope("").len(), live);
+    assert!(store.supersession_pairs().is_empty());
+    assert_eq!(store.get_node(&id).expect("old").content, "stays live");
+    assert!(store.get_node(&id).expect("old").superseded_by.is_none());
+    let err = store
+        .edit(
+            &id,
+            "still no",
+            &AdmissionContext {
+                rule_id: Some("edited".into()),
+                confirm: true,
+            },
+        )
+        .expect_err("unknown rule");
+    assert!(matches!(err, StoreError::Held { .. }), "{err}");
+    assert_eq!(store.node_count(), total);
     std::fs::remove_dir_all(&dir).ok();
 }
 

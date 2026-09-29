@@ -176,6 +176,9 @@ fn receipt_from_proof(proof: &strata_store::EffectProof, trust: f64) -> Receipt 
     if let Some(rating) = proof.rating {
         note.push_str(&format!(" rating={rating}"));
     }
+    if proof.action == strata_store::EffectAction::Edit {
+        note.push_str(" rule=edit");
+    }
     Receipt {
         receipt_id: receipt_id_for(proof.effect_seq),
         retrieved: vec![proof.node_id.clone()],
@@ -494,9 +497,10 @@ impl MemoryStoreSend for StrataMemory {
         let query = query.trim();
         let ids: Vec<String> = self
             .lock()
-            .origins()
+            .nodes()
             .into_iter()
-            .map(|(id, _)| id)
+            .filter(|record| record.is_live())
+            .map(|record| record.id)
             .collect();
         if query.is_empty() {
             return HandleResolution {
@@ -1278,7 +1282,16 @@ impl MemoryStoreSend for StrataMemory {
         if store.get_node(id).is_none() {
             return Err(StorageError::NotFound(id.to_string()));
         }
-        store.edit_content(id, new_content).map_err(map_store)?;
+        store
+            .edit(
+                id,
+                new_content,
+                &strata_store::AdmissionContext {
+                    rule_id: Some(strata_store::RULE_EDIT.to_string()),
+                    confirm: false,
+                },
+            )
+            .map_err(map_store)?;
         Ok(())
     }
 }

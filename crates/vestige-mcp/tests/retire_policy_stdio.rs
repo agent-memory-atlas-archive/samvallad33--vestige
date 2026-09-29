@@ -161,7 +161,7 @@ fn stdio_allows_one_retire_and_holds_another_then_strata_verify() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("data dir");
 
-    let (allowed_id, held_id, successor_id) = {
+    let (allowed_id, held_id, successor_id, edit_source, edit_successor, edit_receipt) = {
         let mut mcp = spawn(env!("CARGO_BIN_EXE_vestige-mcp"), &dir);
         mcp.rpc(
             "initialize",
@@ -180,8 +180,40 @@ fn stdio_allows_one_retire_and_holds_another_then_strata_verify() {
         let allowed_id = ingest(&mut mcp, "STDIO_RETIRE_ALLOWED");
         let held_id = ingest(&mut mcp, "STDIO_RETIRE_HELD");
         let successor_id = ingest(&mut mcp, "STDIO_RETIRE_SUCCESSOR");
+        let edit_source = ingest(&mut mcp, "STDIO_EDIT_SOURCE");
+        let edited = mcp.tool(
+            "memory",
+            serde_json::json!({
+                "action": "edit",
+                "id": edit_source,
+                "content": "STDIO_EDIT_SUCCESSOR"
+            }),
+        );
+        let edit_successor = edited["nodeId"].as_str().expect("successor").to_string();
+        let edit_receipt = edited["receiptId"].as_str().expect("receipt").to_string();
+        assert_ne!(edit_successor, edit_source);
+        assert_eq!(edited["rule"], "edit");
+        assert_eq!(edited["supersedes"], edit_source);
+        assert!(edit_receipt.starts_with("eff-"));
+        let retired = mcp.tool("recall", serde_json::json!({ "handle": edit_source }));
+        assert!(
+            retired.get("nodes").is_none()
+                || retired["nodes"]
+                    .as_array()
+                    .is_some_and(|nodes| nodes.is_empty()),
+            "old node returned by recall: {retired}"
+        );
+        let live = mcp.tool("recall", serde_json::json!({ "handle": edit_successor }));
+        assert_eq!(live["nodes"][0]["content"], "STDIO_EDIT_SUCCESSOR");
         mcp.close();
-        (allowed_id, held_id, successor_id)
+        (
+            allowed_id,
+            held_id,
+            successor_id,
+            edit_source,
+            edit_successor,
+            edit_receipt,
+        )
     };
 
     // The stdio process writes `log/*.seg` and no `store.meta`. That log is
@@ -191,6 +223,34 @@ fn stdio_allows_one_retire_and_holds_another_then_strata_verify() {
 
     {
         let mut store = StrataStore::open(&dir).expect("open stdio store");
+        let edit_seq = u64::from_str_radix(edit_receipt.strip_prefix("eff-").expect("prefix"), 16)
+            .expect("receipt seq");
+        let edit_again = store.retire_receipt(edit_seq).expect("edit receipt");
+        assert_eq!(edit_again.rule_id, Some(strata_store::RULE_EDIT));
+        assert_eq!(edit_again.receipt_id, edit_receipt);
+        assert_eq!(
+            store
+                .get_node(&edit_source)
+                .expect("edited source")
+                .superseded_by
+                .as_deref(),
+            Some(edit_successor.as_str())
+        );
+        assert_eq!(
+            store.get_node(&edit_source).expect("source").content,
+            "STDIO_EDIT_SOURCE"
+        );
+        assert_eq!(
+            store.get_node(&edit_successor).expect("successor").content,
+            "STDIO_EDIT_SUCCESSOR"
+        );
+        let scope = store.get_node(&edit_source).expect("source").scope;
+        assert!(
+            store
+                .get_all_nodes_in_scope(&scope)
+                .iter()
+                .all(|node| node.id != edit_source)
+        );
         let receipt = store
             .retire(
                 &allowed_id,

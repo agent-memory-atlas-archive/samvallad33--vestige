@@ -175,7 +175,8 @@ pub enum EffectAction {
     Create,
     /// Later upsert of an existing node (`set_created_at`). No new review.
     Rewrite,
-    /// Content replacement. No new review.
+    /// Successor admitted under the `edit` RETIRE rule. The predecessor stays
+    /// in the log; its card is not copied.
     Edit,
     /// Explicit FSRS review. `rating` is 1..=4.
     Review,
@@ -423,13 +424,6 @@ impl StrataStore {
             }
             StoreOp::ReviewNode { card_id, rating } => {
                 self.fold_review(*card_id, *rating, ALGO_V2, frame_seq)?;
-            }
-            StoreOp::EditContent { id, content } => {
-                let record = self
-                    .nodes
-                    .get_mut(id)
-                    .ok_or_else(|| StoreError::NotFound(format!("edit target {id}")))?;
-                record.content = content.clone();
             }
         }
         Ok(())
@@ -821,23 +815,56 @@ impl StrataStore {
         Ok(effect_seq)
     }
 
-    /// Admit a content edit. The previous content remains in the earlier frame.
-    /// No review is folded.
-    pub fn edit_content(&mut self, id: &str, content: &str) -> Result<u64, StoreError> {
+    /// Replace `id` with a successor, then retire `id` under rule `edit`.
+    ///
+    /// Lands `UpsertNode` then `SupersedeNode` inside one tool call. The
+    /// successor is a new ingest (its own FSRS card). The predecessor's card
+    /// and bytes stay on the retired node.
+    ///
+    /// A context that is not exactly rule `edit` returns [`StoreError::Held`]
+    /// and writes nothing. An upsert cannot be rolled back, so a RETIRE that
+    /// would hold must not be preceded by a live successor.
+    pub fn edit(
+        &mut self,
+        id: &str,
+        content: &str,
+        ctx: &AdmissionContext,
+    ) -> Result<(String, RetireReceipt), StoreError> {
         if content.trim().is_empty() {
             return Err(StoreError::InvalidInput("content must not be empty".into()));
         }
-        self.require_node(id)?;
-        let context = self.context_for(&[id]);
-        let (effect_seq, _) = self.admit_write(
-            StoreOp::EditContent {
-                id: id.to_string(),
+        let old = self.require_node(id)?.clone();
+        if old.superseded_by.is_some() {
+            return Err(StoreError::InvalidInput(format!(
+                "node {id} is already superseded"
+            )));
+        }
+        if named_retire_rule(ctx.rule_id.as_deref(), ctx.confirm, true) != Some(RULE_EDIT) {
+            return Err(StoreError::Held {
+                propose_seq: self.gate_log.gate_frame_count(),
+            });
+        }
+        let opened = !self.tool_call_open;
+        if opened {
+            self.begin_tool_call();
+        }
+        let result = (|| {
+            let input = IngestInput {
                 content: content.to_string(),
-            },
-            action_kind::WRITE,
-            context,
-        )?;
-        Ok(effect_seq)
+                node_type: old.node_type.clone(),
+                tags: old.tags.clone(),
+                created_at_ms: Some(old.created_at_ms),
+                valid_from_ms: Some(old.valid_from_ms),
+                valid_until_ms: Some(old.valid_until_ms),
+            };
+            let successor = self.ingest_in_scope(input, &old.scope)?;
+            let receipt = self.retire(id, &successor, ctx)?;
+            Ok((successor, receipt))
+        })();
+        if opened {
+            self.end_tool_call();
+        }
+        result
     }
 
     /// Review events in fold order. The kernel test replays these independently.
@@ -859,7 +886,7 @@ impl StrataStore {
         let frames = self.log.read_frames(1)?;
         let mut propose_at: HashMap<u64, Propose> = HashMap::new();
         let mut gates_for: HashMap<u64, Vec<(u64, GateRecord)>> = HashMap::new();
-        let mut pending: HashMap<[u8; 32], VecDeque<u64>> = HashMap::new();
+        let mut pending: HashMap<[u8; 32], VecDeque<(u64, Option<&'static str>)>> = HashMap::new();
         let mut handles: HashMap<u64, String> = HashMap::new();
         let mut proofs = Vec::new();
         let mut gate_seq_counter: u64 = 0;
@@ -901,10 +928,13 @@ impl StrataStore {
                                 })
                             });
                             if covering && allowed && effect.action_hash == effect.payload_digest {
+                                let rule = propose_at
+                                    .get(&effect.propose_seq)
+                                    .and_then(|propose| retire_rule_id(&propose.params_hash));
                                 pending
                                     .entry(effect.payload_digest)
                                     .or_default()
-                                    .push_back(gseq);
+                                    .push_back((gseq, rule));
                             }
                         }
                     }
@@ -912,7 +942,8 @@ impl StrataStore {
                 }
             } else if frame.kind == KIND_STORE_WRITE {
                 let digest = hash32(&frame.payload);
-                let Some(effect_seq) = pending.get_mut(&digest).and_then(|queue| queue.pop_front())
+                let Some((effect_seq, rule)) =
+                    pending.get_mut(&digest).and_then(|queue| queue.pop_front())
                 else {
                     continue;
                 };
@@ -940,14 +971,16 @@ impl StrataStore {
                             rating: None,
                         }
                     }
-                    StoreOp::EditContent { id, content: _ } => EffectProof {
-                        effect_seq,
-                        data_seq: frame.seq,
-                        node_id: id,
-                        action: EffectAction::Edit,
-                        payload_digest: digest,
-                        rating: None,
-                    },
+                    StoreOp::SupersedeNode { superseded_by, .. } if rule == Some(RULE_EDIT) => {
+                        EffectProof {
+                            effect_seq,
+                            data_seq: frame.seq,
+                            node_id: superseded_by,
+                            action: EffectAction::Edit,
+                            payload_digest: digest,
+                            rating: None,
+                        }
+                    }
                     StoreOp::ReviewNode { card_id, rating } => {
                         let Some(node_id) = handles.get(&card_id).cloned() else {
                             return Err(StoreError::Verify(format!(
