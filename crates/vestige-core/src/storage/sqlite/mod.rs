@@ -35,6 +35,7 @@ use crate::storage::portable::{
 
 // Phase 4 wall: types referenced by the MemoryStoreSend forwarding seam below.
 use crate::actor::{ActorPolicySnapshot, RoleResolution};
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use crate::advanced::reconsolidation::LabileCandidate;
 use crate::advanced::{MergeCandidate, MergeOperation, MergePlan, MergePolicy};
 use crate::codebase::anchor::{AnchorStatus, CodeAnchor};
@@ -590,18 +591,6 @@ pub struct EmbeddingProfileMigrationNodeCheckpoint {
     pub error: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
-
-type EmbeddingProfileMigrationRow = (
-    String,
-    String,
-    String,
-    i64,
-    i64,
-    String,
-    Option<String>,
-    String,
-    String,
-);
 
 // ============================================================================
 // STORAGE
@@ -2784,6 +2773,7 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn merge_candidates(&self, policy: MergePolicy, limit: usize, tag_filter: &[String]) -> Result<Vec<MergeCandidate>> {
         SqliteMemoryStore::merge_candidates(self, policy, limit, tag_filter)
     }
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     fn merge_undo(&self, op_id: &str) -> Result<MergeOperation> {
         SqliteMemoryStore::merge_undo(self, op_id)
     }
@@ -2958,6 +2948,7 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn run_rac1_cascade_sweep(&self) -> Result<(usize, usize)> {
         SqliteMemoryStore::run_rac1_cascade_sweep(self)
     }
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     fn smart_ingest_excluding_in_scope_with_secret_policy_and_labile(&self, input: IngestInput, scope: &str, excluded_node_ids: &[String], policy: SecretPolicy, labile: &[LabileCandidate]) -> Result<SmartIngestResult> {
         SqliteMemoryStore::smart_ingest_excluding_in_scope_with_secret_policy_and_labile(self, input, scope, excluded_node_ids, policy, labile)
     }

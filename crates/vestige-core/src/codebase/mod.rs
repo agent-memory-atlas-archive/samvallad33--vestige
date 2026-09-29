@@ -72,6 +72,9 @@
 // quarantined behind `legacy-sqlite` (build/t5-legacy-isolation).
 #[cfg(feature = "legacy-sqlite")]
 pub mod anchor;
+#[cfg(not(feature = "legacy-sqlite"))]
+#[path = "anchor_absent.rs"]
+pub mod anchor;
 pub mod context;
 #[cfg(feature = "codebase-git")]
 pub mod git;

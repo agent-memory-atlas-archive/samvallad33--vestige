@@ -452,10 +452,10 @@ impl CausalWalkOptions {
                                 a.time = a.time.max(Some(r.created_at));
                             }
                         }
-                        if let Some(ms) = ev.last_event_at {
-                            if let Some(t) = DateTime::from_timestamp_millis(ms) {
-                                a.time = a.time.max(Some(t));
-                            }
+                        if let Some(ms) = ev.last_event_at
+                            && let Some(t) = DateTime::from_timestamp_millis(ms)
+                        {
+                            a.time = a.time.max(Some(t));
                         }
                     }
                 },
@@ -974,8 +974,10 @@ pub fn walk_storage(
         })
         .collect();
 
-    let mut ctx = WalkContext::default();
-    ctx.now = Utc::now();
+    let mut ctx = WalkContext {
+        now: Utc::now(),
+        ..Default::default()
+    };
 
     // ci_run evidence: the run's failure channel
     for start in &req.start_points {

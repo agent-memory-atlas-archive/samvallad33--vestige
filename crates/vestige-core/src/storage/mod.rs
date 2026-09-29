@@ -39,6 +39,11 @@ mod resolver;
 mod session_queries;
 #[cfg(feature = "legacy-sqlite")]
 mod sqlite;
+// Names the always-on store trait still uses after `legacy-sqlite` left the
+// default set. The real types stay in the sqlite tree.
+#[cfg(not(feature = "legacy-sqlite"))]
+#[path = "sqlite_absent.rs"]
+mod sqlite;
 #[cfg(feature = "legacy-sqlite")]
 mod synaptic_store;
 #[cfg(feature = "legacy-sqlite")]
@@ -95,6 +100,23 @@ pub use replay_store::{
 };
 #[cfg(feature = "legacy-sqlite")]
 pub use sqlite::{WalCheckpointMode, WalCheckpointStatus};
+#[cfg(not(feature = "legacy-sqlite"))]
+pub use sqlite::{
+    ActorMutationOutcome, AgentRunSummary, BlastReport, ClosedIssueNode, CompositionEventRecord,
+    CompositionMemberRecord, CompositionNeighborRecord, CompositionOutcomeRecord,
+    ConnectionRecord, ConnectorCursor, ConsolidationHistoryRecord, CoverageSnapshot,
+    DreamHistoryRecord, DurableCounterfactualReplay, DurableRetrievalReplayCapsule,
+    DurableSignedRetrievalReceipt, DurableSynapticCapture, EndorsementEventRecord,
+    FailedToolCall, GitCommitNode, HandleResolution, HygieneSnapshot, InsightRecord,
+    IntentionRecord, NeverComposedCandidate, OpenFailureTouching, PendingMemoryMutationDecision,
+    PortableArchive, PortableImportMode, PortableImportReport, PortableSyncReport, PurgeReport,
+    ReceiptAttestationStatus, ReconcileReport, Result, RetireOutcome, RetrievalReplayCapsuleDraft,
+    RetrievalReplayCapsuleSummary, SignedReceiptWrite, SmartIngestResult, SourceUpsertResult,
+    StateTransitionRecord, StorageError, StoredCounterfactualReplay,
+    StoredReceiptAttestationVerification, StoredWalkReceipt, SynapticCaptureRequest,
+    SynapticIngestOutcome, SynapticIngestRequest, TagVocabulary, WalkReceiptHandle,
+    WalCheckpointMode, WalCheckpointStatus,
+};
 #[cfg(feature = "legacy-sqlite")]
 pub use sqlite::{
     ACCESS_LOG_RETENTION_DAYS, ActorMutationOutcome, CompositionEventRecord,
@@ -147,11 +169,6 @@ pub use unlearning_store::{
     V25_UNLEARNING_STORAGE_SCHEMA_VERSION,
 };
 
-/// Backwards-compatibility alias. Retained until Phase 4 completes so every
-/// existing `Arc<Storage>` call site keeps compiling. Scheduled for removal
-/// once no downstream source file references it.
-#[cfg(feature = "legacy-sqlite")]
-
 /// Error returned by [`open_storage`] when the binary was built without the
 /// `legacy-sqlite` feature. Exists in every build so callers can name it
 /// (and print it) regardless of feature state.
@@ -177,11 +194,13 @@ pub struct LegacySqliteDisabled;
 pub type Storage = dyn MemoryStore;
 
 /// Default database artifact path for the SQLite backend.
+#[cfg(feature = "legacy-sqlite")]
 pub fn default_db_path() -> Result<std::path::PathBuf> {
     SqliteMemoryStore::default_db_path()
 }
 
 /// Database artifact path for a given data directory (SQLite backend).
+#[cfg(feature = "legacy-sqlite")]
 pub fn db_path_for_data_dir(data_dir: std::path::PathBuf) -> Result<std::path::PathBuf> {
     SqliteMemoryStore::db_path_for_data_dir(data_dir)
 }

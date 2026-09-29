@@ -544,13 +544,16 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn create_test_storage() -> std::sync::Arc<Storage> {
-        vestige_core::open_storage(None).expect("test storage")
+    fn create_test_storage() -> (tempfile::TempDir, std::sync::Arc<Storage>) {
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("vestige.db");
+        let storage = vestige_core::open_storage(Some(db)).expect("test storage");
+        (dir, storage)
     }
 
     #[test]
     fn test_create_memory() {
-        let mut storage = create_test_storage();
+        let (_dir, storage) = create_test_storage();
         let node = TestDataFactory::create_memory(&*storage, "test content");
 
         assert!(node.is_some());
@@ -559,7 +562,7 @@ mod tests {
 
     #[test]
     fn test_create_batch() {
-        let mut storage = create_test_storage();
+        let (_dir, storage) = create_test_storage();
         let ids = TestDataFactory::create_batch(&*storage, 10);
 
         assert_eq!(ids.len(), 10);
@@ -570,7 +573,7 @@ mod tests {
 
     #[test]
     fn test_create_decay_scenario() {
-        let mut storage = create_test_storage();
+        let (_dir, storage) = create_test_storage();
         let scenario = TestDataFactory::create_decay_scenario(&*storage);
 
         assert!(!scenario.node_ids.is_empty());
@@ -581,7 +584,7 @@ mod tests {
 
     #[test]
     fn test_create_scheduling_scenario() {
-        let mut storage = create_test_storage();
+        let (_dir, storage) = create_test_storage();
         let scenario = TestDataFactory::create_scheduling_scenario(&*storage);
 
         assert!(!scenario.node_ids.is_empty());

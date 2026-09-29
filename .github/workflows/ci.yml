@@ -106,7 +106,11 @@ jobs:
         run: cargo test --workspace
 
       - name: Test paid cloud-sync path
-        run: cargo test --locked --package vestige-core --features cloud-sync cloud --lib
+        # `cloud_sync` is cfg'd on cloud-sync AND legacy-sqlite. The sqlite
+        # wipe dropped both sqlite features from the default set, and this
+        # step builds vestige-core alone, so opt back into the backend the
+        # paid path actually runs against.
+        run: cargo test --locked --package vestige-core --features cloud-sync,bundled-sqlite cloud --lib
 
   no-embeddings-build:
     # The configuration Termux users build from source (#145): no ONNX Runtime,

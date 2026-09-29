@@ -448,6 +448,7 @@ impl SqliteMemoryStore {
         tags
     }
 
+    #[allow(dead_code)] // vector-era bridge; no live caller after the search collapse
     pub(super) fn composition_bridge_score(
         a: &KnowledgeNode,
         b: &KnowledgeNode,
@@ -469,6 +470,7 @@ impl SqliteMemoryStore {
             .clamp(0.0, 1.0)
     }
 
+    #[allow(dead_code)] // only used by composition_bridge_score
     pub(super) fn tag_distance(a: &[String], b: &[String]) -> f64 {
         let a_set = a.iter().map(String::as_str).collect::<HashSet<_>>();
         let b_set = b.iter().map(String::as_str).collect::<HashSet<_>>();
@@ -517,6 +519,7 @@ impl SqliteMemoryStore {
             + usize::from(term.contains('_')) * 2
     }
 
+    #[allow(dead_code)] // vector-era anchor text; no live caller after the search collapse
     pub(super) fn anchor_summary(shared_tags: &[String], shared_terms: &[String]) -> String {
         if !shared_tags.is_empty() && !shared_terms.is_empty() {
             format!(

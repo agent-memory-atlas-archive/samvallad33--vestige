@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::Storage;
 #[cfg(feature = "legacy-sqlite")]
 use crate::storage::Result;
+#[cfg(feature = "legacy-sqlite")]
 use std::sync::Arc;
 
 /// Which client file shape to render.
