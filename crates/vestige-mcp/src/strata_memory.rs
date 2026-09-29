@@ -114,6 +114,21 @@ fn is_memory_id(id: &str) -> bool {
     uuid::Uuid::parse_str(id).is_ok() || is_mem_id(id)
 }
 
+/// Namespaces are identifiers. Blank, oversized, and control-character values
+/// are refused before a frame is appended, the same gate v3 applied on write.
+fn normalize_scope(scope: &str) -> Result<&str, StorageError> {
+    let normalized = scope.trim();
+    if normalized.is_empty()
+        || normalized.len() > 200
+        || normalized.chars().any(char::is_control)
+    {
+        return Err(StorageError::InvalidScope(
+            "expected a non-empty identifier of at most 200 visible characters".into(),
+        ));
+    }
+    Ok(normalized)
+}
+
 fn ms_to_dt(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)
 }
@@ -640,6 +655,7 @@ impl MemoryStoreSend for StrataMemory {
         if input.content.trim().is_empty() {
             return Err(StorageError::Init("content must not be empty".into()));
         }
+        let scope = normalize_scope(scope)?;
         let mut store = self.lock();
         let id = store
             .ingest_in_scope(to_store_input(&input), scope)
@@ -1467,5 +1483,25 @@ mod tests {
         assert_eq!(envelope.source_project.as_deref(), Some("vestige"));
         assert_eq!(envelope.source_id.as_deref(), Some("310"));
         assert_eq!(envelope.source_updated_at, Some(updated));
+    }
+
+    #[test]
+    fn malformed_scopes_are_refused_and_a_padded_scope_is_trimmed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let memory = StrataMemory::open(dir.path()).unwrap();
+        let input = || IngestInput {
+            content: "scoped fixture memory".into(),
+            ..IngestInput::default()
+        };
+        for scope in ["", "   ", &"s".repeat(250), "bad\u{7}scope"] {
+            let err = memory.ingest_in_scope(input(), scope).unwrap_err();
+            assert!(
+                matches!(err, StorageError::InvalidScope(_)),
+                "{scope:?}: {err}"
+            );
+        }
+        let node = memory.ingest_in_scope(input(), "  user  ").unwrap();
+        let stored = memory.lock().get_node(&node.id).expect("stored node");
+        assert_eq!(stored.scope, "user");
     }
 }
