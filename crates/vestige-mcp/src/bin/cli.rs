@@ -196,6 +196,15 @@ enum Commands {
         accept_wal_snapshot: bool,
     },
 
+    /// Verify a STRATA directory. Read-only: creates no files.
+    ///
+    /// Accepts a migrated log (no `kernel.log`), a live store (`log/` plus
+    /// `store.meta`), or the kernel/gate layout.
+    StrataVerify {
+        /// Directory to verify
+        dir: PathBuf,
+    },
+
     /// Export memories in JSON or JSONL format
     Export {
         /// Output file path
@@ -538,6 +547,7 @@ fn main() -> anyhow::Result<()> {
             dry_run,
             accept_wal_snapshot,
         } => run_migrate_to_strata(from, to, dry_run, accept_wal_snapshot),
+        Commands::StrataVerify { dir } => run_strata_verify(dir),
         Commands::Export {
             output,
             format,
@@ -2371,6 +2381,22 @@ fn get_default_db_path() -> anyhow::Result<PathBuf> {
     } else {
         Ok(vestige_core::default_db_path()?)
     }
+}
+
+/// Verify a STRATA directory. Same report as the `strata-verify` binary.
+/// Creates nothing in `dir`.
+fn run_strata_verify(dir: PathBuf) -> anyhow::Result<()> {
+    let report = strata_verify::verify_path(&dir);
+    println!("{}", report.json);
+    if report.ok {
+        println!("OK");
+        return Ok(());
+    }
+    println!("FAILED");
+    for failure in &report.failures {
+        eprintln!("  {failure}");
+    }
+    std::process::exit(1);
 }
 
 /// Open storage using the CLI-selected data directory, if one was provided.
@@ -4242,6 +4268,12 @@ mod tests {
             source_archive_url("v2.1.1"),
             "https://github.com/samvallad33/vestige/archive/refs/tags/v2.1.1.tar.gz"
         );
+    }
+
+    #[test]
+    fn strata_verify_is_a_subcommand() {
+        let cli = Cli::try_parse_from(["vestige", "strata-verify", "/tmp/store"]).unwrap();
+        assert!(matches!(cli.command, Commands::StrataVerify { .. }));
     }
 
     #[test]

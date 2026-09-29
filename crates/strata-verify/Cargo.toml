@@ -24,10 +24,14 @@ strata-kernel = { path = "../strata-kernel" }
 strata-migrate = { path = "../strata-migrate" }
 strata = { path = "../strata" }
 strata-gate = { path = "../strata-gate" }
+# Trailer signatures are checked from the on-disk key. The scanner never
+# writes that key.
+ed25519-dalek = { version = "3", default-features = false, features = ["fast", "rand_core"] }
 
 [dev-dependencies]
 ed25519-dalek = { version = "3", default-features = false, features = ["fast", "rand_core"] }
 tempfile = "3"
+strata-store = { path = "../strata-store" }
 
 [[bin]]
 name = "strata-verify"
