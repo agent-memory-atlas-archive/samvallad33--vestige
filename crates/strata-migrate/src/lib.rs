@@ -833,7 +833,8 @@ fn capture_legacy(
         if mapped.contains(&column.as_str()) {
             continue;
         }
-        let value = row.get(&column)?;
+        // `column` is already `&String`; `get` takes `&str`.
+        let value = row.get(column)?;
         out.push((format!("{table}.{column}"), legacy_value(value)));
     }
     Ok(out)

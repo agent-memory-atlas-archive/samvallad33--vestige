@@ -18,7 +18,7 @@ use std::path::Path;
 
 use strata::StrataLog;
 use strata_migrate::records::{
-    decode_receipt, KIND_EDGE, KIND_MIGRATION_RECEIPT, KIND_NODE, KIND_TOMBSTONE,
+    KIND_EDGE, KIND_MIGRATION_RECEIPT, KIND_NODE, KIND_TOMBSTONE, decode_receipt,
 };
 
 /// Outcome of a full migrated-log verification.
@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn counts_match_detects_duplicate_rows() {
         use ed25519_dalek::SigningKey;
-        use strata_migrate::records::{MigrationReceipt, ReceiptBody, RECEIPT_SIGNING_KEY_ID};
+        use strata_migrate::records::{MigrationReceipt, RECEIPT_SIGNING_KEY_ID, ReceiptBody};
 
         let key = SigningKey::from_bytes(&[3u8; 32]);
         let body = ReceiptBody {

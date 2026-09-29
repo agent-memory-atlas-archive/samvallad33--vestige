@@ -2094,7 +2094,10 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
     {
         let source_uri = format!(
             "file:{}?mode=ro&immutable=1",
-            source.to_string_lossy().replace('?', "%3f").replace('#', "%23")
+            source
+                .to_string_lossy()
+                .replace('?', "%3f")
+                .replace('#', "%23")
         );
         let snapshot = rusqlite::Connection::open_with_flags(
             source_uri,

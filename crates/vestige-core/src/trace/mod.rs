@@ -47,11 +47,11 @@ mod receipt;
 mod review;
 
 pub use receipt::{
-    BACKFILL_RECEIPT_CLAIM_BOUNDARY, BACKFILL_RECEIPT_SCHEMA_V1, WALK_RECEIPT_CLAIM_BOUNDARY,
-    WALK_RECEIPT_SCHEMA_V1, ActorProvenance, BackfillCandidateEvidence, DecayRisk, Receipt,
-    ReceiptEvidence, ReceiptMutation, StrengthDelta, SuppressedReceiptEntry,
-    SynapticCaptureCandidate, SynapticCaptureDisposition, SynapticCaptureEvidence,
-    SynapticCaptureTrigger, SynapticCaptureWindow, SynapticStrengthChange,
+    ActorProvenance, BACKFILL_RECEIPT_CLAIM_BOUNDARY, BACKFILL_RECEIPT_SCHEMA_V1,
+    BackfillCandidateEvidence, DecayRisk, Receipt, ReceiptEvidence, ReceiptMutation, StrengthDelta,
+    SuppressedReceiptEntry, SynapticCaptureCandidate, SynapticCaptureDisposition,
+    SynapticCaptureEvidence, SynapticCaptureTrigger, SynapticCaptureWindow, SynapticStrengthChange,
+    WALK_RECEIPT_CLAIM_BOUNDARY, WALK_RECEIPT_SCHEMA_V1,
 };
 pub use review::{
     HIGH_TRUST_FLOOR, LOW_CONFIDENCE_FLOOR, MemoryPr, MemoryPrAction, MemoryPrKind, MemoryPrStatus,

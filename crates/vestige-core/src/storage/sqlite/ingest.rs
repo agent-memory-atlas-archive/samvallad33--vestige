@@ -338,8 +338,7 @@ impl SqliteMemoryStore {
             tracing::warn!("Failed to generate embedding for {}: {}", id, e);
         }
 
-        self.get_node(&id)?
-            .ok_or(StorageError::NotFound(id))
+        self.get_node(&id)?.ok_or(StorageError::NotFound(id))
     }
 
     /// Smart ingest with Prediction Error Gating
@@ -404,7 +403,11 @@ impl SqliteMemoryStore {
         labile: &[crate::advanced::reconsolidation::LabileCandidate],
     ) -> Result<SmartIngestResult> {
         self.smart_ingest_excluding_in_scope_with_secret_policy_and_labile(
-            input, scope, &[], policy, labile,
+            input,
+            scope,
+            &[],
+            policy,
+            labile,
         )
     }
 
@@ -635,9 +638,9 @@ impl SqliteMemoryStore {
                 // update to the reconsolidating trace.
                 let mut reconsolidation_plan_id: Option<String> = None;
                 for related in &related_memory_ids {
-                    let candidate = labile.iter().find(|c| {
-                        &c.memory_id == related && c.window_expires_at > Utc::now()
-                    });
+                    let candidate = labile
+                        .iter()
+                        .find(|c| &c.memory_id == related && c.window_expires_at > Utc::now());
                     let Some(candidate) = candidate else {
                         continue;
                     };
@@ -648,12 +651,7 @@ impl SqliteMemoryStore {
                     ) {
                         continue;
                     }
-                    match self.plan_reconsolidation(
-                        related,
-                        &node.id,
-                        candidate,
-                        "contradiction",
-                    ) {
+                    match self.plan_reconsolidation(related, &node.id, candidate, "contradiction") {
                         Ok(plan) => {
                             reconsolidation_plan_id = Some(plan.id);
                             reason.push_str(
@@ -874,9 +872,10 @@ impl SqliteMemoryStore {
                 // being reconsolidated is not overwritten by new material —
                 // the material competes for the trace and the outcome is
                 // decided after the window, not during it.
-                if let Some(candidate) = labile.iter().find(
-                    |c| c.memory_id == old_memory_id && c.window_expires_at > Utc::now(),
-                ) {
+                if let Some(candidate) = labile
+                    .iter()
+                    .find(|c| c.memory_id == old_memory_id && c.window_expires_at > Utc::now())
+                {
                     let node = self.ingest_in_scope_with_secret_policy(input, scope, policy)?;
                     let plan = self.plan_reconsolidation(
                         &old_memory_id,

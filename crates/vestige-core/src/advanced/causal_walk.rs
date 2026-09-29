@@ -112,7 +112,11 @@ impl StartPoint {
             StartPoint::StackFrame { frame } => format!("stack_frame {frame}"),
             StartPoint::CiRun { run_id } => format!("ci_run {run_id}"),
             StartPoint::LoggedWrite { node_id } => format!("logged_write {node_id}"),
-            StartPoint::VersionRange { worked_in, broke_in, repo } => {
+            StartPoint::VersionRange {
+                worked_in,
+                broke_in,
+                repo,
+            } => {
                 format!("version_range {worked_in}..{broke_in} in {repo}")
             }
         }
@@ -263,8 +267,7 @@ fn commit_sha_of(content: &str) -> Option<String> {
         return None;
     }
     let sha = words.next()?;
-    (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()))
-        .then(|| sha.to_ascii_lowercase())
+    (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_ascii_lowercase())
 }
 
 /// Parse the `files:` / `symbols:` lines of a `git_records::record_content`
@@ -291,7 +294,13 @@ fn parse_prefixed_line(content: &str, prefix: &str) -> Vec<String> {
 }
 
 #[allow(dead_code)] // callers sit in the legacy-sqlite-gated surface; dead only in the no-embeddings profile
-fn walk_record_of(id: &str, content: &str, tags: &[String], created_at: DateTime<Utc>, stability: f64) -> WalkRecord {
+fn walk_record_of(
+    id: &str,
+    content: &str,
+    tags: &[String],
+    created_at: DateTime<Utc>,
+    stability: f64,
+) -> WalkRecord {
     let is_commit = tags.iter().any(|t| t == git_records::COMMIT_TAG);
     WalkRecord {
         id: id.to_string(),
@@ -300,9 +309,21 @@ fn walk_record_of(id: &str, content: &str, tags: &[String], created_at: DateTime
         created_at,
         stability,
         is_commit,
-        sha: if is_commit { commit_sha_of(content) } else { None },
-        files: if is_commit { parse_prefixed_line(content, "files: ") } else { vec![] },
-        symbols: if is_commit { parse_prefixed_line(content, "symbols: ") } else { vec![] },
+        sha: if is_commit {
+            commit_sha_of(content)
+        } else {
+            None
+        },
+        files: if is_commit {
+            parse_prefixed_line(content, "files: ")
+        } else {
+            vec![]
+        },
+        symbols: if is_commit {
+            parse_prefixed_line(content, "symbols: ")
+        } else {
+            vec![]
+        },
     }
 }
 
@@ -359,7 +380,11 @@ impl CausalWalkOptions {
         records: &[WalkRecord],
         ctx: &WalkContext,
     ) -> CausalWalkResult {
-        let now = if ctx.now.timestamp() == 0 { Utc::now() } else { ctx.now };
+        let now = if ctx.now.timestamp() == 0 {
+            Utc::now()
+        } else {
+            ctx.now
+        };
         let mut missing: Vec<String> = Vec::new();
 
         if starts.is_empty() {
@@ -399,7 +424,11 @@ impl CausalWalkOptions {
             records.iter().map(|r| (r.id.as_str(), r)).collect();
         let mut anchors: Vec<Option<StartAnchors>> = Vec::with_capacity(starts.len());
         for start in starts {
-            let mut a = StartAnchors { entities: BTreeSet::new(), record_ids: BTreeSet::new(), time: None };
+            let mut a = StartAnchors {
+                entities: BTreeSet::new(),
+                record_ids: BTreeSet::new(),
+                time: None,
+            };
             match start {
                 StartPoint::FailingTest { name } => {
                     // test-file records: records naming the test
@@ -412,7 +441,10 @@ impl CausalWalkOptions {
                         a.entities.extend(name_anchors.iter().cloned());
                     }
                     for r in records {
-                        if name_anchors.iter().any(|n| r.content.to_lowercase().contains(n)) {
+                        if name_anchors
+                            .iter()
+                            .any(|n| r.content.to_lowercase().contains(n))
+                        {
                             a.entities.extend(r.entities.iter().cloned());
                             a.record_ids.insert(r.id.clone());
                             a.time = a.time.max(Some(r.created_at));
@@ -456,15 +488,16 @@ impl CausalWalkOptions {
                             }
                         }
                         if let Some(ms) = ev.last_event_at
-                            && let Some(t) = DateTime::from_timestamp_millis(ms) {
-                                a.time = a.time.max(Some(t));
-                            }
+                            && let Some(t) = DateTime::from_timestamp_millis(ms)
+                        {
+                            a.time = a.time.max(Some(t));
+                        }
                     }
                 },
                 StartPoint::LoggedWrite { node_id } => match by_id.get(node_id.as_str()) {
-                    None => missing.push(format!(
-                        "logged write '{node_id}' not found in this scope"
-                    )),
+                    None => {
+                        missing.push(format!("logged write '{node_id}' not found in this scope"))
+                    }
                     Some(r) => {
                         a.entities.extend(r.entities.iter().cloned());
                         a.record_ids.insert(r.id.clone());
@@ -541,9 +574,7 @@ impl CausalWalkOptions {
                                 let others: Vec<String> = r
                                     .files
                                     .iter()
-                                    .filter(|f| {
-                                        !test_files.iter().any(|t| path_matches(f, t))
-                                    })
+                                    .filter(|f| !test_files.iter().any(|t| path_matches(f, t)))
                                     .cloned()
                                     .collect();
                                 let hop_file = touched[0].clone();
@@ -592,8 +623,10 @@ impl CausalWalkOptions {
                                     .is_some_and(|(p, _)| path_matches(p, file))
                             })
                     };
-                    let mut touchers: Vec<&WalkRecord> =
-                        records.iter().filter(|r| r.is_commit && touches(r)).collect();
+                    let mut touchers: Vec<&WalkRecord> = records
+                        .iter()
+                        .filter(|r| r.is_commit && touches(r))
+                        .collect();
                     touchers.sort_by_key(|r| r.created_at);
                     if touchers.is_empty() {
                         missing.push(format!(
@@ -673,8 +706,8 @@ impl CausalWalkOptions {
                         if r.id == *node_id || anchor_record_ids.contains(r.id.as_str()) {
                             continue;
                         }
-                        let is_neighbour = neighbours
-                            .is_some_and(|ns| ns.iter().any(|n| n == &r.id));
+                        let is_neighbour =
+                            neighbours.is_some_and(|ns| ns.iter().any(|n| n == &r.id));
                         let shared: Vec<String> = r
                             .entities
                             .iter()
@@ -708,7 +741,11 @@ impl CausalWalkOptions {
                         }
                     }
                 }
-                StartPoint::VersionRange { worked_in, broke_in, .. } => {
+                StartPoint::VersionRange {
+                    worked_in,
+                    broke_in,
+                    ..
+                } => {
                     match ctx.ranges.get(&idx) {
                         Some(Err(msg)) => missing.push(msg.clone()),
                         Some(Ok(range)) => {
@@ -718,10 +755,8 @@ impl CausalWalkOptions {
                                 if !r.is_commit {
                                     continue;
                                 }
-                                let in_range = r
-                                    .sha
-                                    .as_ref()
-                                    .is_some_and(|s| range.shas.contains(s));
+                                let in_range =
+                                    r.sha.as_ref().is_some_and(|s| range.shas.contains(s));
                                 if !in_range {
                                     continue;
                                 }
@@ -835,9 +870,17 @@ impl CausalWalkOptions {
                 let age_days = (failure_time - r.created_at).num_seconds() as f64 / 86_400.0;
                 let entity_term: f64 = s.anchors.iter().map(|a| idf(a)).sum();
                 let recency_term = 0.3 * (1.0 / (1.0 + age_days / self.lookback_days as f64));
-                let change_term = if r.is_commit { CHANGE_RECORD_BONUS } else { 0.0 };
+                let change_term = if r.is_commit {
+                    CHANGE_RECORD_BONUS
+                } else {
+                    0.0
+                };
                 let mut anchors_sorted = s.anchors.iter().cloned().collect::<Vec<_>>();
-                anchors_sorted.sort_by(|a, b| idf(b).partial_cmp(&idf(a)).unwrap_or(std::cmp::Ordering::Equal));
+                anchors_sorted.sort_by(|a, b| {
+                    idf(b)
+                        .partial_cmp(&idf(a))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 CausalCause {
                     id: r.id.clone(),
                     sha: r.sha.clone(),
@@ -855,35 +898,60 @@ impl CausalWalkOptions {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 // near-ties: the change, not the newest report about it
                 .then(
-                    by_id.get(b.id.as_str())
+                    by_id
+                        .get(b.id.as_str())
                         .map(|r| r.is_commit)
                         .unwrap_or(false)
-                        .cmp(&by_id.get(a.id.as_str()).map(|r| r.is_commit).unwrap_or(false)),
+                        .cmp(
+                            &by_id
+                                .get(a.id.as_str())
+                                .map(|r| r.is_commit)
+                                .unwrap_or(false),
+                        ),
                 )
                 // older-first ties (the older change had more time to be the origin)
                 .then(
-                    by_id.get(a.id.as_str())
+                    by_id
+                        .get(a.id.as_str())
                         .map(|r| r.created_at)
                         .unwrap_or(failure_time)
-                        .cmp(&by_id.get(b.id.as_str()).map(|r| r.created_at).unwrap_or(failure_time)),
+                        .cmp(
+                            &by_id
+                                .get(b.id.as_str())
+                                .map(|r| r.created_at)
+                                .unwrap_or(failure_time),
+                        ),
                 )
         });
         causes.truncate(self.max_causes);
 
         rejections.sort_by(|a, b| {
-            b.shared_anchors.cmp(&a.shared_anchors).then(a.reason.cmp(&b.reason))
+            b.shared_anchors
+                .cmp(&a.shared_anchors)
+                .then(a.reason.cmp(&b.reason))
         });
         rejections.truncate(self.max_rejections);
 
         let needs_report = if causes.is_empty() {
             let required: Vec<String> = if starts.is_empty() {
-                REQUIRED_START_POINTS.iter().map(|s| s.to_string()).collect()
+                REQUIRED_START_POINTS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
             } else {
                 let mut req: Vec<String> = starts
                     .iter()
-                    .map(|s| format!("an anchor for {} (a record that resolves it in this scope)", s.label()))
+                    .map(|s| {
+                        format!(
+                            "an anchor for {} (a record that resolves it in this scope)",
+                            s.label()
+                        )
+                    })
                     .collect();
-                if starts.iter().all(|s| matches!(s, StartPoint::VersionRange { .. })) {
+                if starts
+                    .iter()
+                    .all(|s| matches!(s, StartPoint::VersionRange { .. }))
+                {
                     req = REQUIRED_START_POINTS[..4]
                         .iter()
                         .map(|s| s.to_string())
@@ -898,12 +966,19 @@ impl CausalWalkOptions {
                     "the start points anchored no candidate records in the lookback window".into(),
                 );
             }
-            Some(NeedsReport { missing, required_start_points: required })
+            Some(NeedsReport {
+                missing,
+                required_start_points: required,
+            })
         } else {
             None
         };
 
-        CausalWalkResult { causes, needs_report, rejected: rejections }
+        CausalWalkResult {
+            causes,
+            needs_report,
+            rejected: rejections,
+        }
     }
 }
 
@@ -972,14 +1047,15 @@ pub fn walk_storage(
         .map_err(|e| e.to_string())?;
     let records: Vec<WalkRecord> = nodes
         .iter()
-        .map(|n| {
-            walk_record_of(&n.id, &n.content, &n.tags, n.created_at, n.stability)
-        })
+        .map(|n| walk_record_of(&n.id, &n.content, &n.tags, n.created_at, n.stability))
         .collect();
 
     // Wall clock feeds the non-hashed display path only (H6 applies to the
     // hashed walk state, which is caller-timestamped).
-    let mut ctx = WalkContext { now: Utc::now(), ..WalkContext::default() };
+    let mut ctx = WalkContext {
+        now: Utc::now(),
+        ..WalkContext::default()
+    };
 
     // ci_run evidence: the run's failure channel
     for start in &req.start_points {
@@ -989,7 +1065,11 @@ pub fn walk_storage(
             for event in &events {
                 use crate::trace::MemoryTraceEvent as E;
                 match event {
-                    E::SanhedrinVeto { claim, evidence_ids, .. } => {
+                    E::SanhedrinVeto {
+                        claim,
+                        evidence_ids,
+                        ..
+                    } => {
                         ev.entities.extend(extract_entities(claim, &[]));
                         ev.referenced_ids.extend(evidence_ids.iter().cloned());
                     }
@@ -1038,8 +1118,14 @@ pub fn walk_storage(
         .collect();
     ctx.multiple_repos = repos.len() > 1;
     for (idx, start) in req.start_points.iter().enumerate() {
-        if let StartPoint::VersionRange { worked_in, broke_in, repo } = start {
-            let resolved = match git_lines(repo, &["rev-list", &format!("{worked_in}..{broke_in}")]) {
+        if let StartPoint::VersionRange {
+            worked_in,
+            broke_in,
+            repo,
+        } = start
+        {
+            let resolved = match git_lines(repo, &["rev-list", &format!("{worked_in}..{broke_in}")])
+            {
                 None => Err(format!(
                     "could not resolve the version range {worked_in}..{broke_in} in {repo} (tag missing or not fetched?)"
                 )),
@@ -1163,9 +1249,9 @@ mod tests {
             extra_files: 0,
             symbols: symbols.iter().map(|s| s.to_string()).collect(),
             mentions: mentions.iter().map(|m| m.to_string()).collect(),
-                hunks: vec![],
-                extra_hunks: 0,
-                imports: vec![],
+            hunks: vec![],
+            extra_hunks: 0,
+            imports: vec![],
         });
         seed(storage, &content, vec![git_records::COMMIT_TAG], days_ago)
     }
@@ -1218,9 +1304,12 @@ mod tests {
         // unrelated commit: shares nothing, must be invisible
         commit_record(&storage, &sha_of('c'), "docs", &["README.md"], &[], &[], 2);
 
-        let result = walk_storage(&storage, &req(vec![StartPoint::FailingTest {
-            name: "test_login_flow".into(),
-        }]))
+        let result = walk_storage(
+            &storage,
+            &req(vec![StartPoint::FailingTest {
+                name: "test_login_flow".into(),
+            }]),
+        )
         .unwrap();
 
         assert!(result.needs_report.is_none(), "{:?}", result.needs_report);
@@ -1230,9 +1319,20 @@ mod tests {
         assert_eq!(top.sha.as_deref(), Some(sha_of('a').as_str()));
         assert_eq!(top.path[0].via, "failing_test/co_touch");
         // the hop names the test file AND the co-touched suspect file
-        assert!(top.path[0].hop.contains("tests/auth_test.rs"), "{}", top.path[0].hop);
-        assert!(top.path[0].hop.contains("src/auth.rs"), "{}", top.path[0].hop);
-        assert!(top.shared_anchors.contains(&"tests/auth_test.rs".to_string()));
+        assert!(
+            top.path[0].hop.contains("tests/auth_test.rs"),
+            "{}",
+            top.path[0].hop
+        );
+        assert!(
+            top.path[0].hop.contains("src/auth.rs"),
+            "{}",
+            top.path[0].hop
+        );
+        assert!(
+            top.shared_anchors
+                .contains(&"tests/auth_test.rs".to_string())
+        );
         // the runner-up is the older co-touch, not the chatter
         assert_eq!(result.causes[1].id, good.id);
         assert_eq!(result.causes[1].sha.as_deref(), Some(sha_of('b').as_str()));
@@ -1278,7 +1378,9 @@ mod tests {
 
         let result = walk_storage(
             &storage,
-            &req(vec![StartPoint::StackFrame { frame: "src/auth.rs:88".into() }]),
+            &req(vec![StartPoint::StackFrame {
+                frame: "src/auth.rs:88".into(),
+            }]),
         )
         .unwrap();
 
@@ -1291,7 +1393,10 @@ mod tests {
         assert_eq!(top.path[0].hop, "src/auth.rs:88");
         // the earlier toucher is answered in why-not, not surfaced
         assert!(
-            result.rejected.iter().any(|r| r.id == old.id && r.reason.contains("earlier toucher")),
+            result
+                .rejected
+                .iter()
+                .any(|r| r.id == old.id && r.reason.contains("earlier toucher")),
             "{:?}",
             result.rejected
         );
@@ -1309,7 +1414,11 @@ mod tests {
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "{:?}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             String::from_utf8_lossy(&out.stdout).to_string()
         };
         git(&["init", "-q"]);
@@ -1321,7 +1430,12 @@ mod tests {
         assert_eq!(in_range_sha.len(), 40);
 
         let (storage, _dir) = store();
-        seed(&storage, "test_login_flow failed in tests/auth_test.rs", vec![], 0);
+        seed(
+            &storage,
+            "test_login_flow failed in tests/auth_test.rs",
+            vec![],
+            0,
+        );
         // out-of-range but newer + co-touching: would win without the range
         commit_record(
             &storage,
@@ -1346,7 +1460,9 @@ mod tests {
         let result = walk_storage(
             &storage,
             &req(vec![
-                StartPoint::FailingTest { name: "test_login_flow".into() },
+                StartPoint::FailingTest {
+                    name: "test_login_flow".into(),
+                },
                 StartPoint::VersionRange {
                     worked_in: "w1".into(),
                     broke_in: "b1".into(),
@@ -1359,7 +1475,10 @@ mod tests {
         assert!(result.needs_report.is_none(), "{:?}", result.needs_report);
         // the recency winner is rejected by the range; the in-range commit is it
         assert!(
-            result.rejected.iter().any(|r| r.reason == "outside version range w1..b1"),
+            result
+                .rejected
+                .iter()
+                .any(|r| r.reason == "outside version range w1..b1"),
             "{:?}",
             result.rejected
         );
@@ -1395,7 +1514,9 @@ mod tests {
         // a test name nothing mentions
         let result = walk_storage(
             &storage,
-            &req(vec![StartPoint::FailingTest { name: "test_ghost".into() }]),
+            &req(vec![StartPoint::FailingTest {
+                name: "test_ghost".into(),
+            }]),
         )
         .unwrap();
         let report = result.needs_report.expect("unanchored test must refuse");
@@ -1410,7 +1531,9 @@ mod tests {
         // a logged write that does not exist in the scope
         let result = walk_storage(
             &storage,
-            &req(vec![StartPoint::LoggedWrite { node_id: "ghost-id".into() }]),
+            &req(vec![StartPoint::LoggedWrite {
+                node_id: "ghost-id".into(),
+            }]),
         )
         .unwrap();
         let report = result.needs_report.expect("unknown node must refuse");
@@ -1461,7 +1584,9 @@ mod tests {
 
         let result = walk_storage(
             &storage,
-            &req(vec![StartPoint::CiRun { run_id: "run-1".into() }]),
+            &req(vec![StartPoint::CiRun {
+                run_id: "run-1".into(),
+            }]),
         )
         .unwrap();
 
@@ -1504,7 +1629,9 @@ mod tests {
 
         let result = walk_storage(
             &storage,
-            &req(vec![StartPoint::LoggedWrite { node_id: write.id.clone() }]),
+            &req(vec![StartPoint::LoggedWrite {
+                node_id: write.id.clone(),
+            }]),
         )
         .unwrap();
 
@@ -1540,11 +1667,18 @@ mod tests {
             5,
         );
 
-        let request = req(vec![StartPoint::FailingTest { name: "test_login_flow".into() }]);
+        let request = req(vec![StartPoint::FailingTest {
+            name: "test_login_flow".into(),
+        }]);
         // preview: nothing written
         let preview = walk_storage(&storage, &request).unwrap();
         assert!(preview.causes[0].id == bad.id);
-        assert!(storage.get_connections_for_memory(&bad.id).unwrap().is_empty());
+        assert!(
+            storage
+                .get_connections_for_memory(&bad.id)
+                .unwrap()
+                .is_empty()
+        );
 
         // promote: exactly one evidence_of edge cause -> note
         let written = persist_evidence_edges(&storage, &preview).unwrap();
@@ -1554,18 +1688,29 @@ mod tests {
             e.source_id == bad.id && e.target_id == note.id && e.link_type == EVIDENCE_LINK_TYPE
         }));
         // idempotent: a second promote writes nothing new
-        assert!(persist_evidence_edges(&storage, &preview).unwrap().is_empty());
+        assert!(
+            persist_evidence_edges(&storage, &preview)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn empty_or_unresolvable_ranges_refuse_rather_than_widen() {
         let (storage, _dir) = store();
-        seed(&storage, "test_login_flow failed in tests/auth_test.rs", vec![], 0);
+        seed(
+            &storage,
+            "test_login_flow failed in tests/auth_test.rs",
+            vec![],
+            0,
+        );
         // no repo at all: the range cannot resolve
         let result = walk_storage(
             &storage,
             &req(vec![
-                StartPoint::FailingTest { name: "test_login_flow".into() },
+                StartPoint::FailingTest {
+                    name: "test_login_flow".into(),
+                },
                 StartPoint::VersionRange {
                     worked_in: "w9".into(),
                     broke_in: "b9".into(),
@@ -1576,7 +1721,10 @@ mod tests {
         .unwrap();
         let report = result.needs_report.expect("unresolvable range must refuse");
         assert!(
-            report.missing.iter().any(|m| m.contains("could not resolve")),
+            report
+                .missing
+                .iter()
+                .any(|m| m.contains("could not resolve")),
             "{:?}",
             report.missing
         );
@@ -1594,9 +1742,9 @@ mod tests {
             extra_files: 2,
             symbols: vec!["src/f0.rs/handler_0".into()],
             mentions: vec!["API_TIMEOUT".into()],
-                hunks: vec![],
-                extra_hunks: 0,
-                imports: vec![],
+            hunks: vec![],
+            extra_hunks: 0,
+            imports: vec![],
         });
         assert_eq!(commit_sha_of(&content), Some(sha_of('1')));
         assert_eq!(commit_sha_of("not a commit record"), None);
