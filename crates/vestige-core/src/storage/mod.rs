@@ -201,11 +201,32 @@ pub fn open_storage(path: Option<std::path::PathBuf>) -> Result<std::sync::Arc<d
     Ok(std::sync::Arc::new(SqliteMemoryStore::new(path)?))
 }
 
-/// Feature-off twin of [`open_storage`]: always fails because no legacy
-/// backend exists in this build; the STRATA backend constructs directly.
+#[cfg(not(feature = "legacy-sqlite"))]
+type OpenStorageHook =
+    fn(
+        Option<std::path::PathBuf>,
+    ) -> std::result::Result<std::sync::Arc<dyn MemoryStore>, LegacySqliteDisabled>;
+
+#[cfg(not(feature = "legacy-sqlite"))]
+static OPEN_STORAGE_HOOK: std::sync::OnceLock<OpenStorageHook> = std::sync::OnceLock::new();
+
+/// Test seam so protocol tests can open Strata without editing `stdio.rs`.
+/// The shipped binaries never call this; with the hook unset, [`open_storage`]
+/// still returns [`LegacySqliteDisabled`].
+#[doc(hidden)]
+#[cfg(not(feature = "legacy-sqlite"))]
+pub fn install_open_storage_hook(hook: OpenStorageHook) {
+    let _ = OPEN_STORAGE_HOOK.set(hook);
+}
+
+/// Feature-off twin of [`open_storage`]: fails unless a test hook was
+/// installed. The shipped server constructs Strata directly.
 #[cfg(not(feature = "legacy-sqlite"))]
 pub fn open_storage(
-    _path: Option<std::path::PathBuf>,
+    path: Option<std::path::PathBuf>,
 ) -> std::result::Result<std::sync::Arc<dyn MemoryStore>, LegacySqliteDisabled> {
+    if let Some(hook) = OPEN_STORAGE_HOOK.get() {
+        return hook(path);
+    }
     Err(LegacySqliteDisabled)
 }

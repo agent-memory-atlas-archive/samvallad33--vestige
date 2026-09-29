@@ -315,11 +315,7 @@ mod tests {
         let ids: Vec<&str> = report.affected.iter().map(|a| a.id.as_str()).collect();
         assert!(ids.contains(&sibling.as_str()));
         assert!(!ids.contains(&other.as_str()));
-        let sib = report
-            .affected
-            .iter()
-            .find(|a| a.id == sibling)
-            .unwrap();
+        let sib = report.affected.iter().find(|a| a.id == sibling).unwrap();
         assert_eq!(sib.depth, 0);
         assert_eq!(sib.via, format!("shared_commit:{sha}"));
     }
@@ -338,14 +334,7 @@ mod tests {
 
         let report = s.blast_radius(&root, false).unwrap();
         assert_eq!(report.total, 4, "C must appear once, not twice");
-        assert_eq!(
-            report
-                .affected
-                .iter()
-                .filter(|x| x.id == c)
-                .count(),
-            1
-        );
+        assert_eq!(report.affected.iter().filter(|x| x.id == c).count(), 1);
         let c_entry = report.affected.iter().find(|x| x.id == c).unwrap();
         assert_eq!(c_entry.depth, 2);
     }
@@ -415,7 +404,10 @@ mod tests {
         );
         assert_eq!(commit_sha_of("we commit changes daily"), None);
         assert_eq!(commit_sha_of("commit short nope"), None);
-        assert_eq!(commit_sha_of("first line\ncommit a1b2c3d4e5f6 on line two"), Some("a1b2c3d4e5f6".to_string()));
+        assert_eq!(
+            commit_sha_of("first line\ncommit a1b2c3d4e5f6 on line two"),
+            Some("a1b2c3d4e5f6".to_string())
+        );
     }
 
     #[test]

@@ -2176,7 +2176,11 @@ fn receipt_memory_ids(receipt: &Receipt) -> HashSet<&str> {
         }) => {
             ids.insert(failure_id.as_str());
             ids.extend(path_ids.iter().map(String::as_str));
-            ids.extend(candidates.iter().map(|candidate| candidate.memory_id.as_str()));
+            ids.extend(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.memory_id.as_str()),
+            );
         }
         None => {}
         Some(ReceiptEvidence::CounterfactualReplay { .. }) => {}

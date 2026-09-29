@@ -50,7 +50,7 @@ struct Cli {
     command: Commands,
 }
 
-static CLI_DB_PATH: OnceLock<PathBuf> = OnceLock::new();
+static CLI_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Args)]
 struct SandwichInstallOptions {
@@ -508,12 +508,8 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if let Some(data_dir) = cli.data_dir {
-        // The v3 file lives here. Do not create it: the shipped binary has no
-        // SQLite backend, and `db_path_for_data_dir` without `legacy-sqlite`
-        // refuses instead of returning this path.
-        let db_path = data_dir.join("vestige.db");
-        CLI_DB_PATH
-            .set(db_path)
+        CLI_DATA_DIR
+            .set(expand_tilde(data_dir))
             .map_err(|_| anyhow::anyhow!("data directory was initialized more than once"))?;
     }
 
@@ -1703,6 +1699,7 @@ fn run_update(
 
 /// Run stats command
 fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
+    #[cfg(feature = "migrate-to-strata")]
     if let Some(log_dir) = upgraded_strata_log()? {
         return run_strata_stats(&log_dir, show_tagging, show_states);
     }
@@ -2050,14 +2047,44 @@ fn run_health() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run consolidation cycle
-/// The database this CLI invocation targets (`--data-dir` wins, then the
-/// platform default).
-fn cli_db_path() -> anyhow::Result<PathBuf> {
-    if let Some(path) = CLI_DB_PATH.get() {
+/// Data directory for this invocation (`--data-dir`, then `VESTIGE_DATA_DIR`,
+/// then the platform directory). The Strata log lives here. `vestige.db` is
+/// only the v3 file we refuse to open.
+fn cli_data_dir() -> anyhow::Result<PathBuf> {
+    if let Some(path) = CLI_DATA_DIR.get() {
         return Ok(path.clone());
     }
-    Ok(vestige_core::default_db_path()?)
+    if let Some(value) = std::env::var_os("VESTIGE_DATA_DIR")
+        && !value.is_empty()
+    {
+        return Ok(expand_tilde(PathBuf::from(value)));
+    }
+    let proj = directories::ProjectDirs::from("com", "vestige", "core")
+        .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?;
+    Ok(proj.data_dir().to_path_buf())
+}
+
+fn expand_tilde(path: PathBuf) -> PathBuf {
+    let rest = {
+        let mut components = path.components();
+        match components.next() {
+            Some(std::path::Component::Normal(first)) if first == "~" => {
+                Some(components.as_path().to_path_buf())
+            }
+            _ => None,
+        }
+    };
+    match rest {
+        Some(rest) => directories::BaseDirs::new()
+            .map(|dirs| dirs.home_dir().join(rest))
+            .unwrap_or(path),
+        None => path,
+    }
+}
+
+/// The v3 SQLite file that would have lived in the data directory.
+fn cli_db_path() -> anyhow::Result<PathBuf> {
+    Ok(cli_data_dir()?.join("vestige.db"))
 }
 
 /// Apply pending migrations, or rehearse them on a throwaway copy of the store.
@@ -2074,6 +2101,7 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
         anyhow::bail!("no store at {} (nothing to upgrade)", source.display());
     }
 
+    #[cfg(feature = "migrate-to-strata")]
     if !dry_run
         && let vestige_mcp::auto_upgrade::UpgradeStatus::StrataReady { .. } =
             vestige_mcp::auto_upgrade::upgrade_if_needed(&source)?
@@ -2182,6 +2210,7 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run consolidation cycle
 fn run_consolidate() -> anyhow::Result<()> {
     println!("{}", "=== Vestige Consolidation ===".cyan().bold());
     println!();
@@ -2392,27 +2421,33 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
 
 /// Get the default database path
 fn get_default_db_path() -> anyhow::Result<PathBuf> {
-    if let Some(path) = CLI_DB_PATH.get() {
-        Ok(path.clone())
-    } else {
-        Ok(vestige_core::default_db_path()?)
-    }
+    cli_db_path()
 }
 
 /// Verify a STRATA directory. Same report as the `strata-verify` binary.
 /// Creates nothing in `dir`.
 fn run_strata_verify(dir: PathBuf) -> anyhow::Result<()> {
-    let report = strata_verify::verify_path(&dir);
-    println!("{}", report.json);
-    if report.ok {
-        println!("OK");
-        return Ok(());
+    #[cfg(not(feature = "migrate-to-strata"))]
+    {
+        let _ = dir;
+        anyhow::bail!(
+            "strata-verify is not linked into this binary; rebuild with --features migrate-to-strata"
+        );
     }
-    println!("FAILED");
-    for failure in &report.failures {
-        eprintln!("  {failure}");
+    #[cfg(feature = "migrate-to-strata")]
+    {
+        let report = strata_verify::verify_path(&dir);
+        println!("{}", report.json);
+        if report.ok {
+            println!("OK");
+            return Ok(());
+        }
+        println!("FAILED");
+        for failure in &report.failures {
+            eprintln!("  {failure}");
+        }
+        std::process::exit(1);
     }
-    std::process::exit(1);
 }
 
 /// Open storage using the CLI-selected data directory, if one was provided.
@@ -2420,6 +2455,24 @@ fn run_strata_verify(dir: PathBuf) -> anyhow::Result<()> {
 /// is never opened read-write, migrated in place, or modified in any way;
 /// its path and BLAKE3 are printed and keeping the file is recommended.
 fn run_migrate_to_strata(
+    from: PathBuf,
+    to: Option<PathBuf>,
+    dry_run: bool,
+    accept_wal_snapshot: bool,
+) -> anyhow::Result<()> {
+    #[cfg(not(feature = "migrate-to-strata"))]
+    {
+        let _ = (from, to, dry_run, accept_wal_snapshot);
+        anyhow::bail!(
+            "migrate-to-strata is not linked into this binary; rebuild with --features migrate-to-strata"
+        );
+    }
+    #[cfg(feature = "migrate-to-strata")]
+    run_migrate_to_strata_linked(from, to, dry_run, accept_wal_snapshot)
+}
+
+#[cfg(feature = "migrate-to-strata")]
+fn run_migrate_to_strata_linked(
     from: PathBuf,
     to: Option<PathBuf>,
     dry_run: bool,
@@ -2486,11 +2539,9 @@ fn run_migrate_to_strata(
 
 /// The strata log installed by the shared first-launch upgrade, when this
 /// data dir was a v3 store (or already held a log).
+#[cfg(feature = "migrate-to-strata")]
 fn upgraded_strata_log() -> anyhow::Result<Option<std::path::PathBuf>> {
-    let path = match CLI_DB_PATH.get() {
-        Some(path) => path.clone(),
-        None => vestige_core::default_db_path()?,
-    };
+    let path = cli_db_path()?;
     match vestige_mcp::auto_upgrade::upgrade_if_needed(&path)? {
         vestige_mcp::auto_upgrade::UpgradeStatus::StrataReady { log_dir } => Ok(Some(log_dir)),
         vestige_mcp::auto_upgrade::UpgradeStatus::NoV3 => Ok(None),
@@ -2498,6 +2549,7 @@ fn upgraded_strata_log() -> anyhow::Result<Option<std::path::PathBuf>> {
 }
 
 /// `stats` after the switch. Reads the installed log; does not open the v3 file.
+#[cfg(feature = "migrate-to-strata")]
 fn run_strata_stats(
     log_dir: &std::path::Path,
     show_tagging: bool,
@@ -2530,6 +2582,7 @@ fn run_strata_stats(
 /// Count migrated memories without `StrataLog::open`. That open creates
 /// `strata.lock` with this process's pid and would exclude the server (and
 /// the release-matrix dump) from the same log. `stats` only reads segments.
+#[cfg(feature = "migrate-to-strata")]
 fn migrated_memory_count(log_dir: &Path) -> anyhow::Result<usize> {
     let mut segments = Vec::new();
     for entry in fs::read_dir(log_dir)? {
@@ -2568,26 +2621,14 @@ fn migrated_memory_count(log_dir: &Path) -> anyhow::Result<usize> {
 }
 
 fn open_storage() -> anyhow::Result<std::sync::Arc<Storage>> {
-    let explicit = CLI_DB_PATH.get().cloned();
-    let path = match &explicit {
-        Some(path) => path.clone(),
-        None => vestige_core::default_db_path()?,
-    };
+    let dir = cli_data_dir()?;
     // Same first-launch upgrade `vestige-mcp` runs before stdio. Progress
-    // stays on stderr. A finished strata log is not opened as SQLite.
-    if let vestige_mcp::auto_upgrade::UpgradeStatus::StrataReady { log_dir } =
-        vestige_mcp::auto_upgrade::upgrade_if_needed(&path)?
+    // stays on stderr. The strata open below does not open the v3 file.
+    #[cfg(feature = "migrate-to-strata")]
     {
-        anyhow::bail!(
-            "strata log ready at {}; this command does not open the v3 file",
-            log_dir.display()
-        );
+        let _ = vestige_mcp::auto_upgrade::upgrade_if_needed(&dir.join("vestige.db"))?;
     }
-    if explicit.is_some() {
-        Ok(vestige_core::open_storage(Some(path))?)
-    } else {
-        Ok(vestige_core::open_storage(None)?)
-    }
+    Ok(vestige_mcp::strata_memory::open(&dir)?)
 }
 
 /// Fetch all nodes from storage using pagination

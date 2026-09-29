@@ -1,9 +1,9 @@
 name: v3 contracts
 on:
   pull_request:
-    branches: [main, v4]
+    branches: [main, v4, strata/fix-00a-v3-guard]
   push:
-    branches: [main, v4]
+    branches: [main, v4, strata/fix-00a-v3-guard]
 permissions:
   contents: read
 jobs:
@@ -33,15 +33,41 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: cargo build -p vestige-mcp --bin vestige-mcp
+      - run: cargo build -p vestige-mcp --bins
       - name: boot twice on an empty dir and refuse any sqlite file
         run: |
           set -euo pipefail
           DIR=$(mktemp -d)
           for i in 1 2; do
-            printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"boot","version":"1"}}}' \
+            if ! target/debug/vestige --data-dir "$DIR" stats > "/tmp/vestige-stats-$i.txt" 2>&1; then
+              echo "vestige stats launch $i exited non-zero"
+              cat "/tmp/vestige-stats-$i.txt"
+              exit 1
+            fi
+            if grep -q 'SQLite store creation is disabled' "/tmp/vestige-stats-$i.txt"; then
+              echo "vestige stats launch $i still refuses an empty directory"
+              cat "/tmp/vestige-stats-$i.txt"
+              exit 1
+            fi
+          done
+          INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"boot","version":"1"}}}'
+          READY='{"jsonrpc":"2.0","method":"notifications/initialized"}'
+          CALL='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_status","arguments":{"view":"health"}}}'
+          for i in 1 2; do
+            printf '%s\n' "$INIT" "$READY" "$CALL" \
               | timeout 20 target/debug/vestige-mcp --no-http --data-dir "$DIR" > "/tmp/boot-$i.json"
             grep -q '"id":1' "/tmp/boot-$i.json"
+            grep -q '"id":2' "/tmp/boot-$i.json"
+            if grep -q 'SQLite store creation is disabled' "/tmp/boot-$i.json"; then
+              echo "vestige-mcp launch $i still refuses an empty directory"
+              cat "/tmp/boot-$i.json"
+              exit 1
+            fi
+            if grep -q '"isError":true' "/tmp/boot-$i.json"; then
+              echo "vestige-mcp tool call launch $i failed"
+              cat "/tmp/boot-$i.json"
+              exit 1
+            fi
           done
           if find "$DIR" -type f \( -name '*.sqlite' -o -name '*.sqlite3' -o -name '*.db' -o -name '*.db-wal' -o -name '*.db-shm' \) | grep -q .; then
             echo "sqlite file created"
@@ -59,3 +85,36 @@ jobs:
           path: |
             tool-frontier.json
             runtime-integration.json
+  # Default release profile strips symbols, which would hide a sqlite link
+  # from `nm`. This job overrides strip/LTO only so the check can see them.
+  sqlite-unlinked:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "8"
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "2"
+      CARGO_PROFILE_RELEASE_STRIP: none
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: default release binaries
+        run: cargo build --locked --release -p vestige-mcp --bins
+      - name: cargo tree must not show sqlite
+        run: |
+          set -euo pipefail
+          cargo tree -p vestige-mcp -e features > /tmp/vestige-features.txt
+          if grep -E -i 'rusqlite|libsqlite|legacy-sqlite|bundled-sqlite|sqlite3_' /tmp/vestige-features.txt; then
+            echo "default feature tree still links sqlite"
+            exit 1
+          fi
+      - name: nm must not show sqlite symbols
+        run: |
+          set -euo pipefail
+          for bin in vestige vestige-mcp vestige-restore; do
+            if nm -a "target/release/$bin" | grep -E 'sqlite3_|rusqlite|SqliteMemoryStore|libsqlite'; then
+              echo "$bin still contains sqlite symbols"
+              exit 1
+            fi
+          done

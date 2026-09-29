@@ -196,6 +196,8 @@ pub use trace::{
 // Storage layer
 // Storage: backend-agnostic surface (always available).
 pub use storage::LegacySqliteDisabled;
+#[cfg(not(feature = "legacy-sqlite"))]
+pub use storage::install_open_storage_hook;
 pub use storage::{
     ACCESS_LOG_RETENTION_DAYS, ClassificationResult, DEFAULT_MEMORY_SCOPE, Domain, HealthStatus,
     LocalMemoryStore, MemoryEdge, MemoryRecord, MemoryStore, MemoryStoreError, MemoryStoreResult,

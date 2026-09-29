@@ -61,8 +61,8 @@ use strata_kernel::kernel::Kernel;
 use strata_kernel::state::State;
 use strata_verify::VerifyReport;
 use strata_verify::layout::{GateFrame, KernelRecord, StoreFiles, gate_frame_hash, write_store};
-use vestige_core::storage::{EdgeDirection, TypedEdge};
 use vestige_core::SqliteMemoryStore;
+use vestige_core::storage::{EdgeDirection, TypedEdge};
 use vestige_core::{FSRSScheduler, FSRSState, IngestInput, LearningState, Rating};
 
 // ============================================================================
@@ -413,8 +413,8 @@ fn strata_phase(phase: CardPhase) -> &'static str {
 /// review (the shadow is the deterministic reference; the store's stability
 /// column is wall-clock-fed and excluded from the artifact by design).
 pub fn run_sqlite(script: &Script, root: &Path) -> EngineSnapshot {
-    let storage =
-        SqliteMemoryStore::new(Some(root.join("sqlite.db"))).expect("open sqlite store in fresh dir");
+    let storage = SqliteMemoryStore::new(Some(root.join("sqlite.db")))
+        .expect("open sqlite store in fresh dir");
 
     let mut node_ids: Vec<String> = Vec::new();
     let mut digests: Vec<String> = Vec::new();

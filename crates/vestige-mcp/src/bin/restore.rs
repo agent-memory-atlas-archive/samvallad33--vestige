@@ -67,9 +67,12 @@ fn main() -> anyhow::Result<()> {
 
     println!("Found {} memories to restore", memories.len());
 
-    // Initialize storage (uses default path)
     println!("Initializing storage...");
-    let storage = vestige_core::open_storage(None)?;
+    let dir = directories::ProjectDirs::from("com", "vestige", "core")
+        .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?
+        .data_dir()
+        .to_path_buf();
+    let storage = vestige_mcp::strata_memory::open(&dir)?;
 
     println!("Generating embeddings and ingesting memories...\n");
 

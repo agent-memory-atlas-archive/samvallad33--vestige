@@ -10,12 +10,15 @@
 //! `LegacySqliteDisabled` error at runtime.
 
 pub mod actor_surface;
+#[cfg(feature = "migrate-to-strata")]
 pub mod auto_upgrade;
 
 pub mod autopilot;
 pub mod cognitive;
 pub mod dashboard;
 pub mod protocol;
+#[cfg(all(test, not(feature = "legacy-sqlite")))]
+mod protocol_stdio_store;
 pub mod resources;
 pub mod server;
 pub mod strata_memory;

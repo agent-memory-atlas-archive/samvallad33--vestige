@@ -498,13 +498,17 @@ async fn serve() {
     };
 
     // v3 detection and the upgrade both live in `upgrade_with`, which
-    // `upgrade_if_needed` calls. The CLI uses that same function. `NoV3`
-    // means the probed file is not a v3 store; there is no second check here.
+    // `upgrade_if_needed` calls. The CLI uses that same function. The shipped
+    // build enables `migrate-to-strata`. `NoV3` means the probed file is not
+    // a v3 store.
+    #[cfg(feature = "migrate-to-strata")]
     if let Err(err) = vestige_mcp::auto_upgrade::upgrade_if_needed(&db_path) {
         eprintln!("{err}");
         let _ = std::io::Write::flush(&mut io::stderr());
         std::process::exit(1);
     }
+    #[cfg(not(feature = "migrate-to-strata"))]
+    let _ = &db_path;
 
     // Two servers must not open the same log. `File::lock` dies with this
     // process, including SIGKILL. `log/strata.lock` is a pid file: while this
@@ -522,11 +526,7 @@ async fn serve() {
             std::process::exit(1);
         }
     };
-    let _ = fs::remove_file(
-        strata_dir
-            .join(vestige_mcp::auto_upgrade::LOG_DIR_NAME)
-            .join("strata.lock"),
-    );
+    let _ = fs::remove_file(strata_dir.join("log").join("strata.lock"));
 
     // Preserve the released Nomic default in the background so MCP clients can
     // finish their stdio handshake before a first-run model download. Optional

@@ -31,9 +31,8 @@ pub use super::contracts::{
 // `DurableSynapticPairReceipt`, and `SynapticIngestOutcome` are defined in
 // (and re-exported from) `crate::storage::types`.
 pub use crate::storage::types::{
-    DurableSynapticCapture, DurableSynapticPairReceipt,
-    SynapticCaptureRequest, SynapticImportanceEvent, SynapticIngestOutcome, SynapticIngestRequest,
-    SynapticSignalSnapshot,
+    DurableSynapticCapture, DurableSynapticPairReceipt, SynapticCaptureRequest,
+    SynapticImportanceEvent, SynapticIngestOutcome, SynapticIngestRequest, SynapticSignalSnapshot,
 };
 
 impl SynapticSignalSnapshot {
@@ -2162,8 +2161,8 @@ fn disposition_label(value: SynapticCaptureDisposition) -> &'static str {
 mod tests {
     use super::*;
     use crate::IngestInput;
-    use crate::storage::types::SynapticCapturePolicy;
     use crate::storage::SqliteMemoryStore as Storage;
+    use crate::storage::types::SynapticCapturePolicy;
     // Only the blocker fixture drives a transaction by hand; production
     // writers go through SqliteMemoryStore::begin_write_transaction.
     use rusqlite::TransactionBehavior;

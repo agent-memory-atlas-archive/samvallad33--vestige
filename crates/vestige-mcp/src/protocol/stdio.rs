@@ -251,12 +251,9 @@ impl HandlerProbe {
             Self::None => {}
             Self::Panic => panic!("test/panic: handler panicked on purpose"),
             Self::BlockingPark => {
-                #[cfg(feature = "legacy-sqlite")]
-                {
-                    let _parked = tests::BLOCKING_PARK
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                }
+                let _parked = tests::BLOCKING_PARK
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
         }
     }
@@ -741,7 +738,7 @@ impl Default for StdioTransport {
     }
 }
 
-#[cfg(all(test, feature = "legacy-sqlite"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cognitive::CognitiveEngine;
