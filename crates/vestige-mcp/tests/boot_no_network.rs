@@ -162,8 +162,13 @@ fn default_boot_opens_no_outbound_socket_or_dns() {
     let body = tool_body(&called);
     assert_eq!(
         body["compiledFeatures"]["cloudSync"],
+        json!(false),
+        "4.0 default features must not compile cloud-sync: {body}"
+    );
+    assert_eq!(
+        body["compiledFeatures"]["connectors"],
         json!(true),
-        "default features must still compile cloud-sync: {body}"
+        "connectors stays a default feature: {body}"
     );
 
     for (label, value) in [
