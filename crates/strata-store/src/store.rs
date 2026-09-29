@@ -62,14 +62,110 @@ pub fn permissive_policy() -> Policy {
     }
 }
 
-/// The default pinned policy: allow writes, hold destructive actions.
+/// Domain separator for a RETIRE rule id. The prefix is not a hash of node
+/// content, ids, or names.
+const RETIRE_RULE_DOMAIN: &[u8] = b"strata.retire.v1\0";
+
+/// Named RETIRE rule: successor was admitted in this tool call.
+pub const RULE_EDIT: &str = "edit";
+/// Named RETIRE rule: suppression.
+pub const RULE_SUPPRESS: &str = "suppress";
+/// Named RETIRE rule: intention update.
+pub const RULE_INTENTIONS: &str = "intentions";
+/// Named RETIRE rule: purge. Also requires [`AdmissionContext::confirm`].
+pub const RULE_PURGE: &str = "purge";
+
+const NAMED_RETIRE_RULES: [&str; 4] = [RULE_EDIT, RULE_SUPPRESS, RULE_INTENTIONS, RULE_PURGE];
+
+/// What the caller claims about a RETIRE. The gate matches the rule id here,
+/// never node content or names.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AdmissionContext {
+    /// Exact rule id: `edit`, `suppress`, `intentions`, or `purge`.
+    pub rule_id: Option<String>,
+    /// Required for `purge`. Ignored by the other three rules.
+    pub confirm: bool,
+}
+
+/// Receipt for an admitted RETIRE. `receipt_id` is `eff-` plus the effect seq.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetireReceipt {
+    /// `eff-` + 16 lowercase hex digits of [`Self::effect_seq`].
+    pub receipt_id: String,
+    /// Named rule that authorized this RETIRE, when one did.
+    pub rule_id: Option<&'static str>,
+    /// Gate-space seq of the admitting [`EffectRecord`].
+    pub effect_seq: u64,
+}
+
+/// `eff-` + 16 lowercase hex digits of the admitting effect's gate seq.
+pub fn effect_receipt_id(effect_seq: u64) -> String {
+    format!("eff-{effect_seq:016x}")
+}
+
+/// blake3(domain || rule id). Admission copies this into `PROPOSE.params_hash`
+/// only after the context's rule id matches exactly.
+fn rule_id_hash(rule_id: &str) -> [u8; 32] {
+    let mut body = Vec::with_capacity(RETIRE_RULE_DOMAIN.len() + rule_id.len());
+    body.extend_from_slice(RETIRE_RULE_DOMAIN);
+    body.extend_from_slice(rule_id.as_bytes());
+    hash32(&body)
+}
+
+fn rule_id_prefix(rule_id: &str) -> [u8; 8] {
+    let hash = rule_id_hash(rule_id);
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&hash[..8]);
+    prefix
+}
+
+/// Rule id encoded in `params_hash`, or `None` when it is not one of the four.
+pub fn retire_rule_id(params_hash: &[u8; 32]) -> Option<&'static str> {
+    NAMED_RETIRE_RULES
+        .into_iter()
+        .find(|id| params_hash[..8] == rule_id_prefix(id))
+}
+
+/// `edit` also needs the successor in this tool call. `purge` also needs
+/// `confirm`. Any other id, including a missing one, does not authorize.
+fn named_retire_rule(
+    rule_id: Option<&str>,
+    confirm: bool,
+    successor_in_call: bool,
+) -> Option<&'static str> {
+    match rule_id {
+        Some(RULE_EDIT) if successor_in_call => Some(RULE_EDIT),
+        Some(RULE_SUPPRESS) => Some(RULE_SUPPRESS),
+        Some(RULE_INTENTIONS) => Some(RULE_INTENTIONS),
+        Some(RULE_PURGE) if confirm => Some(RULE_PURGE),
+        _ => None,
+    }
+}
+
+fn retire_allow(rule_id: &str) -> Rule {
+    Rule {
+        match_kind: action_kind::RETIRE,
+        match_params_hash_prefix: rule_id_prefix(rule_id),
+        max_blast_radius: u32::MAX,
+        forbid_forgotten_lessons: false,
+        require_human: false,
+        verdict: Verdict::Allow,
+    }
+}
+
+/// The default pinned policy: four named RETIRE allows, then hold every
+/// other RETIRE, then allow anything else under a blast-radius cap.
 ///
-/// Rule 1 holds every `RETIRE` action (supersession); rule 2 allows anything
-/// else under a generous blast-radius cap. First match wins; empty policy =
-/// deny everything (useful for tests).
+/// First match wins. A named rule matches only when admission copied that
+/// rule id's hash into `params_hash` from [`AdmissionContext`]. Empty policy
+/// denies everything (useful for tests).
 pub fn default_policy() -> Policy {
     Policy {
         rules: vec![
+            retire_allow(RULE_EDIT),
+            retire_allow(RULE_SUPPRESS),
+            retire_allow(RULE_INTENTIONS),
+            retire_allow(RULE_PURGE),
             Rule {
                 match_kind: action_kind::RETIRE,
                 match_params_hash_prefix: WILDCARD_PREFIX,
@@ -88,6 +184,38 @@ pub fn default_policy() -> Policy {
             },
         ],
     }
+}
+
+/// What an admitted node effect did. Derived by replaying the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectAction {
+    /// First upsert of a node (ingest). Folds one Good review.
+    Create,
+    /// Later upsert of an existing node (`set_created_at`). No new review.
+    Rewrite,
+    /// Successor admitted under the `edit` RETIRE rule. The predecessor stays
+    /// in the log; its card is not copied.
+    Edit,
+    /// Explicit FSRS review. `rating` is 1..=4.
+    Review,
+}
+
+/// One node effect proved from the log: covering propose, Allow gate, and a
+/// data frame whose blake3 matches the effect's payload digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectProof {
+    /// Gate-space seq of the EFFECT record (`eff-` receipt id).
+    pub effect_seq: u64,
+    /// Log seq of the STORE_WRITE frame (FSRS `event_seq` for reviews).
+    pub data_seq: u64,
+    /// Node the effect names.
+    pub node_id: String,
+    /// Which mutation landed.
+    pub action: EffectAction,
+    /// blake3 of the `StoreOp` payload. Equals `EFFECT.payload_digest`.
+    pub payload_digest: [u8; 32],
+    /// Review rating when `action` is [`EffectAction::Review`].
+    pub rating: Option<u8>,
 }
 
 /// Stable u64 card handle for a node id: first 8 bytes of blake3(id),
@@ -269,6 +397,12 @@ pub struct StrataStore {
     checkpoints: Vec<Checkpoint>,
     /// Data frames that had no admitting effect in the log (ignored).
     orphan_writes: u64,
+    /// Tool call is open. `edit` may retire only a successor admitted here.
+    tool_call_open: bool,
+    /// Node ids admitted since [`StrataStore::begin_tool_call`].
+    call_admitted: BTreeSet<String>,
+    /// Admitting effect seq -> named rule, for RETIREs the context authorized.
+    retire_rules: BTreeMap<u64, &'static str>,
 }
 
 impl StrataStore {
@@ -304,6 +438,9 @@ impl StrataStore {
             checkpoints: Vec::new(),
             orphan_writes: 0,
             intentions: BTreeMap::new(),
+            tool_call_open: false,
+            call_admitted: BTreeSet::new(),
+            retire_rules: BTreeMap::new(),
         };
         store.replay()?;
         store.verify_checkpoint_chain()?;
@@ -354,6 +491,11 @@ impl StrataStore {
                                     })
                                 });
                             if covering_propose && admitting_gate {
+                                if let Some(propose) = propose_at.get(&effect.propose_seq) {
+                                    if let Some(rule) = retire_rule_id(&propose.params_hash) {
+                                        self.retire_rules.insert(gseq, rule);
+                                    }
+                                }
                                 pending
                                     .entry(effect.payload_digest)
                                     .or_default()
@@ -545,14 +687,36 @@ impl StrataStore {
         action_kind_code: u8,
         context: Vec<u64>,
     ) -> Result<(u64, u64), StoreError> {
+        self.admit_write_with_params(op, action_kind_code, context, None)
+    }
+
+    /// `params_hash` overrides the default (the op hash) when a named RETIRE
+    /// rule authorized this admission. The override is the rule-id digest,
+    /// never a digest of node content.
+    fn admit_write_with_params(
+        &mut self,
+        op: StoreOp,
+        action_kind_code: u8,
+        context: Vec<u64>,
+        params_hash: Option<[u8; 32]>,
+    ) -> Result<(u64, u64), StoreError> {
+        let fresh_id = match &op {
+            StoreOp::UpsertNode { record }
+                if self.tool_call_open && !self.nodes.contains_key(&record.id) =>
+            {
+                Some(record.id.clone())
+            }
+            _ => None,
+        };
         let op_bytes = borsh_vec(&op)?;
         let action_hash = hash32(&op_bytes);
+        let params_hash = params_hash.unwrap_or(action_hash);
 
         let mut runtime = GateRuntime::new(self.gate_log.clone(), self.policy.clone());
         let propose = Propose {
             action_hash,
             action_kind: action_kind_code,
-            params_hash: action_hash,
+            params_hash,
             context,
         };
         let propose_ack = runtime.commit_propose(propose);
@@ -585,12 +749,18 @@ impl StrataStore {
         let effect_ack: SeqAck = runtime
             .commit_effect(effect)
             .map_err(|r| StoreError::Rejected(r.to_string()))?;
+        if let Some(rule) = retire_rule_id(&params_hash) {
+            self.retire_rules.insert(effect_ack.seq, rule);
+        }
 
         // The data frame lands only after an admitted effect cites its digest.
         let data_acks = self.log.append_batch(vec![(KIND_STORE_WRITE, op_bytes)])?;
         let data_seq = data_acks[0].seq;
 
         self.apply_op(&op, effect_ack.seq, data_seq)?;
+        if let Some(id) = fresh_id {
+            self.call_admitted.insert(id);
+        }
         Ok((effect_ack.seq, data_seq))
     }
 
@@ -927,11 +1097,64 @@ impl StrataStore {
         }
     }
 
+    /// Open a tool call. `edit` may retire a node only when its successor was
+    /// admitted after this and before [`Self::end_tool_call`].
+    pub fn begin_tool_call(&mut self) {
+        self.tool_call_open = true;
+        self.call_admitted.clear();
+    }
+
+    /// Close the tool call and drop the successor set.
+    pub fn end_tool_call(&mut self) {
+        self.tool_call_open = false;
+        self.call_admitted.clear();
+    }
+
     /// Mark `id` as superseded by `superseded_by`.
     ///
-    /// Routed as a destructive `RETIRE` action: the default policy HOLDS it;
-    /// a review-gated (permissive) policy lands it.
+    /// Routed as a `RETIRE` with no rule id. The default policy holds it.
     pub fn supersede(&mut self, id: &str, superseded_by: &str) -> Result<(), StoreError> {
+        self.admit_supersede(id, superseded_by, &AdmissionContext::default())
+            .map(|_| ())
+    }
+
+    /// RETIRE `id` in favor of `superseded_by` when `ctx` carries a named rule.
+    ///
+    /// The default policy allows exactly `edit` (successor admitted in this
+    /// tool call), `suppress`, `intentions`, and `purge` (`confirm` set).
+    /// Every other RETIRE is held. An allowed RETIRE returns an `eff-`
+    /// receipt naming the rule.
+    pub fn retire(
+        &mut self,
+        id: &str,
+        superseded_by: &str,
+        ctx: &AdmissionContext,
+    ) -> Result<RetireReceipt, StoreError> {
+        let (seq, rule_id) = self.admit_supersede(id, superseded_by, ctx)?;
+        Ok(RetireReceipt {
+            receipt_id: effect_receipt_id(seq),
+            rule_id,
+            effect_seq: seq,
+        })
+    }
+
+    /// Receipt for an allowed RETIRE, including one rebuilt by replay.
+    pub fn retire_receipt(&self, effect_seq: u64) -> Option<RetireReceipt> {
+        self.retire_rules
+            .get(&effect_seq)
+            .map(|rule| RetireReceipt {
+                receipt_id: effect_receipt_id(effect_seq),
+                rule_id: Some(*rule),
+                effect_seq,
+            })
+    }
+
+    fn admit_supersede(
+        &mut self,
+        id: &str,
+        superseded_by: &str,
+        ctx: &AdmissionContext,
+    ) -> Result<(u64, Option<&'static str>), StoreError> {
         self.require_node(id)?;
         self.require_node(superseded_by)?;
         if id == superseded_by {
@@ -944,16 +1167,20 @@ impl StrataStore {
                 "node {id} is already superseded"
             )));
         }
+        let successor_in_call = self.call_admitted.contains(superseded_by);
+        let rule = named_retire_rule(ctx.rule_id.as_deref(), ctx.confirm, successor_in_call);
+        let params = rule.map(rule_id_hash);
         let context = self.context_for(&[id, superseded_by]);
-        self.admit_write(
+        let (effect_seq, _) = self.admit_write_with_params(
             StoreOp::SupersedeNode {
                 id: id.to_string(),
                 superseded_by: superseded_by.to_string(),
             },
             action_kind::RETIRE,
             context,
+            params,
         )?;
-        Ok(())
+        Ok((effect_seq, rule))
     }
 
     /// All (superseded, superseder) pairs, ordered by superseded id.
@@ -966,26 +1193,28 @@ impl StrataStore {
 
     /// Fold an explicit FSRS review for a node (rating 1..=4).
     ///
+    /// Returns the gate-space effect seq of the admitted review.
     /// `reviewed_at_ms` is the admission clock: unix epoch milliseconds.
-    pub fn review(&mut self, id: &str, rating: u8) -> Result<(), StoreError> {
+    pub fn review(&mut self, id: &str, rating: u8) -> Result<u64, StoreError> {
         self.review_at(id, rating, Some(admission_now_ms()))
     }
 
     /// Same as [`Self::review`] with a caller-supplied clock.
     ///
     /// `None` is written as `borsh` option tag `0`, not an omitted field.
+    /// Returns the gate-space effect seq of the admitted review.
     pub fn review_at(
         &mut self,
         id: &str,
         rating: u8,
         reviewed_at_ms: Option<i64>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<u64, StoreError> {
         self.require_node(id)?;
         if !(1..=4).contains(&rating) {
             return Err(StoreError::InvalidInput("rating must be 1..=4".into()));
         }
         let context = self.context_for(&[id]);
-        self.admit_write(
+        let (effect_seq, _) = self.admit_write(
             StoreOp::ReviewNode {
                 card_id: handle_of(id),
                 rating,
@@ -994,7 +1223,221 @@ impl StrataStore {
             action_kind::WRITE,
             context,
         )?;
-        Ok(())
+        Ok(effect_seq)
+    }
+
+    /// Replace `id` with a successor, then retire `id` under rule `edit`.
+    ///
+    /// Lands `UpsertNode` then `SupersedeNode` inside one tool call. The
+    /// successor is a new ingest (its own FSRS card). The predecessor's card
+    /// and bytes stay on the retired node.
+    ///
+    /// A context that is not exactly rule `edit` returns [`StoreError::Held`]
+    /// and writes nothing. An upsert cannot be rolled back, so a RETIRE that
+    /// would hold must not be preceded by a live successor.
+    pub fn edit(
+        &mut self,
+        id: &str,
+        content: &str,
+        ctx: &AdmissionContext,
+    ) -> Result<(String, RetireReceipt), StoreError> {
+        if content.trim().is_empty() {
+            return Err(StoreError::InvalidInput("content must not be empty".into()));
+        }
+        let old = self.require_node(id)?.clone();
+        if old.superseded_by.is_some() {
+            return Err(StoreError::InvalidInput(format!(
+                "node {id} is already superseded"
+            )));
+        }
+        if named_retire_rule(ctx.rule_id.as_deref(), ctx.confirm, true) != Some(RULE_EDIT) {
+            return Err(StoreError::Held {
+                propose_seq: self.gate_log.gate_frame_count(),
+            });
+        }
+        let opened = !self.tool_call_open;
+        if opened {
+            self.begin_tool_call();
+        }
+        let result = (|| {
+            let input = IngestInput {
+                content: content.to_string(),
+                source: old.source.clone(),
+                source_updated_at_ms: old.source_updated_at_ms,
+                node_type: old.node_type.clone(),
+                tags: old.tags.clone(),
+                created_at_ms: Some(old.created_at_ms),
+                valid_from_ms: Some(old.valid_from_ms),
+                valid_until_ms: Some(old.valid_until_ms),
+            };
+            let successor = self.ingest_in_scope(input, &old.scope)?;
+            let receipt = self.retire(id, &successor, ctx)?;
+            Ok((successor, receipt))
+        })();
+        if opened {
+            self.end_tool_call();
+        }
+        result
+    }
+
+    /// Review events in fold order. The kernel test replays these independently.
+    #[cfg(test)]
+    pub(crate) fn review_events(&self) -> Vec<ReviewEvent> {
+        self.review_events
+            .iter()
+            .map(|(_, _, event)| event.clone())
+            .collect()
+    }
+
+    /// Every node effect proved from the log, in effect-seq order.
+    ///
+    /// `verify_tail` checks the active segment's hash chain (and the trailer
+    /// signature when the segment is sealed). Each effect must cite an Allow
+    /// gate and a data frame with the same payload digest.
+    pub fn prove_effects(&self) -> Result<Vec<EffectProof>, StoreError> {
+        self.log.verify_tail()?;
+        let frames = self.log.read_frames(1)?;
+        let mut propose_at: HashMap<u64, Propose> = HashMap::new();
+        let mut gates_for: HashMap<u64, Vec<(u64, GateRecord)>> = HashMap::new();
+        let mut pending: HashMap<[u8; 32], VecDeque<(u64, Option<&'static str>)>> = HashMap::new();
+        let mut handles: HashMap<u64, String> = HashMap::new();
+        let mut proofs = Vec::new();
+        let mut gate_seq_counter: u64 = 0;
+
+        for frame in frames {
+            if frame.payload_blake3 != strata::payload_blake3(frame.kind, &frame.payload) {
+                return Err(StoreError::Verify(format!(
+                    "frame {} payload blake3 does not match its bytes",
+                    frame.seq
+                )));
+            }
+            if let Some(kind) = RecordKind::from_u8(frame.kind) {
+                let gseq = gate_seq_counter;
+                gate_seq_counter += 1;
+                match kind {
+                    RecordKind::Propose => {
+                        if let Ok(propose) = Propose::try_from_slice(&frame.payload) {
+                            propose_at.insert(gseq, propose);
+                        }
+                    }
+                    RecordKind::Gate => {
+                        if let Ok(gate) = GateRecord::try_from_slice(&frame.payload) {
+                            gates_for
+                                .entry(gate.propose_seq)
+                                .or_default()
+                                .push((gseq, gate));
+                        }
+                    }
+                    RecordKind::Effect => {
+                        if let Ok(effect) = EffectRecord::try_from_slice(&frame.payload) {
+                            let covering = propose_at
+                                .get(&effect.propose_seq)
+                                .is_some_and(|propose| propose.action_hash == effect.action_hash);
+                            let allowed = gates_for.get(&effect.propose_seq).is_some_and(|gates| {
+                                gates.iter().any(|(gate_seq, gate)| {
+                                    *gate_seq == effect.gate_seq
+                                        && gate.verdict == Verdict::Allow
+                                        && *gate_seq < gseq
+                                })
+                            });
+                            if covering && allowed && effect.action_hash == effect.payload_digest {
+                                let rule = propose_at
+                                    .get(&effect.propose_seq)
+                                    .and_then(|propose| retire_rule_id(&propose.params_hash));
+                                pending
+                                    .entry(effect.payload_digest)
+                                    .or_default()
+                                    .push_back((gseq, rule));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else if frame.kind == KIND_STORE_WRITE {
+                let digest = hash32(&frame.payload);
+                let Some((effect_seq, rule)) =
+                    pending.get_mut(&digest).and_then(|queue| queue.pop_front())
+                else {
+                    continue;
+                };
+                let Some(op) = StoreOp::try_from_slice(&frame.payload).ok() else {
+                    return Err(StoreError::Verify(format!(
+                        "admitted frame {} is not a StoreOp",
+                        frame.seq
+                    )));
+                };
+                let proof = match op {
+                    StoreOp::UpsertNode { record } => {
+                        let handle = handle_of(&record.id);
+                        let action = if handles.contains_key(&handle) {
+                            EffectAction::Rewrite
+                        } else {
+                            EffectAction::Create
+                        };
+                        handles.insert(handle, record.id.clone());
+                        EffectProof {
+                            effect_seq,
+                            data_seq: frame.seq,
+                            node_id: record.id,
+                            action,
+                            payload_digest: digest,
+                            rating: None,
+                        }
+                    }
+                    StoreOp::SupersedeNode { superseded_by, .. } if rule == Some(RULE_EDIT) => {
+                        EffectProof {
+                            effect_seq,
+                            data_seq: frame.seq,
+                            node_id: superseded_by,
+                            action: EffectAction::Edit,
+                            payload_digest: digest,
+                            rating: None,
+                        }
+                    }
+                    StoreOp::ReviewNode {
+                        card_id,
+                        rating,
+                        reviewed_at_ms: _,
+                    } => {
+                        let Some(node_id) = handles.get(&card_id).cloned() else {
+                            return Err(StoreError::Verify(format!(
+                                "review effect {effect_seq} names an unknown card"
+                            )));
+                        };
+                        EffectProof {
+                            effect_seq,
+                            data_seq: frame.seq,
+                            node_id,
+                            action: EffectAction::Review,
+                            payload_digest: digest,
+                            rating: Some(rating),
+                        }
+                    }
+                    StoreOp::SaveEdge { .. }
+                    | StoreOp::SupersedeNode { .. }
+                    | StoreOp::UpsertIntentions { .. } => continue,
+                };
+                proofs.push(proof);
+            }
+        }
+        Ok(proofs)
+    }
+
+    /// The proved effect at `effect_seq`, if the log admits one.
+    pub fn effect_by_seq(&self, effect_seq: u64) -> Result<Option<EffectProof>, StoreError> {
+        Ok(self
+            .prove_effects()?
+            .into_iter()
+            .find(|proof| proof.effect_seq == effect_seq))
+    }
+
+    /// The latest proved node effect for `node_id`.
+    pub fn latest_effect(&self, node_id: &str) -> Result<Option<EffectProof>, StoreError> {
+        Ok(self
+            .prove_effects()?
+            .into_iter()
+            .filter(|proof| proof.node_id == node_id)
+            .max_by_key(|proof| proof.effect_seq))
     }
 
     /// Review clock recorded on the latest explicit review of `id`.
@@ -1250,6 +1693,9 @@ impl StrataStore {
             reviewed_at: BTreeMap::new(),
             checkpoints: Vec::new(),
             orphan_writes: 0,
+            tool_call_open: false,
+            call_admitted: BTreeSet::new(),
+            retire_rules: BTreeMap::new(),
         };
         scratch.replay()?;
         let mut retrievability = BTreeMap::new();
@@ -1422,9 +1868,10 @@ fn scan_segment(bytes: &[u8], name: &str) -> Result<ScannedSegment, StoreError> 
             });
         }
         if rem == strata::TRAILER_WIRE_SIZE {
-            let trailer: strata::SegmentTrailer = borsh::from_slice(&bytes[off..]).map_err(|_| {
-                StoreError::Verify(format!("{name}: trailer-sized tail failed to parse"))
-            })?;
+            let trailer: strata::SegmentTrailer =
+                borsh::from_slice(&bytes[off..]).map_err(|_| {
+                    StoreError::Verify(format!("{name}: trailer-sized tail failed to parse"))
+                })?;
             if trailer.frame_count != frames {
                 return Err(StoreError::Verify(format!(
                     "{name}: trailer frame_count {} != scanned {frames}",

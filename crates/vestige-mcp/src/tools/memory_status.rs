@@ -629,6 +629,8 @@ mod strata_stdio {
                 .ingest_in_scope(
                     strata_store::IngestInput {
                         content: "planted origin fact".into(),
+                        source: None,
+                        source_updated_at_ms: None,
                         node_type: "decision".into(),
                         tags: vec!["prov-seed".into()],
                         created_at_ms: Some(CREATED_MS),
@@ -642,6 +644,8 @@ mod strata_stdio {
                 .ingest_in_scope(
                     strata_store::IngestInput {
                         content: "planted successor fact".into(),
+                        source: None,
+                        source_updated_at_ms: None,
                         node_type: "fact".into(),
                         tags: vec!["prov-next".into()],
                         created_at_ms: Some(CREATED_MS + 111_000),
@@ -685,7 +689,10 @@ mod strata_stdio {
                 })
             );
         let out = drive(storage, input).await;
-        let listed = out.iter().find(|v| v["id"] == json!(1)).expect("tools/list");
+        let listed = out
+            .iter()
+            .find(|v| v["id"] == json!(1))
+            .expect("tools/list");
         let tools = listed["result"]["tools"].as_array().unwrap();
         let advertises: Vec<&str> = tools
             .iter()
@@ -698,7 +705,10 @@ mod strata_stdio {
             .collect();
         assert_eq!(advertises, vec!["memory_status"]);
 
-        let call = out.iter().find(|v| v["id"] == json!(2)).expect("tools/call");
+        let call = out
+            .iter()
+            .find(|v| v["id"] == json!(2))
+            .expect("tools/call");
         assert_ne!(call["result"]["isError"], json!(true), "{call}");
         let body = &call["result"]["structuredContent"];
         assert_eq!(body["view"], "provenance");

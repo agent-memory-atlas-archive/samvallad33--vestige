@@ -380,6 +380,8 @@ mod strata_tests {
                         .ingest_in_scope(
                             strata_store::IngestInput {
                                 content: format!("{content} {index}"),
+                                source: None,
+                                source_updated_at_ms: None,
                                 node_type: "fact".into(),
                                 tags: Vec::new(),
                                 created_at_ms: Some(1_700_000_000_000),

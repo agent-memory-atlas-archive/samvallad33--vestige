@@ -804,16 +804,13 @@ description: Some("Inspect a persisted retrieval receipt ('get'), ablate its fro
                     idempotent_hint: false,
                     open_world_hint: false,
                 }),
-description: Some("Manage one memory: 'get', 'get_batch', 'state', 'promote' / 'demote' (demote never deletes), 'edit' (keeps FSRS state), 'purge' (for good; confirm=true). 'delete' aliases purge.".to_string()),
+description: Some("Manage one memory: 'get', 'get_batch', 'state', 'promote' / 'demote' (demote never deletes), 'edit' (keeps FSRS state), 'purge' (retired, can't be retrieved; confirm=true). 'delete' aliases purge.".to_string()),
                 input_schema: tools::compact::of(&tools::memory_unified::schema()),
                 ..Default::default()
             },
             // ================================================================
-            // PURGE (#219): the one irreversible call, on its own so a host
-            // can gate it without gating the reads that share `memory`.
-            // Claude Code honours `anthropic/requiresUserInteraction` with a
-            // prompt on every call. Same code path as memory(action='purge');
-            // the alias keeps working.
+            // PURGE (#219): its own tool so a host can prompt without prompting
+            // on the reads that share `memory`. Same path as memory(action='purge').
             // ================================================================
             ToolDescription {
                 name: "purge".to_string(),
@@ -824,7 +821,7 @@ description: Some("Manage one memory: 'get', 'get_batch', 'state', 'promote' / '
                     idempotent_hint: false,
                     open_world_hint: false,
                 }),
-                description: Some("Remove one memory's content and embeddings for good. Irreversible; confirm=true required, the client prompts. Same path as memory(action='purge').".to_string()),
+                description: Some("Retire one memory so it can't be retrieved. confirm=true required; the client prompts. Same path as memory(action='purge').".to_string()),
                 input_schema: tools::memory_unified::purge_schema(),
                 meta: Some(serde_json::json!({ "anthropic/requiresUserInteraction": true })),
                 ..Default::default()

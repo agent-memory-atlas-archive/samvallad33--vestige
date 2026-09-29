@@ -4,16 +4,16 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use vestige_core::advanced::git_records;
 use vestige_core::advanced::retroactive_backfill::{
     BackfillCandidate, FailureEvent, RetroactiveBackfill,
 };
-use vestige_core::storage::canonical_walk_json;
 use vestige_core::storage::ReceiptAttestationStatus;
+use vestige_core::storage::canonical_walk_json;
 use vestige_core::{
-    Receipt, ReceiptEvidence, ReplayPrivacyState, Storage, BACKFILL_RECEIPT_CLAIM_BOUNDARY,
-    REPLAY_CLAIM_BOUNDARY, SYNAPTIC_CAPTURE_CLAIM_BOUNDARY, WALK_RECEIPT_CLAIM_BOUNDARY,
+    BACKFILL_RECEIPT_CLAIM_BOUNDARY, REPLAY_CLAIM_BOUNDARY, Receipt, ReceiptEvidence,
+    ReplayPrivacyState, SYNAPTIC_CAPTURE_CLAIM_BOUNDARY, Storage, WALK_RECEIPT_CLAIM_BOUNDARY,
     WALK_RECEIPT_SCHEMA_V1,
 };
 
@@ -214,7 +214,12 @@ fn claim_boundary_for_receipt(receipt: &Receipt) -> &'static str {
 
 fn safe_storage_error(operation: &str, error: &impl std::fmt::Display) -> String {
     let text = error.to_string();
-    if text.contains("pending_strata") || text.contains("similarity_disabled") {
+    if text.contains("pending_strata")
+        || text.contains("similarity_disabled")
+        || text.contains("verification failed")
+        || text.contains("gate_denied")
+        || text.contains("gate_held")
+    {
         return text;
     }
     tracing::warn!(%error, "receipt storage operation failed: {operation}");
@@ -240,9 +245,45 @@ fn execute_get(storage: &Arc<Storage>, receipt_id: &str) -> Result<Value, String
     }))
 }
 
+/// Strata effect receipt: recomputed from the log by `get_receipt` (Allow gate,
+/// payload digest, hash chain). Not a DSSE envelope and not an external timestamp.
+fn strata_effect_attestation(storage: &Arc<Storage>, receipt_id: &str) -> Result<Value, String> {
+    let receipt = storage
+        .get_receipt(receipt_id)
+        .map_err(|error| safe_storage_error("attestation lookup", &error))?
+        .ok_or_else(|| format!("Receipt '{receipt_id}' was not found"))?;
+    let note = receipt
+        .mutations
+        .first()
+        .and_then(|mutation| mutation.note.as_deref())
+        .unwrap_or("");
+    let digest = note
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("digest="))
+        .unwrap_or("");
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "Receipt '{receipt_id}' has no proved payload digest"
+        ));
+    }
+    Ok(json!({
+        "status": "strata_effect",
+        "verification": {
+            "locallyVerified": true,
+            "chainValid": true,
+            "gateAllowed": true,
+            "payloadDigest": digest,
+            "claimBoundary": "Recomputed from the hash-chained log: the effect cites an Allow gate and its payload digest matches the admitted frame. A sealed segment trailer signature is checked when one is present. This is not an external timestamp or a truth claim."
+        }
+    }))
+}
+
 /// Present cryptographic receipt state without treating local database row
 /// checks as an external timestamp or non-equivocation proof.
 fn receipt_attestation_view(storage: &Arc<Storage>, receipt_id: &str) -> Result<Value, String> {
+    if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        return strata_effect_attestation(storage, receipt_id);
+    }
     let status = storage
         .receipt_attestation_status(receipt_id)
         .map_err(|error| safe_storage_error("attestation lookup", &error))?
@@ -785,16 +826,18 @@ mod tests {
             get["claimBoundary"], LEGACY_RECEIPT_CLAIM_BOUNDARY,
             "legacy receipts must not inherit the replay claim"
         );
-        assert!(execute(
-            &storage,
-            Some(json!({
-                "action": "replay",
-                "receipt_id": receipt.receipt_id,
-                "withheld_slots": ["evidence_1"]
-            })),
-        )
-        .await
-        .is_err());
+        assert!(
+            execute(
+                &storage,
+                Some(json!({
+                    "action": "replay",
+                    "receipt_id": receipt.receipt_id,
+                    "withheld_slots": ["evidence_1"]
+                })),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -997,10 +1040,12 @@ mod tests {
             actions,
             vec![json!("get"), json!("replay"), json!("save_walk")]
         );
-        assert!(schema()["properties"]["withheld_slots"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("never rerun"));
+        assert!(
+            schema()["properties"]["withheld_slots"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("never rerun")
+        );
         assert_eq!(schema()["additionalProperties"], false);
     }
 
@@ -1075,10 +1120,12 @@ mod tests {
         assert_eq!(first["reusedExisting"], false);
         assert!(first["receiptId"].as_str().unwrap().starts_with("wr_"));
         // Canonical echo: sorted keys, no insignificant whitespace.
-        assert!(first["canonicalParams"]
-            .as_str()
-            .unwrap()
-            .starts_with(r#"{"failure_id":"explicit","lookback_days":30,"manual":"#));
+        assert!(
+            first["canonicalParams"]
+                .as_str()
+                .unwrap()
+                .starts_with(r#"{"failure_id":"explicit","lookback_days":30,"manual":"#)
+        );
 
         // Same envelope, shuffled keys: same receipt, same digest, reused.
         let shuffled = json!({
@@ -1160,10 +1207,12 @@ mod tests {
         assert_eq!(first["replayMode"], "preview");
 
         // The replay is a pure preview: no edges, no promotion.
-        assert!(storage
-            .get_connections_for_memory(&cause.id)
-            .unwrap()
-            .is_empty());
+        assert!(
+            storage
+                .get_connections_for_memory(&cause.id)
+                .unwrap()
+                .is_empty()
+        );
         let node = storage.get_node(&cause.id).unwrap().unwrap();
         assert_eq!(node.reps, 0);
 
@@ -1186,10 +1235,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(replay["promoteRecordedButNotApplied"], true);
-        assert!(storage
-            .get_connections_for_memory(&cause.id)
-            .unwrap()
-            .is_empty());
+        assert!(
+            storage
+                .get_connections_for_memory(&cause.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
