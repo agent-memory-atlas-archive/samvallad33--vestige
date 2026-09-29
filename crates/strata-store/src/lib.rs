@@ -1,4 +1,7 @@
-//! # strata-store — the STRATA-native memory store
+//! # strata-store — the Causal Proof Engine's memory surface
+//!
+//! The vestige tool surface implemented over the proof stack: every
+//! mutation gate-admitted, every reopen bit-identical.
 //!
 //! The SQLite wipe's core data layer: an implementation of the vestige memory
 //! surface whose ONLY source of truth is a [`strata::StrataLog`] — an

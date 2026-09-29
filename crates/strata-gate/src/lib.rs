@@ -1,4 +1,6 @@
-//! # strata-gate — THE GATE RUNTIME
+//! # strata-gate — the Causal Proof Engine's admission runtime
+//!
+//! No verdict, no write. The security layer between thinking and doing.
 //!
 //! The centerpiece invariant: **the model proposes, the deterministic checker
 //! decides, change+verdict land as one signed record; a write with no

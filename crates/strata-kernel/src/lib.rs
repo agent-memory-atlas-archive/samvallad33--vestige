@@ -1,4 +1,6 @@
-//! # strata-kernel
+//! # strata-kernel — the Causal Proof Engine's determinism core
+//!
+//! Integers-only hashed state, pinned kernels, bit-for-bit replay.
 //!
 //! The Strata determinism kernel: a pure, I/O-free fold of review events into
 //! hashed state, plus the checkpoint and replay-verification machinery that

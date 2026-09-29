@@ -1,4 +1,8 @@
-//! # strata — append-only, fail-stop log
+//! # strata — the Causal Proof Engine's log layer
+//!
+//! STRATA is not a database. It is the Causal Proof Engine: it commits,
+//! attests, and testifies — never serves queries. This crate is the
+//! append-only, fail-stop foundation.
 //!
 //! Segment files (`NNNNNNNN-<uuid>.seg`) hold a borsh-encoded header, a chain
 //! of hash-linked frames, and a signed trailer (see [`crate::format`]).
