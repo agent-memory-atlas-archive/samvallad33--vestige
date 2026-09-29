@@ -147,7 +147,10 @@ jobs:
         run: cargo test -p vestige-core --no-default-features --features bundled-sqlite --lib
 
       - name: Test vestige-mcp without embeddings
-        run: cargo test -p vestige-mcp --no-default-features --features connectors,cloud-sync,legacy-sqlite --lib
+        # Tests are the raw engine harness (v3-engine): they create synthetic
+      # stores. The later build step omits it — the shipped binary stays
+      # creation-blocked.
+      run: cargo test -p vestige-mcp --no-default-features --features connectors,cloud-sync,legacy-sqlite,vestige-mcp/v3-engine --lib
 
       - name: Build disposable context-contract test server
         run: cargo build -p vestige-mcp --no-default-features --features connectors,cloud-sync,legacy-sqlite --bin vestige-mcp
