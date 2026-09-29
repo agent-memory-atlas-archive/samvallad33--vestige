@@ -221,10 +221,9 @@ fn intention_set_over_stdio_admits_a_receipt_and_survives_restart() {
     again.shutdown();
     assert!(no_sqlite(dir.path()));
 
-    // The store root has no store.meta until a checkpoint is sealed. The
-    // stdio log is `log/*.seg`; that is the directory strata-verify checks.
+    // An unsealed store has no store.meta. strata-verify still checks log/*.seg.
     #[cfg(feature = "migrate-to-strata")]
-    strata_verify(&dir.path().join("log"));
+    strata_verify(dir.path());
 }
 
 #[cfg(feature = "migrate-to-strata")]
