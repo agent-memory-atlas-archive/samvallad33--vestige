@@ -35,6 +35,7 @@ use crate::storage::portable::{
 
 // Phase 4 wall: types referenced by the MemoryStoreSend forwarding seam below.
 use crate::actor::{ActorPolicySnapshot, RoleResolution};
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use crate::advanced::reconsolidation::LabileCandidate;
 use crate::advanced::{MergeCandidate, MergeOperation, MergePlan, MergePolicy};
 use crate::codebase::anchor::{AnchorStatus, CodeAnchor};
