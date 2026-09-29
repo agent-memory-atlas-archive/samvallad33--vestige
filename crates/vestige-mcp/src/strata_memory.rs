@@ -1566,4 +1566,82 @@ mod tests {
         assert!(receipt.receipt_id.starts_with("eff-"));
         assert!(no_sqlite(dir.path()));
     }
+
+    fn sample_intention(id: &str) -> vestige_core::storage::IntentionRecord {
+        vestige_core::storage::IntentionRecord {
+            id: id.into(),
+            content: "Synthetic reminder".into(),
+            trigger_type: "time".into(),
+            trigger_data: "{}".into(),
+            priority: 2,
+            status: "active".into(),
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            deadline: None,
+            fulfilled_at: None,
+            reminder_count: 0,
+            last_reminded_at: None,
+            notes: None,
+            tags: Vec::new(),
+            related_memories: Vec::new(),
+            snoozed_until: None,
+            source_type: "mcp".into(),
+            source_data: None,
+            scope: Some("user".into()),
+        }
+    }
+
+    #[test]
+    fn intention_check_commit_delivers_the_batch_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = StrataMemory::open(dir.path()).unwrap();
+        let left = sample_intention("int-left");
+        let right = sample_intention("int-right");
+        store.save_intention(&left).unwrap();
+        store.save_intention(&right).unwrap();
+        let reminded_at = left.created_at;
+        let mut left_next = left.clone();
+        left_next.reminder_count = 1;
+        left_next.last_reminded_at = Some(reminded_at);
+        let mut right_next = right.clone();
+        right_next.reminder_count = 1;
+        right_next.last_reminded_at = Some(reminded_at);
+        store
+            .commit_intention_check(&[
+                (left.clone(), left_next.clone()),
+                (right.clone(), right_next.clone()),
+            ])
+            .unwrap();
+        let left_receipt = store.get_receipt(&left.id).unwrap().unwrap();
+        let right_receipt = store.get_receipt(&right.id).unwrap().unwrap();
+        assert_eq!(left_receipt.receipt_id, right_receipt.receipt_id);
+        assert!(left_receipt.receipt_id.starts_with("eff-"));
+
+        let mut left_again = left_next.clone();
+        left_again.reminder_count = 2;
+        let err = store
+            .commit_intention_check(&[(left_next, left_again), (right.clone(), right_next.clone())])
+            .unwrap_err();
+        assert!(err.contains("changed during check"), "{err}");
+        assert_eq!(
+            store
+                .get_intention(&left.id)
+                .unwrap()
+                .unwrap()
+                .reminder_count,
+            1
+        );
+        assert_eq!(
+            store
+                .get_intention(&right.id)
+                .unwrap()
+                .unwrap()
+                .reminder_count,
+            1
+        );
+        assert_eq!(
+            store.get_receipt(&right.id).unwrap().unwrap().receipt_id,
+            right_receipt.receipt_id
+        );
+        assert!(no_sqlite(dir.path()));
+    }
 }

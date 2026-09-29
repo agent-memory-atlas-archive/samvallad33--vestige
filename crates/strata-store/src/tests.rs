@@ -9,7 +9,7 @@ use strata_gate::policy::{ANY_KIND, WILDCARD_PREFIX};
 use strata_gate::record::{RecordKind, Verdict};
 use strata_gate::{Policy, Rule};
 
-use crate::op::{KIND_STORE_CHECKPOINT, KIND_STORE_WRITE};
+use crate::op::{StoreOp, KIND_STORE_CHECKPOINT, KIND_STORE_WRITE};
 use crate::store::handle_of;
 use crate::types::{ConnectionRecord, EdgeDirection, EdgeKind, IngestInput};
 use crate::{looks_like_failure, StoreError, StrataStore};
@@ -543,5 +543,155 @@ fn intention_upsert_replays_and_rejects_an_empty_id() {
     assert_eq!(row.trigger_type, "time");
     assert_eq!(reopened.state_digest(), digest);
     assert_eq!(reopened.intentions().len(), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn upsert_intentions_op_round_trips_through_borsh_and_replay() {
+    let records = vec![intention("int-a", "one"), intention("int-b", "two")];
+    let op = StoreOp::UpsertIntentions {
+        records: records.clone(),
+    };
+    let bytes = borsh::to_vec(&op).expect("encode");
+    let decoded = StoreOp::try_from_slice(&bytes).expect("decode");
+    assert_eq!(decoded, op);
+
+    let dir = temp_dir("intention-roundtrip");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let effect = store.upsert_intentions(records).expect("admit");
+    let digest = store.state_digest();
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    assert_eq!(reopened.origin_seq("int-a"), Some(effect));
+    assert_eq!(reopened.origin_seq("int-b"), Some(effect));
+    assert_eq!(reopened.get_intention("int-a").expect("a").content, "one");
+    assert_eq!(reopened.get_intention("int-b").expect("b").content, "two");
+    assert_eq!(reopened.state_digest(), digest);
+    let writes: Vec<_> = reopened
+        .log()
+        .read_frames(1)
+        .expect("frames")
+        .into_iter()
+        .filter(|frame| frame.kind == KIND_STORE_WRITE)
+        .collect();
+    assert_eq!(writes.len(), 1, "one op, one data frame");
+    assert_eq!(
+        StoreOp::try_from_slice(&writes[0].payload).expect("payload"),
+        op
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_log_without_intention_frames_stays_readable() {
+    let node_op_tag = borsh::to_vec(&StoreOp::UpsertNode {
+        record: crate::types::NodeRecord {
+            id: "mem-old".into(),
+            kernel_id: 2,
+            scope: String::new(),
+            content: "old".into(),
+            tags: Vec::new(),
+            node_type: "fact".into(),
+            created_at_ms: 0,
+            valid_from_ms: 0,
+            valid_until_ms: crate::types::VALID_FOREVER_MS,
+            superseded_by: None,
+        },
+    })
+    .expect("encode node");
+    let edge_tag = borsh::to_vec(&StoreOp::SaveEdge {
+        edge: ConnectionRecord::default(),
+    })
+    .expect("encode edge");
+    let retire_tag = borsh::to_vec(&StoreOp::SupersedeNode {
+        id: "a".into(),
+        superseded_by: "b".into(),
+    })
+    .expect("encode retire");
+    let review_tag = borsh::to_vec(&StoreOp::ReviewNode {
+        card_id: 1,
+        rating: 3,
+    })
+    .expect("encode review");
+    let intention_tag = borsh::to_vec(&StoreOp::UpsertIntentions {
+        records: Vec::new(),
+    })
+    .expect("encode intention");
+    // Appended variant: the four original discriminants stay 0..=3.
+    assert_eq!(
+        [
+            node_op_tag[0],
+            edge_tag[0],
+            retire_tag[0],
+            review_tag[0],
+            intention_tag[0]
+        ],
+        [0, 1, 2, 3, 4]
+    );
+
+    let dir = temp_dir("old-log");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let id = store
+        .ingest(input("pre-intention node", &[]))
+        .expect("ingest");
+    let digest = store.state_digest();
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    assert_eq!(
+        reopened.get_node(&id).expect("node").content,
+        "pre-intention node"
+    );
+    assert!(reopened.intentions().is_empty());
+    assert_eq!(reopened.state_digest(), digest);
+    let mut saw_node = false;
+    for frame in reopened.log().read_frames(1).expect("frames") {
+        if frame.kind != KIND_STORE_WRITE {
+            continue;
+        }
+        match StoreOp::try_from_slice(&frame.payload).expect("old frame still decodes") {
+            StoreOp::UpsertNode { record } => {
+                assert_eq!(record.id, id);
+                saw_node = true;
+            }
+            other => panic!("old log must not carry the new op: {other:?}"),
+        }
+    }
+    assert!(saw_node);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn intention_batch_is_one_admitted_write_and_a_bad_batch_writes_nothing() {
+    let dir = temp_dir("intention-atomic");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let before = store.log().head().frames_total;
+    let effect = store
+        .upsert_intentions(vec![intention("a", "one"), intention("b", "two")])
+        .expect("admit");
+    let after = store.log().head().frames_total;
+    assert_eq!(after - before, 4, "propose, gate, effect, one data frame");
+    assert_eq!(store.origin_seq("a"), Some(effect));
+    assert_eq!(store.origin_seq("b"), Some(effect));
+    let writes = store
+        .log()
+        .read_frames(1)
+        .expect("frames")
+        .into_iter()
+        .filter(|frame| frame.kind == KIND_STORE_WRITE)
+        .count();
+    assert_eq!(writes, 1);
+
+    let head = store.log().head().frames_total;
+    let digest = store.state_digest();
+    let err = store
+        .upsert_intentions(vec![intention("a", "changed"), intention("a", "again")])
+        .expect_err("duplicate id");
+    assert!(err.to_string().contains("duplicate"), "{err}");
+    assert_eq!(store.log().head().frames_total, head);
+    assert_eq!(store.state_digest(), digest);
+    assert_eq!(store.get_intention("a").expect("a").content, "one");
+    assert_eq!(store.get_intention("b").expect("b").content, "two");
     std::fs::remove_dir_all(&dir).ok();
 }
