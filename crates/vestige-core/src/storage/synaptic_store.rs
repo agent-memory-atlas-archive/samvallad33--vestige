@@ -31,46 +31,15 @@ pub const SYNAPTIC_CONTEXT_ALGORITHM_V1: &str = "vestige.synaptic_context.v1";
 pub const SYNAPTIC_CONTEXT_THRESHOLD_V1: f64 = 0.25;
 pub const SYNAPTIC_CAPTURE_CLAIM_BOUNDARY: &str = "Evidence-backed temporal association with a measured memory-state change; not proof that the trigger caused the earlier memory or a downstream outcome.";
 
-/// Frozen scoring policy supplied by the cognitive engine.
-#[derive(Debug, Clone)]
-pub struct SynapticCapturePolicy {
-    pub backward_hours: f64,
-    pub forward_hours: f64,
-    pub tag_lifetime_hours: f64,
-    pub minimum_tag_strength: f64,
-    pub maximum_captures: usize,
-    pub decay_function: DecayFunction,
-}
-
-/// One durable importance-event evaluation request.
-#[derive(Debug, Clone)]
-pub struct SynapticCaptureRequest {
-    pub trigger_memory_id: String,
-    pub event_type: String,
-    pub occurred_at: DateTime<Utc>,
-    pub strength: f64,
-    pub policy: SynapticCapturePolicy,
-}
-
-/// Observable result of a committed capture transaction.
-#[derive(Debug, Clone)]
-pub struct DurableSynapticCapture {
-    pub event_id: String,
-    pub receipt: Receipt,
-    pub captured_count: usize,
-    pub reused_existing: bool,
-}
-
-/// Privacy-safe numeric snapshot of the importance signal that opened an
-/// event. Explanation strings are intentionally excluded.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SynapticSignalSnapshot {
-    pub novelty: f64,
-    pub arousal: f64,
-    pub reward: f64,
-    pub attention: f64,
-    pub composite: f64,
-}
+// `SynapticCapturePolicy`, `SynapticCaptureRequest`, `DurableSynapticCapture`,
+// `SynapticSignalSnapshot`, `SynapticImportanceEvent`, `SynapticIngestRequest`,
+// `DurableSynapticPairReceipt`, and `SynapticIngestOutcome` are defined in
+// (and re-exported from) `crate::storage::types`.
+pub use crate::storage::types::{
+    DurableSynapticCapture, DurableSynapticPairReceipt, SynapticCapturePolicy,
+    SynapticCaptureRequest, SynapticImportanceEvent, SynapticIngestOutcome, SynapticIngestRequest,
+    SynapticSignalSnapshot,
+};
 
 impl SynapticSignalSnapshot {
     fn normalized(&self) -> Self {
@@ -91,46 +60,8 @@ impl SynapticSignalSnapshot {
     }
 }
 
-/// A frozen V2 importance event supplied with the tag produced by one ingest.
-#[derive(Debug, Clone)]
-pub struct SynapticImportanceEvent {
-    pub event_type: String,
-    pub occurred_at: DateTime<Utc>,
-    pub strength: f64,
-    pub policy: SynapticCapturePolicy,
-    pub signal_snapshot: SynapticSignalSnapshot,
-}
-
-/// Atomic event + tag request used by smart_ingest V2.
-#[derive(Debug, Clone)]
-pub struct SynapticIngestRequest {
-    pub memory_id: String,
-    pub tag: Option<SynapticTag>,
-    pub event: Option<SynapticImportanceEvent>,
-}
-
-/// One immutable V2 forward pair receipt.
-#[derive(Debug, Clone)]
-pub struct DurableSynapticPairReceipt {
-    pub event_id: String,
-    pub receipt: Receipt,
-    pub disposition: SynapticCaptureDisposition,
-    pub reused_existing: bool,
-}
-
-/// Observable result of one committed V2 ingest transaction.
-#[derive(Debug, Clone)]
-pub struct SynapticIngestOutcome {
-    pub event: Option<DurableSynapticCapture>,
-    pub tag_id: Option<String>,
-    pub tag_persisted: bool,
-    /// Whether the request tag remains active after the committed transaction.
-    /// A tag can be persisted then immediately consumed by an already-open
-    /// forward event, so callers must not restore it into a live projection
-    /// solely because `tag_persisted` is true.
-    pub tag_active: bool,
-    pub forward_receipts: Vec<DurableSynapticPairReceipt>,
-}
+// Remaining synaptic type definitions moved to `crate::storage::types`
+// (see the re-export above).
 
 #[derive(Debug, Clone)]
 struct ContextEvidence {

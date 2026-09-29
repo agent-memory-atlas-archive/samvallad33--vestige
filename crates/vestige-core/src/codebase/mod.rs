@@ -68,9 +68,9 @@
 //! # }
 //! ```
 
-// `anchor` persists/verifies code anchors through the legacy SQLite store:
-// quarantined behind `legacy-sqlite` (build/t5-legacy-isolation).
-#[cfg(feature = "legacy-sqlite")]
+// `anchor` types and pure capture/verify logic are always available; only
+// the SQLite persistence half is gated on `legacy-sqlite` inside the module
+// (dual-mode rule, strata/fix-00a).
 pub mod anchor;
 pub mod context;
 #[cfg(feature = "codebase-git")]

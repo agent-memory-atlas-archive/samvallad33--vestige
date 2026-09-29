@@ -32,27 +32,12 @@ use super::sqlite::{Result, StorageError, SqliteMemoryStore};
 use crate::advanced::git_records::COMMIT_TAG;
 use crate::advanced::retroactive_backfill::{extract_entities, normalized_tier, IdentifierTier};
 
-/// Hard cap on ambiguous-prefix candidates reported per resolution.
-pub const MAX_CANDIDATES: usize = 20;
-
-/// The canonical detail string for the `handle_required` error payload.
-pub const HANDLE_REQUIRED_DETAIL: &str = "recall is handle-based: pass a memory id, commit sha, file, symbol, test, run, or tool-call id";
-
-/// What kind of handle a query resolved as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HandleKind {
-    Memory,
-    Commit,
-    File,
-    Symbol,
-    Test,
-    Run,
-    ToolCall,
-    Tag,
-    /// No handle rule matched (unresolved query).
-    Unknown,
-}
+// `MAX_CANDIDATES`, `HANDLE_REQUIRED_DETAIL`, `HandleKind`, and
+// `HandleResolution` are defined in (and re-exported from)
+// `crate::storage::types`.
+pub use crate::storage::types::{
+    HANDLE_REQUIRED_DETAIL, HandleKind, HandleResolution, MAX_CANDIDATES,
+};
 
 impl HandleKind {
     /// Stable lowercase name (matches the serde serialization).
@@ -69,27 +54,6 @@ impl HandleKind {
             HandleKind::Unknown => "unknown",
         }
     }
-}
-
-/// Outcome of resolving one query against the store.
-///
-/// - `ids` non-empty: resolved. When `exact` is false the match was a unique
-///   prefix (only sha/symbol can get here).
-/// - `ids` empty and `candidates` non-empty: prefix-ambiguous — the caller
-///   must disambiguate (or supply a longer prefix).
-/// - both empty: no handle matched; `handle_required` carries the message the
-///   handle-based recall flow reports (including the too-short-sha error).
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct HandleResolution {
-    pub kind: HandleKind,
-    pub ids: Vec<String>,
-    pub exact: bool,
-    /// `(id, kind)` pairs shown when a prefix is ambiguous. Capped at
-    /// [`MAX_CANDIDATES`].
-    pub candidates: Vec<(String, HandleKind)>,
-    /// Set when nothing resolved: the handle_required guidance (or the
-    /// specific ambiguity error for a too-short sha).
-    pub handle_required: Option<String>,
 }
 
 impl HandleResolution {

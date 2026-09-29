@@ -69,45 +69,26 @@ use crate::SchemaIntrospection;
 // ERROR TYPES
 // ============================================================================
 
-/// Storage error type
-#[non_exhaustive]
-#[derive(Debug, thiserror::Error)]
-pub enum StorageError {
-    /// Database error
-    #[error("Database error: {0}")]
-    Database(#[from] rusqlite::Error),
-    /// Node not found
-    #[error("Node not found: {0}")]
-    NotFound(String),
-    /// IO error
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    /// Invalid timestamp
-    #[error("Invalid timestamp: {0}")]
-    InvalidTimestamp(String),
-    /// Initialization error
-    #[error("Initialization error: {0}")]
-    Init(String),
-    /// A likely credential was detected before any write side effect.
-    #[error(
-        "Refused to store probable credential(s): {kinds:?}. Secret bytes were not stored, logged, or returned. Redact the value or use an explicit allow-secrets override only when intentional."
-    )]
-    SecretDetected { kinds: Vec<String> },
-    /// A project namespace must be a short, non-empty identifier.
-    #[error("Invalid memory scope: {0}")]
-    InvalidScope(String),
-    /// A typed-edge write or traversal referenced a link type outside the
-    /// owner-approved vocabulary, or otherwise malformed edge input.
-    #[error("Invalid typed edge: {0}")]
-    InvalidEdge(String),
-    /// A profile operation would violate the explicit/reversible embedding
-    /// profile contract.
-    #[error("Invalid embedding profile: {0}")]
-    InvalidEmbeddingProfile(String),
-}
+// `StorageError` and `Result` are defined in (and re-exported from) the
+// ungated `crate::storage::types` module (dual-mode compilation,
+// strata/fix-00a). Every other shared type below likewise.
+pub use crate::storage::types::{
+    CompositionEventRecord, CompositionMemberRecord, CompositionNeighborRecord,
+    CompositionOutcomeRecord, ConnectorCursor, ConsolidationHistoryRecord, DreamHistoryRecord,
+    FailureFeedbackReport, HygieneNodeSummary, HygieneSnapshot, InsightRecord, IntentionRecord,
+    ConnectionRecord, NeverComposedCandidate, PortableSyncReport, PurgeReport, ReconcileReport,
+    Result, SmartIngestResult, SourceUpsertOutcome, SourceUpsertResult, StateTransitionRecord,
+    StorageError, TagVocabulary, WalCheckpointMode, WalCheckpointStatus,
+};
 
-/// Storage result type
-pub type Result<T> = std::result::Result<T, StorageError>;
+/// Backend-typed conversion kept beside the SQLite code that produces it:
+/// `StorageError::Database` carries a stringified error so the enum itself
+/// stays buildable without `rusqlite`.
+impl From<rusqlite::Error> for StorageError {
+    fn from(e: rusqlite::Error) -> Self {
+        StorageError::Database(e.to_string())
+    }
+}
 
 /// Namespace used by existing, unscoped callers and by rows written before
 /// project scopes were exposed. Scoped callers must opt into a different value.
@@ -136,58 +117,8 @@ type TagMutationState = (
     Vec<(String, Vec<String>, Vec<String>)>,
 );
 
-/// Content-bounded row used to compute full-store hygiene statistics without
-/// loading every memory body or issuing per-memory access-log queries.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HygieneNodeSummary {
-    pub id: String,
-    pub node_type: String,
-    pub created_at: DateTime<Utc>,
-    pub retention_strength: f64,
-    pub tags: Vec<String>,
-    pub valid_from: Option<DateTime<Utc>>,
-    pub valid_until: Option<DateTime<Utc>>,
-    pub superseded: bool,
-    pub content_bytes: usize,
-    pub content_preview: String,
-    /// No access evidence exists AND the memory was created inside the
-    /// retained access-log window, so the absence of log rows is meaningful.
-    pub never_accessed: bool,
-    /// No access evidence exists but the memory predates the retained
-    /// access-log window: pruning makes past access unknowable, so this row
-    /// must never be claimed as never-accessed.
-    pub access_unknown: bool,
-}
-
-/// Full hygiene population plus row-corruption findings. Malformed rows are
-/// tolerated (mirroring `row_to_node`) and reported instead of aborting the
-/// whole stats view, because hand-edited stores are exactly where hygiene
-/// tooling is needed most.
-#[derive(Debug, Clone)]
-pub struct HygieneSnapshot {
-    pub nodes: Vec<HygieneNodeSummary>,
-    /// Rows whose stored `tags` column is NULL or unparseable JSON; their
-    /// tags are treated as empty in `nodes`.
-    pub malformed_tag_rows: usize,
-    /// Capped id list for the malformed rows (first
-    /// [`MAX_MALFORMED_TAG_ROW_IDS`] in id order).
-    pub malformed_tag_row_ids: Vec<String>,
-    pub malformed_tag_row_ids_truncated: bool,
-    /// Rows whose nullable `retention_strength` was NULL and fell back to the
-    /// schema default of 1.0.
-    pub defaulted_retention_rows: usize,
-}
-
-/// Exact tag vocabulary for one scope plus the count of stored tags that were
-/// skipped because they exceed the 200-character similarity safety limit.
-/// Overlong stored tags degrade gracefully (skip-and-count) instead of
-/// disabling suggestions for the whole scope.
-#[derive(Debug, Clone)]
-pub struct TagVocabulary {
-    pub tags: Vec<String>,
-    pub skipped_overlong: usize,
-}
+// `HygieneNodeSummary`, `HygieneSnapshot`, and `TagVocabulary` are defined
+// in (and re-exported from) `crate::storage::types`.
 
 #[cfg(any(test, all(feature = "embeddings", feature = "vector-search")))]
 fn temporal_candidate_is_eligible(
@@ -309,23 +240,8 @@ pub struct SqliteIntegrityStatus {
     pub synaptic_consistency_violations: u64,
 }
 
-/// SQLite WAL checkpoint mode exposed for explicit lifecycle operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WalCheckpointMode {
-    /// Checkpoint as many frames as possible without blocking active readers.
-    Passive,
-    /// Checkpoint and truncate the WAL after application writes have stopped.
-    Truncate,
-}
-
-/// Raw `wal_checkpoint` counters reported by SQLite.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WalCheckpointStatus {
-    pub busy: i64,
-    pub log_frames: i64,
-    pub checkpointed_frames: i64,
-}
+// `WalCheckpointMode` / `WalCheckpointStatus` are defined in (and
+// re-exported from) `crate::storage::types`.
 
 /// Verified startup durability and recovery state retained by the store.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -341,43 +257,8 @@ pub struct SqliteDurabilityStatus {
     pub claim_boundary: String,
 }
 
-/// Result of smart ingest with prediction error gating
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SmartIngestResult {
-    /// Decision made: "create", "update", "supersede", "merge", "reinforce", etc.
-    pub decision: String,
-    /// The resulting node (new or updated)
-    pub node: KnowledgeNode,
-    /// ID of superseded memory (if any)
-    pub superseded_id: Option<String>,
-    /// Similarity to closest existing memory (0.0 - 1.0)
-    pub similarity: Option<f32>,
-    /// Prediction error (1.0 - similarity)
-    pub prediction_error: Option<f32>,
-    /// Human-readable explanation of the decision
-    pub reason: String,
-    /// Previous content when smart ingest mutated an existing memory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_content: Option<String>,
-    /// Existing memory id that received merged or appended content.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub merged_from: Option<String>,
-    /// Full updated content after a merge/append/context write.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub merge_preview: Option<String>,
-    /// World-time close stamped onto a newly created dated claim that is
-    /// already superseded by a currently-valid fact starting later.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_closed_until: Option<DateTime<Utc>>,
-    /// Set when the write path conflicted with a memory inside its labile
-    /// window and routed the conflict through a reconsolidation merge plan
-    /// instead of mutating immediately (`decision == "reconsolidation_pending"`
-    /// for a deferred supersede; a plain `"create"` for a contradiction that
-    /// was stored separately and linked to a verdict plan).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reconsolidation_plan_id: Option<String>,
-}
+// `SmartIngestResult` is defined in (and re-exported from)
+// `crate::storage::types`.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MergeWrite {
@@ -483,51 +364,8 @@ impl PortableSyncBackend for FilePortableSyncBackend {
     }
 }
 
-/// Summary of a pull-merge-push sync operation.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PortableSyncReport {
-    /// Backend label that was synced.
-    pub backend: String,
-    /// Whether an existing remote archive was pulled before pushing.
-    pub pulled: bool,
-    /// Merge report from the pull phase, if a remote archive existed.
-    pub pull: Option<PortableImportReport>,
-    /// Number of tables written to the backend during push.
-    pub pushed_tables: usize,
-    /// Number of rows written to the backend during push.
-    pub pushed_rows: usize,
-    /// Portable archive format written during push.
-    pub archive_format: String,
-}
-
-/// Report returned by an irreversible content purge.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PurgeReport {
-    /// Memory ID requested for purge.
-    pub memory_id: String,
-    /// Whether a live memory row was found and removed.
-    pub deleted: bool,
-    /// Non-content tombstone timestamp.
-    pub deleted_at: DateTime<Utc>,
-    /// Number of graph edges removed by foreign-key cascade.
-    pub edges_pruned: i64,
-    /// Number of insight rows whose source list was rewritten.
-    pub insights_rewritten: i64,
-    /// Number of insight rows dropped because fewer than two source memories remained.
-    pub insights_deleted: i64,
-    /// Number of temporal-summary children detached from this parent.
-    pub children_orphaned: i64,
-    /// This established purge path audits legacy local cleanup only.  It does
-    /// not claim the post-V25 lineage coverage required for verified local
-    /// machine unlearning.
-    pub unlearning_scope: crate::storage::UnlearningScope,
-    /// Legacy purge is intentionally never labeled `VerifiedWithinScope`.
-    pub unlearning_verdict: crate::storage::UnlearningVerdict,
-    /// Fixed boundary shown by MCP callers rather than a free-form guarantee.
-    pub unlearning_claim_boundary: &'static str,
-}
+// `PortableSyncReport` and `PurgeReport` are defined in (and re-exported
+// from) `crate::storage::types`.
 
 /// Persistent vector row belonging to exactly one embedding profile.
 ///
@@ -791,17 +629,8 @@ fn warn_skipped_row<T>(operation: &'static str) -> impl FnMut(rusqlite::Result<T
     }
 }
 
-/// What one post-retrieval failure feedback pass did. See
-/// [`SqliteMemoryStore::apply_failure_feedback`].
-#[derive(Debug, Clone, serde::Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct FailureFeedbackReport {
-    pub failure_id: String,
-    pub window_minutes: i64,
-    pub receipts_considered: usize,
-    pub memories_demoted: usize,
-    pub total_delta: f64,
-}
+// `FailureFeedbackReport` is defined in (and re-exported from)
+// `crate::storage::types`.
 
 /// Begin a READ snapshot on the reader connection.
 ///
@@ -996,31 +825,8 @@ impl SqliteMemoryStore {
 // PERSISTENCE LAYER: Intentions, Insights, Connections, States
 // ============================================================================
 
-/// Intention data for persistence (matches the intentions table schema)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct IntentionRecord {
-    pub id: String,
-    pub content: String,
-    pub trigger_type: String,
-    pub trigger_data: String, // JSON
-    pub priority: i32,
-    pub status: String,
-    pub created_at: DateTime<Utc>,
-    pub deadline: Option<DateTime<Utc>>,
-    pub fulfilled_at: Option<DateTime<Utc>>,
-    pub reminder_count: i32,
-    pub last_reminded_at: Option<DateTime<Utc>>,
-    pub notes: Option<String>,
-    pub tags: Vec<String>,
-    pub related_memories: Vec<String>,
-    pub snoozed_until: Option<DateTime<Utc>>,
-    pub source_type: String,
-    pub source_data: Option<String>,
-    /// Project namespace. `None` (legacy rows) resolves to the `user`
-    /// namespace; see `effective_scope`. Prospective surfacing in recall only
-    /// ever reads intentions whose effective scope equals the query scope.
-    pub scope: Option<String>,
-}
+// `IntentionRecord` is defined in (and re-exported from)
+// `crate::storage::types`.
 
 impl IntentionRecord {
     /// Normalized namespace for this intention: blank/None -> "user",
@@ -1034,20 +840,8 @@ impl IntentionRecord {
     }
 }
 
-/// Insight data for persistence (matches the insights table schema)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct InsightRecord {
-    pub id: String,
-    pub insight: String,
-    pub source_memories: Vec<String>,
-    pub confidence: f64,
-    pub novelty_score: f64,
-    pub insight_type: String,
-    pub generated_at: DateTime<Utc>,
-    pub tags: Vec<String>,
-    pub feedback: Option<String>,
-    pub applied_count: i32,
-}
+// `InsightRecord` is defined in (and re-exported from)
+// `crate::storage::types`.
 
 impl Default for InsightRecord {
     fn default() -> Self {
@@ -1066,17 +860,8 @@ impl Default for InsightRecord {
     }
 }
 
-/// Memory connection for activation network
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ConnectionRecord {
-    pub source_id: String,
-    pub target_id: String,
-    pub strength: f64,
-    pub link_type: String,
-    pub created_at: DateTime<Utc>,
-    pub last_activated: DateTime<Utc>,
-    pub activation_count: i32,
-}
+// `ConnectionRecord` is defined in (and re-exported from)
+// `crate::storage::types`.
 
 /// Memory state record
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1090,127 +875,14 @@ pub struct MemoryStateRecord {
     pub suppressed_by: Vec<String>,
 }
 
-/// State transition record for audit trail
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct StateTransitionRecord {
-    pub id: i64,
-    pub memory_id: String,
-    pub from_state: String,
-    pub to_state: String,
-    pub reason_type: String,
-    pub reason_data: Option<String>,
-    pub timestamp: DateTime<Utc>,
-}
+// `StateTransitionRecord`, `ConsolidationHistoryRecord`, and
+// `DreamHistoryRecord` are defined in (and re-exported from)
+// `crate::storage::types`.
 
-/// Consolidation history record
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ConsolidationHistoryRecord {
-    pub id: i64,
-    pub completed_at: DateTime<Utc>,
-    pub duration_ms: i64,
-    pub memories_replayed: i32,
-    pub connections_found: i32,
-    pub connections_strengthened: i32,
-    pub connections_pruned: i32,
-    pub insights_generated: i32,
-}
-
-/// Dream history record — persists dream metadata for automation triggers
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DreamHistoryRecord {
-    pub dreamed_at: DateTime<Utc>,
-    pub duration_ms: i64,
-    pub memories_replayed: i32,
-    pub connections_found: i32,
-    pub insights_generated: i32,
-    pub memories_strengthened: i32,
-    pub memories_compressed: i32,
-    // v2.0: 4-Phase dream cycle metrics
-    pub phase_nrem1_ms: Option<i64>,
-    pub phase_nrem3_ms: Option<i64>,
-    pub phase_rem_ms: Option<i64>,
-    pub phase_integration_ms: Option<i64>,
-    pub summaries_generated: Option<i32>,
-    pub emotional_memories_processed: Option<i32>,
-    pub creative_connections_found: Option<i32>,
-}
-
-/// Composition event envelope for ComposedGraph.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CompositionEventRecord {
-    pub id: String,
-    pub created_at: DateTime<Utc>,
-    pub tool: String,
-    pub mode: String,
-    pub query: Option<String>,
-    pub query_hash: Option<String>,
-    pub confidence: Option<f64>,
-    pub status: Option<String>,
-    pub output_preview: Option<String>,
-    pub metadata: serde_json::Value,
-}
-
-/// Memory participating in a composition event.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CompositionMemberRecord {
-    pub event_id: String,
-    pub memory_id: String,
-    pub role: String,
-    pub rank: i32,
-    pub trust: Option<f64>,
-    pub score: Option<f64>,
-    pub preview: Option<String>,
-    pub metadata: serde_json::Value,
-}
-
-/// Outcome label attached to a composition event.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CompositionOutcomeRecord {
-    pub id: String,
-    pub event_id: String,
-    pub outcome_type: String,
-    pub labeled_at: DateTime<Utc>,
-    pub label_source: String,
-    pub confidence_delta: Option<f64>,
-    pub notes: Option<String>,
-    pub metadata: serde_json::Value,
-}
-
-/// Memory most often composed with another memory.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CompositionNeighborRecord {
-    pub memory_id: String,
-    pub composed_count: i64,
-    pub latest_event_at: DateTime<Utc>,
-}
-
-/// Candidate memory pair that shares useful shape but has never been composed.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NeverComposedCandidate {
-    pub first_id: String,
-    pub second_id: String,
-    pub score: f64,
-    pub novelty_score: f64,
-    pub bridge_score: f64,
-    pub trust_score: f64,
-    pub outcome_score_adjustment: f64,
-    pub shared_tags: Vec<String>,
-    pub boundary_tags: Vec<String>,
-    pub shared_terms: Vec<String>,
-    pub prior_outcomes: Vec<String>,
-    pub outcome_signal: String,
-    pub first_node_type: String,
-    pub second_node_type: String,
-    pub first_preview: String,
-    pub second_preview: String,
-    pub reason: String,
-    pub composition_question: String,
-}
+// `CompositionEventRecord`, `CompositionMemberRecord`,
+// `CompositionOutcomeRecord`, `CompositionNeighborRecord`, and
+// `NeverComposedCandidate` are defined in (and re-exported from)
+// `crate::storage::types`.
 
 impl SqliteMemoryStore {
     /// Adjacency over recorded typed causal edges (both directions treated
@@ -3009,48 +2681,9 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
 // CONNECTOR SYNC (#57) — idempotent external-source ingestion
 // ============================================================================
 
-/// What `upsert_by_source` did with one external record. Drives the
-/// created/updated/unchanged/tombstoned counts a connector reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceUpsertOutcome {
-    /// No memory existed for this `(source_system, source_id)` — inserted.
-    Created,
-    /// A memory existed and the `content_hash` changed — body + envelope updated
-    /// and the embedding regenerated.
-    Updated,
-    /// A memory existed with the same `content_hash` — nothing rewritten except
-    /// `synced_at` (so an incremental re-scan is free).
-    Unchanged,
-}
-
-/// Result of one `upsert_by_source` call.
-#[derive(Debug, Clone)]
-pub struct SourceUpsertResult {
-    pub outcome: SourceUpsertOutcome,
-    /// Memory id of the affected node (new or existing).
-    pub node_id: String,
-}
-
-/// Incremental-sync checkpoint for one `(source_system, scope)`.
-#[derive(Debug, Clone, Default)]
-pub struct ConnectorCursor {
-    pub source_system: String,
-    pub scope: String,
-    /// High-water mark on the source's update timestamp. `None` on first sync.
-    pub cursor_updated_at: Option<DateTime<Utc>>,
-    pub last_synced_at: Option<DateTime<Utc>>,
-    pub last_full_reconcile_at: Option<DateTime<Utc>>,
-    pub records_seen: i64,
-}
-
-/// Outcome of a tombstone reconciliation pass.
-#[derive(Debug, Clone, Default)]
-pub struct ReconcileReport {
-    /// Memory ids that were tombstoned (no longer visible upstream).
-    pub tombstoned: Vec<String>,
-    /// Number of local records considered for this scope.
-    pub considered: usize,
-}
+// `SourceUpsertOutcome`, `SourceUpsertResult`, `ConnectorCursor`, and
+// `ReconcileReport` are defined in (and re-exported from)
+// `crate::storage::types`.
 
 impl SqliteMemoryStore {}
 

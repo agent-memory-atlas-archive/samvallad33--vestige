@@ -22,53 +22,9 @@ use super::sqlite::{Result, SqliteMemoryStore, StorageError};
 /// Stable schema URI for walk receipts.
 pub const WALK_RECEIPT_SCHEMA_V1: &str = "https://vestige.dev/schemas/receipt/walk/v1";
 
-/// Handle returned when a walk receipt is saved. Deterministic: the same
-/// canonical parameters always yield the same pair.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WalkReceiptHandle {
-    pub receipt_id: String,
-    pub digest: String,
-    /// True when the row already existed (idempotent re-save of the same
-    /// canonical envelope) rather than being written by this call.
-    pub reused_existing: bool,
-}
-
-/// One persisted walk receipt row.
-#[derive(Debug, Clone)]
-pub struct StoredWalkReceipt {
-    pub receipt_id: String,
-    pub digest: String,
-    /// The exact canonical JSON bytes that were digested.
-    pub canonical_json: String,
-    /// The canonical envelope parsed back into a JSON value.
-    pub params: Value,
-    /// vestige-core version that canonicalized and digested the envelope.
-    pub engine_version: String,
-    pub created_at: String,
-}
-
-/// Store-wide coverage aggregates for `memory_status(view="coverage")`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CoverageSnapshot {
-    /// Total knowledge nodes in the store.
-    pub total_nodes: u64,
-    /// Distinct nodes carrying at least one code memory anchor.
-    pub anchored_nodes: u64,
-    /// `anchored_nodes / total_nodes * 100`, rounded to 2 decimals. 0.0 when
-    /// the store is empty (no division by zero, no NaN).
-    pub anchor_coverage_pct: f64,
-    /// `memory_connections` counts grouped by `link_type`, ordered by type
-    /// ascending so serialization is byte-stable.
-    pub edge_counts_by_type: Vec<(String, u64)>,
-    /// RFC 3339 `created_at` of the newest git-commit-tagged node, if any.
-    pub newest_git_commit_record: Option<String>,
-    /// Whole days since that record was created (floor of exact days).
-    pub newest_git_commit_record_age_days: Option<i64>,
-    /// Wall-clock millis of the newest Black Box trace event, if any.
-    pub newest_agent_trace_at: Option<i64>,
-    /// Hours since that event (rounded to 1 decimal).
-    pub newest_agent_trace_age_hours: Option<f64>,
-}
+// `WalkReceiptHandle`, `StoredWalkReceipt`, and `CoverageSnapshot` are
+// defined in (and re-exported from) `crate::storage::types`.
+pub use crate::storage::types::{CoverageSnapshot, StoredWalkReceipt, WalkReceiptHandle};
 
 /// Canonicalize a walk parameter envelope with the codebase's canonical JSON
 /// helper (RFC 8785 JCS via `serde_json_canonicalizer`, the same encoder the

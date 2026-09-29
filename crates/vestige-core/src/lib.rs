@@ -211,7 +211,7 @@ pub use storage::{
     SchedulingState,
     SearchQuery,
     StoreStats,
-        open_storage,
+    open_storage,
 };
 
 // Storage: legacy SQLite surface (quarantined behind `legacy-sqlite`,

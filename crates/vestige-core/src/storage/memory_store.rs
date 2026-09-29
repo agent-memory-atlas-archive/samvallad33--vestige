@@ -28,23 +28,26 @@ use crate::neuroscience::SynapticTag;
 use crate::security::SecretPolicy;
 use crate::trace::{MemoryPr, MemoryPrAction, MemoryPrStatus, MemoryTraceEvent, Receipt};
 use crate::SchemaIntrospection;
-use super::sqlite::FailureFeedbackReport;
-use super::{ConnectorCursor, ReconcileReport};
-use super::receipt_attestation::{ChainEntry, DsseEnvelope, TrustedSigningKey};
-use super::{
-    ActorMutationOutcome, AgentRunSummary, BlastReport, ClosedIssueNode, CompositionEventRecord,
-    CompositionMemberRecord, CompositionOutcomeRecord, ConnectionRecord, CoverageSnapshot,
-    DreamHistoryRecord, DurableCounterfactualReplay, DurableRetrievalReplayCapsule,
-    DurableSignedRetrievalReceipt, DurableSynapticCapture, EndorsementEventRecord,
-    CompositionNeighborRecord, ConsolidationHistoryRecord, FailedToolCall, GitCommitNode,
+// Dual-mode rule (strata/fix-00a): every storage type this trait names is
+// defined in the UNGATED `super::types` module, so the trait compiles with
+// AND without `legacy-sqlite`. The pure receipt-attestation trio is
+// re-exported through `types` as well.
+use super::types::{
+    ActorMutationOutcome, AgentRunSummary, BlastReport, ChainEntry, ClosedIssueNode,
+    CompositionEventRecord, CompositionMemberRecord, CompositionNeighborRecord,
+    CompositionOutcomeRecord, ConnectionRecord, ConnectorCursor, ConsolidationHistoryRecord,
+    CoverageSnapshot, DreamHistoryRecord, DurableCounterfactualReplay,
+    DurableRetrievalReplayCapsule, DurableSignedRetrievalReceipt, DurableSynapticCapture,
+    DsseEnvelope, EndorsementEventRecord, FailureFeedbackReport, FailedToolCall, GitCommitNode,
     HandleResolution, HygieneSnapshot, InsightRecord, IntentionRecord, NeverComposedCandidate,
-    OpenFailureTouching, PendingMemoryMutationDecision, PortableArchive, PurgeReport,
-    PortableImportMode, PortableImportReport, PortableSyncReport, ReceiptAttestationStatus,
-    Result as StoreResult, RetireOutcome, RetrievalReplayCapsuleDraft,
+    OpenFailureTouching, PendingMemoryMutationDecision, PortableArchive, PortableImportMode,
+    PortableImportReport, PortableSyncReport, PurgeReport, ReceiptAttestationStatus,
+    ReconcileReport, Result as StoreResult, RetireOutcome, RetrievalReplayCapsuleDraft,
     RetrievalReplayCapsuleSummary, SmartIngestResult, SourceUpsertResult, StateTransitionRecord,
-    SignedReceiptWrite, StorageError, StoredCounterfactualReplay, StoredReceiptAttestationVerification,
-    StoredWalkReceipt, SynapticCaptureRequest, SynapticIngestOutcome, SynapticIngestRequest,
-    TagVocabulary, WalkReceiptHandle, WalCheckpointMode, WalCheckpointStatus,
+    SignedReceiptWrite, StorageError, StoredCounterfactualReplay,
+    StoredReceiptAttestationVerification, StoredWalkReceipt, SynapticCaptureRequest,
+    SynapticIngestOutcome, SynapticIngestRequest, TagVocabulary, TrustedSigningKey,
+    WalkReceiptHandle, WalCheckpointMode, WalCheckpointStatus,
 };
 
 // ----------------------------------------------------------------------------
