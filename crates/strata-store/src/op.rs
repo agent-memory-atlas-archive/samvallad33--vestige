@@ -40,10 +40,19 @@ pub enum StoreOp {
         superseded_by: String,
     },
     /// Fold an explicit FSRS review for a card.
+    ///
+    /// Wire, after the `u8` discriminant `3`: `card_id: u64`, `rating: u8`,
+    /// then `borsh(Option<i64>)` for `reviewed_at_ms`. The option tag is
+    /// always present. A payload that ends after `rating` does not decode.
+    /// The `i64` sits in the `STORE_WRITE` payload, so the existing
+    /// `payload_blake3` and segment signature already cover it.
     ReviewNode {
         /// Card id (the blake3-derived u64 handle of the node id).
         card_id: u64,
         /// Rating 1..=4 (clamped by the kernel fold if outside).
         rating: u8,
+        /// Unix epoch milliseconds of the review. `None` when the source
+        /// had no last-review time. Still encoded (option tag `0`).
+        reviewed_at_ms: Option<i64>,
     },
 }

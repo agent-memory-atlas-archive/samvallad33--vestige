@@ -17,7 +17,8 @@
 //! | `knowledge_nodes.superseded_by`  | `SUPERSESSION` frames                           |
 //! | `memory_connections` rows        | `EDGE` frames (declared 8-type vocabulary;      |
 //! |                                  | inferred types become `legacy_inferred`)        |
-//! | `fsrs_cards` rows                | `FSRS_REVIEW` frames (kernel `ReviewEvent`)     |
+//! | `fsrs_cards` rows                | `FSRS_REVIEW` frames (kernel `ReviewEvent`       |
+//! |                                  | plus `borsh(Option<i64>)` `reviewed_at_ms`)      |
 //! | `sync_tombstones` / `deletion_tombstones` | `TOMBSTONE` frames                     |
 //! | everything else with rows        | counted in `MigrationReport::skipped_tables`    |
 //! | final frame                      | signed `MIGRATION_RECEIPT` (kind 46)            |
@@ -43,6 +44,13 @@
 //! `ReviewEvent::event_seq` is the frame seq the event lands at (the kernel
 //! requires `event.seq() == record seq`), predicted from the log head before
 //! the batch append and asserted against the returned acks afterward.
+//!
+//! Every `FSRS_REVIEW` ends with `borsh(Option<i64>)` `reviewed_at_ms`.
+//! Intermediate synthetic reviews are `None`. The last one is the card's
+//! `fsrs_cards.last_review` (unix ms), or `None` when that column is NULL,
+//! empty, or missing. The kernel `ReviewEvent` prefix is unchanged, so
+//! checkpoint hashes stay valid. Retrievability uses this clock instead of
+//! the import-time frame seq.
 //!
 //! ## Determinism
 //!
@@ -641,13 +649,26 @@ fn migrate_snapshot_into(
             })?;
             let reps = row.integer_or("reps", 0)?.clamp(0, u32::MAX as i64);
             let lapses = row.integer_or("lapses", 0)?.clamp(0, reps);
-            for rating in fsrs_ratings_for(reps, lapses) {
+            let reviewed_at_ms = last_review_ms(&row)?;
+            let ratings = fsrs_ratings_for(reps, lapses);
+            let last = ratings.len().saturating_sub(1);
+            for (index, rating) in ratings.into_iter().enumerate() {
                 let event = ReviewEvent {
                     card_id: kernel_id,
                     rating,
                     event_seq: writer.next_seq(),
                 };
-                writer.push(records::KIND_FSRS_REVIEW, borsh::to_vec(&event))?;
+                let mut payload = borsh::to_vec(&event)
+                    .map_err(|e| MigrationError::Corrupt(format!("borsh encode review: {e}")))?;
+                // Only the card's latest review has a known wall clock.
+                // The option tag is always written.
+                let clock = if index == last { reviewed_at_ms } else { None };
+                payload.extend(
+                    borsh::to_vec(&clock).map_err(|e| {
+                        MigrationError::Corrupt(format!("borsh encode review: {e}"))
+                    })?,
+                );
+                writer.push(records::KIND_FSRS_REVIEW, Ok(payload))?;
                 fsrs_events += 1;
             }
         }
@@ -871,6 +892,20 @@ fn verify_migrated(log: &StrataLog, anchor: [u8; 32]) -> Result<bool, MigrationE
         eprintln!("strata-migrate: kernel verify failed: {error}");
     }
     Ok(tail_ok && replay_ok)
+}
+
+/// `fsrs_cards.last_review` as unix epoch ms.
+///
+/// NULL, `""`, or a table without the column is `None` (the option tag is
+/// still written). A non-empty value that is not RFC3339 is corrupt.
+fn last_review_ms(row: &source::Row<'_>) -> Result<Option<i64>, MigrationError> {
+    if !row.columns().iter().any(|column| column == "last_review") {
+        return Ok(None);
+    }
+    match row.opt_text("last_review")? {
+        Some(raw) if !raw.is_empty() => Ok(Some(source::timestamp_ms(raw)?)),
+        _ => Ok(None),
+    }
 }
 
 /// Deterministic rating series reproducing an fsrs_cards row exactly:

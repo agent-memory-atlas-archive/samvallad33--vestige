@@ -91,6 +91,14 @@ fn borsh_vec<T: BorshSerialize>(value: &T) -> Result<Vec<u8>, StoreError> {
     borsh::to_vec(value).map_err(|e| StoreError::Encode(e.to_string()))
 }
 
+/// Unix epoch milliseconds. Used only to stamp an explicit review.
+fn admission_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 /// Canonical projection of the derived state used by [`StrataStore::state_digest`].
 #[derive(BorshSerialize)]
 struct StateDigest<'a> {
@@ -100,6 +108,8 @@ struct StateDigest<'a> {
     fsrs_root: [u8; 32],
     checkpoints: Vec<[u8; 32]>,
     orphan_writes: u64,
+    /// card handle → latest explicit `reviewed_at_ms`.
+    reviewed_at: Vec<(u64, i64)>,
 }
 
 /// A payload is this type only when borsh consumes it exactly. Kind bytes
@@ -187,6 +197,9 @@ pub struct StrataStore {
     fsrs: State,
     /// Review events in fold order with their hashes (reused by verification).
     review_events: Vec<(u64, [u8; 32], ReviewEvent)>,
+    /// Latest explicit review clock per card. Rebuilt from `ReviewNode`
+    /// payloads. Empty when the latest review frame omitted the field.
+    reviewed_at: BTreeMap<u64, i64>,
     /// Sealed checkpoints in log order.
     checkpoints: Vec<Checkpoint>,
     /// Data frames that had no admitting effect in the log (ignored).
@@ -222,6 +235,7 @@ impl StrataStore {
             reverse: BTreeMap::new(),
             fsrs: State::default(),
             review_events: Vec::new(),
+            reviewed_at: BTreeMap::new(),
             checkpoints: Vec::new(),
             orphan_writes: 0,
         };
@@ -352,8 +366,22 @@ impl StrataStore {
                     record.superseded_by = Some(superseded_by.clone());
                 }
             }
-            StoreOp::ReviewNode { card_id, rating } => {
+            StoreOp::ReviewNode {
+                card_id,
+                rating,
+                reviewed_at_ms,
+            } => {
                 self.fold_review(*card_id, *rating, ALGO_V2, frame_seq)?;
+                // Latest explicit review wins. `None` drops any earlier clock
+                // so retrievability falls back to sequence distance.
+                match reviewed_at_ms {
+                    Some(ms) => {
+                        self.reviewed_at.insert(*card_id, *ms);
+                    }
+                    None => {
+                        self.reviewed_at.remove(card_id);
+                    }
+                }
             }
         }
         Ok(())
@@ -691,7 +719,21 @@ impl StrataStore {
     }
 
     /// Fold an explicit FSRS review for a node (rating 1..=4).
+    ///
+    /// `reviewed_at_ms` is the admission clock: unix epoch milliseconds.
     pub fn review(&mut self, id: &str, rating: u8) -> Result<(), StoreError> {
+        self.review_at(id, rating, Some(admission_now_ms()))
+    }
+
+    /// Same as [`Self::review`] with a caller-supplied clock.
+    ///
+    /// `None` is written as `borsh` option tag `0`, not an omitted field.
+    pub fn review_at(
+        &mut self,
+        id: &str,
+        rating: u8,
+        reviewed_at_ms: Option<i64>,
+    ) -> Result<(), StoreError> {
         self.require_node(id)?;
         if !(1..=4).contains(&rating) {
             return Err(StoreError::InvalidInput("rating must be 1..=4".into()));
@@ -701,6 +743,7 @@ impl StrataStore {
             StoreOp::ReviewNode {
                 card_id: handle_of(id),
                 rating,
+                reviewed_at_ms,
             },
             action_kind::WRITE,
             context,
@@ -708,20 +751,41 @@ impl StrataStore {
         Ok(())
     }
 
+    /// Review clock recorded on the latest explicit review of `id`.
+    pub fn reviewed_at_ms(&self, id: &str) -> Option<i64> {
+        self.reviewed_at.get(&handle_of(id)).copied()
+    }
+
     /// Current FSRS scheduling card for a node (derived state, cloned).
     pub fn card_state(&self, id: &str) -> Option<strata_kernel::fsrs::CardState> {
         self.fsrs.cards.get(&handle_of(id)).cloned()
     }
 
-    /// Retrievability of a node at the current log head — derived on read,
+    /// Retrievability of a node at the admission clock — derived on read,
     /// never stored, and reads append nothing (v1).
+    ///
+    /// An explicit review with `reviewed_at_ms` measures elapsed whole days
+    /// from that timestamp. `None` uses sequence distance from `last_seq`
+    /// to the log head.
     pub fn retrievability(&self, id: &str) -> Result<Option<f64>, StoreError> {
-        let Some(card) = self.fsrs.cards.get(&handle_of(id)) else {
+        self.retrievability_at(id, admission_now_ms())
+    }
+
+    /// [`Self::retrievability`] evaluated at `as_of_ms` instead of now.
+    pub fn retrievability_at(&self, id: &str, as_of_ms: i64) -> Result<Option<f64>, StoreError> {
+        let handle = handle_of(id);
+        let Some(card) = self.fsrs.cards.get(&handle) else {
             return Ok(None);
         };
-        FsrsFold::retrievability(card, self.log.head().last_acked_seq, ALGO_V2)
-            .map(Some)
-            .map_err(|e| StoreError::Verify(e.to_string()))
+        FsrsFold::retrievability_at_review(
+            card,
+            self.reviewed_at.get(&handle).copied(),
+            as_of_ms,
+            self.log.head().last_acked_seq,
+            ALGO_V2,
+        )
+        .map(Some)
+        .map_err(|e| StoreError::Verify(e.to_string()))
     }
 
     /// Does the stored node read like a failure? (`None` if the id is
@@ -894,7 +958,8 @@ impl StrataStore {
 
     /// blake3 digest over the canonical projection of every derived map
     /// (nodes, origins, edges, FSRS state root, checkpoint hashes, orphan
-    /// count). Two stores replaying the same log produce the same digest.
+    /// count, explicit review clocks). Two stores replaying the same log
+    /// produce the same digest.
     pub fn state_digest(&self) -> [u8; 32] {
         let digest = StateDigest {
             nodes: self.nodes.iter().map(|(k, v)| (k.as_str(), v)).collect(),
@@ -903,6 +968,7 @@ impl StrataStore {
             fsrs_root: strata_kernel::checkpoint::state_root(&self.fsrs),
             checkpoints: self.checkpoints.iter().map(checkpoint_hash).collect(),
             orphan_writes: self.orphan_writes,
+            reviewed_at: self.reviewed_at.iter().map(|(k, v)| (*k, *v)).collect(),
         };
         hash32(&borsh_vec(&digest).expect("state digest serialization is infallible"))
     }
