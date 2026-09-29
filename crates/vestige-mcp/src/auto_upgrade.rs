@@ -7,13 +7,18 @@
 //! staging onto `log/`. Any failure deletes staging and leaves the v3 file
 //! byte-identical.
 //!
-//! An `upgrade.lock` in the data directory serializes concurrent launches.
-//! The waiter blocks, then reuses the installed log.
+//! The winner creates `.strata-upgrade-staging` with `create_dir` and holds
+//! `File::try_lock` on a file inside it. The kernel drops that lock when the
+//! process dies, including SIGKILL. A later process that can take the lock
+//! wipes the staging directory and retries. A process that finds the lock
+//! held waits until the directory is renamed onto `log/` or a strata log is
+//! already there, then opens that result.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use strata_migrate::MigrateOptions;
 
@@ -22,8 +27,9 @@ use strata_migrate::MigrateOptions;
 pub const STAGING_DIR_NAME: &str = ".strata-upgrade-staging";
 /// Installed strata log. Same relative path `StrataStore` opens.
 pub const LOG_DIR_NAME: &str = "log";
-/// Exclusive lock held for the whole upgrade attempt.
-pub const LOCK_FILE_NAME: &str = "upgrade.lock";
+/// Lock file inside the staging directory. Held with `File::try_lock` for the
+/// whole attempt. Not a pid file: the kernel releases it when the holder dies.
+pub const LOCK_FILE_NAME: &str = ".upgrade.lock";
 /// Append-only upgrade record. The failure message names this path.
 pub const UPGRADE_LOG_NAME: &str = "upgrade.log";
 /// Last v3 release operators can keep running when 4.0 cannot upgrade.
@@ -78,58 +84,81 @@ pub fn upgrade_if_needed(db_path: &Path) -> Result<UpgradeStatus, UpgradeError> 
 /// Same as [`upgrade_if_needed`], with a post-import seam for tests.
 pub fn upgrade_with(
     db_path: &Path,
-    options: UpgradeOptions,
+    mut options: UpgradeOptions,
 ) -> Result<UpgradeStatus, UpgradeError> {
     let data_dir = data_dir_of(db_path);
     if !upgrade_relevant(&data_dir, db_path) {
         return Ok(UpgradeStatus::NoV3);
     }
 
-    let log_path = data_dir.join(UPGRADE_LOG_NAME);
-    let _lock = match acquire_upgrade_lock(&data_dir) {
-        Ok(lock) => lock,
-        Err(e) => {
-            return Err(UpgradeError {
-                log_path,
-                detail: format!("could not lock upgrade: {e}"),
-            });
-        }
-    };
-    upgrade_locked(db_path, options, &data_dir)
-}
-
-fn upgrade_relevant(data_dir: &Path, db_path: &Path) -> bool {
-    db_path.exists()
-        || data_dir.join(LOG_DIR_NAME).exists()
-        || data_dir.join(STAGING_DIR_NAME).exists()
-}
-
-fn upgrade_locked(
-    db_path: &Path,
-    options: UpgradeOptions,
-    data_dir: &Path,
-) -> Result<UpgradeStatus, UpgradeError> {
     let staging = data_dir.join(STAGING_DIR_NAME);
     let log_dir = data_dir.join(LOG_DIR_NAME);
     let log_path = data_dir.join(UPGRADE_LOG_NAME);
 
-    sweep_incomplete(data_dir, &staging);
+    loop {
+        if let Some(status) = installed_log(&log_dir, &log_path) {
+            return Ok(status);
+        }
+        match fs::create_dir(&staging) {
+            Ok(()) => {
+                let lock = match lock_new_staging(&staging) {
+                    Ok(lock) => lock,
+                    Err(e) => {
+                        let _ = remove_dir_if_exists(&staging);
+                        return Err(UpgradeError {
+                            log_path,
+                            detail: format!("could not lock staging: {e}"),
+                        });
+                    }
+                };
+                return upgrade_holding_lock(db_path, &mut options, &data_dir, lock);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                match wait_or_reclaim(&staging, &log_dir, &log_path)? {
+                    Wait::Ready(status) => return Ok(status),
+                    Wait::Retry => continue,
+                }
+            }
+            Err(e) => {
+                return Err(UpgradeError {
+                    log_path,
+                    detail: format!("could not create staging: {e}"),
+                });
+            }
+        }
+    }
+}
+
+enum Wait {
+    Ready(UpgradeStatus),
+    Retry,
+}
+
+/// `create_dir` won. `lock` is the exclusive `try_lock` on the file inside it.
+fn upgrade_holding_lock(
+    db_path: &Path,
+    options: &mut UpgradeOptions,
+    data_dir: &Path,
+    lock: File,
+) -> Result<UpgradeStatus, UpgradeError> {
+    let staging = data_dir.join(STAGING_DIR_NAME);
+    let log_dir = data_dir.join(LOG_DIR_NAME);
+    let log_path = data_dir.join(UPGRADE_LOG_NAME);
+    sweep_partial_backups(data_dir);
 
     if strata_log_ready(&log_dir) {
-        note(
-            &log_path,
-            &format!(
-                "vestige: strata log already present at {}; skipping v3 upgrade",
-                log_dir.display()
-            ),
+        drop(lock);
+        let _ = remove_dir_if_exists(&staging);
+        return Ok(
+            installed_log(&log_dir, &log_path).unwrap_or(UpgradeStatus::StrataReady { log_dir })
         );
-        return Ok(UpgradeStatus::StrataReady { log_dir });
     }
 
     let detected = match vestige_core::detect_v3(db_path) {
         Ok(v) => v,
         Err(e) => {
-            return Err(fail(
+            return Err(fail_holding(
+                lock,
                 &log_path,
                 &staging,
                 format!("v3 detection failed: {e}"),
@@ -137,6 +166,8 @@ fn upgrade_locked(
         }
     };
     let Some(v3) = detected else {
+        drop(lock);
+        let _ = remove_dir_if_exists(&staging);
         return Ok(UpgradeStatus::NoV3);
     };
 
@@ -150,13 +181,18 @@ fn upgrade_locked(
     );
 
     if let Err(detail) = ensure_space(data_dir, db_path) {
-        return Err(fail(&log_path, &staging, detail));
+        return Err(fail_holding(lock, &log_path, &staging, detail));
     }
 
     let backup = match backup_sqlite_family(db_path) {
         Ok(path) => path,
         Err(e) => {
-            return Err(fail(&log_path, &staging, format!("backup failed: {e}")));
+            return Err(fail_holding(
+                lock,
+                &log_path,
+                &staging,
+                format!("backup failed: {e}"),
+            ));
         }
     };
     note(
@@ -182,14 +218,24 @@ fn upgrade_locked(
     let report = match strata_migrate::migrate_with_options(db_path, &staging, migrate_options) {
         Ok(report) => report,
         Err(e) => {
-            return Err(fail(&log_path, &staging, format!("import failed: {e}")));
+            return Err(fail_holding(
+                lock,
+                &log_path,
+                &staging,
+                format!("import failed: {e}"),
+            ));
         }
     };
 
-    if let Some(hook) = options.after_import
+    if let Some(hook) = options.after_import.take()
         && let Err(e) = hook(&staging)
     {
-        return Err(fail(&log_path, &staging, format!("import failed: {e}")));
+        return Err(fail_holding(
+            lock,
+            &log_path,
+            &staging,
+            format!("import failed: {e}"),
+        ));
     }
 
     note(&log_path, "vestige: verifying strata log");
@@ -206,16 +252,21 @@ fn upgrade_locked(
         Err(e) => problems.push(format!("strata-verify failed: {e}")),
     }
     if !problems.is_empty() {
-        return Err(fail(&log_path, &staging, problems.join("; ")));
+        return Err(fail_holding(lock, &log_path, &staging, problems.join("; ")));
     }
 
+    // Hold the lock across the rename so a waiter cannot treat the directory
+    // as abandoned and delete it. The lock file moves with the directory.
     if let Err(e) = fs::rename(&staging, &log_dir) {
-        return Err(fail(
+        return Err(fail_holding(
+            lock,
             &log_path,
             &staging,
             format!("could not swap staging into place: {e}"),
         ));
     }
+    let _ = fs::remove_file(log_dir.join(LOCK_FILE_NAME));
+    drop(lock);
     if let Err(e) = fsync_dir(data_dir) {
         note(
             &log_path,
@@ -229,53 +280,146 @@ fn upgrade_locked(
     Ok(UpgradeStatus::StrataReady { log_dir })
 }
 
-struct UpgradeLock {
-    _file: File,
+fn installed_log(log_dir: &Path, log_path: &Path) -> Option<UpgradeStatus> {
+    if !strata_log_ready(log_dir) {
+        return None;
+    }
+    note(
+        log_path,
+        &format!(
+            "vestige: strata log already present at {}; skipping v3 upgrade",
+            log_dir.display()
+        ),
+    );
+    Some(UpgradeStatus::StrataReady {
+        log_dir: log_dir.to_path_buf(),
+    })
 }
 
-fn acquire_upgrade_lock(data_dir: &Path) -> io::Result<UpgradeLock> {
-    let path = data_dir.join(LOCK_FILE_NAME);
+fn lock_new_staging(staging: &Path) -> io::Result<File> {
+    let path = staging.join(LOCK_FILE_NAME);
     let file = OpenOptions::new()
-        .create(true)
         .read(true)
         .write(true)
-        .truncate(false)
+        .create_new(true)
         .open(&path)?;
-    lock_exclusive(&file, &path)?;
-    Ok(UpgradeLock { _file: file })
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "staging lock already held",
+        )),
+        Err(TryLockError::Error(err)) => Err(err),
+    }
 }
 
-#[cfg(unix)]
-fn lock_exclusive(file: &File, path: &Path) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let fd = file.as_raw_fd();
-    // Safety: `fd` is open for the lifetime of this call. `LOCK_NB` either
-    // takes the lock or fails without blocking.
-    let nonblock = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if nonblock == 0 {
-        return Ok(());
+enum Held {
+    Acquired(File),
+    Busy,
+    Missing,
+}
+
+fn hold_or_err(staging: &Path, log_path: &Path) -> Result<Held, UpgradeError> {
+    try_hold(staging).map_err(|err| UpgradeError {
+        log_path: log_path.to_path_buf(),
+        detail: format!("could not lock staging: {err}"),
+    })
+}
+
+fn try_hold(staging: &Path) -> io::Result<Held> {
+    let path = staging.join(LOCK_FILE_NAME);
+    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Held::Missing),
+        Err(e) => return Err(e),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(Held::Acquired(file)),
+        Err(TryLockError::WouldBlock) => Ok(Held::Busy),
+        Err(TryLockError::Error(err)) => Err(err),
     }
-    let err = io::Error::last_os_error();
-    let waiting = err.kind() == io::ErrorKind::WouldBlock
-        || err.raw_os_error() == Some(libc::EWOULDBLOCK)
-        || err.raw_os_error() == Some(libc::EAGAIN);
-    if !waiting {
-        return Err(err);
+}
+
+/// How long a loser looks for the lock file after `create_dir` and before
+/// `try_lock`. This covers that gap only. A held lock is not abandoned on a timer.
+const LOCK_FILE_APPEAR: Duration = Duration::from_millis(200);
+
+fn wait_or_reclaim(staging: &Path, log_dir: &Path, log_path: &Path) -> Result<Wait, UpgradeError> {
+    match hold_or_err(staging, log_path)? {
+        Held::Acquired(lock) => {
+            let _ = remove_dir_if_exists(staging);
+            drop(lock);
+            return Ok(Wait::Retry);
+        }
+        Held::Missing if !lock_file_appears(staging, log_dir) => {
+            return reclaim_if_abandoned(staging, log_dir, log_path);
+        }
+        Held::Missing | Held::Busy => {}
     }
-    eprintln!("vestige: waiting for upgrade lock at {}", path.display());
+    eprintln!(
+        "vestige: waiting for the in-progress strata upgrade in {}",
+        staging.display()
+    );
     let _ = io::stderr().flush();
-    // Safety: same open fd. This blocks until the holder closes it.
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    loop {
+        if let Some(status) = installed_log(log_dir, log_path) {
+            return Ok(Wait::Ready(status));
+        }
+        if !staging.exists() {
+            return Ok(Wait::Retry);
+        }
+        match hold_or_err(staging, log_path)? {
+            Held::Acquired(lock) => {
+                let _ = remove_dir_if_exists(staging);
+                drop(lock);
+                return Ok(Wait::Retry);
+            }
+            Held::Busy => thread::sleep(Duration::from_millis(20)),
+            Held::Missing => {
+                if !lock_file_appears(staging, log_dir) {
+                    return reclaim_if_abandoned(staging, log_dir, log_path);
+                }
+            }
+        }
     }
 }
 
-#[cfg(not(unix))]
-fn lock_exclusive(_file: &File, _path: &Path) -> io::Result<()> {
-    Ok(())
+fn lock_file_appears(staging: &Path, log_dir: &Path) -> bool {
+    let path = staging.join(LOCK_FILE_NAME);
+    let started = std::time::Instant::now();
+    while started.elapsed() < LOCK_FILE_APPEAR {
+        if path.exists() {
+            return true;
+        }
+        if !staging.exists() || strata_log_ready(log_dir) {
+            return path.exists();
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    path.exists()
+}
+
+fn reclaim_if_abandoned(
+    staging: &Path,
+    log_dir: &Path,
+    log_path: &Path,
+) -> Result<Wait, UpgradeError> {
+    if let Some(status) = installed_log(log_dir, log_path) {
+        return Ok(Wait::Ready(status));
+    }
+    if !staging.exists() {
+        return Ok(Wait::Retry);
+    }
+    // The directory exists and nobody holds the lock file. The creator died
+    // between `create_dir` and `try_lock`, or the file never appeared.
+    let _ = remove_dir_if_exists(staging);
+    Ok(Wait::Retry)
+}
+
+fn upgrade_relevant(data_dir: &Path, db_path: &Path) -> bool {
+    db_path.exists()
+        || data_dir.join(LOG_DIR_NAME).exists()
+        || data_dir.join(STAGING_DIR_NAME).exists()
 }
 
 fn data_dir_of(db_path: &Path) -> PathBuf {
@@ -295,8 +439,7 @@ pub fn strata_log_ready(log_dir: &Path) -> bool {
     })
 }
 
-fn sweep_incomplete(data_dir: &Path, staging: &Path) {
-    let _ = remove_dir_if_exists(staging);
+fn sweep_partial_backups(data_dir: &Path) {
     let Ok(entries) = fs::read_dir(data_dir) else {
         return;
     };
@@ -439,6 +582,17 @@ fn append_log(log_path: &Path, line: &str) {
         file.sync_all()?;
         Ok(())
     })();
+}
+
+fn fail_holding(
+    lock: File,
+    log_path: &Path,
+    staging: &Path,
+    detail: impl Into<String>,
+) -> UpgradeError {
+    let err = fail(log_path, staging, detail);
+    drop(lock);
+    err
 }
 
 fn fail(log_path: &Path, staging: &Path, detail: impl Into<String>) -> UpgradeError {

@@ -436,6 +436,34 @@ fn main() {
     );
 }
 
+/// Exclusive lock held for the life of `serve`. The kernel releases it when
+/// the process dies. Not a pid file and not a timeout.
+fn hold_serve_lock(data_dir: &Path) -> fs::File {
+    let path = data_dir.join(".serve.lock");
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            error!("Failed to create the serve lock {}: {}", path.display(), e);
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = file.lock() {
+        error!(
+            "Failed to lock {} (another vestige-mcp holds it): {}",
+            path.display(),
+            e
+        );
+        std::process::exit(1);
+    }
+    file
+}
+
 async fn serve() {
     // Parse CLI arguments first (before logging init, so --help/--version work cleanly)
     let config = parse_args();
@@ -503,6 +531,12 @@ async fn serve() {
         exit_if_v3(&db_path);
     }
 
+    // Two servers must not open the same log. `File::lock` dies with this
+    // process, including SIGKILL. `log/strata.lock` is a pid file: while this
+    // process is alive it also stops a reader (`dump-migration` opens that
+    // same directory with `StrataLog::open`). Take the flock first, then drop
+    // the pid file so the reader can reopen the log this process is serving.
+    let _serve_lock = hold_serve_lock(&strata_dir);
     let storage = match vestige_mcp::strata_memory::open(&strata_dir) {
         Ok(s) => {
             info!("Strata log initialized at {}", strata_dir.display());
@@ -513,6 +547,11 @@ async fn serve() {
             std::process::exit(1);
         }
     };
+    let _ = fs::remove_file(
+        strata_dir
+            .join(vestige_mcp::auto_upgrade::LOG_DIR_NAME)
+            .join("strata.lock"),
+    );
 
     // Preserve the released Nomic default in the background so MCP clients can
     // finish their stdio handshake before a first-run model download. Optional

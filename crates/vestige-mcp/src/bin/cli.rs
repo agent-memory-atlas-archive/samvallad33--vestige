@@ -2503,14 +2503,16 @@ fn run_strata_stats(
     show_tagging: bool,
     show_states: bool,
 ) -> anyhow::Result<()> {
-    let log = open_switched_log(log_dir)?;
-    let snapshot = strata_migrate::read_snapshot(&log)
+    let verified = strata_verify::migration::verify_migrated_log(log_dir)
         .map_err(|err| anyhow::anyhow!("strata log at {}: {err}", log_dir.display()))?;
-    let memories = snapshot
-        .nodes
-        .iter()
-        .filter(|node| node.node_type != "walk_receipt")
-        .count();
+    if !verified.ok {
+        anyhow::bail!(
+            "strata log at {} failed verification: {}",
+            log_dir.display(),
+            verified.failures.join("; ")
+        );
+    }
+    let memories = migrated_memory_count(log_dir)?;
 
     println!("{}", "=== Vestige Memory Statistics ===".cyan().bold());
     println!();
@@ -2525,36 +2527,44 @@ fn run_strata_stats(
     Ok(())
 }
 
-/// `StrataLog::open` takes an exclusive directory lock. A second process that
-/// reused a finished upgrade waits out that read instead of failing it.
-fn open_switched_log(log_dir: &std::path::Path) -> anyhow::Result<strata::StrataLog> {
-    let started = std::time::Instant::now();
-    let mut announced = false;
-    loop {
-        match strata::StrataLog::open(log_dir) {
-            Ok(log) => return Ok(log),
-            Err(strata::StrataError::Locked { pid }) => {
-                if started.elapsed() > std::time::Duration::from_secs(30) {
-                    anyhow::bail!(
-                        "strata log at {} stayed locked by pid {pid}",
-                        log_dir.display()
-                    );
-                }
-                if !announced {
-                    eprintln!(
-                        "vestige: waiting for strata log lock at {} (pid {pid})",
-                        log_dir.display()
-                    );
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
-                    announced = true;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(err) => {
-                anyhow::bail!("strata log at {}: {err}", log_dir.display());
-            }
+/// Count migrated memories without `StrataLog::open`. That open creates
+/// `strata.lock` with this process's pid and would exclude the server (and
+/// the release-matrix dump) from the same log. `stats` only reads segments.
+fn migrated_memory_count(log_dir: &Path) -> anyhow::Result<usize> {
+    let mut segments = Vec::new();
+    for entry in fs::read_dir(log_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".seg") {
+            segments.push(entry.path());
         }
     }
+    segments.sort();
+    if segments.is_empty() {
+        anyhow::bail!("no segment files in {}", log_dir.display());
+    }
+    let mut memories = 0usize;
+    for path in segments {
+        let bytes = fs::read(&path)?;
+        let mut off = strata::HEADER_WIRE_SIZE;
+        while off < bytes.len() {
+            let Ok((frame, consumed)) = strata::parse_frame(&bytes[off..]) else {
+                break;
+            };
+            if consumed == 0 {
+                break;
+            }
+            if frame.kind == strata_migrate::records::KIND_NODE
+                && let Ok(node) = strata_migrate::records::decode_node(&frame.payload)
+                && node.node_type != "walk_receipt"
+            {
+                memories += 1;
+            }
+            off += consumed;
+        }
+    }
+    Ok(memories)
 }
 
 fn open_storage() -> anyhow::Result<std::sync::Arc<Storage>> {
