@@ -2891,6 +2891,7 @@ fn test_composition_save_query_outcome_and_never_composed() {
     );
 }
 
+#[test]
 fn test_composition_neighbors_count_distinct_events_not_member_roles() {
     let storage = create_test_storage();
     let first = storage
@@ -3171,52 +3172,6 @@ fn test_never_composed_marks_mixed_prior_outcomes() {
     assert!(out[0].reason.contains("typed-edge hop"), "{}", out[0].reason);
 }
 
-fn test_never_composed_surfaces_weak_tie_shared_terms_without_shared_tags() {
-    let storage = create_test_storage();
-    let incident = storage
-        .ingest(IngestInput {
-            content: "OpenCode handshake stalls when embedding startup blocks stdio negotiation."
-                .to_string(),
-            node_type: "incident".to_string(),
-            tags: vec!["opencode".to_string(), "startup".to_string()],
-            ..Default::default()
-        })
-        .unwrap();
-    let mitigation = storage
-        .ingest(IngestInput {
-            content: "JetBrains startup should keep embedding backfill behind the handshake."
-                .to_string(),
-            node_type: "mitigation".to_string(),
-            tags: vec!["jetbrains".to_string(), "background-work".to_string()],
-            ..Default::default()
-        })
-        .unwrap();
-
-    let candidates = storage.get_never_composed_candidates(10, None).unwrap();
-    let candidate = candidates
-        .iter()
-        .find(|candidate| {
-            let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
-            pair == Storage::pair_key(&incident.id, &mitigation.id)
-        })
-        .expect("shared terms should surface a weak-tie candidate without shared tags");
-
-    assert!(
-        candidate.shared_tags.is_empty(),
-        "test fixture intentionally has no shared tags"
-    );
-    assert!(
-        candidate
-            .shared_terms
-            .iter()
-            .any(|term| term == "embedding" || term == "startup" || term == "handshake"),
-        "shared terms should explain the candidate"
-    );
-    assert!(
-        candidate.bridge_score > 0.5,
-        "different tags and node types should create a bridge signal"
-    );
-}
 
 #[test]
 fn test_dream_history_save_and_get_last() {

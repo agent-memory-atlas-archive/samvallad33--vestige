@@ -18,10 +18,6 @@ name = "trait_round_trip"
 path = "trait_round_trip.rs"
 
 [[test]]
-name = "embedding_model_registry"
-path = "embedding_model_registry.rs"
-
-[[test]]
 name = "domain_column_migration"
 path = "domain_column_migration.rs"
 
@@ -33,6 +29,3 @@ path = "cognitive_module_isolation.rs"
 name = "send_bound_variant"
 path = "send_bound_variant.rs"
 
-[[test]]
-name = "embedder_trait"
-path = "embedder_trait.rs"

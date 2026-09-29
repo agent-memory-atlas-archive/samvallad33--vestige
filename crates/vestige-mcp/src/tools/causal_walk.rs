@@ -252,6 +252,9 @@ mod tests {
             extra_files: 0,
             symbols: vec![],
             mentions: vec![],
+                hunks: vec![],
+                extra_hunks: 0,
+                imports: vec![],
         });
         seed(storage, &content, vec![git_records::COMMIT_TAG], days_ago)
     }
