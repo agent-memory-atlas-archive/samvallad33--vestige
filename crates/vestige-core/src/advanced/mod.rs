@@ -74,7 +74,7 @@ pub use merge_supersede::{
 pub use prediction_error::{
     CandidateMemory, CreateReason, EvaluationIntent, GateDecision, GateStats, MergeStrategy,
     PredictionErrorConfig, PredictionErrorGate, SimilarityResult, SupersedeReason, UpdateType,
-    cosine_similarity,
+    content_similarity,
 };
 pub use reconsolidation::{
     AccessContext, AccessTrigger, AppliedModification, ChangeSummary, LabileCandidate, LabileState,

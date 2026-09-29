@@ -121,69 +121,74 @@ impl SqliteMemoryStore {
         Ok(())
     }
 
-    /// Surface likely duplicate/overlapping memory clusters with confidence
+    /// Surface duplicate/overlapping memory clusters with confidence
     /// scores and the signals behind each (Fellegi-Sunter classified).
     ///
-    /// Only clusters whose weakest pair scores at or above the policy's
-    /// `possible_threshold` are returned. Protected members are flagged so the
-    /// caller never auto-merges a pin.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    /// NOMINATION IS EXACT EQUALITY ONLY (owner decision 2026-09-28: no
+    /// similarity anywhere in dedup/merge nomination). The former O(n²)
+    /// embedding-cosine candidate scan is deleted. A pair of memories is
+    /// nominated when any of these exact equalities holds:
+    ///
+    /// 1. **identical content hash** — the stored envelope `content_hash`
+    ///    (SQL group-by on `COALESCE(content_hash, content)`; nodes without a
+    ///    recorded hash use their byte-identical content as the identity);
+    /// 2. **the same declared source key** `(source_system, source_id)` (SQL
+    ///    group-by): the same upstream record ingested twice. Current schemas
+    ///    enforce a UNIQUE index on the key, so this nominator mainly
+    ///    catches stores written before that constraint existed;
+    /// 3. **exactly equal non-empty entity sets** —
+    ///    `advanced::retroactive_backfill::extract_entities`, compared as sets
+    ///    in memory.
+    ///
+    /// Tag/token overlap (`advanced::score_pair`) NEVER nominates; it only
+    /// orders the nominated clusters and labels them for review. A cluster
+    /// nominated by a shared source key but with diverged contents is
+    /// intentionally still surfaced (labelled `Possible`/`NonMatch`) instead
+    /// of dropped — a repeated declared source is review-worthy on its own,
+    /// and the label tells the reviewer how weak the lexical evidence is.
+    ///
+    /// Protected members are flagged so the caller never auto-merges a pin.
     pub fn merge_candidates(
         &self,
         policy: crate::advanced::MergePolicy,
         limit: usize,
         tag_filter: &[String],
     ) -> Result<Vec<crate::advanced::MergeCandidate>> {
-        use crate::advanced::{MatchClass, MergeCandidate, score_pair};
+        use crate::advanced::{MergeCandidate, score_pair};
+        use std::collections::{BTreeSet, HashMap, HashSet};
 
-        let all_embeddings = self.get_all_embeddings()?;
-        if all_embeddings.is_empty() {
-            return Ok(vec![]);
-        }
+        let superseded: HashSet<String> = self.superseded_node_ids()?;
+        let protected: HashSet<String> = self.protected_node_ids()?;
 
         // Load nodes for metadata. Exclude already-superseded nodes — they are
-        // historical and must not be re-offered for merge.
-        let mut node_map: std::collections::HashMap<String, KnowledgeNode> =
-            std::collections::HashMap::new();
-        let superseded: std::collections::HashSet<String> = self.superseded_node_ids()?;
-        let protected: std::collections::HashSet<String> = self.protected_node_ids()?;
-
+        // historical and must not be re-offered for merge — and apply the
+        // caller's tag filter.
+        let mut nodes: Vec<KnowledgeNode> = Vec::new();
         let mut offset = 0;
         loop {
             let batch = self.get_all_nodes(500, offset)?;
             let n = batch.len();
-            for node in batch {
-                node_map.insert(node.id.clone(), node);
-            }
+            nodes.extend(batch);
             if n < 500 {
                 break;
             }
             offset += 500;
         }
-
-        // Candidate embeddings, filtered by tag and excluding superseded.
-        let items: Vec<(String, Vec<f32>)> = all_embeddings
+        let nodes: Vec<KnowledgeNode> = nodes
             .into_iter()
-            .filter(|(id, _)| !superseded.contains(id))
-            .filter(|(id, _)| {
-                if tag_filter.is_empty() {
-                    return true;
-                }
-                node_map
-                    .get(id)
-                    .map(|n| tag_filter.iter().any(|t| n.tags.contains(t)))
-                    .unwrap_or(false)
-            })
+            .filter(|node| !superseded.contains(&node.id))
+            .filter(|node| tag_filter.is_empty() || tag_filter.iter().any(|t| node.tags.contains(t)))
+            .collect();
+        if nodes.len() < 2 {
+            return Ok(vec![]);
+        }
+        let index_of: HashMap<&str, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id.as_str(), i))
             .collect();
 
-        let n = items.len();
-        if n > 2000 {
-            return Err(StorageError::Init(format!(
-                "Too many memories to scan ({n} with embeddings). Filter by tags to reduce scope."
-            )));
-        }
-
-        // Union-find clustering over pairs above the possible threshold.
+        let n = nodes.len();
         let mut parent: Vec<usize> = (0..n).collect();
         fn find(parent: &mut [usize], x: usize) -> usize {
             let mut root = x;
@@ -198,38 +203,102 @@ impl SqliteMemoryStore {
             }
             root
         }
+        let union = |parent: &mut Vec<usize>, a: usize, b: usize| {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent[ra] = rb;
+            }
+        };
 
-        // Best pair score per resulting cluster member, for the explanation.
-        let mut pair_score: std::collections::HashMap<
-            (usize, usize),
-            crate::advanced::MatchSignals,
-        > = std::collections::HashMap::new();
+        // Nominator 1 (SQL group-by): identical content identity — the stored
+        // envelope hash when present, else the exact content itself.
+        {
+            let reader = self
+                .reader
+                .lock()
+                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+            let mut stmt = reader.prepare(
+                "SELECT COALESCE(content_hash, content) AS identity_key, id
+                 FROM knowledge_nodes
+                 WHERE superseded_by IS NULL AND COALESCE(content_hash, content) IS NOT NULL
+                 ORDER BY identity_key",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+            for row in rows {
+                let (key, id) = row?;
+                if let Some(&idx) = index_of.get(id.as_str()) {
+                    groups.entry(key).or_default().push(idx);
+                }
+            }
+            for members in groups.into_values() {
+                for pair in members.windows(2) {
+                    union(&mut parent, pair[0], pair[1]);
+                }
+            }
+        }
 
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let sim = crate::cosine_similarity(&items[i].1, &items[j].1);
-                let (a_node, b_node) = (node_map.get(&items[i].0), node_map.get(&items[j].0));
-                let signals = score_pair(
-                    sim,
-                    a_node.map(|n| n.tags.as_slice()).unwrap_or(&[]),
-                    b_node.map(|n| n.tags.as_slice()).unwrap_or(&[]),
-                    a_node.map(|n| n.content.as_str()).unwrap_or(""),
-                    b_node.map(|n| n.content.as_str()).unwrap_or(""),
-                );
-                if signals.combined_score >= policy.possible_threshold {
-                    let ri = find(&mut parent, i);
-                    let rj = find(&mut parent, j);
-                    if ri != rj {
-                        parent[ri] = rj;
-                    }
-                    pair_score.insert((i, j), signals);
+        // Nominator 2 (SQL group-by): the same declared source key, at the
+        // same granularity the store's own UNIQUE index uses
+        // (system, project, id) so two projects' "issue 42" stay separate.
+        {
+            let reader = self
+                .reader
+                .lock()
+                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+            let mut stmt = reader.prepare(
+                "SELECT source_system || ':' || COALESCE(source_project, '') || ':' || source_id AS source_key, id
+                 FROM knowledge_nodes
+                 WHERE superseded_by IS NULL
+                   AND source_system IS NOT NULL AND source_id IS NOT NULL
+                 ORDER BY source_key",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+            for row in rows {
+                let (key, id) = row?;
+                if let Some(&idx) = index_of.get(id.as_str()) {
+                    groups.entry(key).or_default().push(idx);
+                }
+            }
+            for members in groups.into_values() {
+                for pair in members.windows(2) {
+                    union(&mut parent, pair[0], pair[1]);
+                }
+            }
+        }
+
+        // Nominator 3 (in-memory set compare): exactly equal, non-empty
+        // extracted-entity sets.
+        {
+            let mut groups: HashMap<BTreeSet<String>, Vec<usize>> = HashMap::new();
+            for (i, node) in nodes.iter().enumerate() {
+                let entities: BTreeSet<String> =
+                    crate::advanced::retroactive_backfill::extract_entities(
+                        &node.content,
+                        &node.tags,
+                    )
+                    .into_iter()
+                    .collect();
+                if entities.is_empty() {
+                    continue;
+                }
+                groups.entry(entities).or_default().push(i);
+            }
+            for members in groups.into_values() {
+                for pair in members.windows(2) {
+                    union(&mut parent, pair[0], pair[1]);
                 }
             }
         }
 
         // Group indices by root.
-        let mut clusters: std::collections::HashMap<usize, Vec<usize>> =
-            std::collections::HashMap::new();
+        let mut clusters: HashMap<usize, Vec<usize>> = HashMap::new();
         for i in 0..n {
             let r = find(&mut parent, i);
             clusters.entry(r).or_default().push(i);
@@ -240,23 +309,23 @@ impl SqliteMemoryStore {
             if members.len() < 2 {
                 continue;
             }
-            // Cluster confidence = weakest recorded pair (the loosest link).
+            // Cluster confidence = weakest pairwise lexical score (the loosest
+            // link); the best-scoring pair's signals are the explanation.
             let mut min_score = 1.0f32;
             let mut best_signals: Option<crate::advanced::MatchSignals> = None;
             for a in 0..members.len() {
                 for b in (a + 1)..members.len() {
-                    let key = (members[a].min(members[b]), members[a].max(members[b]));
-                    if let Some(sig) = pair_score.get(&key) {
-                        if sig.combined_score < min_score {
-                            min_score = sig.combined_score;
-                        }
-                        if best_signals
-                            .as_ref()
-                            .map(|s| sig.combined_score > s.combined_score)
-                            .unwrap_or(true)
-                        {
-                            best_signals = Some(sig.clone());
-                        }
+                    let (na, nb) = (&nodes[members[a]], &nodes[members[b]]);
+                    let sig = score_pair(&na.tags, &nb.tags, &na.content, &nb.content);
+                    if sig.combined_score < min_score {
+                        min_score = sig.combined_score;
+                    }
+                    if best_signals
+                        .as_ref()
+                        .map(|s| sig.combined_score > s.combined_score)
+                        .unwrap_or(true)
+                    {
+                        best_signals = Some(sig);
                     }
                 }
             }
@@ -266,29 +335,25 @@ impl SqliteMemoryStore {
             };
 
             // Survivor = highest retention member.
-            let mut member_ids: Vec<String> =
-                members.iter().map(|&idx| items[idx].0.clone()).collect();
-            member_ids.sort_by(|a, b| {
-                let ra = node_map.get(a).map(|n| n.retention_strength).unwrap_or(0.0);
-                let rb = node_map.get(b).map(|n| n.retention_strength).unwrap_or(0.0);
+            let mut ranked: Vec<usize> = members.clone();
+            ranked.sort_by(|a, b| {
+                let ra = nodes[*a].retention_strength;
+                let rb = nodes[*b].retention_strength;
                 rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
             });
+            let member_ids: Vec<String> = ranked.iter().map(|&idx| nodes[idx].id.clone()).collect();
             let survivor_id = member_ids[0].clone();
             let has_protected_member = member_ids.iter().any(|id| protected.contains(id));
-            let previews: Vec<String> = member_ids
+            let previews: Vec<String> = ranked
                 .iter()
-                .map(|id| {
-                    node_map
-                        .get(id)
-                        .map(|n| preview(&n.content, 120))
-                        .unwrap_or_default()
-                })
+                .map(|&idx| preview(&nodes[idx].content, 120))
                 .collect();
 
-            let classification = match policy.classify(min_score) {
-                MatchClass::NonMatch => continue,
-                c => c,
-            };
+            // Advisory label only. Nomination came from exact equality above,
+            // so a low lexical score surfaces the cluster for review rather
+            // than dropping it (the old cosine scan dropped NonMatch pairs
+            // because its nominations were probabilistic; these are not).
+            let classification = policy.classify(min_score);
 
             out.push(MergeCandidate {
                 member_ids,
@@ -454,20 +519,18 @@ impl SqliteMemoryStore {
             .map(|n| n.id.clone())
             .collect();
 
-        // Confidence = weakest pair survivor↔absorbed.
+        // Confidence = weakest pair survivor↔absorbed (lexical tie-breaker
+        // score; nomination is exact equality in merge_candidates).
         let survivor_node = nodes.iter().find(|n| n.id == survivor).unwrap();
         let mut min_score = 1.0f32;
         let mut best_signals = score_pair(
-            1.0,
             &survivor_node.tags,
             &survivor_node.tags,
             &survivor_node.content,
             &survivor_node.content,
         );
         for node in nodes.iter().filter(|n| n.id != survivor) {
-            let sim = self.pair_similarity(&survivor, &node.id)?;
             let sig = score_pair(
-                sim,
                 &survivor_node.tags,
                 &node.tags,
                 &survivor_node.content,
@@ -541,8 +604,7 @@ impl SqliteMemoryStore {
             )));
         }
 
-        let sim = self.pair_similarity(old_id, new_id)?;
-        let signals = score_pair(sim, &old.tags, &new.tags, &old.content, &new.content);
+        let signals = score_pair(&old.tags, &new.tags, &old.content, &new.content);
         let classification = policy.classify(signals.combined_score);
 
         let plan = crate::advanced::MergePlan {
@@ -582,7 +644,7 @@ impl SqliteMemoryStore {
     ///
     /// Classification is always `Possible`: a conflict with a live memory is
     /// a review case by construction, never an auto-apply, regardless of
-    /// embedding score. See [`super::reconsolidation`] for the neuroscience.
+    /// match score. See [`super::reconsolidation`] for the neuroscience.
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     pub fn plan_reconsolidation(
         &self,
@@ -624,9 +686,7 @@ impl SqliteMemoryStore {
             )));
         }
 
-        let sim = self.pair_similarity(target_id, incoming_id)?;
         let signals = score_pair(
-            sim,
             &target.tags,
             &incoming.tags,
             &target.content,
@@ -663,17 +723,6 @@ impl SqliteMemoryStore {
 
         self.persist_plan(&plan)?;
         Ok(plan)
-    }
-
-    /// Cosine similarity between two nodes' stored embeddings (0 if missing).
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-    pub(super) fn pair_similarity(&self, a: &str, b: &str) -> Result<f32> {
-        let ea = self.get_node_embedding(a)?;
-        let eb = self.get_node_embedding(b)?;
-        match (ea, eb) {
-            (Some(ea), Some(eb)) => Ok(crate::cosine_similarity(&ea, &eb)),
-            _ => Ok(0.0),
-        }
     }
 
     /// Persist a plan row (status pending). Idempotent on plan id.
@@ -1633,5 +1682,193 @@ impl SqliteMemoryStore {
             params![now.to_rfc3339(), superseded_by, id],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod exact_nomination_tests {
+    //! merge_candidates nominates by EXACT EQUALITY ONLY (owner decision
+    //! 2026-09-28): identical content hash / same declared source key /
+    //! exactly equal entity sets. Near-identical content must NOT nominate.
+
+    use crate::{IngestInput, Storage};
+
+    fn store() -> (tempfile::TempDir, Storage) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
+        (dir, storage)
+    }
+
+    fn ingest(storage: &Storage, content: &str, tags: &[&str]) -> String {
+        storage
+            .ingest(IngestInput {
+                content: content.to_string(),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                ..Default::default()
+            })
+            .unwrap()
+            .id
+    }
+
+    fn ingest_with_envelope(
+        storage: &Storage,
+        content: &str,
+        envelope: crate::memory::SourceEnvelope,
+    ) -> String {
+        storage
+            .ingest(IngestInput {
+                content: content.to_string(),
+                source_envelope: Some(envelope),
+                ..Default::default()
+            })
+            .unwrap()
+            .id
+    }
+
+    fn envelope(
+        source_system: Option<&str>,
+        source_id: Option<&str>,
+        content_hash: Option<&str>,
+    ) -> crate::memory::SourceEnvelope {
+        crate::memory::SourceEnvelope {
+            source_system: source_system.map(String::from),
+            source_id: source_id.map(String::from),
+            content_hash: content_hash.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    fn candidate_members(
+        storage: &Storage,
+    ) -> Vec<Vec<String>> {
+        storage
+            .merge_candidates(crate::advanced::MergePolicy::default(), 20, &[])
+            .unwrap()
+            .into_iter()
+            .map(|c| c.member_ids)
+            .collect()
+    }
+
+    #[test]
+    fn identical_content_nominate() {
+        let (_dir, storage) = store();
+        let a = ingest(&storage, "Deploy the gateway before Friday", &[]);
+        let b = ingest(&storage, "Deploy the gateway before Friday", &[]);
+        let _c = ingest(&storage, "An unrelated memory about cooking", &[]);
+
+        let clusters = candidate_members(&storage);
+        assert_eq!(clusters.len(), 1, "exactly one exact-duplicate cluster");
+        assert!(clusters[0].contains(&a) && clusters[0].contains(&b));
+        assert!(!clusters[0].contains(&_c));
+    }
+
+    #[test]
+    fn identical_content_hash_nominate_across_different_text() {
+        let (_dir, storage) = store();
+        // Same declared payload hash, different raw text (e.g. two renderings
+        // of the same upstream record). The stored hash is the identity.
+        let a = ingest_with_envelope(
+            &storage,
+            "issue 7: timeout on import",
+            envelope(None, None, Some("sha256:abc")),
+        );
+        let b = ingest_with_envelope(
+            &storage,
+            "issue 7: timeout during import (reformatted)",
+            envelope(None, None, Some("sha256:abc")),
+        );
+
+        let clusters = candidate_members(&storage);
+        assert_eq!(clusters.len(), 1);
+        assert!(clusters[0].contains(&a) && clusters[0].contains(&b));
+    }
+
+    #[test]
+    fn same_source_key_nominate_even_with_diverged_content() {
+        let (_dir, storage) = store();
+        // Fresh schemas enforce a UNIQUE index on the source key, so a
+        // same-key duplicate can only exist in a store written before that
+        // constraint (or with it relaxed). Simulate that legacy state by
+        // dropping the index for the duration of the test.
+        {
+            let writer = storage.writer.lock().unwrap();
+            writer.execute_batch("DROP INDEX idx_nodes_source_key").unwrap();
+        }
+        let a = ingest_with_envelope(
+            &storage,
+            "Redmine 42: original description",
+            envelope(Some("redmine"), Some("42"), None),
+        );
+        let b = ingest_with_envelope(
+            &storage,
+            "Redmine 42: edited description after upstream change",
+            envelope(Some("redmine"), Some("42"), None),
+        );
+        // A different source key must not join.
+        let c = ingest_with_envelope(
+            &storage,
+            "Redmine 42: cross-posted note",
+            envelope(Some("jira"), Some("42"), None),
+        );
+
+        let clusters = candidate_members(&storage);
+        assert_eq!(clusters.len(), 1);
+        assert!(clusters[0].contains(&a) && clusters[0].contains(&b));
+        assert!(!clusters[0].contains(&c));
+    }
+
+    #[test]
+    fn near_identical_content_no_longer_nominate() {
+        let (_dir, storage) = store();
+        // Under the old cosine scan this pair scored ~0.99 and clustered.
+        // It shares no content hash, no source key, and its extracted entity
+        // sets differ (services vs service), so exact-equality nomination
+        // must NOT offer it.
+        ingest(&storage, "Use tokio runtime for async Rust services", &[]);
+        ingest(&storage, "Use the tokio runtime for async Rust service", &[]);
+
+        let clusters = candidate_members(&storage);
+        assert!(
+            clusters.is_empty(),
+            "near-identical content must not be nominated: {clusters:?}"
+        );
+    }
+
+    #[test]
+    fn exact_entity_set_nominate() {
+        let (_dir, storage) = store();
+        // Two notes over the exact same entity set {alpha, beta, gamma,
+        // delta}: different word order and stopword filler (words shorter
+        // than 4 letters are not entities).
+        ingest(&storage, "alpha beta gamma delta", &[]);
+        ingest(&storage, "delta or gamma and beta of alpha", &[]);
+        // A third note with a different entity set stays out.
+        ingest(&storage, "tokio runtime tuning for the worker pool", &[]);
+
+        let clusters = candidate_members(&storage);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].len(), 2);
+    }
+
+    #[test]
+    fn tag_filter_restricts_nomination() {
+        let (_dir, storage) = store();
+        ingest(&storage, "Duplicated release note text", &["rust"]);
+        ingest(&storage, "Duplicated release note text", &["python"]);
+
+        let clusters = candidate_members(&storage);
+        assert_eq!(clusters.len(), 1, "no tag filter: the pair is nominated");
+
+        let filtered = storage
+            .merge_candidates(
+                crate::advanced::MergePolicy::default(),
+                20,
+                &["rust".to_string()],
+            )
+            .unwrap();
+        assert!(
+            filtered.is_empty(),
+            "with one member filtered out, the cluster dissolves"
+        );
     }
 }

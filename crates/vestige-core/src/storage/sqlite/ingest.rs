@@ -3,30 +3,6 @@
 use super::*;
 
 impl SqliteMemoryStore {
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-    pub(super) fn regular_ingest_result(
-        &self,
-        input: IngestInput,
-        scope: &str,
-        reason: impl Into<String>,
-        policy: SecretPolicy,
-    ) -> Result<SmartIngestResult> {
-        let node = self.ingest_in_scope_with_secret_policy(input, scope, policy)?;
-        Ok(SmartIngestResult {
-            decision: "create".to_string(),
-            node,
-            superseded_id: None,
-            similarity: None,
-            prediction_error: Some(1.0),
-            reason: reason.into(),
-            previous_content: None,
-            merged_from: None,
-            merge_preview: None,
-            auto_closed_until: None,
-            reconsolidation_plan_id: None,
-        })
-    }
-
     pub(super) fn secret_findings_for_input(input: &IngestInput) -> Vec<SecretFinding> {
         let mut findings = scan_secrets(&input.content);
         let mut scan_field = |value: &str| {
@@ -353,7 +329,10 @@ impl SqliteMemoryStore {
             )?;
         }
 
-        // Generate embedding if available
+        // Store an embedding vector if the (soon-to-be-deleted) embeddings
+        // subsystem is built in. This is vector STORAGE, not a similarity
+        // decision — smart ingest's gating no longer reads it. Removed
+        // together with the embeddings module.
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
         if let Err(e) = self.generate_embedding_for_node(&id, &input.content) {
             tracing::warn!("Failed to generate embedding for {}: {}", id, e);
@@ -506,33 +485,14 @@ impl SqliteMemoryStore {
         Self::enforce_secret_policy_for_input(&input, policy)?;
         let scope = Self::normalize_scope(scope)?;
 
-        // Generate embedding for new content
-        if !self.active_embedding_runtime_ready()? {
-            return self.regular_ingest_result(
-                input,
-                scope,
-                "Embeddings not available, falling back to regular ingest",
-                policy,
-            );
-        }
+        // Candidate selection is keyword-only (FTS5/BM25 over the content
+        // tokens); the prediction-error gate then scores each candidate by
+        // content-token similarity. The embedding runtime preflight and the
+        // document-embedding computation that used to live here are gone —
+        // smart ingest no longer depends on the embedding subsystem.
 
-        if !self.vector_search_available() {
-            return self.regular_ingest_result(
-                input,
-                scope,
-                "Vector search unavailable, falling back to regular ingest",
-                policy,
-            );
-        }
-
-        // The prediction gate compares a candidate *document* with stored
-        // document vectors. Qwen's retrieval profile intentionally uses a
-        // different query template, so using get_query_embedding here would
-        // silently compare different encoded spaces.
-        let new_embedding = self.get_document_embedding(&input.content)?;
-
-        // Find similar memories using semantic search
-        let similar = self.semantic_search_raw(&input.content, 10)?;
+        // Find candidate memories using keyword search
+        let similar = self.search(&input.content, 10)?;
 
         // Build candidate memories
         let mut candidates: Vec<CandidateMemory> = Vec::new();
@@ -541,57 +501,51 @@ impl SqliteMemoryStore {
         // candidate, the incoming claim is a stale snapshot whose world time
         // is already known to end where the newer fact begins.
         let mut superseding_valid_from: Option<DateTime<Utc>> = None;
-        for (node_id, _similarity) in similar.iter() {
-            if excluded_node_ids.iter().any(|id| id == node_id) {
+        for node in similar.iter() {
+            if excluded_node_ids.iter().any(|id| id == &node.id) {
                 continue;
             }
-            if !self.node_is_in_scope(node_id, scope)? {
+            if !self.node_is_in_scope(&node.id, scope)? {
                 continue;
             }
-            if let Some(node) = self.get_node(node_id)? {
-                // A historical snapshot must never mutate, reinforce, or demote
-                // a fact whose validity starts later. Likewise, an already
-                // expired input cannot supersede a currently-valid policy.
-                if !temporal_candidate_is_eligible(
-                    input.valid_from,
-                    input.valid_until,
-                    node.valid_from,
-                    node.is_currently_valid(),
-                    Utc::now(),
-                ) {
-                    if let (Some(incoming), Some(existing)) = (input.valid_from, node.valid_from)
-                        && incoming < existing
-                        && node.is_currently_valid()
-                        && superseding_valid_from.is_none_or(|earliest| existing < earliest)
-                    {
-                        superseding_valid_from = Some(existing);
-                    }
-                    continue;
+            // A historical snapshot must never mutate, reinforce, or demote
+            // a fact whose validity starts later. Likewise, an already
+            // expired input cannot supersede a currently-valid policy.
+            if !temporal_candidate_is_eligible(
+                input.valid_from,
+                input.valid_until,
+                node.valid_from,
+                node.is_currently_valid(),
+                Utc::now(),
+            ) {
+                if let (Some(incoming), Some(existing)) = (input.valid_from, node.valid_from)
+                    && incoming < existing
+                    && node.is_currently_valid()
+                    && superseding_valid_from.is_none_or(|earliest| existing < earliest)
+                {
+                    superseding_valid_from = Some(existing);
                 }
-                // Get embedding for this node
-                if let Some(emb) = self.get_node_embedding(node_id)? {
-                    // Check if this memory was previously demoted (low retrieval strength)
-                    let was_demoted = node.retrieval_strength < 0.3;
-                    let was_promoted = node.retrieval_strength > 0.85;
+                continue;
+            }
+            // Check if this memory was previously demoted (low retrieval strength)
+            let was_demoted = node.retrieval_strength < 0.3;
+            let was_promoted = node.retrieval_strength > 0.85;
 
-                    candidates.push(CandidateMemory {
-                        id: node.id.clone(),
-                        content: node.content.clone(),
-                        embedding: emb,
-                        retrieval_strength: node.retrieval_strength,
-                        retention_strength: node.retention_strength,
-                        tags: node.tags.clone(),
-                        source: node.source.clone(),
-                        was_demoted,
-                        was_promoted,
-                    });
-                }
-            }
+            candidates.push(CandidateMemory {
+                id: node.id.clone(),
+                content: node.content.clone(),
+                retrieval_strength: node.retrieval_strength,
+                retention_strength: node.retention_strength,
+                tags: node.tags.clone(),
+                source: node.source.clone(),
+                was_demoted,
+                was_promoted,
+            });
         }
 
-        // Evaluate with prediction error gate
+        // Evaluate with prediction error gate (content-token similarity)
         let mut gate = PredictionErrorGate::new();
-        let decision = gate.evaluate(&input.content, &new_embedding, &candidates);
+        let decision = gate.evaluate(&input.content, &candidates);
 
         match decision {
             GateDecision::Create {
@@ -1113,34 +1067,31 @@ impl SqliteMemoryStore {
             )?;
             // Deleting profile vectors journals invalidation for peer indexes.
             // Every profile encodes the old content, so invalidate all of them.
-            tx.execute(
-                "DELETE FROM embedding_profile_vectors WHERE node_id = ?1",
-                params![id],
-            )?;
-            tx.execute(
-                "DELETE FROM node_embeddings WHERE node_id = ?1",
-                params![id],
-            )?;
+            // (Vector cache hygiene for the still-present embeddings subsystem;
+            // goes away with that module. No similarity decision happens here.)
+            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+            {
+                tx.execute(
+                    "DELETE FROM embedding_profile_vectors WHERE node_id = ?1",
+                    params![id],
+                )?;
+                tx.execute(
+                    "DELETE FROM node_embeddings WHERE node_id = ?1",
+                    params![id],
+                )?;
+            }
             tx.commit()?;
         }
 
-        // Regenerate embedding for updated content
+        // Regenerate the vector for the edited content (storage only).
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
         {
-            // Remove old embedding from index
+            // Remove the old vector from the index.
             if let Some(index) = self.vector_index.as_ref()
                 && let Ok(mut index) = index.lock()
             {
                 let _ = index.remove(id);
             }
-            // Generate new embedding. If the embedder isn't ready yet (e.g. the
-            // model is still downloading on first run), generate_embedding_for_node
-            // is a no-op — which previously left the OLD, now-stale embedding row
-            // with has_embedding = 1, so semantic search kept matching the old
-            // content and the consolidation regeneration query (which only selects
-            // has_embedding = 0 / missing rows / model mismatch) never refreshed
-            // it. Flip has_embedding to 0 on the not-ready path so the stale vector
-            // is picked up and rebuilt once the embedder comes online.
             if self.active_embedding_runtime_ready().unwrap_or(false) {
                 if let Err(e) = self.generate_embedding_for_node(id, new_content) {
                     tracing::warn!("Failed to regenerate embedding for {}: {}", id, e);
