@@ -63,6 +63,20 @@ pub enum StorageError {
     /// profile contract.
     #[error("Invalid embedding profile: {0}")]
     InvalidEmbeddingProfile(String),
+    /// A v3 SQLite store was found where a 4.0 Strata directory is required.
+    /// The original file was never opened read-write, migrated in place, or
+    /// modified in any way; the caller must migrate it first.
+    #[error(
+        "v3 SQLite store at {path} (schema version {schema_version}) cannot be opened by 4.0. hint: {hint}"
+    )]
+    V3StoreNeedsMigration {
+        /// Path of the refused SQLite file (display form).
+        path: String,
+        /// Highest `schema_version` row in the store; 0 when unreadable.
+        schema_version: u32,
+        /// Actionable next step for the operator.
+        hint: String,
+    },
 }
 
 /// Storage result type

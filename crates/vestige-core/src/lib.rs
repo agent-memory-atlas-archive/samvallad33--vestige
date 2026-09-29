@@ -92,9 +92,9 @@ pub mod fsrs;
 /// behind `legacy-sqlite` (build/t5-legacy-isolation).
 #[cfg(feature = "legacy-sqlite")]
 pub mod fts;
-pub mod memory;
 /// Evidence-aware future intentions with deterministic local evaluation.
 pub mod intention_graph;
+pub mod memory;
 pub mod security;
 pub mod storage;
 
@@ -173,45 +173,37 @@ pub use config::{CONFIG_FILE, OutputConfig, OutputDefaults, OutputProfile, Vesti
 
 // Actor provenance (#252 Phase A)
 pub use actor::{
-    ActorIdentityError, ActorPolicySnapshot, ProcessActor, ResolutionDisposition, RoleResolution,
-    ACTOR_KEY_FILE, ED25519_MULTICODEC_PREFIX, FLAT_POLICY_V1, INITIAL_POLICY_VERSION,
-    MAX_AGGREGATE_ENDORSEMENT_WEIGHT, MAX_ROLE_WEIGHT, NEUTRAL_WEIGHT, UNATTRIBUTED_ROLE,
+    ACTOR_KEY_FILE, ActorIdentityError, ActorPolicySnapshot, ED25519_MULTICODEC_PREFIX,
+    FLAT_POLICY_V1, INITIAL_POLICY_VERSION, MAX_AGGREGATE_ENDORSEMENT_WEIGHT, MAX_ROLE_WEIGHT,
+    NEUTRAL_WEIGHT, ProcessActor, ResolutionDisposition, RoleResolution, UNATTRIBUTED_ROLE,
     actor_key_path_for_data_dir, base58btc_decode, base58btc_encode, bounded_aggregate,
     did_key_from_ed25519_public_key, ed25519_public_key_from_did_key, endorsement_event_id,
     revision_digest,
 };
 
 // Agent Black Box / Receipts / Memory PRs (the cognitive flight recorder)
-pub use trace::{
-    BACKFILL_RECEIPT_CLAIM_BOUNDARY, BACKFILL_RECEIPT_SCHEMA_V1, WALK_RECEIPT_CLAIM_BOUNDARY,
-    WALK_RECEIPT_SCHEMA_V1, BackfillCandidateEvidence, DecayRisk, HIGH_TRUST_FLOOR,
-    LOW_CONFIDENCE_FLOOR, MemoryPr, MemoryPrAction, MemoryPrKind, MemoryPrStatus,
-    MemoryTraceEvent, Receipt, ReceiptEvidence, ReceiptMutation, ReviewMode, RiskClass,
-    RiskSignal, StrengthDelta, SuppressReason, SuppressedReceiptEntry, SynapticCaptureCandidate,
-    SynapticCaptureDisposition, SynapticCaptureEvidence, SynapticCaptureTrigger,
-    SynapticCaptureWindow, SynapticStrengthChange, WriteContext, WriteSource, classify_write,
-};
 pub use trace::ActorProvenance;
+pub use trace::{
+    BACKFILL_RECEIPT_CLAIM_BOUNDARY, BACKFILL_RECEIPT_SCHEMA_V1, BackfillCandidateEvidence,
+    DecayRisk, HIGH_TRUST_FLOOR, LOW_CONFIDENCE_FLOOR, MemoryPr, MemoryPrAction, MemoryPrKind,
+    MemoryPrStatus, MemoryTraceEvent, Receipt, ReceiptEvidence, ReceiptMutation, ReviewMode,
+    RiskClass, RiskSignal, StrengthDelta, SuppressReason, SuppressedReceiptEntry,
+    SynapticCaptureCandidate, SynapticCaptureDisposition, SynapticCaptureEvidence,
+    SynapticCaptureTrigger, SynapticCaptureWindow, SynapticStrengthChange,
+    WALK_RECEIPT_CLAIM_BOUNDARY, WALK_RECEIPT_SCHEMA_V1, WriteContext, WriteSource, classify_write,
+};
 
 // Storage layer
 // Storage: backend-agnostic surface (always available).
 pub use storage::LegacySqliteDisabled;
+// v3 SQLite guard: refuses the legacy engine at every 4.0 entry point
+// (ungated — the refusal must fire in Strata-only builds too).
+pub use storage::v3_guard::{MIGRATION_HINT, SQLITE_MAGIC, V3Info, detect_v3, ensure_not_v3};
 #[cfg(feature = "legacy-sqlite")]
 pub use storage::{
-    ClassificationResult,
-    Domain,
-    HealthStatus,
-    LocalMemoryStore,
-    MemoryEdge,
-    MemoryRecord,
-    MemoryStore,
-    MemoryStoreError,
-    MemoryStoreResult,
-    ModelSignature,
-    SchedulingState,
-    SearchQuery,
-    StoreStats,
-    open_storage,
+    ClassificationResult, Domain, HealthStatus, LocalMemoryStore, MemoryEdge, MemoryRecord,
+    MemoryStore, MemoryStoreError, MemoryStoreResult, ModelSignature, SchedulingState, SearchQuery,
+    StoreStats, open_storage,
 };
 
 // Storage: legacy SQLite surface (quarantined behind `legacy-sqlite`,
@@ -225,8 +217,6 @@ pub use storage::{
     BLAST_SCAN_NODE_CAP,
     BlastAffected,
     BlastReport,
-    RetireOutcome,
-    commit_sha_of,
     CompositionEventRecord,
     CompositionMemberRecord,
     CompositionNeighborRecord,
@@ -273,6 +263,7 @@ pub use storage::{
     ReplayPrivacyInvalidation,
     ReplayPrivacyState,
     Result,
+    RetireOutcome,
     RetrievalReplayCapsuleDraft,
     RetrievalReplayCapsuleSummary,
     RetrievalReplayItemDraft,
@@ -292,8 +283,6 @@ pub use storage::{
     StateTransitionRecord,
     Storage,
     StorageError,
-    db_path_for_data_dir,
-    default_db_path,
     StoredCounterfactualReplay,
     SynapticCapturePolicy,
     SynapticCaptureRequest,
@@ -303,6 +292,9 @@ pub use storage::{
     SynapticSignalSnapshot,
     TagVocabulary,
     ablate_frozen_context,
+    commit_sha_of,
+    db_path_for_data_dir,
+    default_db_path,
     private_evidence_digest,
     replay_evidence_slot,
     replay_idempotency_key,
@@ -367,6 +359,8 @@ pub use advanced::{
     ImportanceTracker,
     // Intent detection
     IntentDetector,
+    // Reconsolidation (memories become modifiable on retrieval)
+    LabileCandidate,
     LabileState,
     MaintenanceType,
     // Merge / Supersede controls (Phase 3)
@@ -398,8 +392,6 @@ pub use advanced::{
     ProjectContext,
     ReasoningChain,
     ReconsolidatedMemory,
-    // Reconsolidation (memories become modifiable on retrieval)
-    LabileCandidate,
     ReconsolidationManager,
     ReconsolidationMeta,
     ReconsolidationStats,
@@ -562,9 +554,7 @@ pub use neuroscience::{
 };
 
 // Search fusion (RRF + linear combination over ranked result lists)
-pub use search::{
-    HybridSearchConfig, HybridSearcher, linear_combination, reciprocal_rank_fusion,
-};
+pub use search::{HybridSearchConfig, HybridSearcher, linear_combination, reciprocal_rank_fusion};
 
 // ============================================================================
 // VERSION INFO

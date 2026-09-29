@@ -430,6 +430,28 @@ async fn serve() {
         }
     };
 
+    // PR 0a: a v3 SQLite store at the configured path is refused before any
+    // storage constructor runs, so tools never see a half-open store. The
+    // guard itself never writes; detection is a 100-byte header read. The
+    // default-path case (None) is guarded inside the storage constructor.
+    if let Some(db_path) = storage_path.as_deref() {
+        if let Ok(Some(v3)) = vestige_core::detect_v3(db_path) {
+            error!(
+                "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
+                v3.path.display(),
+                v3.schema_version,
+                vestige_core::MIGRATION_HINT
+            );
+            eprintln!(
+                "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
+                v3.path.display(),
+                v3.schema_version,
+                vestige_core::MIGRATION_HINT
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Initialize storage with optional custom data directory.
     // vestige_core::open_storage(Some(...)) expects a DB file path, so map data dirs to vestige.db here.
     let storage = match vestige_core::open_storage(storage_path) {
@@ -490,7 +512,9 @@ async fn serve() {
     // Startup hygiene: sweep Black Box traces past VESTIGE_TRACE_RETENTION_DAYS
     // now, not only when the consolidation cycle next runs. Best-effort.
     match storage.prune_agent_traces() {
-        Ok(deleted) if deleted > 0 => info!(deleted, "Pruned expired agent trace events at startup"),
+        Ok(deleted) if deleted > 0 => {
+            info!(deleted, "Pruned expired agent trace events at startup")
+        }
         Ok(_) => {}
         Err(e) => warn!("Startup trace retention sweep failed: {}", e),
     }
@@ -661,10 +685,9 @@ async fn serve() {
     info!("CognitiveEngine initialized and hydrated");
 
     // Create shared event broadcast channel for dashboard <-> MCP tool events
-    let (event_tx, _) =
-        tokio::sync::broadcast::channel::<vestige_mcp::dashboard::events::VestigeEvent>(
-            vestige_mcp::dashboard::state::EVENT_CHANNEL_CAPACITY,
-        );
+    let (event_tx, _) = tokio::sync::broadcast::channel::<
+        vestige_mcp::dashboard::events::VestigeEvent,
+    >(vestige_mcp::dashboard::state::EVENT_CHANNEL_CAPACITY);
 
     // v2.0.9 "Autopilot" — spawn the backend event-subscriber that routes
     // every live WebSocket event into the cognitive modules that already
@@ -749,7 +772,6 @@ async fn serve() {
     } else {
         info!("HTTP MCP transport disabled; set VESTIGE_HTTP_ENABLED=1 or pass --http to enable");
     }
-
 
     // Create MCP server with shared event channel for dashboard broadcasts
     let server = McpServer::new_with_events(storage, cognitive, event_tx);

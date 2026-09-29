@@ -28,6 +28,13 @@ default = ["codebase-git"]
 # which fails with a clear error when this feature is off.
 legacy-sqlite = ["dep:rusqlite"]
 
+# Raw v3-engine test harness (PR 0a): builds the legacy engine WITHOUT the
+# v3 read-write guard, for the engine's own restart/durability unit tests
+# and the migration fixture tooling, which legitimately reopen synthetic
+# stores. Off by default; the shipped binary never enables it, so no
+# shipped path can open a v3 SQLite file read-write.
+v3-engine = ["legacy-sqlite"]
+
 # SQLite backend (default, unencrypted)
 bundled-sqlite = ["legacy-sqlite", "rusqlite/bundled"]
 

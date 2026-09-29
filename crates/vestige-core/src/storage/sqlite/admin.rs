@@ -649,6 +649,18 @@ impl SqliteMemoryStore {
             None => Self::default_db_path()?,
         };
 
+        // PR 0a: a v3 SQLite file is never opened read-write. Detect by
+        // magic bytes first — before the write handle, the chmod, and the
+        // migration pass can touch it — and refuse with the migration hint.
+        // Escapes: `v3-engine` (the raw engine test harness) and this
+        // crate's own unit tests, which reopen synthetic stores by design.
+        #[cfg(all(
+            feature = "legacy-sqlite",
+            not(feature = "v3-engine"),
+            not(test)
+        ))]
+        crate::storage::v3_guard::ensure_not_v3(&path)?;
+
         // Open writer connection
         let writer_conn = Connection::open(&path)?;
 
@@ -1021,14 +1033,15 @@ impl SqliteMemoryStore {
                 FROM knowledge_nodes
              )",
         )?;
-        let (active, dormant, silent, unavailable): (i64, i64, i64, i64) = stmt.query_row([], |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-            ))
-        })?;
+        let (active, dormant, silent, unavailable): (i64, i64, i64, i64) =
+            stmt.query_row([], |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                ))
+            })?;
         Ok((active, dormant, silent, unavailable))
     }
 

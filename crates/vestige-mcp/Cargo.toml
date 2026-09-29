@@ -143,7 +143,10 @@ tempfile = "3"
 
 # Integration tests drive the Storage-backed server/tools; the e2e binary
 # test also reads the SQLite file directly (backup WAL). Skipped in a
-# legacy-sqlite-free build (build/t5-legacy-isolation).
+# legacy-sqlite-free build (build/t5-legacy-isolation). Tests get the raw
+# v3-engine harness (no read-write guard) so they may reopen their own
+# synthetic stores; release builds never enable it.
+vestige-core = { path = "../vestige-core", features = ["v3-engine"] }
 [[test]]
 name = "e2e_failure_cases"
 required-features = ["legacy-sqlite"]

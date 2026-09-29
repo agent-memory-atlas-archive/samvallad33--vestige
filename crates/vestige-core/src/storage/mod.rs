@@ -54,6 +54,10 @@ pub mod types;
 pub mod unlearning;
 #[cfg(feature = "legacy-sqlite")]
 mod unlearning_store;
+/// Feature-independent v3 SQLite guard: detects the legacy engine by magic
+/// bytes and refuses read-write opens (PR 0a). Available with AND without
+/// `legacy-sqlite`.
+pub mod v3_guard;
 #[cfg(feature = "legacy-sqlite")]
 mod walk_receipts;
 
@@ -102,9 +106,9 @@ pub use sqlite::{
 };
 #[cfg(feature = "legacy-sqlite")]
 pub use synaptic_store::{
-    SYNAPTIC_CAPTURE_ALGORITHM_V1, SYNAPTIC_CAPTURE_ALGORITHM_V2,
-    SYNAPTIC_CAPTURE_CLAIM_BOUNDARY, SYNAPTIC_CAPTURE_SCHEMA_V1, SYNAPTIC_CAPTURE_SCHEMA_V2,
-    SYNAPTIC_CONTEXT_ALGORITHM_V1, SYNAPTIC_CONTEXT_THRESHOLD_V1,
+    SYNAPTIC_CAPTURE_ALGORITHM_V1, SYNAPTIC_CAPTURE_ALGORITHM_V2, SYNAPTIC_CAPTURE_CLAIM_BOUNDARY,
+    SYNAPTIC_CAPTURE_SCHEMA_V1, SYNAPTIC_CAPTURE_SCHEMA_V2, SYNAPTIC_CONTEXT_ALGORITHM_V1,
+    SYNAPTIC_CONTEXT_THRESHOLD_V1,
 };
 pub use unlearning::{
     AntiResurrectionCommitments, ArtifactKind, ArtifactRef, CheckStatus, Commitment, CommitmentKey,
