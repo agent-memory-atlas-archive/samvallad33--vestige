@@ -2432,7 +2432,7 @@ fn run_migrate_to_strata(
     let options = strata_migrate::MigrateOptions {
         dry_run,
         accept_wal_snapshot,
-        seed: None,
+        ..Default::default()
     };
     let report = strata_migrate::migrate_with_options(&from, &destination, options)?;
 
