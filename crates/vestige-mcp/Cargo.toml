@@ -172,6 +172,9 @@ name = "e2e_real_binary"
 required-features = ["legacy-sqlite"]
 
 [[test]]
+name = "forgotten_lesson_stdio"
+
+[[test]]
 name = "stdio_shutdown"
 required-features = ["legacy-sqlite"]
 
