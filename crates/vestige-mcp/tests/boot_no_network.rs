@@ -209,9 +209,12 @@ fn default_boot_opens_no_outbound_socket_or_dns() {
 
 #[cfg(target_os = "linux")]
 fn assert_no_update_surface(label: &str, text: &str) {
+    // Split so crate sources do not contain the removed host or function name.
+    let registry = concat!("registry.", "npmjs.org");
+    let function = concat!("latest_", "npm_version");
     for needle in [
-        "registry.npmjs.org",
-        "latest_npm_version",
+        registry,
+        function,
         "newer_version_available",
         "vestige.update",
         "updateAvailable",
