@@ -1774,3 +1774,79 @@ fn undo_restores_the_previous_upsert_without_rewriting_it() {
     assert_eq!(restored.content, "original body");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+fn imported_node(id: &str, legacy: &[(&str, &str)]) -> Vec<u8> {
+    borsh::to_vec(&strata_migrate::NodeRecord {
+        record_version: strata_migrate::RECORD_VERSION,
+        legacy_id: id.to_string(),
+        kernel_id: 0,
+        content: format!("imported {id}"),
+        node_type: "fact".to_string(),
+        tags: Vec::new(),
+        created_ms: 1_700_000_000_000,
+        updated_ms: 1_700_000_000_000,
+        last_accessed_ms: 1_700_000_000_000,
+        legacy: legacy
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+        source: None,
+        source_updated_at_ms: None,
+    })
+    .expect("encode")
+}
+
+/// A real v3 store has project scopes, suppressed memories and supersession
+/// links. After the upgrade each keeps its meaning, and reviewing an imported
+/// memory still proves (a review naming an imported card used to fail every
+/// later proof pass).
+#[test]
+fn imported_scope_suppression_and_supersession_survive_replay() {
+    let dir = temp_dir("imported-state");
+    let project = "11111111-1111-4111-8111-aaaaaaaaaaaa";
+    let suppressed = "22222222-2222-4222-8222-aaaaaaaaaaaa";
+    let old = "33333333-3333-4333-8333-aaaaaaaaaaaa";
+    let new = "44444444-4444-4444-8444-aaaaaaaaaaaa";
+    append_payload(
+        &dir,
+        KIND_STORE_WRITE,
+        &imported_node(project, &[("scope", "biohub"), ("suppression_count", "0")]),
+    );
+    append_payload(
+        &dir,
+        KIND_STORE_WRITE,
+        &imported_node(suppressed, &[("scope", "user"), ("suppression_count", "2")]),
+    );
+    append_payload(&dir, KIND_STORE_WRITE, &imported_node(old, &[]));
+    append_payload(&dir, KIND_STORE_WRITE, &imported_node(new, &[]));
+    append_payload(
+        &dir,
+        strata_migrate::records::KIND_SUPERSESSION,
+        &borsh::to_vec(&strata_migrate::SupersessionRecord {
+            record_version: strata_migrate::RECORD_VERSION,
+            superseded_legacy_id: old.to_string(),
+            superseded_by_legacy_id: new.to_string(),
+            superseded_kernel_id: 0,
+            superseded_by_kernel_id: 0,
+        })
+        .expect("encode"),
+    );
+
+    let mut store = StrataStore::open(&dir).expect("replay imported state");
+    let kept = store.get_node(project).expect("project node");
+    assert_eq!(kept.scope, "biohub");
+    assert!(kept.is_live());
+    assert!(!store.get_node(suppressed).expect("suppressed").is_live());
+    assert_eq!(store.get_node(old).expect("old").superseded_by.as_deref(), Some(new));
+    assert!(store.get_node(new).expect("new").is_live());
+    assert_eq!(store.get_node(old).expect("old").scope, "user");
+
+    store.review(project, 3).expect("review an imported memory");
+    let proofs = store.prove_effects().expect("proofs still derive");
+    assert!(proofs.iter().any(|proof| proof.node_id == project));
+    drop(store);
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    assert!(reopened.prove_effects().is_ok());
+    assert!(!reopened.get_node(suppressed).expect("suppressed").is_live());
+    std::fs::remove_dir_all(&dir).ok();
+}

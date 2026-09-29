@@ -535,6 +535,12 @@ impl StrataStore {
                     CheckpointPayload::ImportedEdge(edge) => self.apply_imported_edge(&edge),
                     CheckpointPayload::Neither => {}
                 }
+            } else if frame.kind == strata_migrate::records::KIND_SUPERSESSION {
+                // A v3 `superseded_by` link, carried by the importer. The old
+                // node stops being live and its successor stays the answer.
+                if let Ok(link) = strata_migrate::records::decode_supersession(&frame.payload) {
+                    self.apply_imported_supersession(&link);
+                }
             }
             // Unknown kinds are ignored: forward compatibility.
         }
@@ -615,10 +621,28 @@ impl StrataStore {
 
     /// Imported node. Kind stays on the edge records; this only fills the registry.
     fn apply_imported_node(&mut self, node: &strata_migrate::NodeRecord) {
+        let legacy = |column: &str| {
+            node.legacy
+                .iter()
+                .find(|(key, _)| key == column)
+                .map(|(_, value)| value.as_str())
+        };
+        // v3 kept each memory's project namespace in `scope`; keep it, or
+        // every project's memories would merge into `user`.
+        let scope = legacy("scope")
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty() && *scope != "NULL")
+            .unwrap_or("user")
+            .to_string();
+        // A v3-suppressed memory was out of retrieval. Keep it that way: the
+        // record stays on the log and in the backup, but it is not live.
+        let suppressed = legacy("suppression_count")
+            .and_then(|count| count.trim().parse::<i64>().ok())
+            .is_some_and(|count| count > 0);
         let record = NodeRecord {
             id: node.legacy_id.clone(),
             kernel_id: ALGO_V2,
-            scope: "user".to_string(),
+            scope,
             content: node.content.clone(),
             node_type: if node.node_type.is_empty() {
                 DEFAULT_NODE_TYPE.to_string()
@@ -629,7 +653,7 @@ impl StrataStore {
             created_at_ms: node.created_ms,
             valid_from_ms: node.created_ms,
             valid_until_ms: VALID_FOREVER_MS,
-            superseded_by: None,
+            superseded_by: suppressed.then(|| IMPORTED_SUPPRESSED_MARKER.to_string()),
             source: node.source.as_ref().map(|key| crate::types::SourceKey {
                 system: key.system.clone(),
                 project: key.project.clone(),
@@ -638,6 +662,16 @@ impl StrataStore {
             source_updated_at_ms: node.source_updated_at_ms,
         };
         self.nodes.insert(record.id.clone(), record);
+    }
+
+    /// Imported v3 supersession: both ends must be imported nodes.
+    fn apply_imported_supersession(&mut self, link: &strata_migrate::records::SupersessionRecord) {
+        if !self.nodes.contains_key(&link.superseded_by_legacy_id) {
+            return;
+        }
+        if let Some(record) = self.nodes.get_mut(&link.superseded_legacy_id) {
+            record.superseded_by = Some(link.superseded_by_legacy_id.clone());
+        }
     }
 
     /// Imported edge. `link_type` is copied, including `legacy_inferred`.
@@ -1370,6 +1404,11 @@ impl StrataStore {
                 let Some((effect_seq, rule)) =
                     pending.get_mut(&digest).and_then(|queue| queue.pop_front())
                 else {
+                    // Not an admitted write: an imported v3 node is still a
+                    // card later reviews may name (promote/demote on it).
+                    if let Some(node) = migration_node(&frame.payload) {
+                        handles.insert(handle_of(&node.legacy_id), node.legacy_id);
+                    }
                     continue;
                 };
                 let Some(op) = StoreOp::try_from_slice(&frame.payload).ok() else {
@@ -1914,6 +1953,10 @@ impl StrataStore {
 /// The node stays in the log and in the derived map, and [`NodeRecord::is_live`]
 /// is false, so reads that honor liveness do not return it.
 const UNDO_MARKER_PREFIX: &str = "undo:";
+
+/// `superseded_by` marker on an imported memory that v3 had suppressed.
+/// Like the undo marker it names no node; [`NodeRecord::is_live`] is false.
+const IMPORTED_SUPPRESSED_MARKER: &str = "v3:suppressed";
 
 /// One admitted `UpsertNode`, classified for the reversible operation log.
 #[derive(Debug, Clone, PartialEq, Eq)]
