@@ -9,8 +9,11 @@ use strata_gate::policy::{ANY_KIND, WILDCARD_PREFIX};
 use strata_gate::record::{RecordKind, Verdict};
 use strata_gate::{Policy, Rule};
 
-use crate::op::{KIND_STORE_CHECKPOINT, KIND_STORE_WRITE};
-use crate::store::handle_of;
+use crate::op::{StoreOp, KIND_STORE_CHECKPOINT, KIND_STORE_WRITE};
+use crate::store::{
+    classify_checkpoint_payload, classify_write_payload, decode_exact, handle_of,
+    CheckpointPayload, WritePayload,
+};
 use crate::types::{ConnectionRecord, EdgeDirection, EdgeKind, IngestInput};
 use crate::{looks_like_failure, StoreError, StrataStore};
 
@@ -509,6 +512,158 @@ fn replay_loads_imported_nodes_and_keeps_edge_kinds() {
     assert_eq!(touched.len(), 1);
     assert_eq!(touched[0].target_id, "33333333-3333-4333-8333-333333333333");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+fn log_frames(dir: &std::path::Path) -> Vec<strata::FrameRecord> {
+    let log = strata::StrataLog::open(dir.join("log")).expect("reopen log");
+    log.read_frames(1).expect("read frames")
+}
+
+/// Frames the real store writes, and frames migrated from the v3.1.1 fixture.
+/// Replay calls `classify_*`. Crafted payloads can still satisfy both decoders.
+#[test]
+fn replay_store_and_migration_frames_do_not_cross_classify() {
+    let dir = temp_dir("kinds");
+    let mut store = StrataStore::open_with_policy(&dir, permissive_policy()).expect("open");
+    let alpha = store.ingest(input("alpha record", &["t"])).expect("alpha");
+    let beta = store.ingest(input("beta record", &[])).expect("beta");
+    store
+        .save_connection(&ConnectionRecord {
+            source_id: alpha.clone(),
+            target_id: beta.clone(),
+            strength_milli: 1000,
+            link_type: EdgeKind::Touched.as_str().to_string(),
+            meta_sha: None,
+            created_at_ms: 7,
+            activation_count: 1,
+        })
+        .expect("edge");
+    store.review(&alpha, 3).expect("review");
+    store.supersede(&alpha, &beta).expect("supersede");
+    let sealed = store.seal_checkpoint().expect("checkpoint");
+    let reviews = store.review_event_count();
+    drop(store);
+
+    let frames = log_frames(&dir);
+    let mut saw_upsert = false;
+    let mut saw_edge = false;
+    let mut saw_supersede = false;
+    let mut saw_review = false;
+    let mut store_checkpoints = 0usize;
+    for frame in &frames {
+        if frame.kind == KIND_STORE_WRITE {
+            let op = decode_exact::<StoreOp>(&frame.payload).expect("store write is a StoreOp");
+            assert!(
+                decode_exact::<strata_migrate::NodeRecord>(&frame.payload).is_none(),
+                "StoreOp payload also round-trips as a migration node"
+            );
+            assert!(matches!(
+                classify_write_payload(&frame.payload),
+                WritePayload::StoreOp(_)
+            ));
+            match op {
+                StoreOp::UpsertNode { .. } => saw_upsert = true,
+                StoreOp::SaveEdge { .. } => saw_edge = true,
+                StoreOp::SupersedeNode { .. } => saw_supersede = true,
+                StoreOp::ReviewNode { .. } => saw_review = true,
+            }
+        } else if frame.kind == KIND_STORE_CHECKPOINT {
+            store_checkpoints += 1;
+            let cp = decode_exact::<strata_kernel::checkpoint::Checkpoint>(&frame.payload)
+                .expect("checkpoint frame");
+            assert_eq!(cp.magic, strata_kernel::checkpoint::MAGIC);
+            assert!(
+                decode_exact::<strata_migrate::EdgeRecord>(&frame.payload).is_none(),
+                "checkpoint payload also round-trips as a migration edge"
+            );
+            assert!(matches!(
+                classify_checkpoint_payload(&frame.payload),
+                CheckpointPayload::Checkpoint(_)
+            ));
+        }
+    }
+    assert!(saw_upsert && saw_edge && saw_supersede && saw_review);
+    assert_eq!(store_checkpoints, 1);
+
+    let reopened = StrataStore::open(&dir).expect("replay store log");
+    assert_eq!(
+        reopened.get_node(&alpha).expect("alpha").content,
+        "alpha record"
+    );
+    assert_eq!(
+        reopened
+            .get_node(&alpha)
+            .expect("alpha")
+            .superseded_by
+            .as_deref(),
+        Some(beta.as_str())
+    );
+    assert_eq!(reopened.nodes().len(), 2);
+    assert_eq!(reopened.edges().len(), 1);
+    assert_eq!(reopened.edges()[0].link_type, "touched");
+    assert_eq!(reopened.checkpoints(), &[sealed]);
+    assert_eq!(reopened.review_event_count(), reviews);
+    assert_eq!(reopened.orphan_write_count(), 0);
+    drop(reopened);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let imported = temp_dir("kinds-import");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../strata-migrate/tests/fixtures/v3.1.1-sample.sqlite");
+    strata_migrate::migrate(&fixture, &imported.join("log")).expect("migrate");
+    let frames = log_frames(&imported);
+    let mut migration_nodes = 0usize;
+    let mut migration_edges = 0usize;
+    for frame in &frames {
+        if frame.kind == KIND_STORE_WRITE {
+            migration_nodes += 1;
+            assert!(
+                decode_exact::<strata_migrate::NodeRecord>(&frame.payload).is_some(),
+                "migration node did not round-trip"
+            );
+            assert!(
+                decode_exact::<StoreOp>(&frame.payload).is_none(),
+                "migration node also round-trips as a StoreOp"
+            );
+            assert!(matches!(
+                classify_write_payload(&frame.payload),
+                WritePayload::ImportedNode(_)
+            ));
+        } else if frame.kind == KIND_STORE_CHECKPOINT {
+            migration_edges += 1;
+            assert!(
+                decode_exact::<strata_migrate::EdgeRecord>(&frame.payload).is_some(),
+                "migration edge did not round-trip"
+            );
+            let as_checkpoint =
+                decode_exact::<strata_kernel::checkpoint::Checkpoint>(&frame.payload);
+            assert!(
+                as_checkpoint
+                    .as_ref()
+                    .is_none_or(|cp| cp.magic != strata_kernel::checkpoint::MAGIC),
+                "migration edge also round-trips as a store checkpoint"
+            );
+            assert!(matches!(
+                classify_checkpoint_payload(&frame.payload),
+                CheckpointPayload::ImportedEdge(_)
+            ));
+        }
+    }
+    assert!(migration_nodes > 0 && migration_edges > 0);
+    let store = StrataStore::open(&imported).expect("replay migration");
+    assert_eq!(store.nodes().len(), migration_nodes);
+    assert_eq!(store.edges().len(), migration_edges);
+    assert_eq!(store.checkpoints().len(), 0);
+    assert_eq!(store.orphan_write_count(), 0);
+    assert!(store
+        .get_node("11111111-1111-4111-8111-111111111111")
+        .is_some());
+    assert!(store.edges().iter().any(|edge| edge.link_type == "touched"));
+    assert!(store
+        .edges()
+        .iter()
+        .any(|edge| edge.link_type == "legacy_inferred"));
+    std::fs::remove_dir_all(&imported).ok();
 }
 
 #[test]

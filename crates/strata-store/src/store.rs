@@ -104,13 +104,51 @@ struct StateDigest<'a> {
 
 /// A payload is this type only when borsh consumes it exactly. Kind bytes
 /// 0x20 and 0x21 are shared by store frames and migration frames.
-fn decode_exact<T>(payload: &[u8]) -> Option<T>
+pub(crate) fn decode_exact<T>(payload: &[u8]) -> Option<T>
 where
     T: BorshDeserialize + BorshSerialize,
 {
     let value = T::try_from_slice(payload).ok()?;
     let encoded = borsh::to_vec(&value).ok()?;
     (encoded == payload).then_some(value)
+}
+
+/// What a kind-0x20 payload is. A store write wins when both decoders accept it.
+#[derive(Debug)]
+pub(crate) enum WritePayload {
+    StoreOp(StoreOp),
+    ImportedNode(strata_migrate::NodeRecord),
+    Neither,
+}
+
+/// What a kind-0x21 payload is. A checkpoint whose magic matches wins when both accept it.
+#[derive(Debug)]
+pub(crate) enum CheckpointPayload {
+    Checkpoint(Checkpoint),
+    ImportedEdge(strata_migrate::EdgeRecord),
+    Neither,
+}
+
+pub(crate) fn classify_write_payload(payload: &[u8]) -> WritePayload {
+    if let Some(op) = decode_exact::<StoreOp>(payload) {
+        WritePayload::StoreOp(op)
+    } else if let Some(node) = decode_exact::<strata_migrate::NodeRecord>(payload) {
+        WritePayload::ImportedNode(node)
+    } else {
+        WritePayload::Neither
+    }
+}
+
+pub(crate) fn classify_checkpoint_payload(payload: &[u8]) -> CheckpointPayload {
+    if let Some(cp) = decode_exact::<Checkpoint>(payload)
+        .filter(|cp| cp.magic == strata_kernel::checkpoint::MAGIC)
+    {
+        CheckpointPayload::Checkpoint(cp)
+    } else if let Some(edge) = decode_exact::<strata_migrate::EdgeRecord>(payload) {
+        CheckpointPayload::ImportedEdge(edge)
+    } else {
+        CheckpointPayload::Neither
+    }
 }
 
 /// The STRATA-native memory store.
@@ -234,33 +272,26 @@ impl StrataStore {
                     _ => {}
                 }
             } else if frame.kind == KIND_STORE_WRITE {
-                // 0x20 is also a migration KIND_NODE. A store write round-trips
-                // as StoreOp; anything else that round-trips as a node is imported.
-                if let Some(op) = decode_exact::<StoreOp>(&frame.payload) {
-                    let digest = hash32(&frame.payload);
-                    let admitted = pending.get_mut(&digest).and_then(|queue| queue.pop_front());
-                    if let Some(gseq) = admitted {
-                        self.apply_op(&op, gseq, seq)?;
-                    } else {
-                        self.orphan_writes += 1;
+                // 0x20 is also a migration KIND_NODE.
+                match classify_write_payload(&frame.payload) {
+                    WritePayload::StoreOp(op) => {
+                        let digest = hash32(&frame.payload);
+                        let admitted = pending.get_mut(&digest).and_then(|queue| queue.pop_front());
+                        if let Some(gseq) = admitted {
+                            self.apply_op(&op, gseq, seq)?;
+                        } else {
+                            self.orphan_writes += 1;
+                        }
                     }
-                } else if let Some(node) =
-                    decode_exact::<strata_migrate::NodeRecord>(&frame.payload)
-                {
-                    self.apply_imported_node(&node);
-                } else {
-                    self.orphan_writes += 1;
+                    WritePayload::ImportedNode(node) => self.apply_imported_node(&node),
+                    WritePayload::Neither => self.orphan_writes += 1,
                 }
             } else if frame.kind == KIND_STORE_CHECKPOINT {
                 // 0x21 is also a migration KIND_EDGE.
-                if let Some(cp) = decode_exact::<Checkpoint>(&frame.payload)
-                    .filter(|cp| cp.magic == strata_kernel::checkpoint::MAGIC)
-                {
-                    self.checkpoints.push(cp);
-                } else if let Some(edge) =
-                    decode_exact::<strata_migrate::EdgeRecord>(&frame.payload)
-                {
-                    self.apply_imported_edge(&edge);
+                match classify_checkpoint_payload(&frame.payload) {
+                    CheckpointPayload::Checkpoint(cp) => self.checkpoints.push(cp),
+                    CheckpointPayload::ImportedEdge(edge) => self.apply_imported_edge(&edge),
+                    CheckpointPayload::Neither => {}
                 }
             }
             // Unknown kinds are ignored: forward compatibility.
