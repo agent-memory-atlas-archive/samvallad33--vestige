@@ -14,7 +14,8 @@ path = "src/main.rs"
 [dependencies]
 libc = "0.2"
 directories = "6"
-strata-migrate = { path = "../strata-migrate" }
+# The only product binary that turns on the read-only SQLite reader.
+strata-migrate = { path = "../strata-migrate", features = ["sqlite-source"] }
 strata-verify = { path = "../strata-verify" }
 vestige-core = { path = "../vestige-core", default-features = false }
 
@@ -23,5 +24,5 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 sha2 = "0.11"
 tempfile = "3"
 strata = { path = "../strata" }
-strata-migrate = { path = "../strata-migrate" }
+strata-migrate = { path = "../strata-migrate", features = ["sqlite-source"] }
 strata-verify = { path = "../strata-verify" }

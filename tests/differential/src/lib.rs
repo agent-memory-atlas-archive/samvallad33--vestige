@@ -1,3 +1,4 @@
+#![cfg(feature = "legacy-sqlite")]
 //! # Cross-engine differential harness (SQLite vs STRATA)
 //!
 //! The determinism/parity gate for the SQLite→STRATA default flip.

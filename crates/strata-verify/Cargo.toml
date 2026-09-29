@@ -21,7 +21,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 strata-kernel = { path = "../strata-kernel" }
 # Migrated-log verification (PR-0a): frame kinds + receipt wire types.
-strata-migrate = { path = "../strata-migrate" }
+# Records and the migrated-log cross-check. The SQLite reader stays off
+# unless a caller enables `sqlite-source` (vestige-upgrade does).
+strata-migrate = { path = "../strata-migrate", default-features = false }
 strata = { path = "../strata" }
 strata-gate = { path = "../strata-gate" }
 # Trailer signatures are checked from the on-disk key. The scanner never
@@ -32,6 +34,8 @@ ed25519-dalek = { version = "3", default-features = false, features = ["fast", "
 ed25519-dalek = { version = "3", default-features = false, features = ["fast", "rand_core"] }
 tempfile = "3"
 strata-store = { path = "../strata-store" }
+# Tests migrate a fixture. Not linked into dependents of this crate.
+strata-migrate = { path = "../strata-migrate", features = ["sqlite-source"] }
 
 [[bin]]
 name = "strata-verify"

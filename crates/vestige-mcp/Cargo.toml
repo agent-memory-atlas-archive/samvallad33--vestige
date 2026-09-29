@@ -28,7 +28,7 @@ legacy-sqlite = ["vestige-core/legacy-sqlite", "vestige-core/bundled-sqlite", "d
 # Explicit `vestige migrate-to-strata` / `strata-verify` rebuild. Not linked
 # into the default `vestige` or `vestige-mcp` binaries. The shipped import is
 # `vestige-upgrade`.
-migrate-to-strata = ["dep:strata-migrate", "dep:strata-verify"]
+migrate-to-strata = ["dep:strata-migrate", "strata-migrate/sqlite-source", "dep:strata-verify"]
 # Raw engine test harness for THIS crate's own test builds (feature-gated
 # restart/creation tests). Never in default; the shipped binary keeps the
 # guard + creation block armed.
@@ -89,11 +89,10 @@ path = "src/bin/cli.rs"
 vestige-core = { version = "3.0.0", path = "../vestige-core", default-features = false }
 
 # One-shot SQLite -> STRATA migration. Optional, and not in the default
-# feature set: this crate depends on bundled rusqlite. The shipped importer
-# is the `vestige-upgrade` binary.
-strata-migrate = { path = "../strata-migrate", optional = true }
-# Read-only verifier. Same feature as migration: it depends on strata-migrate
-# and therefore bundled rusqlite.
+# feature set. `default-features = false` keeps `sqlite-source` off until
+# `migrate-to-strata` asks for it. The shipped importer is `vestige-upgrade`.
+strata-migrate = { path = "../strata-migrate", optional = true, default-features = false }
+# Read-only verifier. It depends on strata-migrate without the SQLite reader.
 strata-verify = { path = "../strata-verify", optional = true }
 
 # Strata log the shipped MCP server boots. Workspace-excluded; path dep only.
