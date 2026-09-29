@@ -34,6 +34,7 @@ use crate::storage::portable::{
 };
 
 // Phase 4 wall: types referenced by the MemoryStoreSend forwarding seam below.
+use crate::SchemaIntrospection;
 use crate::actor::{ActorPolicySnapshot, RoleResolution};
 #[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use crate::advanced::reconsolidation::LabileCandidate;
@@ -45,8 +46,12 @@ use crate::storage::attestation_store::ReceiptAttestationStatus;
 use crate::storage::attestation_store::{
     DurableSignedRetrievalReceipt, SignedReceiptWrite, StoredReceiptAttestationVerification,
 };
-use crate::storage::receipt_attestation::{ChainEntry, DsseEnvelope, TrustedSigningKey};
 use crate::storage::blast::{BlastReport, RetireOutcome};
+use crate::storage::receipt_attestation::{ChainEntry, DsseEnvelope, TrustedSigningKey};
+use crate::storage::replay_store::{
+    DurableCounterfactualReplay, DurableRetrievalReplayCapsule, RetrievalReplayCapsuleDraft,
+    RetrievalReplayCapsuleSummary, StoredCounterfactualReplay,
+};
 use crate::storage::resolver::HandleResolution;
 use crate::storage::session_queries::{
     ClosedIssueNode, FailedToolCall, GitCommitNode, OpenFailureTouching,
@@ -54,17 +59,9 @@ use crate::storage::session_queries::{
 use crate::storage::synaptic_store::{
     DurableSynapticCapture, SynapticCaptureRequest, SynapticIngestOutcome, SynapticIngestRequest,
 };
-use crate::storage::replay_store::{
-    DurableCounterfactualReplay, DurableRetrievalReplayCapsule, RetrievalReplayCapsuleDraft,
-    RetrievalReplayCapsuleSummary, StoredCounterfactualReplay,
-};
 use crate::storage::trace_store::{AgentRunSummary, PendingMemoryMutationDecision};
 use crate::storage::walk_receipts::{CoverageSnapshot, StoredWalkReceipt, WalkReceiptHandle};
 use crate::trace::{MemoryPr, MemoryPrAction, MemoryPrStatus, MemoryTraceEvent, Receipt};
-use crate::SchemaIntrospection;
-
-
-
 
 // ============================================================================
 // ERROR TYPES
@@ -75,9 +72,9 @@ use crate::SchemaIntrospection;
 // strata/fix-00a). Every other shared type below likewise.
 pub use crate::storage::types::{
     CompositionEventRecord, CompositionMemberRecord, CompositionNeighborRecord,
-    CompositionOutcomeRecord, ConnectorCursor, ConsolidationHistoryRecord, DreamHistoryRecord,
-    FailureFeedbackReport, HygieneNodeSummary, HygieneSnapshot, InsightRecord, IntentionRecord,
-    ConnectionRecord, NeverComposedCandidate, PortableSyncReport, PurgeReport, ReconcileReport,
+    CompositionOutcomeRecord, ConnectionRecord, ConnectorCursor, ConsolidationHistoryRecord,
+    DreamHistoryRecord, FailureFeedbackReport, HygieneNodeSummary, HygieneSnapshot, InsightRecord,
+    IntentionRecord, NeverComposedCandidate, PortableSyncReport, PurgeReport, ReconcileReport,
     Result, SmartIngestResult, SourceUpsertOutcome, SourceUpsertResult, StateTransitionRecord,
     StorageError, TagVocabulary, WalCheckpointMode, WalCheckpointStatus,
 };
@@ -820,7 +817,6 @@ impl SqliteMemoryStore {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
-
 }
 
 // ============================================================================
@@ -898,11 +894,7 @@ impl SqliteMemoryStore {
             .reader
             .lock()
             .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
-        let placeholders = link_types
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = link_types.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
             "SELECT source_id, target_id FROM memory_connections WHERE link_type IN ({placeholders})"
         );
@@ -973,8 +965,10 @@ impl SqliteMemoryStore {
         // No tag admission, no term admission, no similarity of any kind.
         // With no typed edges in scope this returns NOTHING rather than
         // falling back on shared words.
-        let typed_adjacency = self.typed_edge_adjacency(&["touched", "derived_from", "closed_by"])?;
-        let pool_ids: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        let typed_adjacency =
+            self.typed_edge_adjacency(&["touched", "derived_from", "closed_by"])?;
+        let pool_ids: std::collections::HashSet<&str> =
+            nodes.iter().map(|n| n.id.as_str()).collect();
         // hop-distance map over the pool (BFS depth <= 3, cycle-safe)
         let hop_map = Self::hop_distances(&typed_adjacency, &pool_ids, 3);
 
@@ -2131,20 +2125,52 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn actor_policy_snapshot(&self) -> Result<ActorPolicySnapshot> {
         SqliteMemoryStore::actor_policy_snapshot(self)
     }
-    fn append_mcp_call_outcome(&self, run_id: &str, tool: &str, success: bool, error: Option<&str>, at_ms: i64,) -> Result<()> {
+    fn append_mcp_call_outcome(
+        &self,
+        run_id: &str,
+        tool: &str,
+        success: bool,
+        error: Option<&str>,
+        at_ms: i64,
+    ) -> Result<()> {
         SqliteMemoryStore::append_mcp_call_outcome(self, run_id, tool, success, error, at_ms)
     }
     fn append_trace_event(&self, event: &MemoryTraceEvent) -> Result<i64> {
         SqliteMemoryStore::append_trace_event(self, event)
     }
-    fn apply_failure_feedback(&self, failure_id: &str, window: Duration) -> Result<FailureFeedbackReport> {
+    fn apply_failure_feedback(
+        &self,
+        failure_id: &str,
+        window: Duration,
+    ) -> Result<FailureFeedbackReport> {
         SqliteMemoryStore::apply_failure_feedback(self, failure_id, window)
     }
-    fn apply_intention_graph(&self, scope: &str, command: Command, now: DateTime<Utc>) -> std::result::Result<serde_json::Value, String> {
+    fn apply_intention_graph(
+        &self,
+        scope: &str,
+        command: Command,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<serde_json::Value, String> {
         SqliteMemoryStore::apply_intention_graph(self, scope, command, now)
     }
-    fn apply_tag_mutation(&self, source_tags: &[String], target_tag: &str, scope: Option<&str>, preview_token: &str, op_type: &str, reason: &str,) -> Result<MergeOperation> {
-        SqliteMemoryStore::apply_tag_mutation(self, source_tags, target_tag, scope, preview_token, op_type, reason)
+    fn apply_tag_mutation(
+        &self,
+        source_tags: &[String],
+        target_tag: &str,
+        scope: Option<&str>,
+        preview_token: &str,
+        op_type: &str,
+        reason: &str,
+    ) -> Result<MergeOperation> {
+        SqliteMemoryStore::apply_tag_mutation(
+            self,
+            source_tags,
+            target_tag,
+            scope,
+            preview_token,
+            op_type,
+            reason,
+        )
     }
     fn backup_to(&self, path: &Path) -> Result<()> {
         SqliteMemoryStore::backup_to(self, path)
@@ -2152,16 +2178,24 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn blast_radius(&self, root_id: &str, open_only: bool) -> Result<BlastReport> {
         SqliteMemoryStore::blast_radius(self, root_id, open_only)
     }
-    fn blast_radius_with_link_types(&self, root_id: &str, open_only: bool, link_types: &[&str],) -> Result<BlastReport> {
+    fn blast_radius_with_link_types(
+        &self,
+        root_id: &str,
+        open_only: bool,
+        link_types: &[&str],
+    ) -> Result<BlastReport> {
         SqliteMemoryStore::blast_radius_with_link_types(self, root_id, open_only, link_types)
     }
-    fn capture_synaptic_event(&self, request: &SynapticCaptureRequest) -> Result<DurableSynapticCapture> {
+    fn capture_synaptic_event(
+        &self,
+        request: &SynapticCaptureRequest,
+    ) -> Result<DurableSynapticCapture> {
         SqliteMemoryStore::capture_synaptic_event(self, request)
     }
     fn checkpoint_wal(&self, mode: WalCheckpointMode) -> Result<WalCheckpointStatus> {
         SqliteMemoryStore::checkpoint_wal(self, mode)
     }
-    fn clear_dream_page_tags(&self, ids: &[String], started_at: DateTime<Utc>,) -> Result<usize> {
+    fn clear_dream_page_tags(&self, ids: &[String], started_at: DateTime<Utc>) -> Result<usize> {
         SqliteMemoryStore::clear_dream_page_tags(self, ids, started_at)
     }
     fn closed_issue_nodes(&self, source_system: &str, scope: &str) -> Result<Vec<ClosedIssueNode>> {
@@ -2170,14 +2204,32 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn code_anchors_for_node(&self, node_id: &str) -> Result<Vec<CodeAnchor>> {
         SqliteMemoryStore::code_anchors_for_node(self, node_id)
     }
-    fn code_anchors_for_nodes(&self, node_ids: &[String]) -> Result<HashMap<String, Vec<CodeAnchor>>> {
+    fn code_anchors_for_nodes(
+        &self,
+        node_ids: &[String],
+    ) -> Result<HashMap<String, Vec<CodeAnchor>>> {
         SqliteMemoryStore::code_anchors_for_nodes(self, node_ids)
     }
-    fn commit_intention_check(&self, changes: &[(IntentionRecord, IntentionRecord)]) -> std::result::Result<(), String> {
+    fn commit_intention_check(
+        &self,
+        changes: &[(IntentionRecord, IntentionRecord)],
+    ) -> std::result::Result<(), String> {
         SqliteMemoryStore::commit_intention_check(self, changes)
     }
-    fn concrete_search_filtered(&self, query: &str, limit: i32, include_types: Option<&[String]>, exclude_types: Option<&[String]>,) -> Result<Vec<crate::memory::SearchResult>> {
-        SqliteMemoryStore::concrete_search_filtered(self, query, limit, include_types, exclude_types)
+    fn concrete_search_filtered(
+        &self,
+        query: &str,
+        limit: i32,
+        include_types: Option<&[String]>,
+        exclude_types: Option<&[String]>,
+    ) -> Result<Vec<crate::memory::SearchResult>> {
+        SqliteMemoryStore::concrete_search_filtered(
+            self,
+            query,
+            limit,
+            include_types,
+            exclude_types,
+        )
     }
     fn count_memories_below_retention(&self, threshold: f64) -> Result<i64> {
         SqliteMemoryStore::count_memories_below_retention(self, threshold)
@@ -2194,10 +2246,20 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn coverage_snapshot(&self) -> Result<CoverageSnapshot> {
         SqliteMemoryStore::coverage_snapshot(self)
     }
-    fn create_context_ablation_replay(&self, source_receipt_id: &str, withheld_slots: &[String],) -> Result<DurableCounterfactualReplay> {
+    fn create_context_ablation_replay(
+        &self,
+        source_receipt_id: &str,
+        withheld_slots: &[String],
+    ) -> Result<DurableCounterfactualReplay> {
         SqliteMemoryStore::create_context_ablation_replay(self, source_receipt_id, withheld_slots)
     }
-    fn current_code_context_nodes(&self, node_type: &str, tag: Option<&str>, scope: &str, limit: i32) -> Result<Vec<KnowledgeNode>> {
+    fn current_code_context_nodes(
+        &self,
+        node_type: &str,
+        tag: Option<&str>,
+        scope: &str,
+        limit: i32,
+    ) -> Result<Vec<KnowledgeNode>> {
         SqliteMemoryStore::current_code_context_nodes(self, node_type, tag, scope, limit)
     }
     fn data_dir(&self) -> &Path {
@@ -2209,7 +2271,11 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn decide_memory_pr(&self, id: &str, action: MemoryPrAction) -> Result<MemoryPr> {
         SqliteMemoryStore::decide_memory_pr(self, id, action)
     }
-    fn decide_pending_memory_mutation(&self, id: &str, action: MemoryPrAction,) -> Result<Option<PendingMemoryMutationDecision>> {
+    fn decide_pending_memory_mutation(
+        &self,
+        id: &str,
+        action: MemoryPrAction,
+    ) -> Result<Option<PendingMemoryMutationDecision>> {
         SqliteMemoryStore::decide_pending_memory_mutation(self, id, action)
     }
     fn delete_node(&self, id: &str) -> Result<bool> {
@@ -2218,7 +2284,12 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn demote_memory(&self, id: &str) -> Result<KnowledgeNode> {
         SqliteMemoryStore::demote_memory(self, id)
     }
-    fn demote_memory_as_actor(&self, id: &str, claimed_role: Option<&str>, tool: &str,) -> Result<ActorMutationOutcome> {
+    fn demote_memory_as_actor(
+        &self,
+        id: &str,
+        claimed_role: Option<&str>,
+        tool: &str,
+    ) -> Result<ActorMutationOutcome> {
         SqliteMemoryStore::demote_memory_as_actor(self, id, claimed_role, tool)
     }
     fn due_for_review_node_ids(&self, limit: usize) -> Result<Vec<String>> {
@@ -2245,7 +2316,12 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn get_all_nodes(&self, limit: i32, offset: i32) -> Result<Vec<KnowledgeNode>> {
         SqliteMemoryStore::get_all_nodes(self, limit, offset)
     }
-    fn get_all_nodes_in_scope(&self, scope: &str, limit: i32, offset: i32) -> Result<Vec<KnowledgeNode>> {
+    fn get_all_nodes_in_scope(
+        &self,
+        scope: &str,
+        limit: i32,
+        offset: i32,
+    ) -> Result<Vec<KnowledgeNode>> {
         SqliteMemoryStore::get_all_nodes_in_scope(self, scope, limit, offset)
     }
     fn get_avg_retention(&self) -> Result<f64> {
@@ -2257,13 +2333,21 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn get_composition_members(&self, event_id: &str) -> Result<Vec<CompositionMemberRecord>> {
         SqliteMemoryStore::get_composition_members(self, event_id)
     }
-    fn get_composition_neighbors(&self, memory_id: &str, limit: i32,) -> Result<Vec<CompositionNeighborRecord>> {
+    fn get_composition_neighbors(
+        &self,
+        memory_id: &str,
+        limit: i32,
+    ) -> Result<Vec<CompositionNeighborRecord>> {
         SqliteMemoryStore::get_composition_neighbors(self, memory_id, limit)
     }
-    fn get_composition_outcomes(&self, event_id: &str,) -> Result<Vec<CompositionOutcomeRecord>> {
+    fn get_composition_outcomes(&self, event_id: &str) -> Result<Vec<CompositionOutcomeRecord>> {
         SqliteMemoryStore::get_composition_outcomes(self, event_id)
     }
-    fn get_compositions_for_memory(&self, memory_id: &str, limit: i32,) -> Result<Vec<CompositionEventRecord>> {
+    fn get_compositions_for_memory(
+        &self,
+        memory_id: &str,
+        limit: i32,
+    ) -> Result<Vec<CompositionEventRecord>> {
         SqliteMemoryStore::get_compositions_for_memory(self, memory_id, limit)
     }
     fn get_connections_for_memory(&self, memory_id: &str) -> Result<Vec<ConnectionRecord>> {
@@ -2272,7 +2356,10 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn get_consolidation_history(&self, limit: i32) -> Result<Vec<ConsolidationHistoryRecord>> {
         SqliteMemoryStore::get_consolidation_history(self, limit)
     }
-    fn get_context_ablation_replay(&self, replay_id: &str,) -> Result<Option<StoredCounterfactualReplay>> {
+    fn get_context_ablation_replay(
+        &self,
+        replay_id: &str,
+    ) -> Result<Option<StoredCounterfactualReplay>> {
         SqliteMemoryStore::get_context_ablation_replay(self, replay_id)
     }
     fn get_dream_history(&self, limit: i32) -> Result<Vec<DreamHistoryRecord>> {
@@ -2296,10 +2383,15 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn get_memory_pr(&self, id: &str) -> Result<Option<MemoryPr>> {
         SqliteMemoryStore::get_memory_pr(self, id)
     }
-    fn get_memory_subgraph(&self, center_id: &str, depth: u32, max_nodes: usize,) -> Result<(Vec<KnowledgeNode>, Vec<ConnectionRecord>)> {
+    fn get_memory_subgraph(
+        &self,
+        center_id: &str,
+        depth: u32,
+        max_nodes: usize,
+    ) -> Result<(Vec<KnowledgeNode>, Vec<ConnectionRecord>)> {
         SqliteMemoryStore::get_memory_subgraph(self, center_id, depth, max_nodes)
     }
-    fn get_merge_operation(&self, operation_id: &str,) -> Result<Option<MergeOperation>> {
+    fn get_merge_operation(&self, operation_id: &str) -> Result<Option<MergeOperation>> {
         SqliteMemoryStore::get_merge_operation(self, operation_id)
     }
     fn get_merge_policy(&self) -> Result<MergePolicy> {
@@ -2308,10 +2400,19 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn get_most_connected_memory(&self) -> Result<Option<String>> {
         SqliteMemoryStore::get_most_connected_memory(self)
     }
-    fn get_never_composed_candidates(&self, limit: i32, tag_filter: Option<&[String]>,) -> Result<Vec<NeverComposedCandidate>> {
+    fn get_never_composed_candidates(
+        &self,
+        limit: i32,
+        tag_filter: Option<&[String]>,
+    ) -> Result<Vec<NeverComposedCandidate>> {
         SqliteMemoryStore::get_never_composed_candidates(self, limit, tag_filter)
     }
-    fn get_never_composed_candidates_in_scope(&self, limit: i32, tag_filter: Option<&[String]>, scope: Option<&str>) -> Result<Vec<NeverComposedCandidate>> {
+    fn get_never_composed_candidates_in_scope(
+        &self,
+        limit: i32,
+        tag_filter: Option<&[String]>,
+        scope: Option<&str>,
+    ) -> Result<Vec<NeverComposedCandidate>> {
         SqliteMemoryStore::get_never_composed_candidates_in_scope(self, limit, tag_filter, scope)
     }
     fn get_node(&self, id: &str) -> Result<Option<KnowledgeNode>> {
@@ -2323,13 +2424,17 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn get_receipt(&self, receipt_id: &str) -> Result<Option<Receipt>> {
         SqliteMemoryStore::get_receipt(self, receipt_id)
     }
-    fn get_receipt_attestation_envelope(&self, receipt_id: &str,) -> Result<Option<DsseEnvelope>> {
+    fn get_receipt_attestation_envelope(&self, receipt_id: &str) -> Result<Option<DsseEnvelope>> {
         SqliteMemoryStore::get_receipt_attestation_envelope(self, receipt_id)
     }
     fn get_recent_composition_events(&self, limit: i32) -> Result<Vec<CompositionEventRecord>> {
         SqliteMemoryStore::get_recent_composition_events(self, limit)
     }
-    fn get_recent_composition_events_page(&self, limit: i32, offset: i32,) -> Result<Vec<CompositionEventRecord>> {
+    fn get_recent_composition_events_page(
+        &self,
+        limit: i32,
+        offset: i32,
+    ) -> Result<Vec<CompositionEventRecord>> {
         SqliteMemoryStore::get_recent_composition_events_page(self, limit, offset)
     }
     fn get_recent_connections(&self, limit: usize) -> Result<Vec<ConnectionRecord>> {
@@ -2344,13 +2449,20 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn get_retention_trend(&self) -> Result<String> {
         SqliteMemoryStore::get_retention_trend(self)
     }
-    fn get_retrieval_replay_capsule(&self, source_receipt_id: &str,) -> Result<Option<RetrievalReplayCapsuleSummary>> {
+    fn get_retrieval_replay_capsule(
+        &self,
+        source_receipt_id: &str,
+    ) -> Result<Option<RetrievalReplayCapsuleSummary>> {
         SqliteMemoryStore::get_retrieval_replay_capsule(self, source_receipt_id)
     }
     fn get_review_queue(&self, limit: i32) -> Result<Vec<KnowledgeNode>> {
         SqliteMemoryStore::get_review_queue(self, limit)
     }
-    fn get_state_transitions(&self, memory_id: &str, limit: i32,) -> Result<Vec<StateTransitionRecord>> {
+    fn get_state_transitions(
+        &self,
+        memory_id: &str,
+        limit: i32,
+    ) -> Result<Vec<StateTransitionRecord>> {
         SqliteMemoryStore::get_state_transitions(self, memory_id, limit)
     }
     fn get_stats(&self) -> Result<MemoryStats> {
@@ -2368,19 +2480,49 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn grant_actor_role(&self, actor_did: &str, role: &str, note: Option<&str>) -> Result<u64> {
         SqliteMemoryStore::grant_actor_role(self, actor_did, role, note)
     }
-    fn hybrid_search(&self, query: &str, limit: i32, keyword_weight: f32, semantic_weight: f32,) -> Result<Vec<crate::memory::SearchResult>> {
+    fn hybrid_search(
+        &self,
+        query: &str,
+        limit: i32,
+        keyword_weight: f32,
+        semantic_weight: f32,
+    ) -> Result<Vec<crate::memory::SearchResult>> {
         SqliteMemoryStore::hybrid_search(self, query, limit, keyword_weight, semantic_weight)
     }
-    fn hybrid_search_filtered(&self, query: &str, limit: i32, keyword_weight: f32, semantic_weight: f32, include_types: Option<&[String]>, exclude_types: Option<&[String]>,) -> Result<Vec<crate::memory::SearchResult>> {
-        SqliteMemoryStore::hybrid_search_filtered(self, query, limit, keyword_weight, semantic_weight, include_types, exclude_types)
+    fn hybrid_search_filtered(
+        &self,
+        query: &str,
+        limit: i32,
+        keyword_weight: f32,
+        semantic_weight: f32,
+        include_types: Option<&[String]>,
+        exclude_types: Option<&[String]>,
+    ) -> Result<Vec<crate::memory::SearchResult>> {
+        SqliteMemoryStore::hybrid_search_filtered(
+            self,
+            query,
+            limit,
+            keyword_weight,
+            semantic_weight,
+            include_types,
+            exclude_types,
+        )
     }
     fn hygiene_snapshot(&self, scope: Option<&str>) -> Result<HygieneSnapshot> {
         SqliteMemoryStore::hygiene_snapshot(self, scope)
     }
-    fn import_portable_archive(&self, archive: &PortableArchive, mode: PortableImportMode) -> Result<PortableImportReport> {
+    fn import_portable_archive(
+        &self,
+        archive: &PortableArchive,
+        mode: PortableImportMode,
+    ) -> Result<PortableImportReport> {
         SqliteMemoryStore::import_portable_archive(self, archive, mode)
     }
-    fn import_portable_archive_from_path(&self, path: &Path, mode: PortableImportMode) -> Result<PortableImportReport> {
+    fn import_portable_archive_from_path(
+        &self,
+        path: &Path,
+        mode: PortableImportMode,
+    ) -> Result<PortableImportReport> {
         SqliteMemoryStore::import_portable_archive_from_path(self, path, mode)
     }
     fn ingest(&self, input: IngestInput) -> Result<KnowledgeNode> {
@@ -2389,13 +2531,27 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn ingest_in_scope(&self, input: IngestInput, scope: &str) -> Result<KnowledgeNode> {
         SqliteMemoryStore::ingest_in_scope(self, input, scope)
     }
-    fn ingest_in_scope_with_secret_policy(&self, input: IngestInput, scope: &str, policy: SecretPolicy) -> Result<KnowledgeNode> {
+    fn ingest_in_scope_with_secret_policy(
+        &self,
+        input: IngestInput,
+        scope: &str,
+        policy: SecretPolicy,
+    ) -> Result<KnowledgeNode> {
         SqliteMemoryStore::ingest_in_scope_with_secret_policy(self, input, scope, policy)
     }
-    fn ingest_with_secret_policy(&self, input: IngestInput, policy: SecretPolicy) -> Result<KnowledgeNode> {
+    fn ingest_with_secret_policy(
+        &self,
+        input: IngestInput,
+        policy: SecretPolicy,
+    ) -> Result<KnowledgeNode> {
         SqliteMemoryStore::ingest_with_secret_policy(self, input, policy)
     }
-    fn intention_memory_snapshot(&self, scope: &str, memory_id: &str, now: DateTime<Utc>) -> std::result::Result<serde_json::Value, String> {
+    fn intention_memory_snapshot(
+        &self,
+        scope: &str,
+        memory_id: &str,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<serde_json::Value, String> {
         SqliteMemoryStore::intention_memory_snapshot(self, scope, memory_id, now)
     }
     fn last_backup_timestamp(&self) -> Option<DateTime<Utc>> {
@@ -2413,13 +2569,22 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn list_agent_runs(&self, limit: usize) -> Result<Vec<AgentRunSummary>> {
         SqliteMemoryStore::list_agent_runs(self, limit)
     }
-    fn list_endorsement_events(&self, memory_id: Option<&str>, actor_did: Option<&str>, limit: usize) -> Result<Vec<EndorsementEventRecord>> {
+    fn list_endorsement_events(
+        &self,
+        memory_id: Option<&str>,
+        actor_did: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EndorsementEventRecord>> {
         SqliteMemoryStore::list_endorsement_events(self, memory_id, actor_did, limit)
     }
-    fn list_memory_prs(&self, status: Option<MemoryPrStatus>, limit: usize,) -> Result<Vec<MemoryPr>> {
+    fn list_memory_prs(
+        &self,
+        status: Option<MemoryPrStatus>,
+        limit: usize,
+    ) -> Result<Vec<MemoryPr>> {
         SqliteMemoryStore::list_memory_prs(self, status, limit)
     }
-    fn list_merge_operations(&self, limit: usize,) -> Result<Vec<MergeOperation>> {
+    fn list_merge_operations(&self, limit: usize) -> Result<Vec<MergeOperation>> {
         SqliteMemoryStore::list_merge_operations(self, limit)
     }
     fn list_receipts(&self, limit: usize) -> Result<Vec<Receipt>> {
@@ -2431,7 +2596,11 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn list_reconsolidation_plans(&self, limit: usize) -> Result<Vec<(MergePlan, String)>> {
         SqliteMemoryStore::list_reconsolidation_plans(self, limit)
     }
-    fn list_tag_operations(&self, limit: usize, scope: Option<&str>,) -> Result<Vec<MergeOperation>> {
+    fn list_tag_operations(
+        &self,
+        limit: usize,
+        scope: Option<&str>,
+    ) -> Result<Vec<MergeOperation>> {
         SqliteMemoryStore::list_tag_operations(self, limit, scope)
     }
     fn load_active_synaptic_tags(&self) -> Result<Vec<SynapticTag>> {
@@ -2440,22 +2609,54 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn lowest_retention_nodes(&self, limit: usize) -> Result<Vec<(String, f64)>> {
         SqliteMemoryStore::lowest_retention_nodes(self, limit)
     }
-    fn maintain_gc_batch(&self, limit: usize, after: Option<&str>, budget_ms: u64, dry_run: bool, min_retention: f64, max_age_days: Option<u64>) -> Result<serde_json::Value> {
-        SqliteMemoryStore::maintain_gc_batch(self, limit, after, budget_ms, dry_run, min_retention, max_age_days)
+    fn maintain_gc_batch(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+        budget_ms: u64,
+        dry_run: bool,
+        min_retention: f64,
+        max_age_days: Option<u64>,
+    ) -> Result<serde_json::Value> {
+        SqliteMemoryStore::maintain_gc_batch(
+            self,
+            limit,
+            after,
+            budget_ms,
+            dry_run,
+            min_retention,
+            max_age_days,
+        )
     }
-    fn maintain_lifecycle_batch(&self, limit: usize, after: Option<&str>, budget_ms: u64, dry_run: bool) -> Result<serde_json::Value> {
+    fn maintain_lifecycle_batch(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+        budget_ms: u64,
+        dry_run: bool,
+    ) -> Result<serde_json::Value> {
         SqliteMemoryStore::maintain_lifecycle_batch(self, limit, after, budget_ms, dry_run)
     }
     fn maintain_log_batch(&self, limit: usize, dry_run: bool) -> Result<serde_json::Value> {
         SqliteMemoryStore::maintain_log_batch(self, limit, dry_run)
     }
-    fn maintenance_memory_page(&self, limit: usize, after: Option<&str>, scope: &str,) -> Result<(Vec<crate::KnowledgeNode>, bool)> {
+    fn maintenance_memory_page(
+        &self,
+        limit: usize,
+        after: Option<&str>,
+        scope: &str,
+    ) -> Result<(Vec<crate::KnowledgeNode>, bool)> {
         SqliteMemoryStore::maintenance_memory_page(self, limit, after, scope)
     }
     fn mark_reviewed(&self, id: &str, rating: Rating) -> Result<KnowledgeNode> {
         SqliteMemoryStore::mark_reviewed(self, id, rating)
     }
-    fn merge_candidates(&self, policy: MergePolicy, limit: usize, tag_filter: &[String]) -> Result<Vec<MergeCandidate>> {
+    fn merge_candidates(
+        &self,
+        policy: MergePolicy,
+        limit: usize,
+        tag_filter: &[String],
+    ) -> Result<Vec<MergeCandidate>> {
         SqliteMemoryStore::merge_candidates(self, policy, limit, tag_filter)
     }
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
@@ -2474,22 +2675,40 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn open_failures_touching(&self, changed_files: &[String]) -> Result<Vec<OpenFailureTouching>> {
         SqliteMemoryStore::open_failures_touching(self, changed_files)
     }
-    fn preview_tag_mutation(&self, source_tags: &[String], target_tag: &str, scope: Option<&str>,) -> Result<serde_json::Value> {
+    fn preview_tag_mutation(
+        &self,
+        source_tags: &[String],
+        target_tag: &str,
+        scope: Option<&str>,
+    ) -> Result<serde_json::Value> {
         SqliteMemoryStore::preview_tag_mutation(self, source_tags, target_tag, scope)
     }
     fn process_actor_did(&self) -> Option<String> {
         SqliteMemoryStore::process_actor_did(self)
     }
-    fn process_synaptic_ingest(&self, request: &SynapticIngestRequest) -> Result<SynapticIngestOutcome> {
+    fn process_synaptic_ingest(
+        &self,
+        request: &SynapticIngestRequest,
+    ) -> Result<SynapticIngestOutcome> {
         SqliteMemoryStore::process_synaptic_ingest(self, request)
     }
-    fn projection_candidates(&self, scope: &str, min_retention: f64, limit: i32) -> Result<Vec<KnowledgeNode>> {
+    fn projection_candidates(
+        &self,
+        scope: &str,
+        min_retention: f64,
+        limit: i32,
+    ) -> Result<Vec<KnowledgeNode>> {
         SqliteMemoryStore::projection_candidates(self, scope, min_retention, limit)
     }
     fn promote_memory(&self, id: &str) -> Result<KnowledgeNode> {
         SqliteMemoryStore::promote_memory(self, id)
     }
-    fn promote_memory_as_actor(&self, id: &str, claimed_role: Option<&str>, tool: &str,) -> Result<ActorMutationOutcome> {
+    fn promote_memory_as_actor(
+        &self,
+        id: &str,
+        claimed_role: Option<&str>,
+        tool: &str,
+    ) -> Result<ActorMutationOutcome> {
         SqliteMemoryStore::promote_memory_as_actor(self, id, claimed_role, tool)
     }
     fn promote_memory_backfill(&self, id: &str) -> Result<KnowledgeNode> {
@@ -2501,16 +2720,31 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn purge_node(&self, id: &str, reason: Option<&str>) -> Result<PurgeReport> {
         SqliteMemoryStore::purge_node(self, id, reason)
     }
-    fn query_time_range(&self, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, limit: i32, node_type: Option<&str>, tags: Option<&[String]>,) -> Result<Vec<KnowledgeNode>> {
+    fn query_time_range(
+        &self,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: i32,
+        node_type: Option<&str>,
+        tags: Option<&[String]>,
+    ) -> Result<Vec<KnowledgeNode>> {
         SqliteMemoryStore::query_time_range(self, start, end, limit, node_type, tags)
     }
     fn recall(&self, input: RecallInput) -> Result<Vec<KnowledgeNode>> {
         SqliteMemoryStore::recall(self, input)
     }
-    fn receipt_attestation_status(&self, receipt_id: &str) -> Result<Option<ReceiptAttestationStatus>> {
+    fn receipt_attestation_status(
+        &self,
+        receipt_id: &str,
+    ) -> Result<Option<ReceiptAttestationStatus>> {
         SqliteMemoryStore::receipt_attestation_status(self, receipt_id)
     }
-    fn record_anchor_verification(&self, anchor_id: &str, status: AnchorStatus, checked_at: DateTime<Utc>) -> Result<()> {
+    fn record_anchor_verification(
+        &self,
+        anchor_id: &str,
+        status: AnchorStatus,
+        checked_at: DateTime<Utc>,
+    ) -> Result<()> {
         SqliteMemoryStore::record_anchor_verification(self, anchor_id, status, checked_at)
     }
     fn record_batch_retrieval(&self, ids: &[&str]) -> Result<()> {
@@ -2525,19 +2759,32 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn record_memory_access(&self, memory_id: &str) -> Result<()> {
         SqliteMemoryStore::record_memory_access(self, memory_id)
     }
-    fn record_reinforce_endorsement(&self, id: &str, claimed_role: Option<&str>, tool: &str) -> Result<ActorMutationOutcome> {
+    fn record_reinforce_endorsement(
+        &self,
+        id: &str,
+        claimed_role: Option<&str>,
+        tool: &str,
+    ) -> Result<ActorMutationOutcome> {
         SqliteMemoryStore::record_reinforce_endorsement(self, id, claimed_role, tool)
     }
-    fn registered_receipt_signing_key(&self, key_id: &str,) -> Result<Option<TrustedSigningKey>> {
+    fn registered_receipt_signing_key(&self, key_id: &str) -> Result<Option<TrustedSigningKey>> {
         SqliteMemoryStore::registered_receipt_signing_key(self, key_id)
     }
     fn release_quarantine(&self, id: &str) -> Result<KnowledgeNode> {
         SqliteMemoryStore::release_quarantine(self, id)
     }
-    fn replace_code_anchors(&self, node_id: &str, scope: &str, anchors: &[CodeAnchor],) -> Result<usize> {
+    fn replace_code_anchors(
+        &self,
+        node_id: &str,
+        scope: &str,
+        anchors: &[CodeAnchor],
+    ) -> Result<usize> {
         SqliteMemoryStore::replace_code_anchors(self, node_id, scope, anchors)
     }
-    fn replay_intention_graph(&self, scope: &str) -> std::result::Result<serde_json::Value, String> {
+    fn replay_intention_graph(
+        &self,
+        scope: &str,
+    ) -> std::result::Result<serde_json::Value, String> {
         SqliteMemoryStore::replay_intention_graph(self, scope)
     }
     fn resolve_actor_role(&self, claimed_role: Option<&str>) -> Result<(String, RoleResolution)> {
@@ -2558,14 +2805,27 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn run_consolidation(&self) -> Result<ConsolidationResult> {
         SqliteMemoryStore::run_consolidation(self)
     }
-    fn save_composition(&self, event: &CompositionEventRecord, members: &[CompositionMemberRecord], outcomes: &[CompositionOutcomeRecord],) -> Result<()> {
+    fn save_composition(
+        &self,
+        event: &CompositionEventRecord,
+        members: &[CompositionMemberRecord],
+        outcomes: &[CompositionOutcomeRecord],
+    ) -> Result<()> {
         SqliteMemoryStore::save_composition(self, event, members, outcomes)
     }
     fn save_connection(&self, connection: &ConnectionRecord) -> Result<()> {
         SqliteMemoryStore::save_connection(self, connection)
     }
-    fn save_counterfactual_replay_receipt(&self, replay_id: &str, receipt: &Receipt, run_id: Option<&str>, tool: Option<&str>) -> Result<()> {
-        SqliteMemoryStore::save_counterfactual_replay_receipt(self, replay_id, receipt, run_id, tool)
+    fn save_counterfactual_replay_receipt(
+        &self,
+        replay_id: &str,
+        receipt: &Receipt,
+        run_id: Option<&str>,
+        tool: Option<&str>,
+    ) -> Result<()> {
+        SqliteMemoryStore::save_counterfactual_replay_receipt(
+            self, replay_id, receipt, run_id, tool,
+        )
     }
     fn save_dream_history(&self, record: &DreamHistoryRecord) -> Result<i64> {
         SqliteMemoryStore::save_dream_history(self, record)
@@ -2579,19 +2839,43 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn save_memory_pr(&self, pr: &MemoryPr) -> Result<()> {
         SqliteMemoryStore::save_memory_pr(self, pr)
     }
-    fn save_receipt(&self, receipt: &Receipt, run_id: Option<&str>, tool: Option<&str>, query: Option<&str>) -> Result<()> {
+    fn save_receipt(
+        &self,
+        receipt: &Receipt,
+        run_id: Option<&str>,
+        tool: Option<&str>,
+        query: Option<&str>,
+    ) -> Result<()> {
         SqliteMemoryStore::save_receipt(self, receipt, run_id, tool, query)
     }
-    fn save_retrieval_receipt_with_replay_capsule(&self, receipt: &Receipt, run_id: Option<&str>, tool: Option<&str>, draft: &RetrievalReplayCapsuleDraft,) -> Result<DurableRetrievalReplayCapsule> {
-        SqliteMemoryStore::save_retrieval_receipt_with_replay_capsule(self, receipt, run_id, tool, draft)
+    fn save_retrieval_receipt_with_replay_capsule(
+        &self,
+        receipt: &Receipt,
+        run_id: Option<&str>,
+        tool: Option<&str>,
+        draft: &RetrievalReplayCapsuleDraft,
+    ) -> Result<DurableRetrievalReplayCapsule> {
+        SqliteMemoryStore::save_retrieval_receipt_with_replay_capsule(
+            self, receipt, run_id, tool, draft,
+        )
     }
-    fn save_signed_retrieval_receipt_with_replay_capsule_atomic(&self, write: SignedReceiptWrite<'_>, draft: &RetrievalReplayCapsuleDraft,) -> Result<DurableSignedRetrievalReceipt> {
-        SqliteMemoryStore::save_signed_retrieval_receipt_with_replay_capsule_atomic(self, write, draft)
+    fn save_signed_retrieval_receipt_with_replay_capsule_atomic(
+        &self,
+        write: SignedReceiptWrite<'_>,
+        draft: &RetrievalReplayCapsuleDraft,
+    ) -> Result<DurableSignedRetrievalReceipt> {
+        SqliteMemoryStore::save_signed_retrieval_receipt_with_replay_capsule_atomic(
+            self, write, draft,
+        )
     }
     fn save_synaptic_tag(&self, tag: &SynapticTag) -> Result<String> {
         SqliteMemoryStore::save_synaptic_tag(self, tag)
     }
-    fn save_walk_receipt(&self, canonical_json: &str, params: &serde_json::Value,) -> Result<WalkReceiptHandle> {
+    fn save_walk_receipt(
+        &self,
+        canonical_json: &str,
+        params: &serde_json::Value,
+    ) -> Result<WalkReceiptHandle> {
         SqliteMemoryStore::save_walk_receipt(self, canonical_json, params)
     }
     fn schema_introspection(&self) -> Result<SchemaIntrospection> {
@@ -2621,7 +2905,12 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn export_portable_archive(&self) -> Result<PortableArchive> {
         SqliteMemoryStore::export_portable_archive(self)
     }
-    fn reconcile_source_tombstones(&self, source_system: &str, scope: &str, live_ids: &[String]) -> Result<ReconcileReport> {
+    fn reconcile_source_tombstones(
+        &self,
+        source_system: &str,
+        scope: &str,
+        live_ids: &[String],
+    ) -> Result<ReconcileReport> {
         SqliteMemoryStore::reconcile_source_tombstones(self, source_system, scope, live_ids)
     }
     fn get_connector_cursor(&self, source_system: &str, scope: &str) -> Result<ConnectorCursor> {
@@ -2639,7 +2928,14 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn run_rac1_cascade_sweep(&self) -> Result<(usize, usize)> {
         SqliteMemoryStore::run_rac1_cascade_sweep(self)
     }
-    fn smart_ingest_excluding_in_scope_with_secret_policy_and_labile(&self, _input: IngestInput, scope: &str, excluded_node_ids: &[String], policy: SecretPolicy, labile: &[LabileCandidate]) -> Result<SmartIngestResult> {
+    fn smart_ingest_excluding_in_scope_with_secret_policy_and_labile(
+        &self,
+        _input: IngestInput,
+        scope: &str,
+        excluded_node_ids: &[String],
+        policy: SecretPolicy,
+        labile: &[LabileCandidate],
+    ) -> Result<SmartIngestResult> {
         // Same embedding-gated wipe as merge_undo: the delegation recursed
         // into itself. The plain (non-excluding) smart_ingest path is live.
         let _ = (scope, excluded_node_ids, policy, labile);
@@ -2662,7 +2958,12 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn suppress_memory(&self, id: &str) -> Result<KnowledgeNode> {
         SqliteMemoryStore::suppress_memory(self, id)
     }
-    fn sync_portable_archive_cloud(&self, endpoint: &str, sync_key: &str, encryption_key: Option<String>) -> Result<PortableSyncReport> {
+    fn sync_portable_archive_cloud(
+        &self,
+        endpoint: &str,
+        sync_key: &str,
+        encryption_key: Option<String>,
+    ) -> Result<PortableSyncReport> {
         SqliteMemoryStore::sync_portable_archive_cloud(self, endpoint, sync_key, encryption_key)
     }
     fn sync_portable_archive_file(&self, path: &Path) -> Result<PortableSyncReport> {
@@ -2677,7 +2978,7 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn update_intention_status(&self, id: &str, status: &str) -> Result<bool> {
         SqliteMemoryStore::update_intention_status(self, id, status)
     }
-    fn update_memory_state(&self, memory_id: &str, new_state: &str, reason: &str,) -> Result<bool> {
+    fn update_memory_state(&self, memory_id: &str, new_state: &str, reason: &str) -> Result<bool> {
         SqliteMemoryStore::update_memory_state(self, memory_id, new_state, reason)
     }
     fn update_node_content(&self, id: &str, new_content: &str) -> Result<()> {
@@ -2686,7 +2987,10 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
     fn upsert_by_source(&self, input: IngestInput) -> Result<SourceUpsertResult> {
         SqliteMemoryStore::upsert_by_source(self, input)
     }
-    fn verify_stored_receipt_attestation(&self, receipt_id: &str,) -> Result<Option<StoredReceiptAttestationVerification>> {
+    fn verify_stored_receipt_attestation(
+        &self,
+        receipt_id: &str,
+    ) -> Result<Option<StoredReceiptAttestationVerification>> {
         SqliteMemoryStore::verify_stored_receipt_attestation(self, receipt_id)
     }
 }
@@ -2855,8 +3159,8 @@ mod write_transaction_policy {
 #[path = "../v3_regression_tests.rs"]
 mod v3_regression_tests;
 
-mod admin;
 mod actors;
+mod admin;
 mod connectors;
 mod ingest;
 mod lifecycle;

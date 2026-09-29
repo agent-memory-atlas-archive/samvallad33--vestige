@@ -166,8 +166,15 @@ fn covering_proposal(all: &[GateEvent], effect: &EffectRecord) -> Result<Propose
 /// effect will occupy) and `frame_hash` is blake3(borsh(EffectRecord)).
 /// [`crate::GateRuntime::commit_effect`] calls this, then appends and
 /// returns the log's real `SeqAck`.
-pub fn admit(log: &dyn EventLog, effect: &EffectRecord, pinned: &Policy) -> Result<SeqAck, Rejected> {
+pub fn admit(
+    log: &dyn EventLog,
+    effect: &EffectRecord,
+    pinned: &Policy,
+) -> Result<SeqAck, Rejected> {
     admission_check(log, effect, u64::MAX, Some(pinned))?;
     let bytes = borsh::to_vec(effect).expect("borsh EffectRecord is infallible");
-    Ok(SeqAck { seq: log.tip(), frame_hash: hash32(&bytes) })
+    Ok(SeqAck {
+        seq: log.tip(),
+        frame_hash: hash32(&bytes),
+    })
 }

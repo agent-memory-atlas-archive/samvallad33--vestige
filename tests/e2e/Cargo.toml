@@ -5,14 +5,20 @@ edition = "2024"
 publish = false
 
 [features]
-# The e2e harness drives the legacy SQLite store end to end. Default ON;
-# a legacy-sqlite-free workspace build skips these targets
-# (build/t5-legacy-isolation).
-default = ["legacy-sqlite"]
-legacy-sqlite = ["vestige-core/legacy-sqlite", "vestige-core/bundled-sqlite"]
+# The e2e harness drives the legacy SQLite store end to end. Off by default
+# so `cargo test --workspace` does not enable `legacy-sqlite` through this
+# crate (feature unification). Opt in with `--features legacy-sqlite`.
+# `v3-engine` is part of that opt-in so the harness can create synthetic
+# stores; it is not a default feature (build/t5-legacy-isolation).
+default = []
+legacy-sqlite = [
+    "vestige-core/legacy-sqlite",
+    "vestige-core/bundled-sqlite",
+    "vestige-core/v3-engine",
+]
 
 [dependencies]
-vestige-core = { path = "../../crates/vestige-core", default-features = false, features = ["v3-engine"] }
+vestige-core = { path = "../../crates/vestige-core", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"

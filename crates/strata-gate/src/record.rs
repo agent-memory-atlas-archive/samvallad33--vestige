@@ -202,30 +202,44 @@ impl GateEvent {
 
     /// Typed PROPOSE, or `None` if this frame is not a well-formed PROPOSE.
     pub fn propose(&self) -> Option<Propose> {
-        (self.kind == RecordKind::Propose).then(|| self.decode().ok()).flatten()
+        (self.kind == RecordKind::Propose)
+            .then(|| self.decode().ok())
+            .flatten()
     }
 
     pub fn gate(&self) -> Option<GateRecord> {
-        (self.kind == RecordKind::Gate).then(|| self.decode().ok()).flatten()
+        (self.kind == RecordKind::Gate)
+            .then(|| self.decode().ok())
+            .flatten()
     }
 
     pub fn effect(&self) -> Option<EffectRecord> {
-        (self.kind == RecordKind::Effect).then(|| self.decode().ok()).flatten()
+        (self.kind == RecordKind::Effect)
+            .then(|| self.decode().ok())
+            .flatten()
     }
 
     pub fn lesson_alarm(&self) -> Option<LessonAlarmRecord> {
-        (self.kind == RecordKind::LessonAlarm).then(|| self.decode().ok()).flatten()
+        (self.kind == RecordKind::LessonAlarm)
+            .then(|| self.decode().ok())
+            .flatten()
     }
 
     pub fn canary(&self) -> Option<CanaryRecord> {
-        (self.kind == RecordKind::Canary).then(|| self.decode().ok()).flatten()
+        (self.kind == RecordKind::Canary)
+            .then(|| self.decode().ok())
+            .flatten()
     }
 
     pub fn alert(&self) -> Option<AlertRecord> {
-        (self.kind == RecordKind::Alert).then(|| self.decode().ok()).flatten()
+        (self.kind == RecordKind::Alert)
+            .then(|| self.decode().ok())
+            .flatten()
     }
 
     pub fn gap(&self) -> Option<GapRecord> {
-        (self.kind == RecordKind::Gap).then(|| self.decode().ok()).flatten()
+        (self.kind == RecordKind::Gap)
+            .then(|| self.decode().ok())
+            .flatten()
     }
 }

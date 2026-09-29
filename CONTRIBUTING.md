@@ -67,7 +67,7 @@ VESTIGE_TEST_MOCK_EMBEDDINGS=1 cargo test -p vestige-mcp --lib
 
 # E2E MCP protocol tests (requires release build)
 cargo build --release -p vestige-mcp
-cargo test -p vestige-e2e-tests --test mcp_protocol -- --test-threads=1
+cargo test -p vestige-e2e-tests --features legacy-sqlite --test mcp_protocol -- --test-threads=1
 
 # Dashboard build test
 cd apps/dashboard && pnpm build

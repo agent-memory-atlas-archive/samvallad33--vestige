@@ -55,7 +55,9 @@ const COMMIT_LOOKUP_LIMIT: i64 = 1_000;
 // `OpenFailureTouching`, `FailedToolCall`, `ClosedIssueNode`, and
 // `GitCommitNode` are defined in (and re-exported from)
 // `crate::storage::types`.
-pub use crate::storage::types::{ClosedIssueNode, FailedToolCall, GitCommitNode, OpenFailureTouching};
+pub use crate::storage::types::{
+    ClosedIssueNode, FailedToolCall, GitCommitNode, OpenFailureTouching,
+};
 
 /// Cut `text` to at most `max` chars on a UTF-8 boundary.
 fn cap_chars(text: &str, max: usize) -> String {
@@ -139,10 +141,7 @@ impl SqliteMemoryStore {
             let failure_ids: Vec<String> = page
                 .iter()
                 .filter(|n| {
-                    crate::advanced::retroactive_backfill::looks_like_failure(
-                        &n.content,
-                        &n.tags,
-                    )
+                    crate::advanced::retroactive_backfill::looks_like_failure(&n.content, &n.tags)
                 })
                 .map(|n| n.id.clone())
                 .collect();
@@ -211,10 +210,7 @@ impl SqliteMemoryStore {
     /// `run_id = None` selects the latest run by `agent_runs.last_at`. The
     /// last [`FAILED_CALLS_MAX`] failed calls are returned in chronological
     /// order (oldest first), so the section reads like the run unfolded.
-    pub fn last_session_failed_calls(
-        &self,
-        run_id: Option<&str>,
-    ) -> Result<Vec<FailedToolCall>> {
+    pub fn last_session_failed_calls(&self, run_id: Option<&str>) -> Result<Vec<FailedToolCall>> {
         let run = match run_id {
             Some(given) => given.to_string(),
             None => {
@@ -363,10 +359,7 @@ impl SqliteMemoryStore {
             let Some(issue_number) = source_id.filter(|s| !s.trim().is_empty()) else {
                 continue;
             };
-            if parse_tags(&tags_raw)
-                .iter()
-                .any(|t| t == "state:closed")
-            {
+            if parse_tags(&tags_raw).iter().any(|t| t == "state:closed") {
                 out.push(ClosedIssueNode {
                     node_id,
                     issue_number: issue_number.trim().to_string(),
@@ -387,13 +380,16 @@ impl SqliteMemoryStore {
             "SELECT id, content, tags FROM knowledge_nodes \
              WHERE tags LIKE '%git-commit%' ORDER BY created_at DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit.min(COMMIT_LOOKUP_LIMIT as usize) as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![limit.min(COMMIT_LOOKUP_LIMIT as usize) as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
         let mut out = Vec::new();
         for row in rows {
             let (node_id, content, tags_raw) = row?;
@@ -503,7 +499,9 @@ mod tests {
             "Deploy failed: connection pool saturated at 100%.",
             &[],
         );
-        store.record_code_anchors(&[anchor(&failure, "src/pool.rs", Some("acquire"))]).unwrap();
+        store
+            .record_code_anchors(&[anchor(&failure, "src/pool.rs", Some("acquire"))])
+            .unwrap();
 
         let commit_failure = ingest(
             &store,
@@ -529,10 +527,12 @@ mod tests {
         assert_eq!(hits[0].anchor.as_deref(), Some("src/other.rs"));
 
         // Prefix/suffix near-misses are noise, not matches.
-        assert!(store
-            .open_failures_touching(&["src/pool.rs.bak".to_string(), "pool.rs".to_string()])
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .open_failures_touching(&["src/pool.rs.bak".to_string(), "pool.rs".to_string()])
+                .unwrap()
+                .is_empty()
+        );
         // Absent/empty changed set: nothing, not noise.
         assert!(store.open_failures_touching(&[]).unwrap().is_empty());
     }
@@ -541,27 +541,49 @@ mod tests {
     fn open_failures_skip_non_failures_and_closed_memories() {
         let (_dir, store) = store();
         let quiet = ingest(&store, "Prefer Rust for systems work.", &[]);
-        store.record_code_anchors(&[anchor(&quiet, "src/pool.rs", None)]).unwrap();
-        assert!(store
-            .open_failures_touching(&["src/pool.rs".to_string()])
-            .unwrap()
-            .is_empty(), "a non-failure memory anchored to the file must not surface");
+        store
+            .record_code_anchors(&[anchor(&quiet, "src/pool.rs", None)])
+            .unwrap();
+        assert!(
+            store
+                .open_failures_touching(&["src/pool.rs".to_string()])
+                .unwrap()
+                .is_empty(),
+            "a non-failure memory anchored to the file must not surface"
+        );
 
         let failure = ingest(&store, "Build broke on CI.", &[]);
-        store.record_code_anchors(&[anchor(&failure, "src/ci.rs", None)]).unwrap();
+        store
+            .record_code_anchors(&[anchor(&failure, "src/ci.rs", None)])
+            .unwrap();
         store.suppress_memory(&failure).unwrap();
-        assert!(store
-            .open_failures_touching(&["src/ci.rs".to_string()])
-            .unwrap()
-            .is_empty(), "a suppressed failure is not open");
+        assert!(
+            store
+                .open_failures_touching(&["src/ci.rs".to_string()])
+                .unwrap()
+                .is_empty(),
+            "a suppressed failure is not open"
+        );
     }
 
     #[test]
     fn failed_calls_latest_run_last_twenty_chronological() {
         let (_dir, store) = store();
-        store.append_mcp_call_outcome("run_a", "recall", true, None, 100).unwrap();
-        store.append_mcp_call_outcome("run_a", "backfill", false, Some("scope must be non-empty"), 110).unwrap();
-        store.append_mcp_call_outcome("run_b", "memory", false, Some("NotFound: abc"), 200).unwrap();
+        store
+            .append_mcp_call_outcome("run_a", "recall", true, None, 100)
+            .unwrap();
+        store
+            .append_mcp_call_outcome(
+                "run_a",
+                "backfill",
+                false,
+                Some("scope must be non-empty"),
+                110,
+            )
+            .unwrap();
+        store
+            .append_mcp_call_outcome("run_b", "memory", false, Some("NotFound: abc"), 200)
+            .unwrap();
 
         // Latest run is run_b (last_at 200): only its failed call appears.
         let latest = store.last_session_failed_calls(None).unwrap();
@@ -578,7 +600,12 @@ mod tests {
         assert!(run_a[0].error_excerpt.contains("scope must be non-empty"));
 
         // Unknown run: empty, not an error.
-        assert!(store.last_session_failed_calls(Some("run_zz")).unwrap().is_empty());
+        assert!(
+            store
+                .last_session_failed_calls(Some("run_zz"))
+                .unwrap()
+                .is_empty()
+        );
 
         // The outcome rows still replay as plain mcp.call events.
         let events = store.get_trace("run_a").unwrap();
@@ -590,7 +617,15 @@ mod tests {
     fn failed_calls_cap_at_twenty() {
         let (_dir, store) = store();
         for i in 0..25 {
-            store.append_mcp_call_outcome("run_c", &format!("tool_{i}"), false, Some("boom"), 1000 + i).unwrap();
+            store
+                .append_mcp_call_outcome(
+                    "run_c",
+                    &format!("tool_{i}"),
+                    false,
+                    Some("boom"),
+                    1000 + i,
+                )
+                .unwrap();
         }
         let calls = store.last_session_failed_calls(Some("run_c")).unwrap();
         assert_eq!(calls.len(), FAILED_CALLS_MAX);

@@ -23,7 +23,9 @@ pub enum StrataError {
     /// Corruption at or below the acked watermark. Never truncated.
     Halt(HaltDetail),
     /// The directory lock is held by a live writer.
-    Locked { pid: u64 },
+    Locked {
+        pid: u64,
+    },
     /// On-disk metadata (key file, head.state, segment names) is unusable.
     Corrupt(String),
     Io(io::Error),

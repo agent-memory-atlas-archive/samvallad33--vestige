@@ -6,13 +6,19 @@ publish = false
 
 [features]
 # Phase-1 tests round-trip through the legacy SQLite store; the raw
-# domain-column migration test reads the SQLite file directly. Skipped in a
-# legacy-sqlite-free build (build/t5-legacy-isolation).
-default = ["legacy-sqlite"]
-legacy-sqlite = ["vestige-core/legacy-sqlite", "dep:rusqlite"]
+# domain-column migration test reads the SQLite file directly. Off by
+# default so a workspace build does not unify rusqlite into the 4.0
+# binaries. Opt in with `--features legacy-sqlite`.
+default = []
+legacy-sqlite = [
+    "vestige-core/legacy-sqlite",
+    "vestige-core/bundled-sqlite",
+    "vestige-core/v3-engine",
+    "dep:rusqlite",
+]
 
 [dependencies]
-vestige-core = { path = "../../crates/vestige-core", features = ["v3-engine"] }
+vestige-core = { path = "../../crates/vestige-core", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }

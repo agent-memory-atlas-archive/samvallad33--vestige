@@ -151,16 +151,14 @@ pub fn ed25519_public_key_from_did_key(did: &str) -> Result<[u8; 32], ActorIdent
     let encoded = did
         .strip_prefix("did:key:")
         .ok_or_else(|| ActorIdentityError::InvalidDid("missing did:key: prefix".into()))?;
-    let payload = base58btc_decode(
-        encoded
-            .strip_prefix('z')
-            .ok_or_else(|| ActorIdentityError::InvalidDid("multibase must be base58btc 'z'".into()))?,
-    )
-    .ok_or_else(|| ActorIdentityError::InvalidDid("invalid base58btc payload".into()))?;
+    let payload =
+        base58btc_decode(encoded.strip_prefix('z').ok_or_else(|| {
+            ActorIdentityError::InvalidDid("multibase must be base58btc 'z'".into())
+        })?)
+        .ok_or_else(|| ActorIdentityError::InvalidDid("invalid base58btc payload".into()))?;
     if payload.len() != 34 || payload[..2] != ED25519_MULTICODEC_PREFIX {
         return Err(ActorIdentityError::InvalidDid(
-            "payload must be exactly the 0xed01 Ed25519 multicodec prefix plus 32 key bytes"
-                .into(),
+            "payload must be exactly the 0xed01 Ed25519 multicodec prefix plus 32 key bytes".into(),
         ));
     }
     let mut public_key = [0_u8; 32];
@@ -205,7 +203,9 @@ impl ProcessActor {
     pub fn mint() -> Self {
         let seed = random_actor_seed();
         let did = did_key_from_ed25519_public_key(
-            &ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes(),
+            &ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes(),
         );
         Self { did, seed }
     }
@@ -228,11 +228,13 @@ impl ProcessActor {
             }
         }
         let seed = std::fs::read(path)?;
-        let seed: [u8; 32] = seed
-            .try_into()
-            .map_err(|_| ActorIdentityError::Malformed("actor key file must hold exactly 32 seed bytes"))?;
+        let seed: [u8; 32] = seed.try_into().map_err(|_| {
+            ActorIdentityError::Malformed("actor key file must hold exactly 32 seed bytes")
+        })?;
         let did = did_key_from_ed25519_public_key(
-            &ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes(),
+            &ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes(),
         );
         Ok(Self { did, seed })
     }
@@ -431,12 +433,7 @@ pub fn revision_digest(content: &str) -> String {
 /// Deterministic endorsement event id. Same actor + same memory + same
 /// revision + same stance = the same id, so retries are idempotent at the
 /// storage layer instead of accumulating votes.
-pub fn endorsement_event_id(
-    actor_did: &str,
-    memory_id: &str,
-    digest: &str,
-    kind: &str,
-) -> String {
+pub fn endorsement_event_id(actor_did: &str, memory_id: &str, digest: &str, kind: &str) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(actor_did.as_bytes());
@@ -478,7 +475,9 @@ mod tests {
     #[test]
     fn base58_round_trips_random_payloads() {
         for seed_byte in 0_u8..32 {
-            let payload: Vec<u8> = (0_u8..48).map(|i| i.wrapping_mul(seed_byte).wrapping_add(seed_byte)).collect();
+            let payload: Vec<u8> = (0_u8..48)
+                .map(|i| i.wrapping_mul(seed_byte).wrapping_add(seed_byte))
+                .collect();
             let encoded = base58btc_encode(&payload);
             assert_eq!(base58btc_decode(&encoded), Some(payload.clone()));
         }
@@ -519,10 +518,14 @@ mod tests {
     fn did_key_is_stable_across_mints_of_the_same_seed() {
         let seed = [7_u8; 32];
         let did_a = did_key_from_ed25519_public_key(
-            &ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes(),
+            &ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes(),
         );
         let did_b = did_key_from_ed25519_public_key(
-            &ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes(),
+            &ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes(),
         );
         assert_eq!(did_a, did_b);
         assert!(did_a.starts_with("did:key:z6Mk"));
@@ -574,8 +577,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-                .expect("chmod");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
             assert!(matches!(
                 ProcessActor::load(&path),
                 Err(ActorIdentityError::PermissiveKeyFile)
@@ -585,8 +587,7 @@ mod tests {
         // so the permission check does not fire before the size check).
         std::fs::write(&path, [3_u8; 31]).expect("rewrite short");
         #[cfg(unix)]
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .expect("chmod");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
         assert!(matches!(
             ProcessActor::load(&path),
             Err(ActorIdentityError::Malformed(_))
@@ -665,7 +666,10 @@ mod tests {
             .insert("ghost-role".to_string());
         let resolution = snapshot.resolve("did:key:z6MkX", Some("ghost-role"));
         assert_eq!(resolution.resolved_weight, NEUTRAL_WEIGHT);
-        assert_eq!(resolution.disposition, ResolutionDisposition::UnknownRoleNeutral);
+        assert_eq!(
+            resolution.disposition,
+            ResolutionDisposition::UnknownRoleNeutral
+        );
     }
 
     #[test]
@@ -687,7 +691,10 @@ mod tests {
         // GROUP BY actor_did / MAX). The ceiling still applies.
         assert_eq!(bounded_aggregate(&[1.5]), 1.5);
         let flat_total = bounded_aggregate(&[1.5, 1.3, 1.25, 1.15, 1.1, 1.0]);
-        assert!((flat_total - 7.3).abs() < 1e-9, "flat table sums to 7.3, got {flat_total}");
+        assert!(
+            (flat_total - 7.3).abs() < 1e-9,
+            "flat table sums to 7.3, got {flat_total}"
+        );
         assert_eq!(
             bounded_aggregate(&[9.0, 9.0]),
             MAX_AGGREGATE_ENDORSEMENT_WEIGHT
@@ -708,10 +715,22 @@ mod tests {
     #[test]
     fn deterministic_event_ids_make_retries_idempotent() {
         let a = endorsement_event_id("did:key:z6MkA", "mem-1", "d1", "support");
-        assert_eq!(a, endorsement_event_id("did:key:z6MkA", "mem-1", "d1", "support"));
-        assert_ne!(a, endorsement_event_id("did:key:z6MkA", "mem-1", "d1", "oppose"));
-        assert_ne!(a, endorsement_event_id("did:key:z6MkA", "mem-2", "d1", "support"));
-        assert_ne!(a, endorsement_event_id("did:key:z6MkB", "mem-1", "d1", "support"));
+        assert_eq!(
+            a,
+            endorsement_event_id("did:key:z6MkA", "mem-1", "d1", "support")
+        );
+        assert_ne!(
+            a,
+            endorsement_event_id("did:key:z6MkA", "mem-1", "d1", "oppose")
+        );
+        assert_ne!(
+            a,
+            endorsement_event_id("did:key:z6MkA", "mem-2", "d1", "support")
+        );
+        assert_ne!(
+            a,
+            endorsement_event_id("did:key:z6MkB", "mem-1", "d1", "support")
+        );
         assert_ne!(
             a,
             endorsement_event_id("did:key:z6MkA", "mem-1", "d2", "support"),

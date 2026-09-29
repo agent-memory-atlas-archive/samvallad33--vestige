@@ -344,7 +344,10 @@ fn group_commit_concurrent_appenders_coalesce() {
         handles.push(std::thread::spawn(move || {
             barrier.wait();
             (0..PER_THREAD)
-                .map(|i| log.append(t as u8, format!("t{t}-i{i}").as_bytes()).unwrap())
+                .map(|i| {
+                    log.append(t as u8, format!("t{t}-i{i}").as_bytes())
+                        .unwrap()
+                })
                 .collect::<Vec<_>>()
         }));
     }
@@ -355,7 +358,11 @@ fn group_commit_concurrent_appenders_coalesce() {
     assert_eq!(all.len() as u64, total);
     let mut seqs: Vec<u64> = all.iter().map(|a| a.seq).collect();
     seqs.sort_unstable();
-    assert_eq!(seqs, (1..=total).collect::<Vec<_>>(), "seqs are unique and dense");
+    assert_eq!(
+        seqs,
+        (1..=total).collect::<Vec<_>>(),
+        "seqs are unique and dense"
+    );
     assert_eq!(log.head().last_acked_seq, total);
 
     let syncs = SYNC_COUNT.load(Ordering::SeqCst);
@@ -400,7 +407,11 @@ fn failpoint_third_sync_panics_fail_stop() {
     // continues past it.
     drop(log);
     let log = StrataLog::open(&dir).unwrap();
-    assert_eq!(log.head().last_acked_seq, 2, "failed commit must not advance the watermark");
+    assert_eq!(
+        log.head().last_acked_seq,
+        2,
+        "failed commit must not advance the watermark"
+    );
     assert_eq!(log.read_frames(1).unwrap().len(), 3);
     assert_eq!(log.append(4, b"four").unwrap().seq, 4);
     fs::remove_dir_all(&dir).unwrap();
@@ -422,7 +433,11 @@ fn single_writer_lock_and_stale_takeover() {
     drop(log2);
 
     // A stale lock (pid that cannot exist) is detected and taken over.
-    fs::write(dir.join(crate::lockfile::LOCK_NAME), 4_000_000u64.to_le_bytes()).unwrap();
+    fs::write(
+        dir.join(crate::lockfile::LOCK_NAME),
+        4_000_000u64.to_le_bytes(),
+    )
+    .unwrap();
     let log3 = StrataLog::open(&dir).unwrap();
     log3.append(2, b"y").unwrap();
     assert_eq!(log3.read_frames(1).unwrap().len(), 2);
@@ -467,7 +482,10 @@ fn merkle_tree_shapes() {
     let empty_root: [u8; 32] = blake3::hash(&[]).into();
     assert_eq!(format::merkle_root(&[]), empty_root);
     assert_eq!(format::merkle_root(&l[..1]), leaf(&l[0]));
-    assert_eq!(format::merkle_root(&l[..2]), node(&leaf(&l[0]), &leaf(&l[1])));
+    assert_eq!(
+        format::merkle_root(&l[..2]),
+        node(&leaf(&l[0]), &leaf(&l[1]))
+    );
     assert_eq!(format::merkle_root(&l[..3]), reference(&leaves[..3]));
     assert_eq!(format::merkle_root(&l), reference(&leaves));
     assert_ne!(format::merkle_root(&l[..2]), format::merkle_root(&l[..3]));

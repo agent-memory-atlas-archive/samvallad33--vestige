@@ -28,9 +28,9 @@
 
 use rusqlite::params;
 
-use super::sqlite::{Result, StorageError, SqliteMemoryStore};
+use super::sqlite::{Result, SqliteMemoryStore, StorageError};
 use crate::advanced::git_records::COMMIT_TAG;
-use crate::advanced::retroactive_backfill::{extract_entities, normalized_tier, IdentifierTier};
+use crate::advanced::retroactive_backfill::{IdentifierTier, extract_entities, normalized_tier};
 
 // `MAX_CANDIDATES`, `HANDLE_REQUIRED_DETAIL`, `HandleKind`, and
 // `HandleResolution` are defined in (and re-exported from)
@@ -236,37 +236,38 @@ impl SqliteMemoryStore {
                 HandleKind::File
             };
             if let Ok(ids) = self.boundary_match_ids(query)
-                && !ids.is_empty() {
-                    return HandleResolution::resolved(kind, ids, true);
-                }
+                && !ids.is_empty()
+            {
+                return HandleResolution::resolved(kind, ids, true);
+            }
         }
 
         // 4. symbol exact/prefix over extracted entities (Code tier only).
         if let Some(normalized) = normalize_identifier(query)
             && matches!(normalized_tier(&normalized), IdentifierTier::Code)
-                && let Some(hit) = self.resolve_symbol(&normalized) {
-                    return hit;
-                }
+            && let Some(hit) = self.resolve_symbol(&normalized)
+        {
+            return hit;
+        }
 
         // 5. run id / tool-call id over agent_traces (V18). Exact only.
         if let Ok(found) = self.run_id_exists(query)
-            && found {
-                return HandleResolution::resolved(HandleKind::Run, vec![query.to_string()], true);
-            }
+            && found
+        {
+            return HandleResolution::resolved(HandleKind::Run, vec![query.to_string()], true);
+        }
         if let Ok(found) = self.tool_call_id_exists(query)
-            && found {
-                return HandleResolution::resolved(
-                    HandleKind::ToolCall,
-                    vec![query.to_string()],
-                    true,
-                );
-            }
+            && found
+        {
+            return HandleResolution::resolved(HandleKind::ToolCall, vec![query.to_string()], true);
+        }
 
         // 6. tag exact over node tags.
         if let Ok(ids) = self.tag_match_ids(query)
-            && !ids.is_empty() {
-                return HandleResolution::resolved(HandleKind::Tag, ids, true);
-            }
+            && !ids.is_empty()
+        {
+            return HandleResolution::resolved(HandleKind::Tag, ids, true);
+        }
 
         HandleResolution::unresolved()
     }
@@ -299,12 +300,7 @@ impl SqliteMemoryStore {
         let rows = stmt
             .query_map(
                 params![format!("%\"{}\"%", escape_like(COMMIT_TAG))],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .ok()?;
 
@@ -326,9 +322,11 @@ impl SqliteMemoryStore {
                 needle.len() == 40,
             )),
             // A duplicated full sha still resolves exactly (both rows).
-            _ if needle.len() == 40 => {
-                Some(HandleResolution::resolved(HandleKind::Commit, matches, true))
-            }
+            _ if needle.len() == 40 => Some(HandleResolution::resolved(
+                HandleKind::Commit,
+                matches,
+                true,
+            )),
             _ => {
                 matches.truncate(MAX_CANDIDATES);
                 Some(HandleResolution::ambiguous(
@@ -495,9 +493,8 @@ impl SqliteMemoryStore {
             .lock()
             .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
         let pattern = format!("%\"{}\"%", escape_like(query));
-        let mut stmt = reader.prepare(
-            "SELECT id, tags FROM knowledge_nodes WHERE tags LIKE ?1 ESCAPE '\\'",
-        )?;
+        let mut stmt = reader
+            .prepare("SELECT id, tags FROM knowledge_nodes WHERE tags LIKE ?1 ESCAPE '\\'")?;
         let rows = stmt.query_map(params![pattern], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -527,12 +524,7 @@ mod tests {
         (storage, dir)
     }
 
-    fn insert_node(
-        storage: &SqliteMemoryStore,
-        id: &str,
-        content: &str,
-        tags: &[&str],
-    ) {
+    fn insert_node(storage: &SqliteMemoryStore, id: &str, content: &str, tags: &[&str]) {
         let now = chrono::Utc::now().to_rfc3339();
         let writer = storage.writer.lock().unwrap();
         writer
@@ -651,8 +643,13 @@ mod tests {
         let r = storage.resolve_handle("abc12"); // 5 hex chars, has a digit
         assert_eq!(r.kind, HandleKind::Commit);
         assert!(r.ids.is_empty() && r.candidates.is_empty());
-        let msg = r.handle_required.expect("too-short sha must carry an error");
-        assert!(msg.contains("7 hex"), "message should name the minimum: {msg}");
+        let msg = r
+            .handle_required
+            .expect("too-short sha must carry an error");
+        assert!(
+            msg.contains("7 hex"),
+            "message should name the minimum: {msg}"
+        );
         // English hex words without digits are NOT sha attempts.
         let r = storage.resolve_handle("face");
         assert_eq!(r.kind, HandleKind::Unknown);
@@ -673,7 +670,11 @@ mod tests {
         // NO fuzzy: "pyvenv" is not the token "pyvenv.cfg" and files are
         // exact-only, so it must resolve nothing.
         let r = storage.resolve_handle("pyvenv");
-        assert_eq!(r.kind, HandleKind::Unknown, "word must not fuzzy-match a path");
+        assert_eq!(
+            r.kind,
+            HandleKind::Unknown,
+            "word must not fuzzy-match a path"
+        );
         assert!(r.ids.is_empty());
         assert!(r.handle_required.is_some());
 
@@ -766,10 +767,7 @@ mod tests {
         let r = storage.resolve_handle("how did the build break");
         assert_eq!(r.kind, HandleKind::Unknown);
         assert!(r.ids.is_empty() && r.candidates.is_empty());
-        assert_eq!(
-            r.handle_required.as_deref(),
-            Some(HANDLE_REQUIRED_DETAIL)
-        );
+        assert_eq!(r.handle_required.as_deref(), Some(HANDLE_REQUIRED_DETAIL));
         // Whitespace-only is empty.
         let r = storage.resolve_handle("   ");
         assert_eq!(r.kind, HandleKind::Unknown);

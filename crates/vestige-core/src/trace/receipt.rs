@@ -654,7 +654,10 @@ mod tests {
         assert_eq!(json["actor"]["claimed_role"], "operator");
         assert_eq!(json["actor"]["effective_role"], "unattributed");
         assert_eq!(json["actor"]["resolved_weight"], 1.0);
-        assert_eq!(json["actor"]["resolution_disposition"], "unregistered_claim");
+        assert_eq!(
+            json["actor"]["resolution_disposition"],
+            "unregistered_claim"
+        );
         assert_eq!(json["actor"]["policy_version"], 1);
         let decoded: Receipt = serde_json::from_value(json).expect("decode with actor");
         assert_eq!(decoded.actor, with_actor.actor);

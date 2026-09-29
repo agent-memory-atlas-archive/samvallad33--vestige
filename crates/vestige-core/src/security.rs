@@ -579,7 +579,10 @@ mod scan_budget {
             .filter(|f| f.kind == SecretKind::GitHubToken)
             .count();
         assert!(github > 0, "tokens must still be detected");
-        assert!(github <= MAX_FINDINGS_PER_KIND, "{github} findings exceed the per-kind cap");
+        assert!(
+            github <= MAX_FINDINGS_PER_KIND,
+            "{github} findings exceed the per-kind cap"
+        );
     }
 
     #[test]

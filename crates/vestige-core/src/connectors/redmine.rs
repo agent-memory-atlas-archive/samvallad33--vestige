@@ -225,9 +225,10 @@ impl RedmineConnector {
         if let Some(err) = Self::classify_status(&resp, &url) {
             return Err(err);
         }
-        let wrapper: IssueWrapper = resp.json().await.map_err(|e| {
-            ConnectorError::Transport(format!("GET {url}: decode failed: {e}"))
-        })?;
+        let wrapper: IssueWrapper = resp
+            .json()
+            .await
+            .map_err(|e| ConnectorError::Transport(format!("GET {url}: decode failed: {e}")))?;
         Ok(wrapper.issue)
     }
 
@@ -464,9 +465,10 @@ impl Connector for RedmineConnector {
         if let Some(err) = Self::classify_status(&resp, &url) {
             return Err(err);
         }
-        let page: IssueListResponse = resp.json().await.map_err(|e| {
-            ConnectorError::Transport(format!("GET {url}: decode failed: {e}"))
-        })?;
+        let page: IssueListResponse = resp
+            .json()
+            .await
+            .map_err(|e| ConnectorError::Transport(format!("GET {url}: decode failed: {e}")))?;
 
         // Per-issue detail fetch for journals (list endpoint omits them).
         //
@@ -532,9 +534,10 @@ impl Connector for RedmineConnector {
             if let Some(err) = Self::classify_status(&resp, &url) {
                 return Err(err);
             }
-            let page: IssueListResponse = resp.json().await.map_err(|e| {
-                ConnectorError::Transport(format!("GET {url}: decode failed: {e}"))
-            })?;
+            let page: IssueListResponse = resp
+                .json()
+                .await
+                .map_err(|e| ConnectorError::Transport(format!("GET {url}: decode failed: {e}")))?;
             if page.issues.is_empty() {
                 break;
             }

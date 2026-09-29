@@ -365,11 +365,7 @@ impl PredictionErrorGate {
     /// Returns a decision on whether to create, update, or supersede.
     /// Similarity is computed from content tokens only (Dice coefficient over
     /// the two token sets); the embedding-similarity component was removed.
-    pub fn evaluate(
-        &mut self,
-        new_content: &str,
-        candidates: &[CandidateMemory],
-    ) -> GateDecision {
+    pub fn evaluate(&mut self, new_content: &str, candidates: &[CandidateMemory]) -> GateDecision {
         self.stats.total_evaluations += 1;
 
         // No candidates = definitely create
@@ -812,17 +808,29 @@ mod tests {
         let original = "The approach is to retain the storage policy node.";
         let correction = "Actually, the correct approach is to retire the storage policy node.";
         let sim = content_similarity(correction, original);
-        assert!(sim >= 0.70, "correction must reach the correction band, got {sim}");
-        assert!(sim < 0.85, "correction must not look near-identical, got {sim}");
+        assert!(
+            sim >= 0.70,
+            "correction must reach the correction band, got {sim}"
+        );
+        assert!(
+            sim < 0.85,
+            "correction must not look near-identical, got {sim}"
+        );
 
         // A strict token-subset note scores low: Dice charges for the
         // unmatched remainder. 3-of-7 shared tokens -> 0.6, below both the
         // correction band (0.70) and the update band (0.75).
         let subset = content_similarity("alpha beta gamma", BASE_CONTENT);
-        assert!(subset < 0.70, "subset note must stay below the correction band, got {subset}");
+        assert!(
+            subset < 0.70,
+            "subset note must stay below the correction band, got {subset}"
+        );
 
         // Disjoint contents share nothing.
-        assert_eq!(content_similarity("completely different topic", BASE_CONTENT), 0.0);
+        assert_eq!(
+            content_similarity("completely different topic", BASE_CONTENT),
+            0.0
+        );
 
         // Stopword-only content has no signal.
         assert_eq!(content_similarity("to be or not to be", "so it goes"), 0.0);
@@ -991,11 +999,8 @@ mod tests {
         let mut gate = PredictionErrorGate::new();
         let candidate = make_candidate("mem-1", BASE_CONTENT);
 
-        let decision = gate.evaluate_with_intent(
-            "New content",
-            &[candidate],
-            EvaluationIntent::ForceCreate,
-        );
+        let decision =
+            gate.evaluate_with_intent("New content", &[candidate], EvaluationIntent::ForceCreate);
 
         assert!(matches!(
             decision,
@@ -1095,7 +1100,13 @@ mod tests {
 
         let decision = gate.evaluate(BASE_CONTENT, &[strong]);
         assert!(
-            matches!(decision, GateDecision::Update { update_type: UpdateType::Reinforce, .. }),
+            matches!(
+                decision,
+                GateDecision::Update {
+                    update_type: UpdateType::Reinforce,
+                    ..
+                }
+            ),
             "got {decision:?}"
         );
     }
@@ -1114,7 +1125,13 @@ mod tests {
 
         let decision = gate.evaluate(UPDATE_BAND, &[strong]);
         assert!(
-            matches!(decision, GateDecision::Update { update_type: UpdateType::Merge, .. }),
+            matches!(
+                decision,
+                GateDecision::Update {
+                    update_type: UpdateType::Merge,
+                    ..
+                }
+            ),
             "got {decision:?}"
         );
     }
@@ -1129,7 +1146,13 @@ mod tests {
 
         let decision = gate.evaluate(ONE_TOKEN_OFF, &[candidate]);
         assert!(
-            matches!(decision, GateDecision::Update { update_type: UpdateType::Reinforce, .. }),
+            matches!(
+                decision,
+                GateDecision::Update {
+                    update_type: UpdateType::Reinforce,
+                    ..
+                }
+            ),
             "got {decision:?}"
         );
     }

@@ -368,7 +368,10 @@ mod tests {
     /// subject identity at write time.
     #[test]
     fn short_phrasal_negation_is_seen_by_the_write_path() {
-        let pair = ("Don't use synchronous code", "Use synchronous code for simplicity");
+        let pair = (
+            "Don't use synchronous code",
+            "Use synchronous code for simplicity",
+        );
         for (x, y) in [pair, (pair.1, pair.0)] {
             assert!(
                 appears_contradictory(x, y, SubjectIdentity::AlreadyEstablished),
@@ -403,7 +406,11 @@ mod tests {
                 !appears_contradictory(a, b, SubjectIdentity::AlreadyEstablished),
                 "unpaired negation word must not read as contradiction: {a:?}"
             );
-            assert!(!appears_contradictory(b, a, SubjectIdentity::AlreadyEstablished));
+            assert!(!appears_contradictory(
+                b,
+                a,
+                SubjectIdentity::AlreadyEstablished
+            ));
         }
     }
 
@@ -414,8 +421,16 @@ mod tests {
     fn correction_signals_need_subject_overlap() {
         let a = "We fixed the flaky retry loop in the uploader last sprint";
         let b = "The dashboard uses websockets for live updates with a retry loop";
-        assert!(!appears_contradictory(a, b, SubjectIdentity::AlreadyEstablished));
-        assert!(!appears_contradictory(b, a, SubjectIdentity::AlreadyEstablished));
+        assert!(!appears_contradictory(
+            a,
+            b,
+            SubjectIdentity::AlreadyEstablished
+        ));
+        assert!(!appears_contradictory(
+            b,
+            a,
+            SubjectIdentity::AlreadyEstablished
+        ));
     }
 
     /// Two instances of the same template with different values ("different
@@ -426,7 +441,11 @@ mod tests {
     fn template_instances_with_different_values_diverge() {
         let a = "Premium lead — Alice Chen | Spotify. Route: linkedin outreach";
         let b = "Premium lead — Dana Smith | Spotify. Route: linkedin outreach";
-        assert!(appears_contradictory(a, b, SubjectIdentity::AlreadyEstablished));
+        assert!(appears_contradictory(
+            a,
+            b,
+            SubjectIdentity::AlreadyEstablished
+        ));
     }
 
     /// Unrelated memories that merely share a topic word must never pair up.
