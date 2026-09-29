@@ -244,24 +244,6 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
     }
 }
 
-fn exit_if_v3(db_path: &Path) {
-    if let Ok(Some(v3)) = vestige_core::detect_v3(db_path) {
-        error!(
-            "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
-            v3.path.display(),
-            v3.schema_version,
-            vestige_core::MIGRATION_HINT
-        );
-        eprintln!(
-            "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
-            v3.path.display(),
-            v3.schema_version,
-            vestige_core::MIGRATION_HINT
-        );
-        std::process::exit(1);
-    }
-}
-
 fn default_strata_dir() -> io::Result<PathBuf> {
     if let Some(data_dir) = data_dir_from_env() {
         let data_dir = expand_tilde(data_dir);
@@ -515,20 +497,13 @@ async fn serve() {
         },
     };
 
-    // Same first-launch upgrade the `vestige` CLI runs from `open_storage`.
-    // A finished upgrade leaves the v3 file in place, so the refusal below
-    // must not run after `StrataReady`.
-    let upgraded = match vestige_mcp::auto_upgrade::upgrade_if_needed(&db_path) {
-        Ok(vestige_mcp::auto_upgrade::UpgradeStatus::StrataReady { .. }) => true,
-        Ok(vestige_mcp::auto_upgrade::UpgradeStatus::NoV3) => false,
-        Err(err) => {
-            eprintln!("{err}");
-            let _ = std::io::Write::flush(&mut io::stderr());
-            std::process::exit(1);
-        }
-    };
-    if !upgraded {
-        exit_if_v3(&db_path);
+    // v3 detection and the upgrade both live in `upgrade_with`, which
+    // `upgrade_if_needed` calls. The CLI uses that same function. `NoV3`
+    // means the probed file is not a v3 store; there is no second check here.
+    if let Err(err) = vestige_mcp::auto_upgrade::upgrade_if_needed(&db_path) {
+        eprintln!("{err}");
+        let _ = std::io::Write::flush(&mut io::stderr());
+        std::process::exit(1);
     }
 
     // Two servers must not open the same log. `File::lock` dies with this
