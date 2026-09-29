@@ -401,6 +401,20 @@ fn main() {
     );
 }
 
+/// Stand-in until `serve` opens the strata log. Stdin is MCP; nothing is written
+/// to stdout. A client disconnect ends the wait.
+async fn hold_stdio_until_disconnect() {
+    use tokio::io::AsyncReadExt;
+    let mut stdin = tokio::io::stdin();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stdin.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
 async fn serve() {
     // Parse CLI arguments first (before logging init, so --help/--version work cleanly)
     let config = parse_args();
@@ -430,26 +444,45 @@ async fn serve() {
         }
     };
 
+    // First launch of 4.0: backup, import, verify, then swap a strata log in
+    // before stdio `initialize`. Failure exits here; the v3 file is not opened.
+    if let Some(db_path) = storage_path.as_deref() {
+        match vestige_mcp::auto_upgrade::upgrade_if_needed(db_path) {
+            Ok(vestige_mcp::auto_upgrade::UpgradeStatus::StrataReady { .. }) => {
+                // StrataStore boot is a separate change. Do not open vestige.db.
+                hold_stdio_until_disconnect().await;
+                return;
+            }
+            Ok(vestige_mcp::auto_upgrade::UpgradeStatus::NoV3) => {}
+            Err(err) => {
+                eprintln!("{err}");
+                let _ = std::io::Write::flush(&mut io::stderr());
+                std::process::exit(1);
+            }
+        }
+    }
+
     // PR 0a: a v3 SQLite store at the configured path is refused before any
     // storage constructor runs, so tools never see a half-open store. The
     // guard itself never writes; detection is a 100-byte header read. The
     // default-path case (None) is guarded inside the storage constructor.
     if let Some(db_path) = storage_path.as_deref()
-        && let Ok(Some(v3)) = vestige_core::detect_v3(db_path) {
-            error!(
-                "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
-                v3.path.display(),
-                v3.schema_version,
-                vestige_core::MIGRATION_HINT
-            );
-            eprintln!(
-                "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
-                v3.path.display(),
-                v3.schema_version,
-                vestige_core::MIGRATION_HINT
-            );
-            std::process::exit(1);
-        }
+        && let Ok(Some(v3)) = vestige_core::detect_v3(db_path)
+    {
+        error!(
+            "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
+            v3.path.display(),
+            v3.schema_version,
+            vestige_core::MIGRATION_HINT
+        );
+        eprintln!(
+            "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
+            v3.path.display(),
+            v3.schema_version,
+            vestige_core::MIGRATION_HINT
+        );
+        std::process::exit(1);
+    }
 
     // Initialize storage with optional custom data directory.
     // vestige_core::open_storage(Some(...)) expects a DB file path, so map data dirs to vestige.db here.

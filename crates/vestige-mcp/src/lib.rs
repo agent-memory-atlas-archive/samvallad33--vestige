@@ -10,6 +10,7 @@
 //! `LegacySqliteDisabled` error at runtime.
 
 pub mod actor_surface;
+pub mod auto_upgrade;
 
 pub mod autopilot;
 pub mod cognitive;
