@@ -145,6 +145,7 @@ def run(binary, output):
             receipt = tool("receipt", {"action": "get", "receipt_id": node_id})
             assert "receipt" in receipt
             typed("recall", {"query": marker}, "similarity_disabled")
+            typed("recall", {"query": "which fixture handle did we store"}, "similarity_disabled")
             handle = tool("recall", {"handle": node_id})
             assert marker in json.dumps(handle) and handle["exact"] is True
             passed("ingest, exact get, write receipt, and handle recall; query recall is refused")
@@ -337,9 +338,18 @@ def run(binary, output):
             assert "STRATA_SUPPRESS_DOOMED" not in json.dumps(hidden_suppress)
             hidden_recall = tool("recall", {"handle": suppress_id})
             assert "STRATA_SUPPRESS_DOOMED" not in json.dumps(hidden_recall)
-            typed("causal_walk", {"scope": "user"}, "pending_strata")
-            typed("selftest", {}, "pending_strata")
-            typed("forgotten_lesson", {"failure_id": node_id}, "pending_strata")
+            unanchored = tool("causal_walk", {"scope": "user"})
+            assert unanchored["status"] == "completed" and unanchored["causes"] == []
+            assert unanchored["needs_report"]["missing"] == ["node_id"], unanchored
+            walked = tool("causal_walk", {"node_id": successor})
+            assert walked["start"] == successor and walked["direction"] == "backward"
+            assert walked["truncated"] is False and walked["needs_report"] is None
+            selftest = tool("selftest", {})
+            assert selftest["all_passed"] is True and selftest["deterministic"] is True
+            assert selftest["checks_passed"] == selftest["checks_total"] > 0, selftest
+            lessons = tool("forgotten_lesson", {"failure_id": successor})
+            assert lessons["failure_id"] == successor and isinstance(lessons["forgotten_lessons"], list)
+            passed("causal_walk, selftest and forgotten_lesson answer from recorded edges only")
             called = {row["tool"] for row in coverage}
             missing = [name for name in names if name not in called]
             assert not missing, missing
