@@ -2908,7 +2908,6 @@ dependencies = [
  "sha2",
  "strata-migrate",
  "strata-store",
- "strata-verify",
  "subtle",
  "tempfile",
  "thiserror",

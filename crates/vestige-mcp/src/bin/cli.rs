@@ -50,7 +50,7 @@ struct Cli {
     command: Commands,
 }
 
-static CLI_DB_PATH: OnceLock<PathBuf> = OnceLock::new();
+static CLI_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Args)]
 struct SandwichInstallOptions {
@@ -499,9 +499,8 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if let Some(data_dir) = cli.data_dir {
-        let db_path = vestige_core::db_path_for_data_dir(data_dir)?;
-        CLI_DB_PATH
-            .set(db_path)
+        CLI_DATA_DIR
+            .set(expand_tilde(data_dir))
             .map_err(|_| anyhow::anyhow!("data directory was initialized more than once"))?;
     }
 
@@ -2034,14 +2033,57 @@ fn run_health() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run consolidation cycle
-/// The database this CLI invocation targets (`--data-dir` wins, then the
-/// platform default).
-fn cli_db_path() -> anyhow::Result<PathBuf> {
-    if let Some(path) = CLI_DB_PATH.get() {
+/// Data directory for this invocation (`--data-dir`, then `VESTIGE_DATA_DIR`,
+/// then the platform directory). The Strata log lives here. `vestige.db` is
+/// only the v3 file we refuse to open.
+fn cli_data_dir() -> anyhow::Result<PathBuf> {
+    if let Some(path) = CLI_DATA_DIR.get() {
         return Ok(path.clone());
     }
-    Ok(vestige_core::default_db_path()?)
+    if let Some(value) = std::env::var_os("VESTIGE_DATA_DIR")
+        && !value.is_empty()
+    {
+        return Ok(expand_tilde(PathBuf::from(value)));
+    }
+    let proj = directories::ProjectDirs::from("com", "vestige", "core")
+        .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?;
+    Ok(proj.data_dir().to_path_buf())
+}
+
+fn expand_tilde(path: PathBuf) -> PathBuf {
+    let rest = {
+        let mut components = path.components();
+        match components.next() {
+            Some(std::path::Component::Normal(first)) if first == "~" => {
+                Some(components.as_path().to_path_buf())
+            }
+            _ => None,
+        }
+    };
+    match rest {
+        Some(rest) => directories::BaseDirs::new()
+            .map(|dirs| dirs.home_dir().join(rest))
+            .unwrap_or(path),
+        None => path,
+    }
+}
+
+/// The v3 SQLite file that would have lived in the data directory.
+fn cli_db_path() -> anyhow::Result<PathBuf> {
+    Ok(cli_data_dir()?.join("vestige.db"))
+}
+
+fn refuse_v3_sqlite(data_dir: &Path) -> anyhow::Result<()> {
+    let db = data_dir.join("vestige.db");
+    let Some(v3) = vestige_core::detect_v3(&db)? else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
+        v3.path.display(),
+        v3.schema_version,
+        vestige_core::MIGRATION_HINT
+    );
 }
 
 /// Apply pending migrations, or rehearse them on a throwaway copy of the store.
@@ -2094,7 +2136,10 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
     {
         let source_uri = format!(
             "file:{}?mode=ro&immutable=1",
-            source.to_string_lossy().replace('?', "%3f").replace('#', "%23")
+            source
+                .to_string_lossy()
+                .replace('?', "%3f")
+                .replace('#', "%23")
         );
         let snapshot = rusqlite::Connection::open_with_flags(
             source_uri,
@@ -2156,6 +2201,7 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run consolidation cycle
 fn run_consolidate() -> anyhow::Result<()> {
     println!("{}", "=== Vestige Consolidation ===".cyan().bold());
     println!();
@@ -2366,11 +2412,7 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
 
 /// Get the default database path
 fn get_default_db_path() -> anyhow::Result<PathBuf> {
-    if let Some(path) = CLI_DB_PATH.get() {
-        Ok(path.clone())
-    } else {
-        Ok(vestige_core::default_db_path()?)
-    }
+    cli_db_path()
 }
 
 /// Open storage using the CLI-selected data directory, if one was provided.
@@ -2378,6 +2420,24 @@ fn get_default_db_path() -> anyhow::Result<PathBuf> {
 /// is never opened read-write, migrated in place, or modified in any way;
 /// its path and BLAKE3 are printed and keeping the file is recommended.
 fn run_migrate_to_strata(
+    from: PathBuf,
+    to: Option<PathBuf>,
+    dry_run: bool,
+    accept_wal_snapshot: bool,
+) -> anyhow::Result<()> {
+    #[cfg(not(feature = "migrate-to-strata"))]
+    {
+        let _ = (from, to, dry_run, accept_wal_snapshot);
+        anyhow::bail!(
+            "migrate-to-strata is not linked into this binary; rebuild with --features migrate-to-strata"
+        );
+    }
+    #[cfg(feature = "migrate-to-strata")]
+    run_migrate_to_strata_linked(from, to, dry_run, accept_wal_snapshot)
+}
+
+#[cfg(feature = "migrate-to-strata")]
+fn run_migrate_to_strata_linked(
     from: PathBuf,
     to: Option<PathBuf>,
     dry_run: bool,
@@ -2443,11 +2503,9 @@ fn run_migrate_to_strata(
 }
 
 fn open_storage() -> anyhow::Result<std::sync::Arc<Storage>> {
-    if let Some(path) = CLI_DB_PATH.get() {
-        Ok(vestige_core::open_storage(Some(path.clone()))?)
-    } else {
-        Ok(vestige_core::open_storage(None)?)
-    }
+    let dir = cli_data_dir()?;
+    refuse_v3_sqlite(&dir)?;
+    Ok(vestige_mcp::strata_memory::open(&dir)?)
 }
 
 /// Fetch all nodes from storage using pagination
