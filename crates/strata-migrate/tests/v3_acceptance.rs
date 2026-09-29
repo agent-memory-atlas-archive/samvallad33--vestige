@@ -25,9 +25,26 @@ fn copy_fixture(tag: &str) -> (tempfile::TempDir, PathBuf) {
     (dir, db)
 }
 
+/// sha256 of the committed v3.1.1 fixture. Import must not move this.
+const FIXTURE_SHA256: &str = "961f12d1750dbd2f6e6a8fc365c4a4bb42dd1b7e49cbf465985a36b665e10479";
+
 fn hash_file(path: &Path) -> String {
     blake3::hash(&fs::read(path).expect("read"))
         .to_hex()
+        .to_string()
+}
+
+fn sha256_file(path: &Path) -> String {
+    let output = std::process::Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .expect("sha256sum");
+    assert!(output.status.success(), "sha256sum failed");
+    String::from_utf8(output.stdout)
+        .expect("sha256sum utf8")
+        .split_whitespace()
+        .next()
+        .expect("sha256 digest")
         .to_string()
 }
 
@@ -324,15 +341,33 @@ fn migrate_to_strata_counts_match() {
     assert_eq!(nodes_row.1, 4);
 }
 
-/// Spec: `migrate_to_strata_legacy_links_are_legacy_inferred` — a v3
-/// `causal` row (lookalike name-match provenance) migrates as
-/// `derived_from{legacy_inferred=1}`, an in-vocabulary row passes through
-/// untouched, and the legacy type survives only as provenance.
+/// Spec: `migrate_to_strata_legacy_links_are_legacy_inferred` — inferred v3
+/// rows (`causal` from entity backfill, `semantic` from keyword/similarity)
+/// migrate as kind `legacy_inferred`, never a causal vocabulary kind. A
+/// declared in-vocabulary row passes through. Counts match the source and
+/// the v3 file's sha256 is unchanged.
 #[test]
 fn migrate_to_strata_legacy_links_are_legacy_inferred() {
     let (dir, db) = copy_fixture("legacy");
     let dest = dir.path().join("strata");
-    migrate_with_options(
+    let sha_before = sha256_file(&db);
+    assert_eq!(
+        sha256_file(&fixture_path()),
+        FIXTURE_SHA256,
+        "committed v3.1.1 fixture sha256"
+    );
+
+    let source_edges: i64 = {
+        let conn =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open fixture");
+        conn.query_row("SELECT COUNT(*) FROM memory_connections", [], |row| {
+            row.get(0)
+        })
+        .expect("count connections")
+    };
+
+    let report = migrate_with_options(
         &db,
         &dest,
         MigrateOptions {
@@ -341,8 +376,13 @@ fn migrate_to_strata_legacy_links_are_legacy_inferred() {
         },
     )
     .expect("migration succeeds");
+    assert_eq!(sha256_file(&db), sha_before, "v3 sha changed");
+    assert_eq!(sha256_file(&fixture_path()), FIXTURE_SHA256);
+    assert_eq!(report.edges, source_edges as u64);
+    assert!(report.verify_passed);
 
     let snapshot = read_snapshot(&strata::StrataLog::open(&dest).unwrap()).unwrap();
+    assert_eq!(snapshot.edges.len() as i64, source_edges);
     let by_legacy = |legacy: &str| {
         snapshot
             .edges
@@ -352,27 +392,34 @@ fn migrate_to_strata_legacy_links_are_legacy_inferred() {
     };
 
     let causal = by_legacy("causal");
-    assert_eq!(causal.link_type, "derived_from");
+    assert_eq!(causal.link_type, strata_migrate::LEGACY_INFERRED_KIND);
     assert!(
         causal.legacy_inferred,
-        "causal lookalike must be legacy_inferred"
+        "entity-inferred causal must be flagged"
     );
+    assert!(!strata_migrate::STRATA_EDGE_VOCABULARY.contains(&causal.link_type.as_str()));
 
     let semantic = by_legacy("semantic");
-    assert_eq!(semantic.link_type, "derived_from");
+    assert_eq!(semantic.link_type, strata_migrate::LEGACY_INFERRED_KIND);
     assert!(semantic.legacy_inferred);
+    assert!(!strata_migrate::STRATA_EDGE_VOCABULARY.contains(&semantic.link_type.as_str()));
 
     let touched = by_legacy("touched");
     assert_eq!(touched.link_type, "touched");
     assert!(
         !touched.legacy_inferred,
-        "in-vocabulary type passes through"
+        "declared vocabulary type passes through"
     );
 
-    // Default-walk semantics: only the 8-type vocabulary participates, and
-    // every rewritten edge is flagged so a default walk can exclude it.
-    assert!(snapshot.edges.iter().all(|e| !e.legacy_inferred
-        || strata_migrate::STRATA_EDGE_VOCABULARY.contains(&e.link_type.as_str())));
+    let causal_kinds = strata_migrate::STRATA_EDGE_VOCABULARY;
+    assert!(snapshot.edges.iter().all(|e| {
+        if e.legacy_inferred {
+            e.link_type == strata_migrate::LEGACY_INFERRED_KIND
+                && !causal_kinds.contains(&e.link_type.as_str())
+        } else {
+            causal_kinds.contains(&e.link_type.as_str())
+        }
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +564,7 @@ fn migrate_wal_snapshot_includes_wal_only_rows() {
     let dest = dir.path().join("strata");
 
     // Hold a connection open so the commit stays in the -wal.
-    let mut conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     conn.execute(
         "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, tags)

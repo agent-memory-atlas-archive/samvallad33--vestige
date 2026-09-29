@@ -28,7 +28,8 @@ pub const KIND_GENESIS: u8 = 0x1F;
 pub const KIND_PARAMS: u8 = 0x26;
 /// One `knowledge_nodes` row (or a V40 `walk_receipts` reference node).
 pub const KIND_NODE: u8 = 0x20;
-/// One `memory_connections` row mapped into the 8-type STRATA vocabulary.
+/// One `memory_connections` row. Declared rows keep an 8-type kind;
+/// inferred rows store `legacy_inferred` in `link_type`.
 pub const KIND_EDGE: u8 = 0x21;
 /// One synthesized review event (payload = kernel `ReviewEvent`).
 pub const KIND_FSRS_REVIEW: u8 = 0x22;
@@ -116,10 +117,10 @@ pub struct NodeRecord {
     pub legacy: Vec<(String, String)>,
 }
 
-/// A migrated typed edge. Legacy link types are folded into the 8-type
-/// STRATA vocabulary: any `link_type` outside the vocabulary becomes
-/// `derived_from` with `legacy_inferred = 1` (H4: only the 8 types exist;
-/// migration never invents new edge semantics for inferred history).
+/// A migrated typed edge. A declared v3 `link_type` (the 8-type vocabulary)
+/// is stored as itself. Every inferred v3 link stores `legacy_inferred` in
+/// the existing `link_type` field — never `derived_from` or another causal
+/// kind — with `legacy_inferred = 1` and the original type kept aside.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct EdgeRecord {
     pub record_version: u16,
@@ -127,9 +128,9 @@ pub struct EdgeRecord {
     pub target_kernel_id: u64,
     pub source_legacy_id: String,
     pub target_legacy_id: String,
-    /// STRATA vocabulary type (`derived_from` when rewritten from legacy).
+    /// Declared vocabulary type, or `legacy_inferred` for an inferred v3 link.
     pub link_type: String,
-    /// True when `link_type` was rewritten from the legacy vocabulary.
+    /// True when `link_type` was rewritten from an inferred v3 type.
     pub legacy_inferred: bool,
     /// Original legacy link type, kept for provenance only.
     pub legacy_link_type: String,
