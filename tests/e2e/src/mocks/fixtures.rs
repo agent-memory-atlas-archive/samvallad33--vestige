@@ -559,7 +559,11 @@ mod tests {
 
     #[test]
     fn test_create_batch() {
-        let mut storage = create_test_storage();
+        // Count assertions need a private store: the shared default store is
+        // order-dependent across tests (pre-existing isolation bug).
+        let dir = tempdir().expect("tempdir");
+        let storage = vestige_core::open_storage(Some(dir.path().join("batch.db")))
+            .expect("private test storage");
         let ids = TestDataFactory::create_batch(&*storage, 10);
 
         assert_eq!(ids.len(), 10);
