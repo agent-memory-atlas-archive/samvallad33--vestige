@@ -176,10 +176,10 @@ The mechanisms below are implemented in the Rust engine. Write-up: [docs/SCIENCE
 | `graph` | Chains, associations, bridges, predictions, composition topology. `label` is the write |
 | `intention` | Set, check, update, list. `graph` runs the evidence-aware plan |
 | `maintain` | `consolidate`, `dream`, `gc` (dry run unless you turn it off), `importance_score`, `backup`, `export`, `restore` |
-| `memory` | `get`, `get_batch`, `state`, `promote`, `demote`, `edit`, `purge` (`confirm=true`). `delete` aliases `purge`. Demote does not delete |
+| `memory` | `get`, `get_batch`, `state`, `promote`, `demote`, `edit`, `purge` (`confirm=true`; retired, can't be retrieved). `delete` aliases `purge`. Demote does not delete |
 | `memory_status` | `health`, `retention`, `timeline`, `changelog`, `stats`, `tools`. `view=tools` plus `tool` unfolds one full schema |
 | `project` | Preview a fenced region of `CLAUDE.md` or `MEMORY.md`. `write` needs `confirm=true` and replaces only the fence |
-| `purge` | Remove one memory's content and embeddings. Irreversible; `confirm=true` required. `destructiveHint` is true, and `_meta["anthropic/requiresUserInteraction"]` is true, so the client prompts. Same path as `memory` action `purge`. The tombstone is an opaque marker; the reason is logged, not stored |
+| `purge` | Retire one memory so it can't be retrieved. `confirm=true` required. `destructiveHint` is true, and `_meta["anthropic/requiresUserInteraction"]` is true, so the client prompts. Same path as `memory` action `purge`. Returns the node id and an `eff-` receipt naming `purge` |
 | `receipt` | `get` a stored receipt, or `replay` it with named slots withheld |
 | `recall` | `lookup` (hybrid search), `reason`, or `contradictions`. Retrieval does not change strength |
 | `session_start` | Memories, open intentions, status, predictions, and codebase context under one budget |

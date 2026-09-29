@@ -55,7 +55,7 @@ pub fn schema() -> Value {
             "action": {
                 "type": "string",
                 "enum": ["get", "get_batch", "delete", "purge", "state", "promote", "demote", "edit"],
-                "description": "'get', 'get_batch' (ids), 'state', 'promote' / 'demote' (retrieval strength; demote never deletes), 'edit' (admit a successor under rule edit, then retire the previous node), 'purge' (content and embeddings gone; confirm=true). 'delete' aliases purge"
+                "description": "'get', 'get_batch' (ids), 'state', 'promote' / 'demote' (retrieval strength; demote never deletes), 'edit' (admit a successor under rule edit, then retire the previous node), 'purge' (retired, can't be retrieved; confirm=true). 'delete' aliases purge"
             },
             "id": {
                 "type": "string",
@@ -76,7 +76,7 @@ pub fn schema() -> Value {
             },
             "confirm": {
                 "type": "boolean",
-                "description": "Required for purge and delete. Removes canonical content and embeddings; legacy audit and sync rows keep opaque markers, so this is not verified unlearning.",
+                "description": "Required for purge and delete. Retires the memory so it can't be retrieved.",
                 "default": false
             },
             "content": {
@@ -104,15 +104,14 @@ struct MemoryArgs {
 }
 
 /// Execute the unified memory tool
-/// Standalone `purge` tool schema (#219): the one irreversible call,
-/// advertised on its own so hosts can gate it without gating the reads that
-/// share `memory`. Same parameters as `memory(action='purge')`.
+/// Standalone `purge` tool schema (#219). Same parameters as
+/// `memory(action='purge')`. Hosts can prompt on this tool alone.
 pub fn purge_schema() -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
             "id": {
-                "description": "Memory UUID to purge (for good; confirm=true).",
+                "description": "Memory id to retire (confirm=true).",
                 "type": "string"
             },
             "role": {
@@ -120,7 +119,7 @@ pub fn purge_schema() -> Value {
                 "description": "[promote/demote] CLAIMED role for provenance. Resolved against the operator-controlled policy; claims never override the process identity or self-grant authority. Unregistered claims stay neutral at 1.0."
             },
             "confirm": {
-                "description": "Required: purge is irreversible. Content and embeddings are removed; legacy audit/sync rows keep only opaque markers.",
+                "description": "Required. Retires the memory so it can't be retrieved.",
                 "type": "boolean"
             },
             "reason": {
@@ -239,7 +238,7 @@ async fn execute_get(storage: &Arc<Storage>, id: &str) -> Result<Value, String> 
             "action": "get",
             "found": false,
             "nodeId": id,
-            "message": "Memory not found",
+            "message": absent_message(storage, id),
         })),
     }
 }
@@ -268,6 +267,7 @@ async fn execute_get_batch(storage: &Arc<Storage>, ids: &[String]) -> Result<Val
                 results.push(serde_json::json!({
                     "id": id,
                     "found": false,
+                    "message": absent_message(storage, id),
                 }));
             }
             Err(e) => {
@@ -287,7 +287,19 @@ async fn execute_get_batch(storage: &Arc<Storage>, ids: &[String]) -> Result<Val
     }))
 }
 
-/// Permanently purge a memory and return cleanup details.
+fn absent_message(storage: &Arc<Storage>, id: &str) -> &'static str {
+    if storage
+        .superseded_node_ids()
+        .ok()
+        .is_some_and(|ids| ids.contains(id))
+    {
+        "retired, can't be retrieved"
+    } else {
+        "Memory not found"
+    }
+}
+
+/// Retire a memory. On Strata this is a confirmed `purge` RETIRE.
 async fn execute_purge(
     storage: &Arc<Storage>,
     cognitive: &Arc<Mutex<CognitiveEngine>>,
@@ -297,20 +309,15 @@ async fn execute_purge(
     action: &str,
 ) -> Result<Value, String> {
     if !confirm {
-        return Err(
-            "Purge is irreversible. Pass confirm=true to permanently remove memory content and embeddings."
-                .to_string(),
-        );
+        return Err("Pass confirm=true to retire this memory. It can't be retrieved.".to_string());
     }
 
     let report = storage
         .purge_node(id, reason.as_deref())
         .map_err(|e| e.to_string())?;
 
-    // A successful purge must not leave a stale in-process cognitive projection
-    // able to retrieve the removed id. Replacing the entire engine is safer
-    // than attempting to discover and edit every module-local cache, and the
-    // new engine hydrates only surviving durable state.
+    // Drop in-process projections of the retired id. Hydration reads only
+    // what the store still returns.
     let runtime_rebuilt = if report.deleted {
         let mut rebuilt = CognitiveEngine::new();
         rebuilt.hydrate(storage);
@@ -319,6 +326,25 @@ async fn execute_purge(
     } else {
         false
     };
+
+    if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        return Ok(match report.receipt_id {
+            Some(receipt_id) => serde_json::json!({
+                "action": action,
+                "success": true,
+                "nodeId": id,
+                "receiptId": receipt_id,
+                "rule": "purge",
+                "message": "Retired; can't be retrieved.",
+            }),
+            None => serde_json::json!({
+                "action": action,
+                "success": false,
+                "nodeId": id,
+                "message": absent_message(storage, id),
+            }),
+        });
+    }
 
     Ok(serde_json::json!({
         "action": action,
@@ -355,7 +381,7 @@ async fn execute_state(storage: &Arc<Storage>, id: &str) -> Result<Value, String
     let memory = storage
         .get_node(id)
         .map_err(|e| format!("Error: {}", e))?
-        .ok_or("Memory not found")?;
+        .ok_or_else(|| absent_message(storage, id))?;
 
     // Calculate accessibility score
     let accessibility = compute_accessibility(
@@ -1557,10 +1583,7 @@ mod strata_tests {
             let successor_card = mem.card_q(&successor).unwrap();
             assert_eq!(successor_card.3, 1, "successor is a fresh ingest fold");
             assert_eq!(successor_card.4, 0, "successor has no lapses");
-            assert_eq!(
-                storage.get_node(&id).unwrap().unwrap().content,
-                "original cause text"
-            );
+            assert!(storage.get_node(&id).unwrap().is_none());
             assert_eq!(
                 storage.supersession_pairs().unwrap(),
                 vec![(id.clone(), successor.clone())]
@@ -1569,10 +1592,6 @@ mod strata_tests {
                 storage.get_node(&successor).unwrap().unwrap().content,
                 "replacement cause text"
             );
-            // The predecessor is still returned by handle recall. Withholding
-            // superseded ids is the purge lane's read-layer fix (agent
-            // bc-72e9a3fa, stacked on #329) in `resolve_handle`. See
-            // `recall_withholds_the_node_retired_by_edit`.
             let live_recall = crate::tools::recall::execute(
                 &storage,
                 &cognitive(),
@@ -1600,19 +1619,20 @@ mod strata_tests {
             )
         };
 
-        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        let reopened = Arc::new(StrataMemory::open(dir.path()).unwrap());
+        let storage: Arc<Storage> = reopened.clone();
         let (promote_receipt, demote_receipt, edit_receipt, id, successor) = receipts;
         proved(&storage, &promote_receipt, &id, "promoted").await;
         proved(&storage, &demote_receipt, &id, "demoted").await;
         proved(&storage, &edit_receipt, &successor, "edited").await;
-        let node = storage.get_node(&id).unwrap().unwrap();
-        assert_eq!(node.content, "original cause text");
+        assert!(reopened.get_node(&id).unwrap().is_none());
+        let card = reopened.card_q(&id).unwrap();
+        assert_eq!(card.3, cards.3);
+        assert_eq!(card.4, cards.4);
         assert_eq!(
             storage.supersession_pairs().unwrap(),
             vec![(id.clone(), successor.clone())]
         );
-        assert_eq!(node.reps, i32::try_from(cards.3).unwrap());
-        assert_eq!(node.lapses, i32::try_from(cards.4).unwrap());
         let successor_node = storage.get_node(&successor).unwrap().unwrap();
         assert_eq!(successor_node.content, "replacement cause text");
         assert_eq!(successor_node.reps, 1);
@@ -1684,13 +1704,7 @@ mod strata_tests {
     }
 
     /// Predecessor of an edit must not come back from handle recall.
-    ///
-    /// Ignored until the purge lane (agent bc-72e9a3fa, stacked on #329)
-    /// withholds superseded ids in `StrataMemory::resolve_handle`. This
-    /// branch does not carry a second copy of that filter. Drop the ignore
-    /// when that branch is merged here.
     #[tokio::test]
-    #[ignore = "superseded ids still resolve; fixed once in the purge PR (agent bc-72e9a3fa, stacked on #329)"]
     async fn recall_withholds_the_node_retired_by_edit() {
         let (_mem, storage, _dir) = open();
         let id = ingest(&storage, "original cause text");

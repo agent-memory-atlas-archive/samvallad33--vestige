@@ -181,14 +181,23 @@ def run(binary, output):
             assert edit_receipt["receipt"]["mutations"][0]["kind"] == "edited"
             assert "rule=edit" in edit_receipt["receipt"]["mutations"][0]["note"]
             assert "edited fixture" in json.dumps(tool("memory", {"action": "get", "id": successor}))
-            assert "edited fixture" not in json.dumps(tool("memory", {"action": "get", "id": node_id}))
-            # Superseded ids are still returned by handle recall. That filter
-            # lands once in the purge lane (agent bc-72e9a3fa, stacked on #329).
+            hidden_edit = tool("memory", {"action": "get", "id": node_id})
+            assert hidden_edit["message"] == "retired, can't be retrieved"
+            retired = tool("recall", {"handle": node_id})
+            assert node_id not in json.dumps(retired.get("nodes", []))
             live = tool("recall", {"handle": successor})
             assert "edited fixture" in json.dumps(live)
             typed("memory", {"action": "promote", "id": "not-a-handle"}, "Invalid memory ID")
             typed("memory", {"action": "edit", "id": "mem-ffffffffffffffff", "content": "nope"}, "not found")
-            typed("purge", {"id": node_id, "confirm": True}, "pending_strata")
+            doomed = tool("smart_ingest", {"content": "STRATA_PURGE_DOOMED", "forceCreate": True})
+            doomed_id = doomed["nodeId"]
+            typed("purge", {"id": doomed_id, "confirm": False}, "confirm=true")
+            purged = tool("purge", {"id": doomed_id, "confirm": True})
+            assert purged["rule"] == "purge" and purged["nodeId"] == doomed_id
+            assert str(purged["receiptId"]).startswith("eff-")
+            hidden = tool("memory", {"action": "get", "id": doomed_id})
+            assert "STRATA_PURGE_DOOMED" not in json.dumps(hidden)
+            assert hidden["message"] == "retired, can't be retrieved"
             context = tool("codebase", {"action": "get_context", "codebase": "fixture"})
             assert marker not in json.dumps(context)
             typed("project", {"action": "preview"}, "pending_strata")
