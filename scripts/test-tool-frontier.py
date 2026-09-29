@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Disposable stdio MCP contracts for discovery and evidence-aware tools.
+"""Stdio contracts for the Strata-backed vestige-mcp binary.
 
-No real memory, credentials, connector requests or model agents are used.
-The server may initialize its locally configured embedding runtime.
---output stores a synthetic request/response transcript and coverage inventory.
+Discovery stays exact. Writes go through the gate. Similarity (embeddings,
+cosine, BM25, FTS, Jaccard, keyword or name match) is an error. A link
+exists only when the log recorded an edge. No SQLite file is created.
 """
 import argparse
 import json
 import os
 from pathlib import Path
 import select
-import sqlite3
 import subprocess
 import tempfile
 
@@ -20,13 +19,19 @@ def run(binary, output):
     coverage = []
     with tempfile.TemporaryDirectory(prefix="vestige-tool-frontier-") as temp:
         root = Path(temp)
-        # Keep inherited connector credentials and integration hooks out of fixtures.
+        store = root / "store"
         env = {k: v for k, v in os.environ.items() if not k.startswith(("VESTIGE_", "REDMINE_", "GITHUB_"))}
         env.update(VESTIGE_DASHBOARD_ENABLED="false", VESTIGE_HTTP_ENABLED="false", RUST_LOG="error")
-        proc = subprocess.Popen([str(binary.resolve()), "--no-http", "--data-dir", str(root / "store")],
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, env=env, text=True, bufsize=1)
+        proc = None
         seq = 0
+
+        def spawn():
+            nonlocal proc
+            proc = subprocess.Popen(
+                [str(binary.resolve()), "--no-http", "--data-dir", str(store)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, env=env, text=True, bufsize=1,
+            )
 
         def rpc(method, params):
             nonlocal seq
@@ -49,30 +54,56 @@ def run(binary, output):
         def tool(name, args, error=False):
             result = rpc("tools/call", {"name": name, "arguments": args})
             assert bool(result.get("isError")) == error, result
-            coverage.append({"tool": name, "selector": args.get("action", args.get("mode", args.get("view", "default"))),
-                             "outcome": "expected_error" if error else "success"})
+            coverage.append({
+                "tool": name,
+                "selector": args.get("action", args.get("mode", args.get("view", "default"))),
+                "outcome": "expected_error" if error else "success",
+            })
             return result.get("structuredContent") or json.loads(result["content"][0]["text"])
+
+        def typed(name, args, needle):
+            body = tool(name, args, error=True)
+            assert needle in body["error"], body
+            return body
+
+        def handshake():
+            rpc("initialize", {
+                "protocolVersion": "2025-11-25", "capabilities": {},
+                "clientInfo": {"name": "tool-frontier-fixture", "version": "1"},
+            })
+            proc.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+            proc.stdin.flush()
 
         def passed(name):
             print("PASS", name, flush=True)
 
+        def assert_no_sqlite():
+            bad = []
+            if store.exists():
+                for path in store.rglob("*"):
+                    name = path.name.lower()
+                    if path.is_file() and (
+                        name.endswith(".sqlite") or name.endswith(".sqlite3")
+                        or name.endswith(".db") or name.endswith(".db-wal")
+                        or name.endswith(".db-shm")
+                    ):
+                        bad.append(str(path))
+            assert not bad, bad
+
+        spawn()
         try:
-            rpc("initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
-                               "clientInfo": {"name": "tool-frontier-fixture", "version": "1"}})
-            proc.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
-            proc.stdin.flush()
+            handshake()
             catalog = rpc("tools/list", {})["tools"]
+            names = [x["name"] for x in catalog]
+            assert len(names) == 18, names
             guide = tool("memory_status", {"view": "tools"})["tools"]
-            assert [x["name"] for x in guide] == [x["name"] for x in catalog]
+            assert [x["name"] for x in guide] == names
             for entry, definition in zip(guide, catalog):
                 for selector in ("action", "mode", "view"):
                     values = definition["inputSchema"].get("properties", {}).get(selector, {}).get("enum")
                     if values is not None:
                         assert entry["selectors"][selector]["values"] == values
                 detail = tool("memory_status", {"view": "tools", "tool": entry["name"]})
-                # #212: the catalog schema is compact; the selected tool gets
-                # the full registry schema. It must carry every property the
-                # compact form has and must not be smaller.
                 full = detail["tools"][0]["inputSchema"]
                 assert full.get("type") == definition["inputSchema"].get("type")
                 assert len(json.dumps(full)) >= len(json.dumps(definition["inputSchema"]))
@@ -91,158 +122,87 @@ def run(binary, output):
             assert annotations["suppress"]["idempotentHint"] is False
             passed("all installed tool and action definitions match progressive discovery")
 
-            tool("smart_ingest", {"content": "Must not silently disappear", "items": [{"content":"Batch fixture"}]}, error=True)
-            tool("maintain", {"action":"export", "start":"2026-01-01"}, error=True)
-            maintenance_page = tool("maintain", {"action":"consolidate", "phase":"embeddings", "batchSize":2})
-            assert maintenance_page["dryRun"] is True and maintenance_page["selected"] == 0
-            assert maintenance_page["hasMore"] is False
-            tool("maintain", {"action":"consolidate", "batchSize":2}, error=True)
-            tool("maintain", {"action":"consolidate", "phase":"embeddings", "batchSize":101}, error=True)
-            passed("embedding maintenance previews bounded pages and rejects misplaced controls")
+            typed("maintain", {"action": "consolidate", "phase": "embeddings", "batchSize": 2},
+                  "phase must be all, lifecycle or logs")
+            tool("maintain", {"action": "consolidate", "batchSize": 2}, error=True)
+            tool("maintain", {"action": "consolidate", "phase": "embeddings", "batchSize": 101}, error=True)
+            passed("embedding maintenance is refused; it is not a Strata operation")
             for phase in ("lifecycle", "logs"):
-                page = tool("maintain", {"action":"consolidate", "phase":phase, "batchSize":2})
-                assert page["dryRun"] is True and page["hasMore"] is False
-            tool("maintain", {"action":"consolidate", "phase":"logs", "after":"invalid"}, error=True)
-            passed("lifecycle/log maintenance previews and invalid-control rejection")
-            assert annotations["receipt"]["readOnlyHint"] is False
-            assert annotations["receipt"]["idempotentHint"] is True
-            cause = tool("smart_ingest", {"content": "Set FIXTURE_TIMEOUT to two seconds in fixture service.",
-                         "tags": ["fixture-old", "FIXTURE_TIMEOUT"], "forceCreate": True})["nodeId"]
-            failure = tool("smart_ingest", {"content": "Fixture service failure: FIXTURE_TIMEOUT caused a timeout.",
-                           "tags": ["FIXTURE_TIMEOUT", "failure"], "forceCreate": True})["nodeId"]
-            foreign = tool("smart_ingest", {"content": "Foreign project fixture-only marker FOREIGN_CANARY.",
-                           "scope": "other-project", "forceCreate": True})["nodeId"]
-            project_failure = tool("smart_ingest", {"content": "Project fixture deployment failed due to timeout.",
-                                   "tags": ["failure"], "scope": "other-project", "forceCreate": True})
-            hook = project_failure["failureHooks"]["backfill"]
-            assert hook["scope"] == "other-project" and hook["preview"] is True
-            assert hook["causesPromoted"] == 0 and hook["evidenceStatus"] == "hypothesis"
-            db = next(p for p in (root / "store").rglob("*.db") if "knowledge_nodes" in {
-                row[0] for row in sqlite3.connect(p).execute("SELECT name FROM sqlite_master")})
-            with sqlite3.connect(db) as conn:
-                conn.execute("UPDATE knowledge_nodes SET created_at='2026-01-01T00:00:00Z' WHERE id=?", (cause,))
-                conn.execute("UPDATE knowledge_nodes SET created_at='2026-01-03T00:00:00Z' WHERE id=?", (failure,))
-                before = conn.execute("SELECT reps,stability FROM knowledge_nodes WHERE id=?", (cause,)).fetchone()
-                edges_before = conn.execute("SELECT COUNT(*) FROM memory_connections").fetchone()
-            for _ in range(2):
-                preview = tool("backfill", {"failure_id": failure})
-                assert preview["preview"] is True and preview["causality_verified"] is False
-                assert preview["causes"] and not any(x["promoted"] for x in preview["causes"])
-            with sqlite3.connect(db) as conn:
-                assert before == conn.execute("SELECT reps,stability FROM knowledge_nodes WHERE id=?", (cause,)).fetchone()
-                assert edges_before == conn.execute("SELECT COUNT(*) FROM memory_connections").fetchone()
-            tool("backfill", {"failure_id": foreign}, error=True)
-            promoted = tool("backfill", {"failure_id": failure, "promote": True})
-            assert any(x["promoted"] for x in promoted["causes"])
-            passed("backfill preview has no strength/graph mutation; explicit promotion remains available")
+                page = tool("maintain", {"action": "consolidate", "phase": phase, "batchSize": 2})
+                assert page["dryRun"] is True and page["hasMore"] is False and page["selected"] == 0
+            tool("maintain", {"action": "consolidate", "phase": "logs", "after": "invalid"}, error=True)
+            passed("lifecycle/log maintenance previews empty pages and rejects invalid controls")
 
-            for action in ("get", "state"):
-                tool("memory", {"action": action, "id": cause})
-            tool("memory", {"action": "get_batch", "ids": [cause, failure]})
-            mode_path = db.parent / "review_mode.json"
-            mode_path.write_text('{"mode":"risk_gated"}')
-            held = tool("suppress", {"id": cause})
-            assert held["pendingReview"] is True and held["success"] is False
-            # Exercise the separate supported fast mode only in this disposable
-            # database, after proving the opt-in review gate above.
-            mode_path = db.parent / "review_mode.json"
-            mode_path.write_text('{"mode":"fast"}')
-            for action in ("promote", "demote"):
-                tool("memory", {"action": action, "id": cause, "reason": "Synthetic fixture feedback"})
-            first = tool("suppress", {"id": cause})
-            second = tool("suppress", {"id": cause})
-            assert second["suppressionCount"] == first["suppressionCount"] + 1
-            reversed_state = tool("suppress", {"id": cause, "reverse": True})
-            assert reversed_state["reversalScope"] == "local_state_and_journaled_cascades"
-            assert reversed_state["unrecordedEffectsReversed"] is False
-            tool("suppress", {"id": cause, "reverse": True})
-            mode_path.unlink()
-            passed("opt-in suppression review gate and automatic compounding/reversal")
+            marker = "STRATA_FIXTURE_EXACT_HANDLE"
+            created = tool("smart_ingest", {"content": marker, "forceCreate": True, "tags": ["fixture-old"]})
+            node_id = created["nodeId"]
+            assert node_id.startswith("mem-") and created["success"] is True
+            got = tool("memory", {"action": "get", "id": node_id})
+            assert marker in json.dumps(got)
+            tool("memory", {"action": "get_batch", "ids": [node_id]})
+            tool("memory", {"action": "state", "id": node_id})
+            receipt = tool("receipt", {"action": "get", "receipt_id": node_id})
+            assert "receipt" in receipt
+            typed("recall", {"query": marker}, "similarity_disabled")
+            handle = tool("recall", {"handle": node_id})
+            assert marker in json.dumps(handle) and handle["exact"] is True
+            passed("ingest, exact get, write receipt, and handle recall; query recall is refused")
 
-            for view in ("health", "retention", "timeline", "changelog", "stats"):
-                tool("memory_status", {"view": view})
-            intention = tool("intention", {"action": "set", "description": "Synthetic reminder",
-                             "trigger": {"type": "time", "at": "2020-01-01T00:00:00Z"}})["intentionId"]
-            tool("intention", {"action": "list"})
-            tool("intention", {"action": "check"})
-            tool("intention", {"action": "update", "id": intention, "status": "complete"})
-            tool("graph", {"action": "recent", "limit": 5})
-            graph = tool("graph", {"action": "never_composed", "limit": 5})
-            assert graph["scope"] == "user" and graph["globalNoveltyVerified"] is False
-            assert foreign not in json.dumps(graph)
-            tool("maintain", {"action": "importance_score", "content": "Synthetic fixture design decision"})
-            gc = tool("maintain", {"action": "gc"})
-            assert gc.get("dryRun", gc.get("dry_run")) is True
-            tool("dedup", {"action": "tag_rename", "source_tag": "fixture-old", "target_tag": "fixture-new"})
-            tool("session_start", {"queries": [], "include_predictions": False})
-            passed("status, intention lifecycle, graph investigation and maintenance preview contracts")
-
-            lookup = tool("recall", {"query": "FIXTURE_TIMEOUT", "concrete": True})
-            receipt_id = lookup.get("receiptId")
-            assert receipt_id, lookup
-            tool("receipt", {"action": "get", "receipt_id": receipt_id})
-            replay = tool("receipt", {"action": "replay", "receipt_id": receipt_id, "withheld_slots": []})
-            repeated = tool("receipt", {"action": "replay", "receipt_id": receipt_id, "withheld_slots": []})
-            assert replay["replayId"] == repeated["replayId"] and replay["receiptId"] == repeated["receiptId"]
-            assert repeated["reusedExisting"] is True
-            with sqlite3.connect(db) as conn:
-                conn.execute("UPDATE knowledge_nodes SET has_embedding=1 WHERE id=?", (cause,))
-            edited = tool("memory", {"action":"edit", "id":cause, "content":"Reviewed FIXTURE_TIMEOUT fixture setting is two seconds."})
-            assert edited["embeddingStatus"] in ("pending", "available")
-            with sqlite3.connect(db) as conn:
-                state = conn.execute("SELECT has_embedding FROM knowledge_nodes WHERE id=?", (cause,)).fetchone()[0]
-                assert state == int(edited["embeddingStatus"] == "available")
-                if state:
-                    assert conn.execute("SELECT COUNT(*) FROM embedding_profile_vectors WHERE node_id=?", (cause,)).fetchone()[0] > 0
-            passed("edit invalidates embedding state without falsely promising regeneration")
-            for budget in (100, 101, 250, 1000, 2500):
-                reason = tool("recall", {"mode":"reason", "query":"FIXTURE_TIMEOUT", "token_budget":budget, "min_similarity":0})
-                size = len(json.dumps(reason, ensure_ascii=False, separators=(",", ":")).encode())
-                assert size <= budget * 4, (budget, size, reason)
-                assert reason["tokensUsed"] == (size + 3) // 4
-                assert reason["budgetUnit"] == "utf8_bytes_div_4_ceiling"
-                assert foreign not in json.dumps(reason)
-            reason = tool("recall", {"mode":"reason", "query":"FIXTURE_TIMEOUT", "token_budget":500,
-                          "runId":"long-correlation-" * 1000, "min_similarity":0})
-            assert len(json.dumps(reason, ensure_ascii=False, separators=(",", ":")).encode()) <= 2000
-            tool("recall", {"mode":"reason", "query":"FIXTURE_TIMEOUT", "detail_level":"full"}, error=True)
-            other = tool("recall", {"mode":"reason", "query":"FOREIGN_CANARY", "scope":"other-project", "min_similarity":0})
-            assert foreign in json.dumps(other), other
-            passed("reason scopes and final structured-content budgets after receipt metadata")
-            for concrete in (True, False):
-                for budget in (100, 101, 256, 1000):
-                    limited = tool("recall", {"query":"FIXTURE_TIMEOUT", "concrete":concrete,
-                                   "token_budget":budget, "min_similarity":0})
-                    size = len(json.dumps(limited, ensure_ascii=False, separators=(",", ":")).encode())
-                    assert size <= budget * 4, (budget, size, limited)
-                    assert limited["tokensUsed"] == (size + 3) // 4
-            packet_args = {"query":"FOREIGN_CANARY", "scope":"other-project", "concrete":True,
-                           "context_packet":True, "token_budget":2000}
-            packet = tool("recall", packet_args)
-            assert packet["results"] and packet["packetId"]
-            same = tool("recall", dict(packet_args, known_packet_id=packet["packetId"]))
-            assert same["notModified"] is True and same["results"] == []
-            tool("memory", {"action":"edit", "id":foreign,
-                            "content":"FOREIGN_CANARY updated source decision."})
-            changed = tool("recall", dict(packet_args, known_packet_id=packet["packetId"]))
-            assert changed["notModified"] is False and changed["packetId"] != packet["packetId"]
-            fresh = tool("recall", packet_args)
-            assert fresh["results"] and fresh["notModified"] is False
-            tool("recall", {"query":"FOREIGN_CANARY", "known_packet_id":packet["packetId"]}, error=True)
-            passed("lookup complete-envelope budgets and stable-packet acknowledgment/edit/refresh")
-            contradictions = tool("recall", {"mode":"contradictions"})
-            assert foreign not in json.dumps(contradictions)
-            tool("recall", {"mode":"contradictions", "token_budget":100}, error=True)
-            timed = tool("intention", {"action":"check", "context":{"current_time":"2020-01-01T00:00:00Z"}})
-            assert timed["checkedAt"].startswith("2020-01-01T00:00:00")
-            tool("intention", {"action":"check", "context":{"current_time":"invalid"}}, error=True)
-            passed("retrieval receipt inspection and frozen replay execute through MCP")
-        finally:
             proc.terminate()
             proc.wait(timeout=10)
+            assert_no_sqlite()
+            spawn()
+            handshake()
+            again = tool("memory", {"action": "get", "id": node_id})
+            assert marker in json.dumps(again)
+            assert_no_sqlite()
+            passed("empty-dir restart keeps the node and creates no sqlite file")
+
+            typed("recall", {"mode": "reason", "query": marker}, "similarity_disabled")
+            typed("recall", {"mode": "contradictions"}, "similarity_disabled")
+            typed("receipt", {"action": "replay", "receipt_id": node_id, "withheld_slots": []}, "pending_strata")
+            typed("memory", {"action": "promote", "id": node_id, "reason": "fixture"}, "pending_strata")
+            typed("memory", {"action": "edit", "id": node_id, "content": "edited"}, "pending_strata")
+            typed("purge", {"id": node_id, "confirm": True}, "pending_strata")
+            context = tool("codebase", {"action": "get_context", "codebase": "fixture"})
+            assert marker not in json.dumps(context)
+            typed("project", {"action": "preview"}, "pending_strata")
+            typed("intention", {"action": "set", "description": "Synthetic reminder",
+                                "trigger": {"type": "time", "at": "2020-01-01T00:00:00Z"}}, "pending_strata")
+            tool("source_sync", {"source": "gitlab", "repo": "a/b"}, error=True)
+            for view in ("health", "retention", "timeline", "changelog", "stats", "coverage"):
+                tool("memory_status", {"view": view})
+            score = tool("maintain", {"action": "importance_score", "content": "Synthetic fixture design decision"})
+            assert isinstance(score.get("composite"), (int, float))
+            gc = tool("maintain", {"action": "gc"})
+            assert gc.get("dryRun", gc.get("dry_run")) is True
+            assert gc.get("deleted", gc.get("candidateCount", 0)) == 0 or gc.get("candidateCount") == 0
+            preview = tool("dedup", {"action": "tag_rename", "source_tag": "fixture-old", "target_tag": "fixture-new"})
+            assert preview.get("wouldWrite") is False
+            recent = tool("graph", {"action": "recent", "limit": 5})
+            assert recent.get("events", recent.get("compositions", [])) == [] or recent.get("count", 0) == 0 or "events" in recent
+            never = tool("graph", {"action": "never_composed", "limit": 5})
+            assert never["scope"] == "user" and never["globalNoveltyVerified"] is False
+            typed("session_start", {"queries": [marker], "include_predictions": False, "include_intentions": False}, "similarity_disabled")
+            typed("suppress", {"id": node_id}, "pending_strata")
+            typed("causal_walk", {"scope": "user"}, "pending_strata")
+            typed("selftest", {}, "pending_strata")
+            typed("forgotten_lesson", {"failure_id": node_id}, "pending_strata")
+            called = {row["tool"] for row in coverage}
+            missing = [name for name in names if name not in called]
+            assert not missing, missing
+            assert_no_sqlite()
+            passed("all 18 tools answered on Strata: real writes, or a typed error")
+        finally:
+            if proc and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=10)
             if output:
-                output.write_text(json.dumps({"catalog": locals().get("catalog", []), "coverage": coverage,
-                                              "transcript": transcript}, indent=2) + "\n")
+                output.write_text(json.dumps({
+                    "catalog": locals().get("catalog", []),
+                    "coverage": coverage,
+                    "transcript": transcript,
+                }, indent=2) + "\n")
     print(f"PASS {len(coverage)} tool calls; coverage lists successful and expected-error paths explicitly")
 
 

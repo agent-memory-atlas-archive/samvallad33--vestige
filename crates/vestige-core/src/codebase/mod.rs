@@ -85,8 +85,7 @@ pub mod staleness;
 pub mod types;
 pub mod watcher;
 
-// Re-export main types
-#[cfg(feature = "legacy-sqlite")]
+// Re-export main types. Anchor capture/verify is pure and always available.
 pub use anchor::{
     AnchorDraft, AnchorStatus, AnchorVerification, CodeAnchor, MAX_ANCHORED_FILE_BYTES,
     MAX_SPAN_LINES, capture_anchor, find_symbol_definition, hash_span, verify_anchor,

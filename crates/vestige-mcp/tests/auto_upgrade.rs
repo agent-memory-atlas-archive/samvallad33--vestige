@@ -437,6 +437,10 @@ fn sigkill_mid_upgrade_then_relaunch_succeeds() {
         "relaunch exited after installing the log"
     );
     assert_eq!(before, sha256_file(&db), "relaunch modified the v3 file");
+    // The booted server holds `log/strata.lock`. Stop it, then read the log.
+    let _ = again.child.kill();
+    let _ = again.child.wait();
+    std::thread::sleep(Duration::from_millis(50));
     assert_fixture_landed(&db, &log_dir);
     let ids = knowledge_ids(&db);
     let snap = snapshot(&log_dir);
@@ -446,9 +450,6 @@ fn sigkill_mid_upgrade_then_relaunch_succeeds() {
         .filter(|node| ids.iter().any(|id| id == &node.legacy_id))
         .count();
     assert_eq!(imported, ids.len(), "relaunch dropped or duplicated nodes");
-    let _ = again.child.kill();
-    let _ = again.child.wait();
-    std::thread::sleep(Duration::from_millis(50));
     let stdout = again.stdout.lock().unwrap().clone();
     assert!(
         stdout.trim().is_empty(),

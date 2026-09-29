@@ -42,7 +42,7 @@ use directories::BaseDirs;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -244,6 +244,41 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
     }
 }
 
+fn exit_if_v3(db_path: &Path) {
+    if let Ok(Some(v3)) = vestige_core::detect_v3(db_path) {
+        error!(
+            "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
+            v3.path.display(),
+            v3.schema_version,
+            vestige_core::MIGRATION_HINT
+        );
+        eprintln!(
+            "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
+            v3.path.display(),
+            v3.schema_version,
+            vestige_core::MIGRATION_HINT
+        );
+        std::process::exit(1);
+    }
+}
+
+fn default_strata_dir() -> io::Result<PathBuf> {
+    if let Some(data_dir) = data_dir_from_env() {
+        let data_dir = expand_tilde(data_dir);
+        fs::create_dir_all(&data_dir)?;
+        return Ok(data_dir);
+    }
+    let proj = directories::ProjectDirs::from("com", "vestige", "core").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Could not determine project directories",
+        )
+    })?;
+    let dir = proj.data_dir().to_path_buf();
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 fn prepare_storage_path(data_dir: Option<PathBuf>) -> io::Result<Option<PathBuf>> {
     let Some(data_dir) = data_dir else {
         return Ok(None);
@@ -401,20 +436,6 @@ fn main() {
     );
 }
 
-/// Stand-in until `serve` opens the strata log. Stdin is MCP; nothing is written
-/// to stdout. A client disconnect ends the wait.
-async fn hold_stdio_until_disconnect() {
-    use tokio::io::AsyncReadExt;
-    let mut stdin = tokio::io::stdin();
-    let mut buf = [0u8; 4096];
-    loop {
-        match stdin.read(&mut buf).await {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
-        }
-    }
-}
-
 async fn serve() {
     // Parse CLI arguments first (before logging init, so --help/--version work cleanly)
     let config = parse_args();
@@ -444,52 +465,47 @@ async fn serve() {
         }
     };
 
-    // First launch of 4.0: the same `upgrade_if_needed` the `vestige` CLI runs
-    // from `open_storage`. Backup, import, verify, then swap a strata log in
-    // before stdio `initialize`. Failure exits here; the v3 file is not opened.
-    if let Some(db_path) = storage_path.as_deref() {
-        match vestige_mcp::auto_upgrade::upgrade_if_needed(db_path) {
-            Ok(vestige_mcp::auto_upgrade::UpgradeStatus::StrataReady { .. }) => {
-                // StrataStore boot is a separate change. Do not open vestige.db.
-                hold_stdio_until_disconnect().await;
-                return;
+    // The probed path is `<data-dir>/vestige.db`. The Strata log lives in the
+    // data directory (`log/`) and the open below never creates that sqlite file.
+    let (strata_dir, db_path) = match storage_path.as_deref() {
+        Some(db_path) => {
+            let dir = db_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| db_path.to_path_buf());
+            (dir, db_path.to_path_buf())
+        }
+        None => match default_strata_dir() {
+            Ok(dir) => {
+                let db_path = dir.join(DATABASE_FILE);
+                (dir, db_path)
             }
-            Ok(vestige_mcp::auto_upgrade::UpgradeStatus::NoV3) => {}
-            Err(err) => {
-                eprintln!("{err}");
-                let _ = std::io::Write::flush(&mut io::stderr());
+            Err(e) => {
+                error!("Failed to resolve the Strata data directory: {}", e);
                 std::process::exit(1);
             }
+        },
+    };
+
+    // Same first-launch upgrade the `vestige` CLI runs from `open_storage`.
+    // A finished upgrade leaves the v3 file in place, so the refusal below
+    // must not run after `StrataReady`.
+    let upgraded = match vestige_mcp::auto_upgrade::upgrade_if_needed(&db_path) {
+        Ok(vestige_mcp::auto_upgrade::UpgradeStatus::StrataReady { .. }) => true,
+        Ok(vestige_mcp::auto_upgrade::UpgradeStatus::NoV3) => false,
+        Err(err) => {
+            eprintln!("{err}");
+            let _ = std::io::Write::flush(&mut io::stderr());
+            std::process::exit(1);
         }
+    };
+    if !upgraded {
+        exit_if_v3(&db_path);
     }
 
-    // PR 0a: a v3 SQLite store at the configured path is refused before any
-    // storage constructor runs, so tools never see a half-open store. The
-    // guard itself never writes; detection is a 100-byte header read. The
-    // default-path case (None) is guarded inside the storage constructor.
-    if let Some(db_path) = storage_path.as_deref()
-        && let Ok(Some(v3)) = vestige_core::detect_v3(db_path)
-    {
-        error!(
-            "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
-            v3.path.display(),
-            v3.schema_version,
-            vestige_core::MIGRATION_HINT
-        );
-        eprintln!(
-            "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
-            v3.path.display(),
-            v3.schema_version,
-            vestige_core::MIGRATION_HINT
-        );
-        std::process::exit(1);
-    }
-
-    // Initialize storage with optional custom data directory.
-    // vestige_core::open_storage(Some(...)) expects a DB file path, so map data dirs to vestige.db here.
-    let storage = match vestige_core::open_storage(storage_path) {
+    let storage = match vestige_mcp::strata_memory::open(&strata_dir) {
         Ok(s) => {
-            info!("Storage initialized successfully");
+            info!("Strata log initialized at {}", strata_dir.display());
             s
         }
         Err(e) => {

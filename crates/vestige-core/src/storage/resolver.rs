@@ -39,23 +39,6 @@ pub use crate::storage::types::{
     HANDLE_REQUIRED_DETAIL, HandleKind, HandleResolution, MAX_CANDIDATES,
 };
 
-impl HandleKind {
-    /// Stable lowercase name (matches the serde serialization).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            HandleKind::Memory => "memory",
-            HandleKind::Commit => "commit",
-            HandleKind::File => "file",
-            HandleKind::Symbol => "symbol",
-            HandleKind::Test => "test",
-            HandleKind::Run => "run",
-            HandleKind::ToolCall => "tool_call",
-            HandleKind::Tag => "tag",
-            HandleKind::Unknown => "unknown",
-        }
-    }
-}
-
 impl HandleResolution {
     fn unresolved() -> Self {
         Self {

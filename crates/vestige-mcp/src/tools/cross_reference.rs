@@ -1958,7 +1958,7 @@ fn enforce_reason_token_budget(mut response: Value, raw_budget: Option<i32>) -> 
 // TESTS
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::{query_coverage, topic_overlap};
 
@@ -2839,7 +2839,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod reason_envelope_tests {
     use super::*;
     use tempfile::TempDir;

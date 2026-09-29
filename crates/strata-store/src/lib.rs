@@ -43,7 +43,7 @@
 //!
 //! ## v1 scope (documented deviations in SCOPE-HANDOFF.md)
 //!
-//! Single-threaded single-writer (`!Send` gate-log cache); reads append
+//! Single-writer (`Send` via the gate-log mutex); reads append
 //! nothing (reads-as-writes is a later wave); one FSRS kernel version
 //! (`ALGO_V2`) per store, recorded per record as `kernel_id`.
 

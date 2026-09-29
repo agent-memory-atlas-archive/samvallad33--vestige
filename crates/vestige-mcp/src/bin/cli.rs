@@ -508,7 +508,10 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if let Some(data_dir) = cli.data_dir {
-        let db_path = vestige_core::db_path_for_data_dir(data_dir)?;
+        // The v3 file lives here. Do not create it: the shipped binary has no
+        // SQLite backend, and `db_path_for_data_dir` without `legacy-sqlite`
+        // refuses instead of returning this path.
+        let db_path = data_dir.join("vestige.db");
         CLI_DB_PATH
             .set(db_path)
             .map_err(|_| anyhow::anyhow!("data directory was initialized more than once"))?;
@@ -4323,7 +4326,7 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
 

@@ -16,6 +16,17 @@ const ACCESSIBILITY_ACTIVE: f64 = 0.7;
 const ACCESSIBILITY_DORMANT: f64 = 0.4;
 const ACCESSIBILITY_SILENT: f64 = 0.1;
 
+/// UUID or a Strata node id (`mem-` + 16 hex digits).
+pub fn is_memory_id(id: &str) -> bool {
+    if uuid::Uuid::parse_str(id).is_ok() {
+        return true;
+    }
+    let Some(rest) = id.strip_prefix("mem-") else {
+        return false;
+    };
+    rest.len() == 16 && rest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Compute accessibility score from memory strengths
 /// Combines retention, retrieval, and storage strengths
 fn compute_accessibility(retention: f64, retrieval: f64, storage: f64) -> f64 {
@@ -141,14 +152,18 @@ pub async fn execute(
             return Err("get_batch supports max 20 IDs per call".to_string());
         }
         for id in &ids {
-            uuid::Uuid::parse_str(id).map_err(|_| format!("Invalid memory ID format: {}", id))?;
+            if !is_memory_id(id) {
+                return Err(format!("Invalid memory ID format: {}", id));
+            }
         }
         return execute_get_batch(storage, &ids).await;
     }
 
     // All other actions require 'id'
     let id = args.id.ok_or("This action requires 'id' parameter")?;
-    uuid::Uuid::parse_str(&id).map_err(|_| "Invalid memory ID format".to_string())?;
+    if !is_memory_id(&id) {
+        return Err("Invalid memory ID format".to_string());
+    }
 
     match args.action.as_str() {
         "get" => execute_get(storage, &id).await,
@@ -582,7 +597,7 @@ async fn execute_edit(
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
 

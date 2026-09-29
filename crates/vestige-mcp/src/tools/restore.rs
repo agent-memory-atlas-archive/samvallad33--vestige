@@ -267,7 +267,7 @@ fn ensure_restore_path_allowed(storage: &Arc<Storage>, path: &Path) -> Result<()
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use std::io::Write;

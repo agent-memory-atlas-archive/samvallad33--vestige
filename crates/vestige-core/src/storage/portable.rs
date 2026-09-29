@@ -6,8 +6,7 @@
 
 use rusqlite::types::Value;
 
-/// Current portable archive format identifier.
-pub const PORTABLE_ARCHIVE_FORMAT: &str = "vestige.portable.v1";
+pub use super::contracts::PORTABLE_ARCHIVE_FORMAT;
 
 // `PortableArchive`, `PortableTable`, `PortableValue`, `PortableImportMode`,
 // and `PortableImportReport` are defined in (and re-exported from)
@@ -15,13 +14,6 @@ pub const PORTABLE_ARCHIVE_FORMAT: &str = "vestige.portable.v1";
 pub use crate::storage::types::{
     PortableArchive, PortableImportMode, PortableImportReport, PortableTable, PortableValue,
 };
-
-impl PortableArchive {
-    /// Count all rows across all tables.
-    pub fn total_rows(&self) -> usize {
-        self.tables.iter().map(|table| table.rows.len()).sum()
-    }
-}
 
 // `PortableTable` and `PortableValue` definitions live in
 // `crate::storage::types` (see the re-export above).

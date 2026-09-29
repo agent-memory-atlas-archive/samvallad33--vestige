@@ -74,7 +74,7 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
         return Err("'id' must not be empty".to_string());
     }
     // Basic UUID sanity check — don't reject if missing, but warn
-    if uuid::Uuid::parse_str(&args.id).is_err() {
+    if !crate::tools::memory_unified::is_memory_id(&args.id) {
         return Err(format!("Invalid memory ID format: {}", args.id));
     }
 
@@ -276,7 +276,7 @@ async fn derive_and_gate_cascade(
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;
