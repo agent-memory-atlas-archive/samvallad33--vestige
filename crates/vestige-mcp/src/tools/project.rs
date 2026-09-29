@@ -102,6 +102,10 @@ fn resolve_target(root: Option<&str>, path: &str) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+fn gate_refused(err: &str) -> bool {
+    err.contains("gate_denied") || err.contains("gate_held")
+}
+
 fn items_json(items: &[projection::ProjectedItem]) -> Vec<Value> {
     items
         .iter()
@@ -191,8 +195,39 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
                         .to_string(),
                 );
             }
+            // The gate admits every projected_to edge before any byte of the
+            // target file is replaced. A refusal leaves the file alone.
+            let receipt = if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+                let ids: Vec<String> = projection
+                    .items
+                    .iter()
+                    .map(|item| item.id.clone())
+                    .collect();
+                match storage.admit_projection(
+                    &ids,
+                    &path.display().to_string(),
+                    projection.region.as_bytes(),
+                ) {
+                    Ok((receipt_id, hash)) => Some(json!({
+                        "receiptId": receipt_id,
+                        "hash": hash,
+                    })),
+                    Err(err) if gate_refused(&err.to_string()) => {
+                        return Ok(json!({
+                            "action": "write",
+                            "written": false,
+                            "refused": true,
+                            "path": path.display().to_string(),
+                            "note": "The gate refused this projection. The file was not changed.",
+                        }));
+                    }
+                    Err(err) => return Err(err.to_string()),
+                }
+            } else {
+                None
+            };
             if added == 0 && removed == 0 {
-                return Ok(json!({
+                let mut response = json!({
                     "action": "write",
                     "written": false,
                     "path": path.display().to_string(),
@@ -200,11 +235,15 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
                     "added": 0,
                     "removed": 0,
                     "note": "The file already holds this projection; nothing to change.",
-                }));
+                });
+                if let Some(receipt) = receipt {
+                    response["receipt"] = receipt;
+                }
+                return Ok(response);
             }
             projection::write_projection(&path, existing.as_deref(), &new_text)
                 .map_err(|e| format!("cannot update projection: {e}"))?;
-            Ok(json!({
+            let mut response = json!({
                 "action": "write",
                 "written": true,
                 "path": path.display().to_string(),
@@ -213,7 +252,11 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
                 "added": added,
                 "removed": removed,
                 "note": "Only the fenced region changed. Re-run preview any time; an unchanged store projects to an unchanged file.",
-            }))
+            });
+            if let Some(receipt) = receipt {
+                response["receipt"] = receipt;
+            }
+            Ok(response)
         }
         other => Err(format!("unknown action '{other}'; use preview or write")),
     }
@@ -636,5 +679,205 @@ mod strata_preview {
             .unwrap_err();
         assert!(unknown.contains("unknown action 'frobnicate'"), "{unknown}");
         assert_eq!(blake3_tree(dir.path()), before);
+    }
+
+    fn deny_policy() -> Policy {
+        Policy {
+            rules: vec![Rule {
+                match_kind: ANY_KIND,
+                match_params_hash_prefix: WILDCARD_PREFIX,
+                max_blast_radius: u32::MAX,
+                forbid_forgotten_lessons: false,
+                require_human: false,
+                verdict: Verdict::Deny,
+            }],
+        }
+    }
+
+    fn frame_count(dir: &std::path::Path, kind: u8) -> usize {
+        let store = strata_store::StrataStore::open(dir).unwrap();
+        store
+            .log()
+            .read_frames(1)
+            .unwrap()
+            .iter()
+            .filter(|frame| frame.kind == kind)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn admitted_write_returns_a_receipt_and_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        let decision = ingest(
+            &storage,
+            "Ship releases from an integration branch",
+            "decision",
+            &[],
+            "user",
+            None,
+            None,
+        );
+        let pattern = ingest(
+            &storage,
+            "Touch files after scripted edits",
+            "pattern",
+            &[],
+            "user",
+            None,
+            None,
+        );
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("CLAUDE.md");
+        let value = execute(
+            &storage,
+            Some(json!({
+                "action": "write",
+                "path": "CLAUDE.md",
+                "root": root.path(),
+                "confirm": true,
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["written"], true, "{value}");
+        assert_eq!(value["refused"], Value::Null);
+        let hash = value["receipt"]["hash"].as_str().unwrap().to_string();
+        let receipt_id = value["receipt"]["receiptId"].as_str().unwrap();
+        assert!(receipt_id.starts_with("eff-"), "{receipt_id}");
+        let bytes = std::fs::read(&target).unwrap();
+        assert_eq!(hash, blake3::hash(&bytes).to_hex().as_str());
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            text.contains(&decision) && text.contains(&pattern),
+            "{text}"
+        );
+        drop(storage);
+
+        let mut store = strata_store::StrataStore::open(dir.path()).unwrap();
+        let edges: Vec<_> = store
+            .edges()
+            .into_iter()
+            .filter(|edge| edge.link_type == "projected_to")
+            .collect();
+        assert_eq!(edges.len(), 2, "{edges:?}");
+        let sources: Vec<&str> = edges.iter().map(|edge| edge.source_id.as_str()).collect();
+        assert!(sources.contains(&decision.as_str()) && sources.contains(&pattern.as_str()));
+        assert!(
+            edges
+                .iter()
+                .all(|edge| edge.meta_sha.as_deref() == Some(hash.as_str()))
+        );
+        assert!(
+            edges
+                .iter()
+                .all(|edge| edge.target_id == target.display().to_string())
+        );
+        store.seal_checkpoint().unwrap();
+        drop(store);
+        let report = strata_verify::verify_path(dir.path());
+        assert!(report.ok, "{}", report.json);
+    }
+
+    #[tokio::test]
+    async fn refused_write_leaves_the_file_and_appends_no_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        ingest(
+            &storage,
+            "Ship releases from an integration branch",
+            "decision",
+            &[],
+            "user",
+            None,
+            None,
+        );
+        drop(storage);
+        let effects_before =
+            frame_count(dir.path(), strata_gate::record::RecordKind::Effect.to_u8());
+        let writes_before = frame_count(dir.path(), strata_store::KIND_STORE_WRITE);
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("CLAUDE.md");
+        std::fs::write(&target, "# Mine\n\nKeep me.\n").unwrap();
+        let before = blake3::hash(&std::fs::read(&target).unwrap());
+
+        let storage: Arc<Storage> = Arc::new(
+            crate::strata_memory::StrataMemory::open_with_policy(dir.path(), deny_policy())
+                .unwrap(),
+        );
+        let value = execute(
+            &storage,
+            Some(json!({
+                "action": "write",
+                "path": "CLAUDE.md",
+                "root": root.path(),
+                "confirm": true,
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["written"], false, "{value}");
+        assert_eq!(value["refused"], true, "{value}");
+        assert!(
+            value["note"].as_str().unwrap().contains("refused"),
+            "{value}"
+        );
+        drop(storage);
+
+        assert_eq!(blake3::hash(&std::fs::read(&target).unwrap()), before);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "# Mine\n\nKeep me.\n"
+        );
+        assert_eq!(
+            frame_count(dir.path(), strata_gate::record::RecordKind::Effect.to_u8()),
+            effects_before
+        );
+        assert_eq!(
+            frame_count(dir.path(), strata_store::KIND_STORE_WRITE),
+            writes_before
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_still_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        ingest(
+            &storage,
+            "Ship releases from an integration branch",
+            "decision",
+            &[],
+            "user",
+            None,
+            None,
+        );
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("CLAUDE.md");
+        std::fs::write(&target, "# Mine\n").unwrap();
+        let log_before = blake3_tree(dir.path());
+        let file_before = blake3::hash(&std::fs::read(&target).unwrap());
+        let value = execute(
+            &storage,
+            Some(json!({
+                "action": "preview",
+                "path": "CLAUDE.md",
+                "root": root.path(),
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["action"], "preview");
+        assert!(value.get("receipt").is_none());
+        assert_eq!(blake3_tree(dir.path()), log_before);
+        assert_eq!(blake3::hash(&std::fs::read(&target).unwrap()), file_before);
+        drop(storage);
+        let store = strata_store::StrataStore::open(dir.path()).unwrap();
+        assert!(
+            store
+                .edges()
+                .iter()
+                .all(|edge| edge.link_type != "projected_to")
+        );
     }
 }

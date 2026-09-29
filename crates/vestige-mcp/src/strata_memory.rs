@@ -47,9 +47,17 @@ pub struct StrataMemory {
 
 impl StrataMemory {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_with_policy(dir, strata_store::default_policy())
+    }
+
+    pub fn open_with_policy(
+        dir: impl AsRef<Path>,
+        policy: strata_gate::Policy,
+    ) -> Result<Self, StorageError> {
         let data_dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
-        let store = strata_store::StrataStore::open(&data_dir).map_err(map_store)?;
+        let store =
+            strata_store::StrataStore::open_with_policy(&data_dir, policy).map_err(map_store)?;
         Ok(Self {
             log_dir: data_dir.join("log"),
             data_dir,
@@ -640,7 +648,56 @@ impl MemoryStoreSend for StrataMemory {
 
     fn save_connection(&self, connection: &VestigeEdge) -> Result<(), StorageError> {
         let edge = to_strata_edge(connection);
-        self.lock().save_connection(&edge).map_err(map_store)
+        self.lock().save_connection(&edge).map_err(map_store).map(|_| ())
+    }
+
+    fn admit_projection(
+        &self,
+        memory_ids: &[String],
+        target: &str,
+        region: &[u8],
+    ) -> Result<(String, String), StorageError> {
+        let hash = blake3::hash(region).to_hex().to_string();
+        let mut store = self.lock();
+        for id in memory_ids {
+            if store.get_node(id).is_none() {
+                return Err(StorageError::NotFound(id.clone()));
+            }
+        }
+        let mut sources: Vec<String> = memory_ids.to_vec();
+        if sources.is_empty() {
+            // No memory to point from. A projection record is the source of
+            // the one projected_to edge. It is not a decision, pattern, or
+            // durable tag, so a later preview does not select it.
+            let id = store
+                .ingest_in_scope(
+                    strata_store::IngestInput {
+                        content: target.to_string(),
+                        node_type: "projection".into(),
+                        tags: Vec::new(),
+                        created_at_ms: Some(0),
+                        valid_from_ms: None,
+                        valid_until_ms: None,
+                    },
+                    "projection",
+                )
+                .map_err(map_store)?;
+            sources.push(id);
+        }
+        let mut effect_seq = 0u64;
+        for source in &sources {
+            let edge = strata_store::ConnectionRecord {
+                source_id: source.clone(),
+                target_id: target.to_string(),
+                strength_milli: 1000,
+                link_type: strata_store::EdgeKind::ProjectedTo.as_str().to_string(),
+                meta_sha: Some(hash.clone()),
+                created_at_ms: 0,
+                activation_count: 0,
+            };
+            effect_seq = store.save_connection(&edge).map_err(map_store)?;
+        }
+        Ok((receipt_id_for(effect_seq), hash))
     }
 
     fn superseded_node_ids(&self) -> Result<HashSet<String>, StorageError> {

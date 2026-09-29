@@ -96,6 +96,9 @@ strata-verify = { path = "../strata-verify", optional = true }
 
 # Strata log the shipped MCP server boots. Workspace-excluded; path dep only.
 strata-store = { path = "../strata-store" }
+# Gate policy type for projection admission. No SQLite.
+strata-gate = { path = "../strata-gate" }
+blake3 = "1"
 
 # ============================================================================
 # MCP Server Dependencies
@@ -156,8 +159,7 @@ tempfile = "3"
 
 [dev-dependencies]
 ctor = "0.4"
-blake3 = "1"
-strata-gate = { path = "../strata-gate" }
+strata-verify = { path = "../strata-verify" }
 
 # Integration tests drive the Storage-backed server/tools; the e2e binary
 # test also reads the SQLite file directly (backup WAL). Skipped in a
