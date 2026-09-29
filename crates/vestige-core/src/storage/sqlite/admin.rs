@@ -793,10 +793,6 @@ impl SqliteMemoryStore {
         self.data_dir().join(name)
     }
 
-    /// Return the profile-scoped HNSW sidecar location. The profile ID is
-    /// validated before being placed in a path, preventing traversal through a
-    /// manifest or CLI argument.
-
     /// Get memory statistics
     pub fn get_stats(&self) -> Result<MemoryStats> {
         let now = Utc::now().to_rfc3339();

@@ -93,12 +93,11 @@ def run(binary, output):
 
             tool("smart_ingest", {"content": "Must not silently disappear", "items": [{"content":"Batch fixture"}]}, error=True)
             tool("maintain", {"action":"export", "start":"2026-01-01"}, error=True)
-            maintenance_page = tool("maintain", {"action":"consolidate", "phase":"embeddings", "batchSize":2})
-            assert maintenance_page["dryRun"] is True and maintenance_page["selected"] == 0
-            assert maintenance_page["hasMore"] is False
+            # w1b removed the embeddings consolidate phase with the vector runtime.
+            tool("maintain", {"action":"consolidate", "phase":"embeddings", "batchSize":2}, error=True)
             tool("maintain", {"action":"consolidate", "batchSize":2}, error=True)
             tool("maintain", {"action":"consolidate", "phase":"embeddings", "batchSize":101}, error=True)
-            passed("embedding maintenance previews bounded pages and rejects misplaced controls")
+            passed("embeddings phase and misplaced consolidate controls are rejected")
             for phase in ("lifecycle", "logs"):
                 page = tool("maintain", {"action":"consolidate", "phase":phase, "batchSize":2})
                 assert page["dryRun"] is True and page["hasMore"] is False
