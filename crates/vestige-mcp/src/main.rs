@@ -444,7 +444,8 @@ async fn serve() {
         }
     };
 
-    // First launch of 4.0: backup, import, verify, then swap a strata log in
+    // First launch of 4.0: the same `upgrade_if_needed` the `vestige` CLI runs
+    // from `open_storage`. Backup, import, verify, then swap a strata log in
     // before stdio `initialize`. Failure exits here; the v3 file is not opened.
     if let Some(db_path) = storage_path.as_deref() {
         match vestige_mcp::auto_upgrade::upgrade_if_needed(db_path) {

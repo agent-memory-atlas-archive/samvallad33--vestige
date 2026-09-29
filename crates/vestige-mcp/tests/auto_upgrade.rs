@@ -317,7 +317,6 @@ impl WaitTimeout for std::process::Child {
 fn reset_attempt(data: &Path, db: &Path) {
     let _ = fs::remove_dir_all(data.join(LOG_DIR_NAME));
     let _ = fs::remove_dir_all(data.join(STAGING_DIR_NAME));
-    let _ = fs::remove_dir_all(data.join(auto_upgrade::VERIFY_DIR_NAME));
     for entry in fs::read_dir(data).unwrap().flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -454,5 +453,168 @@ fn sigkill_mid_upgrade_then_relaunch_succeeds() {
     assert!(
         stdout.trim().is_empty(),
         "upgrade wrote to stdout (MCP): {stdout}"
+    );
+}
+
+fn run_cli_stats(data_dir: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_vestige"))
+        .args([
+            "--data-dir",
+            data_dir.to_str().expect("temp path is utf-8"),
+            "stats",
+        ])
+        .output()
+        .expect("spawn vestige")
+}
+
+fn assert_progress_stayed_on_stderr(stdout: &str) {
+    assert!(
+        !stdout.contains("vestige:") && !stdout.contains("upgrading to strata"),
+        "upgrade progress leaked to stdout: {stdout}"
+    );
+}
+
+fn assert_no_sqlite_sidecars(db: &Path) {
+    for suffix in ["-wal", "-shm"] {
+        let mut name = db.as_os_str().to_os_string();
+        name.push(suffix);
+        let path = PathBuf::from(name);
+        assert!(!path.exists(), "sqlite sidecar created: {}", path.display());
+    }
+}
+
+#[test]
+fn cli_first_upgrades_fixture_and_preserves_v3_sha() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = plant(dir.path());
+    let before = sha256_file(&db);
+    let output = run_cli_stats(dir.path());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        before,
+        sha256_file(&db),
+        "cli upgrade changed the v3 file\n{stderr}"
+    );
+    assert_no_sqlite_sidecars(&db);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "vestige stats exited {:?}\nstdout: {stdout}\nstderr: {stderr}",
+        output.status.code()
+    );
+    assert!(
+        stdout.contains("Total Memories"),
+        "stats did not read the switched log\n{stdout}"
+    );
+    assert_progress_stayed_on_stderr(&stdout);
+    let record = format!("{stdout}{stderr}");
+    let lowered = record.to_lowercase();
+    assert!(
+        lowered.contains("import")
+            && lowered.contains("verif")
+            && !lowered.contains("verify failed"),
+        "stats did not record import and verify\n{record}"
+    );
+    assert!(
+        stderr.contains("strata log ready"),
+        "cli did not report the upgrade\n{stderr}"
+    );
+    assert!(!stderr.contains("upgrade failed"), "{stderr}");
+    assert!(
+        !stderr.contains("cannot be opened by 4.0"),
+        "cli hit the v3 refusal instead of upgrading\n{stderr}"
+    );
+    let log_dir = dir.path().join(LOG_DIR_NAME);
+    assert!(!dir.path().join(STAGING_DIR_NAME).exists());
+    assert!(!dir.path().join(".strata-upgrade-verify").exists());
+    assert_fixture_landed(&db, &log_dir);
+    assert_memory_count(&db, &log_dir);
+}
+
+#[test]
+fn cli_first_corrupt_import_leaves_bytes_and_names_v311() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = plant(dir.path());
+    let file = fs::OpenOptions::new().write(true).open(&db).unwrap();
+    file.set_len(4096).unwrap();
+    drop(file);
+    let before = sha256_file(&db);
+    let output = run_cli_stats(dir.path());
+    assert!(
+        !output.status.success(),
+        "corrupt cli import exited 0: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(before, sha256_file(&db));
+    assert_no_sqlite_sidecars(&db);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_progress_stayed_on_stderr(&stdout);
+    assert!(stdout.trim().is_empty(), "cli wrote stdout: {stdout}");
+    assert_failure_message(&stderr, &dir.path().join(UPGRADE_LOG_NAME));
+    assert!(!dir.path().join(STAGING_DIR_NAME).exists());
+    assert!(
+        !dir_has_seg(&dir.path().join(LOG_DIR_NAME)),
+        "failed cli upgrade installed a log"
+    );
+}
+
+#[test]
+fn two_cli_processes_upgrade_the_fixture_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = plant(dir.path());
+    let before = sha256_file(&db);
+    let dir_s = dir.path().to_str().expect("temp path is utf-8");
+    let spawn = || {
+        Command::new(env!("CARGO_BIN_EXE_vestige"))
+            .args(["--data-dir", dir_s, "stats"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vestige")
+    };
+    let mut first = spawn();
+    let mut second = spawn();
+    let first_status = first
+        .wait_timeout_ext(Duration::from_secs(120))
+        .expect("first cli upgrade timed out");
+    let second_status = second
+        .wait_timeout_ext(Duration::from_secs(120))
+        .expect("second cli upgrade timed out");
+    assert!(
+        first_status.success(),
+        "first cli stats failed: {first_status}"
+    );
+    assert!(
+        second_status.success(),
+        "second cli stats failed: {second_status}"
+    );
+    assert_eq!(
+        before,
+        sha256_file(&db),
+        "concurrent cli upgrade wrote the v3 file"
+    );
+    assert_no_sqlite_sidecars(&db);
+    let log_dir = dir.path().join(LOG_DIR_NAME);
+    assert!(!dir.path().join(STAGING_DIR_NAME).exists());
+    assert_fixture_landed(&db, &log_dir);
+    assert_memory_count(&db, &log_dir);
+}
+
+fn assert_memory_count(db: &Path, log_dir: &Path) {
+    let ids = knowledge_ids(db);
+    let snap = snapshot(log_dir);
+    let imported = snap
+        .nodes
+        .iter()
+        .filter(|node| ids.iter().any(|id| id == &node.legacy_id))
+        .count();
+    assert_eq!(
+        imported,
+        ids.len(),
+        "memory count diverged (log nodes {}, memories {})",
+        snap.nodes.len(),
+        ids.len()
     );
 }

@@ -91,6 +91,8 @@ strata-verify = { path = "../strata-verify" }
 
 # One-shot SQLite -> STRATA migration (standalone crate; `migrate-to-strata` CLI).
 strata-migrate = { path = "../strata-migrate" }
+# Read the switched log after first-launch upgrade (`vestige stats`).
+strata = { path = "../strata" }
 
 # ============================================================================
 # MCP Server Dependencies

@@ -1700,6 +1700,9 @@ fn run_update(
 
 /// Run stats command
 fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
+    if let Some(log_dir) = upgraded_strata_log()? {
+        return run_strata_stats(&log_dir, show_tagging, show_states);
+    }
     let storage = open_storage()?;
     let stats = storage.get_stats()?;
 
@@ -2068,6 +2071,13 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
         anyhow::bail!("no store at {} (nothing to upgrade)", source.display());
     }
 
+    if !dry_run
+        && let vestige_mcp::auto_upgrade::UpgradeStatus::StrataReady { .. } =
+            vestige_mcp::auto_upgrade::upgrade_if_needed(&source)?
+    {
+        return Ok(());
+    }
+
     // PR 0a: a v3 SQLite store is refused before anything opens it — the
     // 4.0 answer to a v3 store is migrate-to-strata, not upgrade. This path
     // previously opened the source READ-ONLY but without immutable=1, which
@@ -2104,7 +2114,10 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
     {
         let source_uri = format!(
             "file:{}?mode=ro&immutable=1",
-            source.to_string_lossy().replace('?', "%3f").replace('#', "%23")
+            source
+                .to_string_lossy()
+                .replace('?', "%3f")
+                .replace('#', "%23")
         );
         let snapshot = rusqlite::Connection::open_with_flags(
             source_uri,
@@ -2468,9 +2481,97 @@ fn run_migrate_to_strata(
     Ok(())
 }
 
+/// The strata log installed by the shared first-launch upgrade, when this
+/// data dir was a v3 store (or already held a log).
+fn upgraded_strata_log() -> anyhow::Result<Option<std::path::PathBuf>> {
+    let path = match CLI_DB_PATH.get() {
+        Some(path) => path.clone(),
+        None => vestige_core::default_db_path()?,
+    };
+    match vestige_mcp::auto_upgrade::upgrade_if_needed(&path)? {
+        vestige_mcp::auto_upgrade::UpgradeStatus::StrataReady { log_dir } => Ok(Some(log_dir)),
+        vestige_mcp::auto_upgrade::UpgradeStatus::NoV3 => Ok(None),
+    }
+}
+
+/// `stats` after the switch. Reads the installed log; does not open the v3 file.
+fn run_strata_stats(
+    log_dir: &std::path::Path,
+    show_tagging: bool,
+    show_states: bool,
+) -> anyhow::Result<()> {
+    let log = open_switched_log(log_dir)?;
+    let snapshot = strata_migrate::read_snapshot(&log)
+        .map_err(|err| anyhow::anyhow!("strata log at {}: {err}", log_dir.display()))?;
+    let memories = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.node_type != "walk_receipt")
+        .count();
+
+    println!("{}", "=== Vestige Memory Statistics ===".cyan().bold());
+    println!();
+    println!("{}: {}", "Total Memories".white().bold(), memories);
+    println!("{}: {}", "Store".white().bold(), log_dir.display());
+    if show_tagging || show_states {
+        println!(
+            "{}",
+            "Tagging and state breakdowns are not on the strata log yet.".yellow()
+        );
+    }
+    Ok(())
+}
+
+/// `StrataLog::open` takes an exclusive directory lock. A second process that
+/// reused a finished upgrade waits out that read instead of failing it.
+fn open_switched_log(log_dir: &std::path::Path) -> anyhow::Result<strata::StrataLog> {
+    let started = std::time::Instant::now();
+    let mut announced = false;
+    loop {
+        match strata::StrataLog::open(log_dir) {
+            Ok(log) => return Ok(log),
+            Err(strata::StrataError::Locked { pid }) => {
+                if started.elapsed() > std::time::Duration::from_secs(30) {
+                    anyhow::bail!(
+                        "strata log at {} stayed locked by pid {pid}",
+                        log_dir.display()
+                    );
+                }
+                if !announced {
+                    eprintln!(
+                        "vestige: waiting for strata log lock at {} (pid {pid})",
+                        log_dir.display()
+                    );
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    announced = true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(err) => {
+                anyhow::bail!("strata log at {}: {err}", log_dir.display());
+            }
+        }
+    }
+}
+
 fn open_storage() -> anyhow::Result<std::sync::Arc<Storage>> {
-    if let Some(path) = CLI_DB_PATH.get() {
-        Ok(vestige_core::open_storage(Some(path.clone()))?)
+    let explicit = CLI_DB_PATH.get().cloned();
+    let path = match &explicit {
+        Some(path) => path.clone(),
+        None => vestige_core::default_db_path()?,
+    };
+    // Same first-launch upgrade `vestige-mcp` runs before stdio. Progress
+    // stays on stderr. A finished strata log is not opened as SQLite.
+    if let vestige_mcp::auto_upgrade::UpgradeStatus::StrataReady { log_dir } =
+        vestige_mcp::auto_upgrade::upgrade_if_needed(&path)?
+    {
+        anyhow::bail!(
+            "strata log ready at {}; this command does not open the v3 file",
+            log_dir.display()
+        );
+    }
+    if explicit.is_some() {
+        Ok(vestige_core::open_storage(Some(path))?)
     } else {
         Ok(vestige_core::open_storage(None)?)
     }

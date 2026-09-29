@@ -1,11 +1,14 @@
 //! First-launch v3 → strata upgrade.
 //!
-//! Runs before stdio `initialize`. The v3 file is only ever read. Import goes
-//! to a staging directory; [`strata_verify::migration::verify_migrated_log`]
-//! (the `strata-verify` entry point) runs against a copy so `StrataLog::open`
-//! cannot rewrite the log that gets installed. The copy is discarded. Only a
-//! passing verify renames staging onto `log/`. Any failure deletes staging
-//! and exits with the v3 file still byte-identical.
+//! `vestige-mcp` and the `vestige` CLI both call [`upgrade_if_needed`] before
+//! opening a store. The v3 file is only ever read. Import goes to a staging
+//! directory. [`strata_verify::migration::verify_migrated_log`] reads that
+//! directory in place and creates nothing. Only a passing verify renames
+//! staging onto `log/`. Any failure deletes staging and leaves the v3 file
+//! byte-identical.
+//!
+//! An `upgrade.lock` in the data directory serializes concurrent launches.
+//! The waiter blocks, then reuses the installed log.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -17,17 +20,17 @@ use strata_migrate::MigrateOptions;
 /// Staging directory inside the data dir. Removed on failure and on the next
 /// launch, so a crash mid-upgrade retries instead of appending.
 pub const STAGING_DIR_NAME: &str = ".strata-upgrade-staging";
-/// Throwaway tree for the read-only verify pass.
-pub const VERIFY_DIR_NAME: &str = ".strata-upgrade-verify";
 /// Installed strata log. Same relative path `StrataStore` opens.
 pub const LOG_DIR_NAME: &str = "log";
+/// Exclusive lock held for the whole upgrade attempt.
+pub const LOCK_FILE_NAME: &str = "upgrade.lock";
 /// Append-only upgrade record. The failure message names this path.
 pub const UPGRADE_LOG_NAME: &str = "upgrade.log";
 /// Last v3 release operators can keep running when 4.0 cannot upgrade.
 pub const V311_RELEASE: &str = "https://github.com/samvallad33/vestige/releases/tag/v3.1.1";
 
-/// Backup + staging log + verify copy, relative to the sqlite family size.
-const SPACE_FACTOR: u64 = 4;
+/// Backup plus staging log, relative to the sqlite family size.
+const SPACE_FACTOR: u64 = 3;
 
 /// What the boot path should do after the upgrade attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,12 +81,39 @@ pub fn upgrade_with(
     options: UpgradeOptions,
 ) -> Result<UpgradeStatus, UpgradeError> {
     let data_dir = data_dir_of(db_path);
+    if !upgrade_relevant(&data_dir, db_path) {
+        return Ok(UpgradeStatus::NoV3);
+    }
+
+    let log_path = data_dir.join(UPGRADE_LOG_NAME);
+    let _lock = match acquire_upgrade_lock(&data_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            return Err(UpgradeError {
+                log_path,
+                detail: format!("could not lock upgrade: {e}"),
+            });
+        }
+    };
+    upgrade_locked(db_path, options, &data_dir)
+}
+
+fn upgrade_relevant(data_dir: &Path, db_path: &Path) -> bool {
+    db_path.exists()
+        || data_dir.join(LOG_DIR_NAME).exists()
+        || data_dir.join(STAGING_DIR_NAME).exists()
+}
+
+fn upgrade_locked(
+    db_path: &Path,
+    options: UpgradeOptions,
+    data_dir: &Path,
+) -> Result<UpgradeStatus, UpgradeError> {
     let staging = data_dir.join(STAGING_DIR_NAME);
-    let verify_dir = data_dir.join(VERIFY_DIR_NAME);
     let log_dir = data_dir.join(LOG_DIR_NAME);
     let log_path = data_dir.join(UPGRADE_LOG_NAME);
 
-    sweep_incomplete(&data_dir, &staging, &verify_dir);
+    sweep_incomplete(data_dir, &staging);
 
     if strata_log_ready(&log_dir) {
         note(
@@ -102,7 +132,6 @@ pub fn upgrade_with(
             return Err(fail(
                 &log_path,
                 &staging,
-                &verify_dir,
                 format!("v3 detection failed: {e}"),
             ));
         }
@@ -120,19 +149,14 @@ pub fn upgrade_with(
         ),
     );
 
-    if let Err(detail) = ensure_space(&data_dir, db_path) {
-        return Err(fail(&log_path, &staging, &verify_dir, detail));
+    if let Err(detail) = ensure_space(data_dir, db_path) {
+        return Err(fail(&log_path, &staging, detail));
     }
 
     let backup = match backup_sqlite_family(db_path) {
         Ok(path) => path,
         Err(e) => {
-            return Err(fail(
-                &log_path,
-                &staging,
-                &verify_dir,
-                format!("backup failed: {e}"),
-            ));
+            return Err(fail(&log_path, &staging, format!("backup failed: {e}")));
         }
     };
     note(
@@ -158,40 +182,22 @@ pub fn upgrade_with(
     let report = match strata_migrate::migrate_with_options(db_path, &staging, migrate_options) {
         Ok(report) => report,
         Err(e) => {
-            return Err(fail(
-                &log_path,
-                &staging,
-                &verify_dir,
-                format!("import failed: {e}"),
-            ));
+            return Err(fail(&log_path, &staging, format!("import failed: {e}")));
         }
     };
 
     if let Some(hook) = options.after_import
         && let Err(e) = hook(&staging)
     {
-        return Err(fail(
-            &log_path,
-            &staging,
-            &verify_dir,
-            format!("import failed: {e}"),
-        ));
+        return Err(fail(&log_path, &staging, format!("import failed: {e}")));
     }
 
     note(&log_path, "vestige: verifying strata log");
-    if let Err(e) = copy_tree(&staging, &verify_dir) {
-        return Err(fail(
-            &log_path,
-            &staging,
-            &verify_dir,
-            format!("verify copy failed: {e}"),
-        ));
-    }
     let mut problems = Vec::new();
     if !report.verify_passed {
         problems.push("strata-migrate replay verification failed".to_string());
     }
-    match strata_verify::migration::verify_migrated_log(&verify_dir) {
+    match strata_verify::migration::verify_migrated_log(&staging) {
         Ok(verified) if verified.ok => {}
         Ok(verified) => problems.push(format!(
             "strata-verify failed: {}",
@@ -199,20 +205,18 @@ pub fn upgrade_with(
         )),
         Err(e) => problems.push(format!("strata-verify failed: {e}")),
     }
-    let _ = remove_dir_if_exists(&verify_dir);
     if !problems.is_empty() {
-        return Err(fail(&log_path, &staging, &verify_dir, problems.join("; ")));
+        return Err(fail(&log_path, &staging, problems.join("; ")));
     }
 
     if let Err(e) = fs::rename(&staging, &log_dir) {
         return Err(fail(
             &log_path,
             &staging,
-            &verify_dir,
             format!("could not swap staging into place: {e}"),
         ));
     }
-    if let Err(e) = fsync_dir(&data_dir) {
+    if let Err(e) = fsync_dir(data_dir) {
         note(
             &log_path,
             &format!("vestige: directory fsync after swap failed ({e}); log is in place"),
@@ -223,6 +227,55 @@ pub fn upgrade_with(
         &format!("vestige: strata log ready at {}", log_dir.display()),
     );
     Ok(UpgradeStatus::StrataReady { log_dir })
+}
+
+struct UpgradeLock {
+    _file: File,
+}
+
+fn acquire_upgrade_lock(data_dir: &Path) -> io::Result<UpgradeLock> {
+    let path = data_dir.join(LOCK_FILE_NAME);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    lock_exclusive(&file, &path)?;
+    Ok(UpgradeLock { _file: file })
+}
+
+#[cfg(unix)]
+fn lock_exclusive(file: &File, path: &Path) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    // Safety: `fd` is open for the lifetime of this call. `LOCK_NB` either
+    // takes the lock or fails without blocking.
+    let nonblock = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if nonblock == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    let waiting = err.kind() == io::ErrorKind::WouldBlock
+        || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+        || err.raw_os_error() == Some(libc::EAGAIN);
+    if !waiting {
+        return Err(err);
+    }
+    eprintln!("vestige: waiting for upgrade lock at {}", path.display());
+    let _ = io::stderr().flush();
+    // Safety: same open fd. This blocks until the holder closes it.
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_exclusive(_file: &File, _path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn data_dir_of(db_path: &Path) -> PathBuf {
@@ -242,9 +295,8 @@ pub fn strata_log_ready(log_dir: &Path) -> bool {
     })
 }
 
-fn sweep_incomplete(data_dir: &Path, staging: &Path, verify_dir: &Path) {
+fn sweep_incomplete(data_dir: &Path, staging: &Path) {
     let _ = remove_dir_if_exists(staging);
-    let _ = remove_dir_if_exists(verify_dir);
     let Ok(entries) = fs::read_dir(data_dir) else {
         return;
     };
@@ -334,22 +386,6 @@ fn copy_file_fsync(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree(&from, &to)?;
-        } else if entry.file_name() != "strata.lock" {
-            copy_file_fsync(&from, &to)?;
-        }
-    }
-    fsync_dir(dst)?;
-    Ok(())
-}
-
 fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
@@ -405,14 +441,8 @@ fn append_log(log_path: &Path, line: &str) {
     })();
 }
 
-fn fail(
-    log_path: &Path,
-    staging: &Path,
-    verify_dir: &Path,
-    detail: impl Into<String>,
-) -> UpgradeError {
+fn fail(log_path: &Path, staging: &Path, detail: impl Into<String>) -> UpgradeError {
     let _ = remove_dir_if_exists(staging);
-    let _ = remove_dir_if_exists(verify_dir);
     let err = UpgradeError {
         log_path: log_path.to_path_buf(),
         detail: detail.into(),
