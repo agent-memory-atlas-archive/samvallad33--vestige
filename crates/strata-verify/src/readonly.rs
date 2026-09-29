@@ -274,5 +274,5 @@ fn validate_trailer(
     let sig = Signature::from_bytes(&trailer.signature);
     verifying
         .verify(&msg, &sig)
-        .map_err(|_| "trailer signature invalid".to_string())
+        .map_err(|_| "trailer signature does not match pinned strata.key".to_string())
 }

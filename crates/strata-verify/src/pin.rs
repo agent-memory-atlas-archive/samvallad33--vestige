@@ -28,7 +28,7 @@ pub(crate) fn segment_only(segment_key: &[u8; 32]) -> KeyUse {
     KeyUse {
         fingerprint: fingerprint(segment_key),
         pin: "strata.key",
-        note: "no migration receipt. Segment signatures checked against strata.key in the log directory. No receipt-signing.key was required.".into(),
+        note: "no migration receipt. Folder pin is strata.key in the log directory. A trailer signature must match it. No receipt-signing.key was required.".into(),
     }
 }
 
