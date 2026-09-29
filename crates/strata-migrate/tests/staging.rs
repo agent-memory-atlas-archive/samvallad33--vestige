@@ -16,7 +16,7 @@ const FIXTURE: &str = concat!(
 fn staging_of(dest: &Path) -> PathBuf {
     let name = dest.file_name().unwrap();
     let mut staged = name.to_os_string();
-    staged.push(".strata-staging");
+    staged.push(strata_migrate::STAGING_SUFFIX);
     dest.with_file_name(staged)
 }
 

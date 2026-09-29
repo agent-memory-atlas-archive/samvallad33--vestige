@@ -16,10 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use strata_migrate::MigrateOptions;
 
-/// Staging directory the shared importer uses when the destination is `log/`.
-/// Removed on failure and on the next launch.
-pub const STAGING_DIR_NAME: &str = ".strata-upgrade-staging";
 /// Installed strata log. Same relative path `StrataStore` opens.
+/// Staging for this destination is `log` plus [`strata_migrate::STAGING_SUFFIX`]:
+/// `<data-dir>/log.strata-staging`.
 pub const LOG_DIR_NAME: &str = "log";
 /// Append-only upgrade record. The failure message names this path.
 pub const UPGRADE_LOG_NAME: &str = "upgrade.log";
@@ -189,9 +188,15 @@ fn installed_log(log_dir: &Path, log_path: &Path) -> Option<UpgradeStatus> {
 }
 
 fn upgrade_relevant(data_dir: &Path, db_path: &Path) -> bool {
-    db_path.exists()
-        || data_dir.join(LOG_DIR_NAME).exists()
-        || data_dir.join(STAGING_DIR_NAME).exists()
+    db_path.exists() || data_dir.join(LOG_DIR_NAME).exists() || staging_directory(data_dir).exists()
+}
+
+/// `<data-dir>/log.strata-staging`. Same path [`strata_migrate`] publishes into
+/// before renaming onto `log/`.
+pub fn staging_directory(data_dir: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(LOG_DIR_NAME);
+    name.push(strata_migrate::STAGING_SUFFIX);
+    data_dir.join(name)
 }
 
 fn data_dir_of(db_path: &Path) -> PathBuf {

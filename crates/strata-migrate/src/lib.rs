@@ -61,7 +61,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use strata::StrataLog;
-use strata_kernel::checkpoint::{Checkpoint, checkpoint_hash};
+use strata_kernel::checkpoint::{checkpoint_hash, Checkpoint};
 use strata_kernel::event::ReviewEvent;
 use strata_kernel::fsrs::ALGO_V1;
 use strata_kernel::kernel::Kernel;
@@ -70,10 +70,11 @@ use vestige_core::storage::PortableArchive;
 use vestige_core::storage::PortableValue;
 
 pub use records::{
-    EdgeRecord, GenesisRecord, KIND_MIGRATION_RECEIPT, MigrationReceipt, NodeRecord, ParamsRecord,
-    RECEIPT_SIGNING_KEY_ID, RECORD_VERSION, ReceiptBody, SupersessionRecord, TombstoneRecord,
+    EdgeRecord, GenesisRecord, MigrationReceipt, NodeRecord, ParamsRecord, ReceiptBody,
+    SupersessionRecord, TombstoneRecord, KIND_MIGRATION_RECEIPT, RECEIPT_SIGNING_KEY_ID,
+    RECORD_VERSION,
 };
-pub use snapshot::{Snapshot, read_snapshot};
+pub use snapshot::{read_snapshot, Snapshot};
 
 /// Parameter set implemented by this migrator. Written as the `PARAMS`
 /// frame on a fresh log.
@@ -314,6 +315,11 @@ pub fn migrate_with_options(
     )
 }
 
+/// Appended to the destination directory's file name. The first-launch
+/// destination is `<data-dir>/log`, so its staging directory is
+/// `<data-dir>/log.strata-staging`.
+pub const STAGING_SUFFIX: &str = ".strata-staging";
+
 /// Lock file inside the staging directory. A dotfile, so destination
 /// occupancy and the migrator ignore it. Held with `File::try_lock`.
 const STAGING_LOCK_NAME: &str = ".upgrade.lock";
@@ -322,19 +328,11 @@ const STAGING_LOCK_NAME: &str = ".upgrade.lock";
 /// `try_lock`. This covers that gap only. A held lock is not abandoned on a timer.
 const LOCK_FILE_APPEAR: Duration = Duration::from_millis(200);
 
-/// Sibling of `dest` that holds the log until the rename.
-///
-/// `migrate-to-strata --to <dest>` uses `<dest>.strata-staging`. The
-/// first-launch upgrade publishes `<data-dir>/log`, and the release matrix
-/// watches `.strata-upgrade-staging` beside that log, so a destination named
-/// `log` uses the watched name. The lock, wipe, and rename are the same.
+/// Sibling of `dest`: `<dest>`'s file name plus [`STAGING_SUFFIX`].
 fn staging_path(dest: &Path) -> std::path::PathBuf {
     let name = dest.file_name().unwrap_or(std::ffi::OsStr::new("strata"));
-    if name == "log" {
-        return dest.with_file_name(".strata-upgrade-staging");
-    }
     let mut staging_name = name.to_os_string();
-    staging_name.push(".strata-staging");
+    staging_name.push(STAGING_SUFFIX);
     dest.with_file_name(staging_name)
 }
 

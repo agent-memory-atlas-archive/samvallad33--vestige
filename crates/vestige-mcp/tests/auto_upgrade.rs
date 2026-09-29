@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use vestige_mcp::auto_upgrade::{
-    self, LOG_DIR_NAME, STAGING_DIR_NAME, UPGRADE_LOG_NAME, UpgradeOptions, UpgradeStatus,
-    V311_RELEASE,
+    self, LOG_DIR_NAME, UPGRADE_LOG_NAME, UpgradeOptions, UpgradeStatus, V311_RELEASE,
+    staging_directory,
 };
 
 fn fixture_db() -> PathBuf {
@@ -126,7 +126,7 @@ fn happy_path_on_real_v3_fixture_keeps_the_source_hash() {
     let db = plant(dir.path());
     let before = sha256_file(&db);
     // A crashed previous attempt must be discarded, not resumed.
-    let staging = dir.path().join(STAGING_DIR_NAME);
+    let staging = staging_directory(dir.path());
     fs::create_dir_all(&staging).unwrap();
     fs::write(staging.join("leftover.seg"), b"not a log").unwrap();
 
@@ -175,7 +175,7 @@ fn import_failure_leaves_the_v3_hash_and_names_v311() {
     assert_failure_message(&text, &dir.path().join(UPGRADE_LOG_NAME));
     assert!(text.contains("import failed"), "{text}");
     assert_eq!(before, sha256_file(&db));
-    assert!(!dir.path().join(STAGING_DIR_NAME).exists());
+    assert!(!staging_directory(dir.path()).exists());
     assert!(!dir.path().join(LOG_DIR_NAME).exists());
 }
 
@@ -211,7 +211,7 @@ fn verify_failure_leaves_the_v3_hash_and_names_v311() {
         "verify injection did not fail closed: {text}"
     );
     assert_eq!(before, sha256_file(&db));
-    assert!(!dir.path().join(STAGING_DIR_NAME).exists());
+    assert!(!staging_directory(dir.path()).exists());
     assert!(!dir.path().join(LOG_DIR_NAME).exists());
 }
 
@@ -290,7 +290,7 @@ fn failed_import_process_exits_on_stderr_and_leaves_stdout_empty() {
     );
     assert_failure_message(&stderr, &dir.path().join(UPGRADE_LOG_NAME));
     assert_eq!(before, sha256_file(&db));
-    assert!(!dir.path().join(STAGING_DIR_NAME).exists());
+    assert!(!staging_directory(dir.path()).exists());
 }
 
 trait WaitTimeout {
@@ -316,7 +316,7 @@ impl WaitTimeout for std::process::Child {
 
 fn reset_attempt(data: &Path, db: &Path) {
     let _ = fs::remove_dir_all(data.join(LOG_DIR_NAME));
-    let _ = fs::remove_dir_all(data.join(STAGING_DIR_NAME));
+    let _ = fs::remove_dir_all(staging_directory(data));
     for entry in fs::read_dir(data).unwrap().flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -382,14 +382,14 @@ fn sigkill_mid_upgrade_then_relaunch_succeeds() {
         let started = Instant::now();
         let mut saw_segment = false;
         while started.elapsed() < Duration::from_secs(180) {
-            if dir_has_seg(&data.join(STAGING_DIR_NAME)) {
+            if dir_has_seg(&staging_directory(&data)) {
                 saw_segment = true;
                 break;
             }
             if running.child.try_wait().unwrap().is_some() {
                 break;
             }
-            if dir_has_seg(&data.join(LOG_DIR_NAME)) && !data.join(STAGING_DIR_NAME).exists() {
+            if dir_has_seg(&data.join(LOG_DIR_NAME)) && !staging_directory(&data).exists() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -412,7 +412,7 @@ fn sigkill_mid_upgrade_then_relaunch_succeeds() {
     let started = Instant::now();
     let log_dir = data.join(LOG_DIR_NAME);
     loop {
-        if dir_has_seg(&log_dir) && !data.join(STAGING_DIR_NAME).exists() {
+        if dir_has_seg(&log_dir) && !staging_directory(&data).exists() {
             break;
         }
         if let Some(status) = again.child.try_wait().unwrap() {
@@ -527,7 +527,7 @@ fn cli_first_upgrades_fixture_and_preserves_v3_sha() {
         "cli hit the v3 refusal instead of upgrading\n{stderr}"
     );
     let log_dir = dir.path().join(LOG_DIR_NAME);
-    assert!(!dir.path().join(STAGING_DIR_NAME).exists());
+    assert!(!staging_directory(dir.path()).exists());
     assert!(!dir.path().join(".strata-upgrade-verify").exists());
     assert_fixture_landed(&db, &log_dir);
     assert_memory_count(&db, &log_dir);
@@ -554,7 +554,7 @@ fn cli_first_corrupt_import_leaves_bytes_and_names_v311() {
     assert_progress_stayed_on_stderr(&stdout);
     assert!(stdout.trim().is_empty(), "cli wrote stdout: {stdout}");
     assert_failure_message(&stderr, &dir.path().join(UPGRADE_LOG_NAME));
-    assert!(!dir.path().join(STAGING_DIR_NAME).exists());
+    assert!(!staging_directory(dir.path()).exists());
     assert!(
         !dir_has_seg(&dir.path().join(LOG_DIR_NAME)),
         "failed cli upgrade installed a log"
@@ -598,7 +598,7 @@ fn two_cli_processes_upgrade_the_fixture_once() {
     );
     assert_no_sqlite_sidecars(&db);
     let log_dir = dir.path().join(LOG_DIR_NAME);
-    assert!(!dir.path().join(STAGING_DIR_NAME).exists());
+    assert!(!staging_directory(dir.path()).exists());
     assert_fixture_landed(&db, &log_dir);
     assert_memory_count(&db, &log_dir);
 }
