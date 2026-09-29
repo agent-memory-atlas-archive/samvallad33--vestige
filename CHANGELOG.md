@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A default `vestige-mcp` boot no longer contacts the npm registry. There is
+  no startup version check and no `newer_version_available` notification.
+  `cloud-sync` stays on by default; network use remains `source_sync` and
+  `vestige sync --cloud`.
+
 - `tools/list` payloads dropped from 56 KB to 19.8 KB (#212): discriminator
   enums and types stay on the wire, deep variant trees and per-field prose
   move one call deeper. `memory_status` `view='tools'` with `tool='<name>'`
