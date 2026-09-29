@@ -198,6 +198,27 @@ pub use trace::{
 pub use storage::LegacySqliteDisabled;
 #[cfg(not(feature = "legacy-sqlite"))]
 pub use storage::install_open_storage_hook;
+
+/// Install the protocol-test Strata opener when this crate was built without
+/// `legacy-sqlite`. Workspace feature unification can turn that feature on
+/// for `vestige-core` while `vestige-mcp`'s own feature stays off; the
+/// `legacy-sqlite` expansion drops the hook so the caller still compiles and
+/// `open_storage` stays the SQLite constructor.
+#[cfg(not(feature = "legacy-sqlite"))]
+#[macro_export]
+macro_rules! install_strata_open_hook {
+    ($hook:expr) => {
+        $crate::install_open_storage_hook($hook)
+    };
+}
+
+#[cfg(feature = "legacy-sqlite")]
+#[macro_export]
+macro_rules! install_strata_open_hook {
+    ($hook:expr) => {{
+        let _ = $hook;
+    }};
+}
 pub use storage::{
     ACCESS_LOG_RETENTION_DAYS, ClassificationResult, DEFAULT_MEMORY_SCOPE, Domain, HealthStatus,
     LocalMemoryStore, MemoryEdge, MemoryRecord, MemoryStore, MemoryStoreError, MemoryStoreResult,

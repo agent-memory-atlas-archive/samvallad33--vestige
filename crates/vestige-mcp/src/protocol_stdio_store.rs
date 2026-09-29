@@ -10,7 +10,7 @@ use ctor::ctor;
 
 #[ctor]
 fn install_strata_open_storage() {
-    vestige_core::install_open_storage_hook(open_strata);
+    vestige_core::install_strata_open_hook!(open_strata);
 }
 
 fn open_strata(

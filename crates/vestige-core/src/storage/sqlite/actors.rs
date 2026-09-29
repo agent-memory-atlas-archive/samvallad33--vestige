@@ -589,7 +589,7 @@ impl SqliteMemoryStore {
         tx.query_row(
             "SELECT * FROM knowledge_nodes WHERE id = ?1",
             params![id],
-            |row| Self::row_to_node(row),
+            Self::row_to_node,
         )
         .map_err(|error| match error {
             rusqlite::Error::QueryReturnedNoRows => StorageError::NotFound(id.to_string()),
