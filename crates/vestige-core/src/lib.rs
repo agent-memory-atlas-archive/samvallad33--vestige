@@ -195,6 +195,8 @@ pub use trace::ActorProvenance;
 
 // Storage layer
 // Storage: backend-agnostic surface (always available).
+pub use storage::LegacySqliteDisabled;
+#[cfg(feature = "legacy-sqlite")]
 pub use storage::{
     ClassificationResult,
     Domain,
@@ -209,8 +211,7 @@ pub use storage::{
     SchedulingState,
     SearchQuery,
     StoreStats,
-    LegacySqliteDisabled,
-    open_storage,
+        open_storage,
 };
 
 // Storage: legacy SQLite surface (quarantined behind `legacy-sqlite`,

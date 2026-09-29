@@ -23,6 +23,7 @@ mod blast;
 mod intention_claim;
 #[cfg(feature = "legacy-sqlite")]
 mod intention_graph_store;
+#[cfg(feature = "legacy-sqlite")]
 mod memory_store;
 #[cfg(feature = "legacy-sqlite")]
 mod maintenance_batches;
@@ -64,6 +65,7 @@ pub use blast::{
     BLAST_LINK_TYPES, BLAST_MAX_DEPTH, BLAST_SCAN_NODE_CAP, BlastAffected, BlastReport,
     RetireOutcome, commit_sha_of,
 };
+#[cfg(feature = "legacy-sqlite")]
 pub use memory_store::{
     ClassificationResult, Domain, HealthStatus, LocalMemoryStore, MemoryEdge, MemoryRecord,
     MemoryStore, MemoryStoreError, MemoryStoreResult, MemoryStoreSend, ModelSignature,
@@ -169,13 +171,16 @@ pub struct LegacySqliteDisabled;
 /// is one implementation of it, constructed only via [`open_storage`] (and
 /// direct backend construction inside `vestige-core`'s own tests). A second
 /// engine implements `MemoryStoreSend` and drops in behind the same alias.
+#[cfg(feature = "legacy-sqlite")]
 pub type Storage = dyn MemoryStore;
 
+#[cfg(feature = "legacy-sqlite")]
 /// Default database artifact path for the SQLite backend.
 pub fn default_db_path() -> Result<std::path::PathBuf> {
     SqliteMemoryStore::default_db_path()
 }
 
+#[cfg(feature = "legacy-sqlite")]
 /// Database artifact path for a given data directory (SQLite backend).
 pub fn db_path_for_data_dir(data_dir: std::path::PathBuf) -> Result<std::path::PathBuf> {
     SqliteMemoryStore::db_path_for_data_dir(data_dir)
@@ -193,8 +198,6 @@ pub fn open_storage(path: Option<std::path::PathBuf>) -> Result<std::sync::Arc<d
 /// Feature-off twin of [`open_storage`]: always fails because no legacy
 /// backend exists in this build; the STRATA backend constructs directly.
 #[cfg(not(feature = "legacy-sqlite"))]
-pub fn open_storage(
-    _path: Option<std::path::PathBuf>,
-) -> std::result::Result<std::sync::Arc<dyn MemoryStore>, LegacySqliteDisabled> {
+pub fn open_storage(_path: Option<std::path::PathBuf>) -> Result<(), LegacySqliteDisabled> {
     Err(LegacySqliteDisabled)
 }
