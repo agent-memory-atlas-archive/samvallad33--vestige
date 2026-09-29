@@ -195,6 +195,20 @@ fn project_node(store: &strata_store::StrataStore, record: &strata_store::NodeRe
     node
 }
 
+fn retrievable(record: &strata_store::NodeRecord) -> bool {
+    record.superseded_by.is_none()
+}
+
+fn endpoint_retired(store: &strata_store::StrataStore, id: &str) -> bool {
+    store
+        .get_node(id)
+        .is_some_and(|record| record.superseded_by.is_some())
+}
+
+fn edge_visible(store: &strata_store::StrataStore, edge: &strata_store::ConnectionRecord) -> bool {
+    !endpoint_retired(store, &edge.source_id) && !endpoint_retired(store, &edge.target_id)
+}
+
 fn project_edge(edge: &strata_store::ConnectionRecord) -> VestigeEdge {
     let created = ms_to_dt(edge.created_at_ms);
     VestigeEdge {
@@ -446,11 +460,12 @@ impl MemoryStoreSend for StrataMemory {
     fn resolve_handle(&self, query: &str) -> HandleResolution {
         let query = query.trim();
         let store = self.lock();
+        // Origins keep retired ids. Handle recall only sees nodes with no successor.
         let ids: Vec<String> = store
             .origins()
             .into_iter()
+            .filter(|(id, _)| store.get_node(id).is_some_and(|record| retrievable(&record)))
             .map(|(id, _)| id)
-            .filter(|id| store.get_node(id).is_some_and(|record| record.is_live()))
             .collect();
         drop(store);
         if query.is_empty() {
@@ -593,7 +608,7 @@ impl MemoryStoreSend for StrataMemory {
         let store = self.lock();
         Ok(store
             .get_node(id)
-            .filter(|record| record.is_live())
+            .filter(retrievable)
             .as_ref()
             .map(|record| project_node(&store, record)))
     }
@@ -612,26 +627,32 @@ impl MemoryStoreSend for StrataMemory {
     }
 
     fn node_is_in_scope(&self, id: &str, scope: &str) -> Result<bool, StorageError> {
-        Ok(self
-            .lock()
-            .get_node(id)
-            .is_some_and(|record| record.scope == scope))
+        Ok(self.lock().get_node(id).is_some_and(|record| {
+            retrievable(&record) && record.scope == scope
+        }))
     }
 
     fn get_connections_for_memory(
         &self,
         memory_id: &str,
     ) -> Result<Vec<VestigeEdge>, StorageError> {
-        Ok(self
-            .lock()
+        let store = self.lock();
+        Ok(store
             .get_connections_for_memory(memory_id)
             .iter()
+            .filter(|edge| edge_visible(&store, edge))
             .map(project_edge)
             .collect())
     }
 
     fn get_all_connections(&self) -> Result<Vec<VestigeEdge>, StorageError> {
-        Ok(self.lock().edges().iter().map(project_edge).collect())
+        let store = self.lock();
+        Ok(store
+            .edges()
+            .iter()
+            .filter(|edge| edge_visible(&store, edge))
+            .map(project_edge)
+            .collect())
     }
 
     fn save_connection(&self, connection: &VestigeEdge) -> Result<(), StorageError> {
@@ -654,7 +675,7 @@ impl MemoryStoreSend for StrataMemory {
 
     fn get_stats(&self) -> Result<MemoryStats, StorageError> {
         let store = self.lock();
-        let nodes = store.nodes();
+        let nodes: Vec<_> = store.nodes().into_iter().filter(retrievable).collect();
         let strengths: Vec<f64> = nodes
             .iter()
             .map(|record| store.retrievability(&record.id).ok().flatten().unwrap_or(0.0))
@@ -680,7 +701,7 @@ impl MemoryStoreSend for StrataMemory {
     fn state_distribution(&self) -> Result<(i64, i64, i64, i64), StorageError> {
         let store = self.lock();
         let mut bands = [0i64; 4];
-        for record in store.nodes() {
+        for record in store.nodes().into_iter().filter(retrievable) {
             let score = store
                 .retrievability(&record.id)
                 .ok()
@@ -707,7 +728,7 @@ impl MemoryStoreSend for StrataMemory {
     fn get_retention_distribution(&self) -> Result<Vec<(String, i64)>, StorageError> {
         let store = self.lock();
         let mut counts: BTreeMap<&'static str, i64> = BTreeMap::new();
-        for record in store.nodes() {
+        for record in store.nodes().into_iter().filter(retrievable) {
             let score = store
                 .retrievability(&record.id)
                 .ok()
@@ -730,6 +751,7 @@ impl MemoryStoreSend for StrataMemory {
         let count = store
             .nodes()
             .iter()
+            .filter(|record| retrievable(record))
             .filter(|record| {
                 store
                     .retrievability(&record.id)
@@ -795,7 +817,7 @@ impl MemoryStoreSend for StrataMemory {
         let mut out = Vec::new();
         let cap = usize::try_from(limit).unwrap_or(0);
         for record in store.nodes() {
-            if !record.is_live() || record.node_type != node_type || record.scope != scope {
+            if !retrievable(&record) || record.node_type != node_type || record.scope != scope {
                 continue;
             }
             if tag.is_some_and(|wanted| !record.tags.iter().any(|stored| stored == wanted)) {
@@ -1039,7 +1061,7 @@ impl MemoryStoreSend for StrataMemory {
             .nodes()
             .iter()
             .filter(|record| {
-                if !record.is_live() {
+                if !retrievable(record) {
                     return false;
                 }
                 let created = ms_to_dt(record.created_at_ms);
@@ -1065,14 +1087,13 @@ impl MemoryStoreSend for StrataMemory {
         let nodes = store
             .nodes()
             .into_iter()
-            .filter(|record| scope.is_none_or(|scope| record.scope == scope))
+            .filter(|record| retrievable(record) && scope.is_none_or(|scope| record.scope == scope))
             .map(|record| {
                 let retrieval = store
                     .retrievability(&record.id)
                     .ok()
                     .flatten()
                     .unwrap_or(0.0);
-                let live = record.is_live();
                 HygieneNodeSummary {
                     id: record.id,
                     node_type: record.node_type,
@@ -1082,13 +1103,9 @@ impl MemoryStoreSend for StrataMemory {
                     valid_from: Some(ms_to_dt(record.valid_from_ms)),
                     valid_until: (record.valid_until_ms != VALID_FOREVER_MS)
                         .then(|| ms_to_dt(record.valid_until_ms)),
-                    superseded: record.superseded_by.is_some(),
-                    content_bytes: if live { record.content.len() } else { 0 },
-                    content_preview: if live {
-                        record.content.chars().take(140).collect()
-                    } else {
-                        String::new()
-                    },
+                    superseded: false,
+                    content_bytes: record.content.len(),
+                    content_preview: record.content.chars().take(140).collect(),
                     never_accessed: false,
                     access_unknown: true,
                 }
@@ -1128,7 +1145,7 @@ impl MemoryStoreSend for StrataMemory {
     fn coverage_snapshot(&self) -> Result<CoverageSnapshot, StorageError> {
         let store = self.lock();
         let mut counts: BTreeMap<String, u64> = BTreeMap::new();
-        for edge in store.edges() {
+        for edge in store.edges().into_iter().filter(|edge| edge_visible(&store, edge)) {
             *counts.entry(edge.link_type).or_default() += 1;
         }
         Ok(CoverageSnapshot {
@@ -1264,7 +1281,7 @@ impl StrataMemory {
         let mut nodes: Vec<KnowledgeNode> = store
             .nodes()
             .iter()
-            .filter(|record| record.is_live() && scope.is_none_or(|scope| record.scope == scope))
+            .filter(|record| retrievable(record) && scope.is_none_or(|scope| record.scope == scope))
             .map(|record| project_node(&store, record))
             .collect();
         nodes.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
@@ -1298,6 +1315,9 @@ impl StrataMemory {
             let Some(b) = records.iter().find(|record| record.id == second) else {
                 continue;
             };
+            if !retrievable(a) || !retrievable(b) {
+                continue;
+            }
             if let Some(tags) = tag_filter.filter(|tags| !tags.is_empty()) {
                 let has = |record: &strata_store::NodeRecord| {
                     record.tags.iter().any(|tag| tags.iter().any(|want| want == tag))
@@ -1335,15 +1355,20 @@ impl StrataMemory {
 }
 
 fn lookup_origin(store: &strata_store::StrataStore, receipt_or_node: &str) -> Option<(String, u64)> {
-    if let Some(seq) = parse_receipt_seq(receipt_or_node) {
-        return store
+    let found = if let Some(seq) = parse_receipt_seq(receipt_or_node) {
+        store
             .origins()
             .into_iter()
-            .find(|(_, origin)| *origin == seq);
-    }
+            .find(|(_, origin)| *origin == seq)
+    } else {
+        store
+            .origin_seq(receipt_or_node)
+            .map(|seq| (receipt_or_node.to_string(), seq))
+    }?;
     store
-        .origin_seq(receipt_or_node)
-        .map(|seq| (receipt_or_node.to_string(), seq))
+        .get_node(&found.0)
+        .is_some_and(|record| retrievable(&record))
+        .then_some(found)
 }
 
 #[cfg(test)]
@@ -1527,5 +1552,416 @@ mod tests {
         let stored = reopened.get_node(&node.id).unwrap();
         assert!(stored.superseded_by.is_some());
         assert_eq!(stored.content, marker);
+    }
+
+    #[tokio::test]
+    async fn retired_nodes_stay_out_of_every_read_tool() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = "RETIRED_READ_MARKER_7c2e";
+        let (doomed, kept) = {
+            let mut store = strata_store::StrataStore::open(dir.path()).unwrap();
+            let doomed = store
+                .ingest_in_scope(
+                    strata_store::IngestInput {
+                        content: marker.into(),
+                        node_type: "fact".into(),
+                        ..strata_store::IngestInput::default()
+                    },
+                    "user",
+                )
+                .unwrap();
+            let kept = store
+                .ingest_in_scope(
+                    strata_store::IngestInput {
+                        content: "KEPT_READ_VISIBLE".into(),
+                        node_type: "fact".into(),
+                        ..strata_store::IngestInput::default()
+                    },
+                    "user",
+                )
+                .unwrap();
+            store
+                .save_connection(&strata_store::ConnectionRecord {
+                    source_id: kept.clone(),
+                    target_id: doomed.clone(),
+                    strength_milli: 1000,
+                    link_type: "derived_from".into(),
+                    meta_sha: None,
+                    created_at_ms: 0,
+                    activation_count: 0,
+                })
+                .unwrap();
+            store
+                .retire(
+                    &doomed,
+                    &kept,
+                    &strata_store::AdmissionContext {
+                        rule_id: Some(strata_store::RULE_SUPPRESS.to_string()),
+                        confirm: false,
+                    },
+                )
+                .unwrap();
+            (doomed, kept)
+        };
+
+        let storage = open(dir.path()).unwrap();
+        let cognitive = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::cognitive::CognitiveEngine::new(),
+        ));
+        cognitive.lock().await.hydrate(&storage);
+        let config = vestige_core::OutputConfig::default();
+
+        let prefix = &doomed[..12];
+        let resolved = storage.resolve_handle(&doomed);
+        assert!(resolved.ids.is_empty(), "exact handle returned {resolved:?}");
+        let prefixed = storage.resolve_handle(prefix);
+        assert!(
+            !prefixed.ids.iter().any(|id| id == &doomed)
+                && !prefixed.candidates.iter().any(|(id, _)| id == &doomed),
+            "prefix handle returned {prefixed:?}"
+        );
+        assert!(storage.get_node(&doomed).unwrap().is_none());
+        assert!(storage.get_receipt(&doomed).unwrap().is_none());
+        assert!(
+            !storage
+                .get_connections_for_memory(&kept)
+                .unwrap()
+                .iter()
+                .any(|edge| edge.source_id == doomed || edge.target_id == doomed)
+        );
+        assert!(
+            !storage
+                .hygiene_snapshot(None)
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|node| node.id == doomed || node.content_preview.contains(marker))
+        );
+
+        fn show(result: Result<serde_json::Value, String>) -> String {
+            match result {
+                Ok(value) => value.to_string(),
+                Err(error) => error,
+            }
+        }
+        fn hidden(tool: &str, text: &str, marker: &str, id: &str) {
+            assert!(!text.contains(marker), "{tool} leaked content: {text}");
+            assert!(!text.contains(id), "{tool} leaked id: {text}");
+        }
+        fn content_hidden(tool: &str, text: &str, marker: &str) {
+            assert!(!text.contains(marker), "{tool} leaked content: {text}");
+        }
+
+        let kept_get = crate::tools::memory_unified::execute(
+            &storage,
+            &cognitive,
+            Some(serde_json::json!({ "action": "get", "id": kept })),
+        )
+        .await
+        .unwrap();
+        assert!(kept_get.to_string().contains("KEPT_READ_VISIBLE"));
+        hidden("memory get kept", &kept_get.to_string(), marker, &doomed);
+
+        let doomed_get = crate::tools::memory_unified::execute(
+            &storage,
+            &cognitive,
+            Some(serde_json::json!({ "action": "get", "id": doomed })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(doomed_get["found"], false);
+        content_hidden("memory get", &doomed_get.to_string(), marker);
+
+        let batch = crate::tools::memory_unified::execute(
+            &storage,
+            &cognitive,
+            Some(serde_json::json!({ "action": "get_batch", "ids": [doomed, kept] })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(batch["found"], 1);
+        content_hidden("memory get_batch", &batch.to_string(), marker);
+
+        content_hidden(
+            "memory state",
+            &show(
+                crate::tools::memory_unified::execute(
+                    &storage,
+                    &cognitive,
+                    Some(serde_json::json!({ "action": "state", "id": doomed })),
+                )
+                .await,
+            ),
+            marker,
+        );
+
+        let handle_kept = crate::tools::recall::execute(
+            &storage,
+            &cognitive,
+            &config,
+            Some(serde_json::json!({ "handle": kept })),
+        )
+        .await
+        .unwrap();
+        assert!(handle_kept.to_string().contains("KEPT_READ_VISIBLE"));
+        hidden("recall handle", &handle_kept.to_string(), marker, &doomed);
+        content_hidden(
+            "recall handle retired",
+            &show(
+                crate::tools::recall::execute(
+                    &storage,
+                    &cognitive,
+                    &config,
+                    Some(serde_json::json!({ "handle": doomed })),
+                )
+                .await,
+            ),
+            marker,
+        );
+        for (tool, args) in [
+            (
+                "recall lookup",
+                serde_json::json!({ "mode": "lookup", "query": "unrelated fixture" }),
+            ),
+            (
+                "recall reason",
+                serde_json::json!({ "mode": "reason", "query": "unrelated fixture" }),
+            ),
+            (
+                "recall contradictions",
+                serde_json::json!({ "mode": "contradictions" }),
+            ),
+        ] {
+            hidden(
+                tool,
+                &show(crate::tools::recall::execute(&storage, &cognitive, &config, Some(args)).await),
+                marker,
+                &doomed,
+            );
+        }
+
+        hidden(
+            "receipt",
+            &show(
+                crate::tools::receipt::execute(
+                    &storage,
+                    Some(serde_json::json!({ "action": "get", "receipt_id": kept })),
+                )
+                .await,
+            ),
+            marker,
+            &doomed,
+        );
+        content_hidden(
+            "receipt retired",
+            &show(
+                crate::tools::receipt::execute(
+                    &storage,
+                    Some(serde_json::json!({ "action": "get", "receipt_id": doomed })),
+                )
+                .await,
+            ),
+            marker,
+        );
+
+        for (tool, args) in [
+            (
+                "graph chain",
+                serde_json::json!({ "action": "chain", "from": kept, "to": kept }),
+            ),
+            (
+                "graph associations",
+                serde_json::json!({ "action": "associations", "from": kept }),
+            ),
+            (
+                "graph bridges",
+                serde_json::json!({ "action": "bridges", "from": kept, "to": kept }),
+            ),
+            (
+                "graph neighbors",
+                serde_json::json!({ "action": "neighbors", "memory_id": kept }),
+            ),
+            (
+                "graph memory",
+                serde_json::json!({ "action": "memory", "memory_id": kept }),
+            ),
+            (
+                "graph memory_graph",
+                serde_json::json!({ "action": "memory_graph", "center_id": kept }),
+            ),
+            (
+                "graph recent",
+                serde_json::json!({ "action": "recent", "limit": 5 }),
+            ),
+            (
+                "graph never_composed",
+                serde_json::json!({ "action": "never_composed", "limit": 5 }),
+            ),
+            ("graph predict", serde_json::json!({ "action": "predict" })),
+        ] {
+            hidden(
+                tool,
+                &show(crate::tools::graph_unified::execute(&storage, &cognitive, Some(args)).await),
+                marker,
+                &doomed,
+            );
+        }
+        content_hidden(
+            "graph chain to retired",
+            &show(
+                crate::tools::graph_unified::execute(
+                    &storage,
+                    &cognitive,
+                    Some(serde_json::json!({ "action": "chain", "from": kept, "to": doomed })),
+                )
+                .await,
+            ),
+            marker,
+        );
+
+        for view in [
+            "health",
+            "retention",
+            "timeline",
+            "changelog",
+            "stats",
+            "coverage",
+            "provenance",
+            "tools",
+        ] {
+            hidden(
+                &format!("memory_status {view}"),
+                &show(
+                    crate::tools::memory_status::execute(
+                        &storage,
+                        &cognitive,
+                        &config,
+                        Some(serde_json::json!({ "view": view })),
+                    )
+                    .await,
+                ),
+                marker,
+                &doomed,
+            );
+        }
+
+        hidden(
+            "codebase",
+            &show(
+                crate::tools::codebase_unified::execute(
+                    &storage,
+                    &cognitive,
+                    &config,
+                    Some(serde_json::json!({ "action": "get_context", "codebase": "fixture" })),
+                )
+                .await,
+            ),
+            marker,
+            &doomed,
+        );
+        hidden(
+            "session_start",
+            &show(
+                crate::tools::session_context::execute(
+                    &storage,
+                    &cognitive,
+                    &config,
+                    Some(serde_json::json!({
+                        "queries": ["unrelated fixture"],
+                        "include_predictions": false,
+                        "include_intentions": false
+                    })),
+                )
+                .await,
+            ),
+            marker,
+            &doomed,
+        );
+        hidden(
+            "dedup",
+            &show(
+                crate::tools::dedup::execute_unified(
+                    &storage,
+                    Some(&cognitive),
+                    Some(serde_json::json!({ "action": "scan" })),
+                )
+                .await,
+            ),
+            marker,
+            &doomed,
+        );
+        hidden(
+            "maintain",
+            &show(
+                crate::tools::maintain::execute(
+                    &storage,
+                    &cognitive,
+                    Some(serde_json::json!({ "action": "export", "format": "json" })),
+                )
+                .await,
+            ),
+            marker,
+            &doomed,
+        );
+        hidden(
+            "project",
+            &show(
+                crate::tools::project::execute(
+                    &storage,
+                    Some(serde_json::json!({ "action": "preview" })),
+                )
+                .await,
+            ),
+            marker,
+            &doomed,
+        );
+        hidden(
+            "intention",
+            &show(
+                crate::tools::intention_unified::execute(
+                    &storage,
+                    &cognitive,
+                    Some(serde_json::json!({ "action": "list" })),
+                )
+                .await,
+            ),
+            marker,
+            &doomed,
+        );
+        hidden(
+            "source_sync",
+            &show(
+                crate::tools::source_sync::execute(
+                    &storage,
+                    Some(serde_json::json!({ "source": "gitlab", "repo": "a/b" })),
+                )
+                .await,
+            ),
+            marker,
+            &doomed,
+        );
+        hidden(
+            "causal_walk",
+            &show(crate::tools::causal_walk::execute(&storage, None).await),
+            marker,
+            &doomed,
+        );
+        hidden(
+            "selftest",
+            &show(crate::tools::selftest::execute(&storage, None).await),
+            marker,
+            &doomed,
+        );
+        content_hidden(
+            "forgotten_lesson",
+            &show(
+                crate::tools::forgotten_lesson::execute(
+                    &storage,
+                    Some(serde_json::json!({ "failure_id": doomed })),
+                )
+                .await,
+            ),
+            marker,
+        );
     }
 }
