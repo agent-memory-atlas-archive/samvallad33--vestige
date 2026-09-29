@@ -1,0 +1,30 @@
+[package]
+name = "strata-verify"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-only"
+description = "Store-level verification harness composing kernel replay, checkpoint chain, and gate rederivation+sweep; gates the SQLite->STRATA default flip"
+publish = false
+
+# Standalone on purpose (same discipline as strata-kernel / strata-gate): this
+# crate keeps its own (empty) workspace table so it does NOT join the root
+# vestige workspace implicitly. The root workspace reaches it only through an
+# explicit path dependency (vestige-mcp) and the differential test crate. Drop
+# this table when the crates/strata integration lands.
+[workspace]
+
+[dependencies]
+borsh = { version = "1", features = ["derive"] }
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+strata-kernel = { path = "../strata-kernel" }
+strata-gate = { path = "../strata-gate" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "strata-verify"
+path = "src/bin/strata_verify.rs"

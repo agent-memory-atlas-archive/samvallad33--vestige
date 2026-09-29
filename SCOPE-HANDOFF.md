@@ -1619,3 +1619,86 @@ entity-set equality); edges only from declared sources.
 - Behavioral note: with keyword-only retrieval, four rare word-tier shared
   entities can outscore one code-tier entity in backfill ranking (see the
   backfill.rs test comment). That weighting lives in core.
+
+# SCOPE-HANDOFF — build/t4-verify-harness (determinism/parity gate for the SQLite→STRATA default flip)
+
+Branch: `build/t4-verify-harness` (base = main @ 82f0cf5). Committed locally;
+NOT pushed. Adds the verification + differential harness that gates flipping
+the default store from SQLite to STRATA.
+
+## What landed
+
+1. **`crates/strata-verify`** (standalone, own `[workspace]` table like its
+   siblings): `verify_store(dir) -> VerifyReport { log_tail_ok,
+   checkpoint_chain_ok, state_root_matches, gate_verdicts_rederived, gaps:
+   Vec<GapKind>, duration_ms, failures }`. Every field is RECOMPUTED from raw
+   bytes — `strata_kernel::verify_with_head` plus an independent explicit
+   fold pass (per-event hashes, seq monotonicity, segment-versioned replay,
+   state roots at every checkpoint, head anchor), gate frame density + head
+   anchor, verdict rederivation under the stored `gate.policy`
+   (`strata_gate::rederive_verdicts`), and the structural sweep
+   (`strata_gate::sweep`). Every `VerifyFailure` Display names the offending
+   seq / checkpoint log_seq. `layout.rs` defines the on-disk contract
+   (`kernel.log`, `kernel.checkpoints`, `kernel.head`, `gate.log`,
+   `gate.policy`, `gate.head`; framing magic `STVFv1\0\0`) the sibling
+   `strata-store` crate must emit, with the writer (`write_store`) the
+   harness uses until that crate merges.
+2. **`vestige strata-verify <dir>`** — surgical block in
+   `crates/vestige-mcp/src/bin/cli.rs` (JSON report, exit 1 on failure);
+   `strata-verify` path dep added to vestige-mcp. Standalone bin
+   `strata-verify` also exists in the crate.
+3. **`tests/differential`** (`vestige-differential-tests`, workspace member):
+   the cross-engine driver. Takes an op script (JSON `{ingest,edge,review,
+   suppress}` list; `Script::from_json`), replays against BOTH engines —
+   vestige-core SQLite `Storage` (real ingest / typed edges / `mark_reviewed`
+   / `suppress_memory` + the real `FSRSScheduler` core as a pinned-time
+   shadow fold) and strata (GateRuntime propose→gate→effect over MemLog +
+   kernel v1 fold, then materialized + `verify_store`d). Asserts: same node
+   COUNTS, same content digests sorted, same edge sets sorted (SQLite side
+   is a store read-back), same suppressed sets, same per-card integer FSRS
+   trajectory (review_count, lapse_count; phase on Hard-free scripts). FSRS
+   stability/difficulty are compared as Q32.32-quantized streams RUN-OVER-RUN
+   per engine (byte-identical snapshots), never cross-engine — the engines
+   pin different weight tables by design. Seeded SplitMix64 fuzz ≥ 20 ops.
+   Manual runner: `cargo run -p vestige-differential-tests --bin differential
+   -- --seed N`.
+
+## Root-workspace wiring (deliberate)
+
+`crates/strata-{kernel,gate,verify}` are in the root `Cargo.toml` `exclude`
+list (like fastembed-rs) so the workspace can path-depend on them WITHOUT
+absorbing them; they keep their own workspace tables and lockfiles. When the
+`crates/strata` integration lands, drop their `[workspace]` tables, remove
+the excludes, and move them into `members`.
+
+## Findings the flip decision should read
+
+- `mark_reviewed` derives elapsed from the WALL CLOCK
+  (`days_since_review(last_accessed)`), so (a) stored stability is not
+  byte-reproducible run-over-run, and (b) under fast test cadence every
+  post-first review classifies same-day and the STORE's lapse counter
+  under-counts vs any pinned-time reference. The harness records this in
+  `extras.store_lapses_total` instead of asserting it away. This is the
+  concrete non-determinism the default flip retires.
+- Known engine delta: a Hard (rating 2) review at elapsed ≥ 1 day moves a
+  card to `Review` in vestige-core but preserves phase in the strata kernel.
+  Phase parity is asserted only on Hard-free scripts.
+- 1 SEQ = 1 day is the harness's shared time base; `elapsed_seq >= 1` keeps
+  both engines off their same-day/short-term paths so lapse counting aligns.
+
+## Test status (all green)
+
+- `cargo test -p strata-verify` (standalone): 7 passed — clean-store verify,
+  sealed-segment byte flip (names the seq), checkpoint byte flip (names
+  log_seq), forged EFFECT without GATE (re-anchor-consistent; sweep flags
+  `orphan_effect` naming the forged seq; rederivation still passes), tampered
+  GATE verdict (rederivation names the gate seq), missing artifact, trailing
+  event past head checkpoint.
+- `cargo test -p vestige-differential-tests`: 5 passed — fixed-script full
+  parity (incl. phase), two-runs byte-identical per engine, 3-seed fuzz
+  parity + determinism, 6-seed materialize-and-verify-green, script JSON
+  round-trip.
+- `cargo test --workspace`: ALL PASS (exit 0), including 789-test
+  vestige-mcp lib. `cargo clippy` clean for both new crates (0 warnings).
+- CLI smoke: `vestige strata-verify <materialized-store>` prints the report
+  and exits 0/1 by `report.ok()`.

@@ -462,6 +462,14 @@ enum Commands {
     /// Run the planted-cause selftest against a throwaway copy of the store
     Selftest,
 
+    /// Verify a strata store directory (kernel replay + checkpoint chain +
+    /// gate rederivation/sweep). Gates the SQLite->STRATA default flip.
+    StrataVerify {
+        /// Store directory holding kernel.log / kernel.checkpoints /
+        /// kernel.head / gate.log / gate.policy / gate.head
+        dir: PathBuf,
+    },
+
     /// Find decayed fix/lesson memories sharing an anchor with a failure
     ForgottenLesson {
         /// Failure memory id to inspect
@@ -618,6 +626,7 @@ fn main() -> anyhow::Result<()> {
             dashboard_port,
         } => run_serve(port, dashboard, dashboard_port),
         Commands::Selftest => run_selftest(),
+        Commands::StrataVerify { dir } => run_strata_verify(dir),
         Commands::ForgottenLesson {
             failure_id,
             scope,
@@ -2445,6 +2454,38 @@ fn run_selftest() -> anyhow::Result<()> {
     println!();
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+/// Verify a strata store directory: recompute the kernel log tail, the
+/// checkpoint chain, every state root, and every gate verdict under the
+/// stored policy, plus the structural sweep. Nothing on disk is trusted.
+fn run_strata_verify(dir: PathBuf) -> anyhow::Result<()> {
+    println!("{}", "=== Strata Store Verification ===".cyan().bold());
+    println!();
+    let report = strata_verify::verify_store(&dir);
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    println!();
+    if report.ok() {
+        println!(
+            "{}",
+            format!(
+                "OK · log_tail ✓ · checkpoint_chain ✓ · state_root ✓ · gate_verdicts ✓ · no gaps · {}ms",
+                report.duration_ms
+            )
+            .green()
+            .bold()
+        );
+        Ok(())
+    } else {
+        for failure in &report.failures {
+            println!("{}", format!("  {failure}").red());
+        }
+        Err(anyhow::anyhow!(
+            "strata store verification failed: {} failure(s), gaps: {:?}",
+            report.failures.len(),
+            report.gaps
+        ))
+    }
 }
 
 /// Run the forgotten-lesson scan (the MCP `forgotten_lesson` tool) from the
