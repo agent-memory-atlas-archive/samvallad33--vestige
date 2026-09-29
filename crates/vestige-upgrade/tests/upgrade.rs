@@ -103,14 +103,16 @@ fn assert_fixture_landed(db: &Path, log_dir: &Path) {
         .find(|edge| edge.legacy_link_type == "causal")
         .expect("causal link dropped");
     assert!(causal.legacy_inferred);
-    assert_eq!(causal.link_type, "derived_from");
+    // #318: an inferred v3 link is history, not recorded causal proof, so it
+    // migrates as legacy_inferred rather than a Strata edge kind.
+    assert_eq!(causal.link_type, strata_migrate::LEGACY_INFERRED_KIND);
     let semantic = snap
         .edges
         .iter()
         .find(|edge| edge.legacy_link_type == "semantic")
         .expect("semantic link dropped");
     assert!(semantic.legacy_inferred);
-    assert_eq!(semantic.link_type, "derived_from");
+    assert_eq!(semantic.link_type, strata_migrate::LEGACY_INFERRED_KIND);
     let touched = snap
         .edges
         .iter()

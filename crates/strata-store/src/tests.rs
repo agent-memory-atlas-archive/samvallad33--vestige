@@ -778,13 +778,16 @@ fn crafted_version_256_node() -> Vec<u8> {
     .expect("encode")
 }
 
+/// Sized so the bytes also decode exactly as a migration `NodeRecord`
+/// (record_version 257), including its two trailing `Option` fields. If
+/// `NodeRecord` gains fields, re-derive the lengths so this stays ambiguous.
 fn crafted_version_257_edge_bytes() -> Vec<u8> {
     borsh::to_vec(&StoreOp::SaveEdge {
         edge: ConnectionRecord {
             source_id: "\0".to_string(),
             target_id: "\0".repeat(9),
             strength_milli: 0,
-            link_type: "\0".repeat(6),
+            link_type: "\0".repeat(8),
             meta_sha: None,
             created_at_ms: 0,
             activation_count: 0,
