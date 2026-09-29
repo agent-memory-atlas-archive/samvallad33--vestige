@@ -1,0 +1,26 @@
+[package]
+name = "strata-kernel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "AGPL-3.0-only"
+description = "Strata determinism kernel: canonical FSRS fold, checkpoints, replay verification"
+publish = false
+
+# Standalone on purpose: this crate keeps its own (empty) workspace table so it
+# does NOT join the root vestige workspace while crates/strata is being built by
+# a parallel agent. Drop this table (and move deps to the root Cargo.toml) when
+# the integration lands.
+[workspace]
+
+[features]
+default = ["std"]
+# Float math already routes through libm (no host libm); `std` currently only
+# provides the error `std::error::Error` impls. Flipping this off is the first
+# step of the later no_std port (borsh/blake3 feature flags remain).
+std = []
+
+[dependencies]
+borsh = { version = "1", features = ["derive"] }
+blake3 = "1"
+libm = "0.2"
