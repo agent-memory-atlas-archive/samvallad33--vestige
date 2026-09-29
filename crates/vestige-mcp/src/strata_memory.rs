@@ -103,6 +103,26 @@ fn pending_async(op: &str) -> MemoryStoreError {
     MemoryStoreError::Init(pending(op).to_string())
 }
 
+fn purge_report(
+    id: &str,
+    deleted: bool,
+    receipt_id: Option<String>,
+) -> vestige_core::storage::PurgeReport {
+    vestige_core::storage::PurgeReport {
+        memory_id: id.to_string(),
+        deleted,
+        deleted_at: Utc::now(),
+        edges_pruned: 0,
+        insights_rewritten: 0,
+        insights_deleted: 0,
+        children_orphaned: 0,
+        unlearning_scope: vestige_core::storage::UnlearningScope::LegacyAuditedPurge,
+        unlearning_verdict: vestige_core::storage::UnlearningVerdict::Incomplete,
+        unlearning_claim_boundary: "Retired; can't be retrieved.",
+        receipt_id,
+    }
+}
+
 fn is_mem_id(id: &str) -> bool {
     let Some(rest) = id.strip_prefix("mem-") else {
         return false;
@@ -425,7 +445,14 @@ impl MemoryStoreSend for StrataMemory {
 
     fn resolve_handle(&self, query: &str) -> HandleResolution {
         let query = query.trim();
-        let ids: Vec<String> = self.lock().origins().into_iter().map(|(id, _)| id).collect();
+        let store = self.lock();
+        let ids: Vec<String> = store
+            .origins()
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| store.get_node(id).is_some_and(|record| record.is_live()))
+            .collect();
+        drop(store);
         if query.is_empty() {
             return HandleResolution {
                 kind: HandleKind::Unknown,
@@ -564,7 +591,11 @@ impl MemoryStoreSend for StrataMemory {
 
     fn get_node(&self, id: &str) -> Result<Option<KnowledgeNode>, StorageError> {
         let store = self.lock();
-        Ok(store.get_node(id).as_ref().map(|record| project_node(&store, record)))
+        Ok(store
+            .get_node(id)
+            .filter(|record| record.is_live())
+            .as_ref()
+            .map(|record| project_node(&store, record)))
     }
 
     fn get_all_nodes(&self, limit: i32, offset: i32) -> Result<Vec<KnowledgeNode>, StorageError> {
@@ -764,7 +795,7 @@ impl MemoryStoreSend for StrataMemory {
         let mut out = Vec::new();
         let cap = usize::try_from(limit).unwrap_or(0);
         for record in store.nodes() {
-            if record.node_type != node_type || record.scope != scope {
+            if !record.is_live() || record.node_type != node_type || record.scope != scope {
                 continue;
             }
             if tag.is_some_and(|wanted| !record.tags.iter().any(|stored| stored == wanted)) {
@@ -1008,6 +1039,9 @@ impl MemoryStoreSend for StrataMemory {
             .nodes()
             .iter()
             .filter(|record| {
+                if !record.is_live() {
+                    return false;
+                }
                 let created = ms_to_dt(record.created_at_ms);
                 start.is_none_or(|start| created >= start)
                     && end.is_none_or(|end| created <= end)
@@ -1038,6 +1072,7 @@ impl MemoryStoreSend for StrataMemory {
                     .ok()
                     .flatten()
                     .unwrap_or(0.0);
+                let live = record.is_live();
                 HygieneNodeSummary {
                     id: record.id,
                     node_type: record.node_type,
@@ -1048,8 +1083,12 @@ impl MemoryStoreSend for StrataMemory {
                     valid_until: (record.valid_until_ms != VALID_FOREVER_MS)
                         .then(|| ms_to_dt(record.valid_until_ms)),
                     superseded: record.superseded_by.is_some(),
-                    content_bytes: record.content.len(),
-                    content_preview: record.content.chars().take(140).collect(),
+                    content_bytes: if live { record.content.len() } else { 0 },
+                    content_preview: if live {
+                        record.content.chars().take(140).collect()
+                    } else {
+                        String::new()
+                    },
                     never_accessed: false,
                     access_unknown: true,
                 }
@@ -1138,10 +1177,47 @@ impl MemoryStoreSend for StrataMemory {
 
     fn purge_node(
         &self,
-        _id: &str,
-        _reason: Option<&str>,
+        id: &str,
+        reason: Option<&str>,
     ) -> Result<vestige_core::storage::PurgeReport, StorageError> {
-        Err(pending("purge_node"))
+        // Reason stays off the log. Real erasure is a later change.
+        if let Some(reason) = reason {
+            tracing::info!(memory_id = %id, reason, "retiring memory");
+        }
+        let mut store = self.lock();
+        let Some(record) = store.get_node(id) else {
+            return Ok(purge_report(id, false, None));
+        };
+        if !record.is_live() {
+            return Ok(purge_report(id, false, None));
+        }
+        let scope = record.scope.clone();
+        // SupersedeNode needs a successor. This anchor is retired in the same call.
+        let anchor = store
+            .ingest_in_scope(
+                strata_store::IngestInput {
+                    content: ".".into(),
+                    node_type: "fact".into(),
+                    tags: Vec::new(),
+                    created_at_ms: Some(0),
+                    valid_from_ms: None,
+                    valid_until_ms: None,
+                },
+                &scope,
+            )
+            .map_err(map_store)?;
+        let ctx = strata_store::AdmissionContext {
+            rule_id: Some(strata_store::RULE_PURGE.to_string()),
+            confirm: true,
+        };
+        let receipt = store.retire(id, &anchor, &ctx).map_err(map_store)?;
+        if receipt.rule_id != Some(strata_store::RULE_PURGE) {
+            return Err(StorageError::Init(
+                "purge retire was not admitted under purge".into(),
+            ));
+        }
+        store.retire(&anchor, id, &ctx).map_err(map_store)?;
+        Ok(purge_report(id, true, Some(receipt.receipt_id)))
     }
 
     fn delete_node(&self, _id: &str) -> Result<bool, StorageError> {
@@ -1188,7 +1264,7 @@ impl StrataMemory {
         let mut nodes: Vec<KnowledgeNode> = store
             .nodes()
             .iter()
-            .filter(|record| scope.is_none_or(|scope| record.scope == scope))
+            .filter(|record| record.is_live() && scope.is_none_or(|scope| record.scope == scope))
             .map(|record| project_node(&store, record))
             .collect();
         nodes.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
@@ -1330,5 +1406,126 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("similarity_disabled"), "{err}");
+    }
+
+    fn log_files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.join("log")];
+        while let Some(path) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    let rel = path
+                        .strip_prefix(dir)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned();
+                    out.push((rel, bytes));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn purge_with_confirm_returns_a_receipt_and_hides_content() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open(dir.path()).unwrap();
+        let marker = "PURGE_MARKER_SECRET";
+        let node = storage
+            .ingest_in_scope(
+                IngestInput {
+                    content: marker.into(),
+                    ..IngestInput::default()
+                },
+                "user",
+            )
+            .unwrap();
+        let kept = storage
+            .ingest_in_scope(
+                IngestInput {
+                    content: "KEEP_VISIBLE".into(),
+                    ..IngestInput::default()
+                },
+                "user",
+            )
+            .unwrap();
+        let cognitive = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::cognitive::CognitiveEngine::new(),
+        ));
+        let before = log_files(dir.path());
+        let refused = crate::tools::memory_unified::execute(
+            &storage,
+            &cognitive,
+            Some(serde_json::json!({ "action": "purge", "id": node.id })),
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.contains("confirm=true"), "{refused}");
+        assert_eq!(log_files(dir.path()), before);
+        assert_eq!(storage.get_node(&node.id).unwrap().unwrap().content, marker);
+
+        let purged = crate::tools::memory_unified::execute(
+            &storage,
+            &cognitive,
+            Some(serde_json::json!({
+                "action": "purge",
+                "id": node.id,
+                "confirm": true
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(purged["rule"], "purge");
+        assert_eq!(purged["nodeId"], node.id);
+        let receipt_id = purged["receiptId"].as_str().unwrap();
+        assert!(receipt_id.starts_with("eff-"), "{receipt_id}");
+        assert!(storage.get_node(&node.id).unwrap().is_none());
+        assert!(storage.resolve_handle(&node.id).ids.is_empty());
+        assert_eq!(
+            storage.get_node(&kept.id).unwrap().unwrap().content,
+            "KEEP_VISIBLE"
+        );
+        let listed = serde_json::to_string(&storage.get_all_nodes(50, 0).unwrap()).unwrap();
+        assert!(!listed.contains(marker), "{listed}");
+        let ranged = serde_json::to_string(
+            &storage
+                .query_time_range(None, None, 50, None, None)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!ranged.contains(marker), "{ranged}");
+        let hygiene = storage.hygiene_snapshot(None).unwrap();
+        assert!(
+            hygiene
+                .nodes
+                .iter()
+                .all(|node| !node.content_preview.contains(marker))
+        );
+        let got = crate::tools::memory_unified::execute(
+            &storage,
+            &cognitive,
+            Some(serde_json::json!({ "action": "get", "id": node.id })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got["message"], "retired, can't be retrieved");
+        assert!(!got.to_string().contains(marker));
+
+        let seq = u64::from_str_radix(receipt_id.trim_start_matches("eff-"), 16).unwrap();
+        drop(storage);
+        let reopened = strata_store::StrataStore::open(dir.path()).unwrap();
+        let again = reopened.retire_receipt(seq).unwrap();
+        assert_eq!(again.rule_id, Some(strata_store::RULE_PURGE));
+        assert_eq!(again.receipt_id, receipt_id);
+        let stored = reopened.get_node(&node.id).unwrap();
+        assert!(stored.superseded_by.is_some());
+        assert_eq!(stored.content, marker);
     }
 }

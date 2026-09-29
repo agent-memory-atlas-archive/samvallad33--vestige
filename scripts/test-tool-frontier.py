@@ -163,7 +163,15 @@ def run(binary, output):
             typed("receipt", {"action": "replay", "receipt_id": node_id, "withheld_slots": []}, "pending_strata")
             typed("memory", {"action": "promote", "id": node_id, "reason": "fixture"}, "pending_strata")
             typed("memory", {"action": "edit", "id": node_id, "content": "edited"}, "pending_strata")
-            typed("purge", {"id": node_id, "confirm": True}, "pending_strata")
+            doomed = tool("smart_ingest", {"content": "STRATA_PURGE_DOOMED", "forceCreate": True})
+            doomed_id = doomed["nodeId"]
+            typed("purge", {"id": doomed_id, "confirm": False}, "confirm=true")
+            purged = tool("purge", {"id": doomed_id, "confirm": True})
+            assert purged["rule"] == "purge" and purged["nodeId"] == doomed_id
+            assert str(purged["receiptId"]).startswith("eff-")
+            hidden = tool("memory", {"action": "get", "id": doomed_id})
+            assert "STRATA_PURGE_DOOMED" not in json.dumps(hidden)
+            assert hidden["message"] == "retired, can't be retrieved"
             context = tool("codebase", {"action": "get_context", "codebase": "fixture"})
             assert marker not in json.dumps(context)
             typed("project", {"action": "preview"}, "pending_strata")

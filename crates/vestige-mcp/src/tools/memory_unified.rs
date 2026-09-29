@@ -55,7 +55,7 @@ pub fn schema() -> Value {
             "action": {
                 "type": "string",
                 "enum": ["get", "get_batch", "delete", "purge", "state", "promote", "demote", "edit"],
-                "description": "'get', 'get_batch' (ids), 'state', 'promote' / 'demote' (retrieval strength; demote never deletes), 'edit' (replace content, keep FSRS state), 'purge' (content and embeddings gone; confirm=true). 'delete' aliases purge"
+                "description": "'get', 'get_batch' (ids), 'state', 'promote' / 'demote' (retrieval strength; demote never deletes), 'edit' (replace content, keep FSRS state), 'purge' (retired, can't be retrieved; confirm=true). 'delete' aliases purge"
             },
             "id": {
                 "type": "string",
@@ -76,7 +76,7 @@ pub fn schema() -> Value {
             },
             "confirm": {
                 "type": "boolean",
-                "description": "Required for purge and delete. Removes canonical content and embeddings; legacy audit and sync rows keep opaque markers, so this is not verified unlearning.",
+                "description": "Required for purge and delete. Retires the memory so it can't be retrieved.",
                 "default": false
             },
             "content": {
@@ -104,15 +104,14 @@ struct MemoryArgs {
 }
 
 /// Execute the unified memory tool
-/// Standalone `purge` tool schema (#219): the one irreversible call,
-/// advertised on its own so hosts can gate it without gating the reads that
-/// share `memory`. Same parameters as `memory(action='purge')`.
+/// Standalone `purge` tool schema (#219). Same parameters as
+/// `memory(action='purge')`. Hosts can prompt on this tool alone.
 pub fn purge_schema() -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
             "id": {
-                "description": "Memory UUID to purge (for good; confirm=true).",
+                "description": "Memory id to retire (confirm=true).",
                 "type": "string"
             },
             "role": {
@@ -120,7 +119,7 @@ pub fn purge_schema() -> Value {
                 "description": "[promote/demote] CLAIMED role for provenance. Resolved against the operator-controlled policy; claims never override the process identity or self-grant authority. Unregistered claims stay neutral at 1.0."
             },
             "confirm": {
-                "description": "Required: purge is irreversible. Content and embeddings are removed; legacy audit/sync rows keep only opaque markers.",
+                "description": "Required. Retires the memory so it can't be retrieved.",
                 "type": "boolean"
             },
             "reason": {
@@ -239,7 +238,7 @@ async fn execute_get(storage: &Arc<Storage>, id: &str) -> Result<Value, String> 
             "action": "get",
             "found": false,
             "nodeId": id,
-            "message": "Memory not found",
+            "message": absent_message(storage, id),
         })),
     }
 }
@@ -268,6 +267,7 @@ async fn execute_get_batch(storage: &Arc<Storage>, ids: &[String]) -> Result<Val
                 results.push(serde_json::json!({
                     "id": id,
                     "found": false,
+                    "message": absent_message(storage, id),
                 }));
             }
             Err(e) => {
@@ -287,7 +287,19 @@ async fn execute_get_batch(storage: &Arc<Storage>, ids: &[String]) -> Result<Val
     }))
 }
 
-/// Permanently purge a memory and return cleanup details.
+fn absent_message(storage: &Arc<Storage>, id: &str) -> &'static str {
+    if storage
+        .superseded_node_ids()
+        .ok()
+        .is_some_and(|ids| ids.contains(id))
+    {
+        "retired, can't be retrieved"
+    } else {
+        "Memory not found"
+    }
+}
+
+/// Retire a memory. On Strata this is a confirmed `purge` RETIRE.
 async fn execute_purge(
     storage: &Arc<Storage>,
     cognitive: &Arc<Mutex<CognitiveEngine>>,
@@ -297,20 +309,15 @@ async fn execute_purge(
     action: &str,
 ) -> Result<Value, String> {
     if !confirm {
-        return Err(
-            "Purge is irreversible. Pass confirm=true to permanently remove memory content and embeddings."
-                .to_string(),
-        );
+        return Err("Pass confirm=true to retire this memory. It can't be retrieved.".to_string());
     }
 
     let report = storage
         .purge_node(id, reason.as_deref())
         .map_err(|e| e.to_string())?;
 
-    // A successful purge must not leave a stale in-process cognitive projection
-    // able to retrieve the removed id. Replacing the entire engine is safer
-    // than attempting to discover and edit every module-local cache, and the
-    // new engine hydrates only surviving durable state.
+    // Drop in-process projections of the retired id. Hydration reads only
+    // what the store still returns.
     let runtime_rebuilt = if report.deleted {
         let mut rebuilt = CognitiveEngine::new();
         rebuilt.hydrate(storage);
@@ -319,6 +326,25 @@ async fn execute_purge(
     } else {
         false
     };
+
+    if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        return Ok(match report.receipt_id {
+            Some(receipt_id) => serde_json::json!({
+                "action": action,
+                "success": true,
+                "nodeId": id,
+                "receiptId": receipt_id,
+                "rule": "purge",
+                "message": "Retired; can't be retrieved.",
+            }),
+            None => serde_json::json!({
+                "action": action,
+                "success": false,
+                "nodeId": id,
+                "message": absent_message(storage, id),
+            }),
+        });
+    }
 
     Ok(serde_json::json!({
         "action": action,
@@ -355,7 +381,7 @@ async fn execute_state(storage: &Arc<Storage>, id: &str) -> Result<Value, String
     let memory = storage
         .get_node(id)
         .map_err(|e| format!("Error: {}", e))?
-        .ok_or("Memory not found")?;
+        .ok_or_else(|| absent_message(storage, id))?;
 
     // Calculate accessibility score
     let accessibility = compute_accessibility(
