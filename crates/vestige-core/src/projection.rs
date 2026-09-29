@@ -12,10 +12,10 @@
 //! a retention floor, in the requested scope. A projection that carried every
 //! memory would be the "prompt sludge" the roadmap warns about.
 
-#[cfg_attr(not(feature = "legacy-sqlite"), allow(unused_imports))]
-use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(unused_imports))]
+use std::sync::Arc;
 
 use crate::Storage;
 use crate::storage::Result;
@@ -107,7 +107,10 @@ const CANDIDATE_LIMIT: i32 = 500;
 const MAX_LINE_CHARS: usize = 400;
 
 /// Pick the durable subset of `opts.scope`.
-pub fn select_durable(storage: &Arc<Storage>, opts: &ProjectionOptions) -> Result<Vec<ProjectedItem>> {
+pub fn select_durable(
+    storage: &Arc<Storage>,
+    opts: &ProjectionOptions,
+) -> Result<Vec<ProjectedItem>> {
     let now = Utc::now();
     let candidates =
         storage.projection_candidates(&opts.scope, opts.min_retention, CANDIDATE_LIMIT)?;
@@ -193,7 +196,12 @@ fn render_line(item: &ProjectedItem) -> String {
 /// no timestamps inside the fence, so an unchanged store projects to an
 /// unchanged file.
 pub fn render(format: ProjectionFormat, scope: &str, items: &[ProjectedItem]) -> String {
-    let scope = scope.trim().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('`', "&#96;");
+    let scope = scope
+        .trim()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('`', "&#96;");
     let mut out = String::new();
     out.push_str(&format!(
         "{BEGIN_MARKER} scope={scope} format={} -->\n",

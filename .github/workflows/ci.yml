@@ -102,6 +102,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
+      # strata-migrate is workspace-excluded, so the step above never lints it.
+      - name: Clippy strata-migrate (all features, warnings are errors)
+        run: cargo clippy --manifest-path crates/strata-migrate/Cargo.toml -p strata-migrate --all-features -- -D warnings
+
       - name: Test
         run: cargo test --workspace
 

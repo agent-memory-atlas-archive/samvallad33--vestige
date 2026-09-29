@@ -850,7 +850,10 @@ pub trait LocalMemoryStore: Sync + 'static {
     }
 
     /// Members of one composition event.
-    fn get_composition_members(&self, _event_id: &str) -> StoreResult<Vec<CompositionMemberRecord>> {
+    fn get_composition_members(
+        &self,
+        _event_id: &str,
+    ) -> StoreResult<Vec<CompositionMemberRecord>> {
         Err(StorageError::Init(
             concat!(
                 stringify!(get_composition_members),

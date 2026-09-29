@@ -469,6 +469,7 @@ async fn serve() {
     // storage constructor runs, so tools never see a half-open store. The
     // guard itself never writes; detection is a 100-byte header read. The
     // default-path case (None) is guarded inside the storage constructor.
+    // One v3 check. exit_if_v3 prints the 0a refusal and exits 1.
     if let Some(db_path) = storage_path.as_deref() {
         exit_if_v3(db_path);
     }
