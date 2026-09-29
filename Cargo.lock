@@ -2312,13 +2312,17 @@ dependencies = [
 name = "strata-migrate"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "base64 0.22.1",
  "blake3",
  "borsh",
  "chrono",
+ "rusqlite",
  "serde",
  "serde_json",
  "strata",
  "strata-kernel",
+ "tempfile",
  "thiserror",
  "vestige-core",
 ]

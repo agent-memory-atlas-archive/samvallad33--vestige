@@ -1,24 +1,31 @@
 //! # strata-migrate — one-shot Vestige SQLite → STRATA migration
 //!
-//! `vestige migrate-to-strata <src> <dst>` empties a Vestige SQLite store
-//! into an append-only STRATA log. It is a MIGRATION, not a sync: run it
-//! once, keep the SQLite file as the pre-migration backup, and write new
-//! memories to STRATA.
+//! `vestige migrate-to-strata --from <src> [--to <dst>]` reads a Vestige
+//! SQLite store STRICTLY READ-ONLY and replays it into an append-only
+//! STRATA log through a signed MIGRATION_RECEIPT. It is a MIGRATION, not a
+//! sync: run it once, keep the SQLite file (byte-identical, never opened
+//! read-write) as the pre-migration record, and write new memories to
+//! STRATA.
 //!
 //! ## What lands in the log
 //!
 //! | SQLite source                    | STRATA record                                  |
 //! |----------------------------------|------------------------------------------------|
+//! | `GENESIS` / `PARAMS v4-migrate/1`| provenance + parameter frames on a fresh log   |
 //! | `knowledge_nodes` rows           | `NODE` frames (kernel_id v1 + legacy UUID)      |
+//! | V40 `walk_receipts` rows         | reference `NODE` frames tagged migrated_from_v4 |
 //! | `knowledge_nodes.superseded_by`  | `SUPERSESSION` frames                           |
-//! | `memory_connections` rows        | `EDGE` frames (link_type VERBATIM, no re-check) |
+//! | `memory_connections` rows        | `EDGE` frames (8-type vocabulary; legacy types  |
+//! |                                  | become `derived_from{legacy_inferred=1}`)       |
 //! | `fsrs_cards` rows                | `FSRS_REVIEW` frames (kernel `ReviewEvent`)     |
 //! | `sync_tombstones` / `deletion_tombstones` | `TOMBSTONE` frames                     |
 //! | everything else with rows        | counted in `MigrationReport::skipped_tables`    |
+//! | final frame                      | signed `MIGRATION_RECEIPT` (kind 46)            |
 //!
-//! The run finishes with a sealed segment (`StrataLog::seal`) and a kernel
-//! `Checkpoint` appended as the last frame; `strata_kernel::verify_with_head`
-//! plus `StrataLog::verify_tail` must both pass before `verify_passed` is
+//! The run re-hashes the source after the replay and refuses to seal if a
+//! single byte changed (the reader is read-only at the SQLite VFS level,
+//! so this is belt-and-suspenders). `strata_kernel::verify_with_head` plus
+//! `StrataLog::verify_tail` must both pass before `verify_passed` is
 //! reported true.
 //!
 //! ## FSRS fold semantics (read before relying on it)
@@ -36,6 +43,14 @@
 //! `ReviewEvent::event_seq` is the frame seq the event lands at (the kernel
 //! requires `event.seq() == record seq`), predicted from the log head before
 //! the batch append and asserted against the returned acks afterward.
+//!
+//! ## Determinism
+//!
+//! Every timestamp in the log comes from the source rows (a replay clock:
+//! the migration never reads the wall clock into hashed state), the log is
+//! opened seeded from the source BLAKE3 unless a seed is pinned, and all
+//! hashed collections are ordered Vecs. Two runs over one source produce
+//! byte-identical segments.
 
 pub mod records;
 pub mod snapshot;
@@ -54,9 +69,15 @@ use strata_kernel::verify::verify_with_head;
 use vestige_core::PortableArchive;
 
 pub use records::{
-    EdgeRecord, MigrationMeta, NodeRecord, SupersessionRecord, TombstoneRecord, RECORD_VERSION,
+    EdgeRecord, GenesisRecord, MigrationReceipt, NodeRecord, ParamsRecord, ReceiptBody,
+    SupersessionRecord, TombstoneRecord, KIND_MIGRATION_RECEIPT, RECEIPT_SIGNING_KEY_ID,
+    RECORD_VERSION,
 };
 pub use snapshot::{read_snapshot, Snapshot};
+
+/// Parameter set implemented by this migrator. Written as the `PARAMS`
+/// frame on a fresh log.
+pub const PARAMS_ID: &str = "v4-migrate/1";
 
 /// Frames per `append_batch` call: bounds peak memory on huge stores while
 /// staying far above the log's own 64-frame group-commit cap.
@@ -72,6 +93,34 @@ const MAPPED_TABLES: &[&str] = &[
     "deletion_tombstones",
 ];
 
+/// The only edge vocabulary STRATA carries (H4). Any legacy `link_type`
+/// outside this set migrates as `derived_from` with `legacy_inferred = 1`.
+pub const STRATA_EDGE_VOCABULARY: [&str; 8] = [
+    "touched",
+    "anchored_to",
+    "derived_from",
+    "supersedes",
+    "corrects",
+    "closed_by",
+    "projected_to",
+    "evidence_of",
+];
+
+/// Options for one migration run.
+#[derive(Debug, Clone, Default)]
+pub struct MigrateOptions {
+    /// Read and verify the source, report counts, write nothing.
+    pub dry_run: bool,
+    /// Allow migrating a source with a non-empty `-wal` by snapshot-copying
+    /// db + sidecars to a scratch directory first. The original is still
+    /// never modified.
+    pub accept_wal_snapshot: bool,
+    /// Pin the strata log seed (signing key + segment ids derive from it).
+    /// `None` derives the seed from the source BLAKE3, which already makes
+    /// two runs over one source byte-identical.
+    pub seed: Option<[u8; 32]>,
+}
+
 /// Everything that can stop a migration. Nothing is ever half-written: the
 /// strata log is append-only, so a failed run leaves already-appended frames
 /// durable and simply reports the error.
@@ -84,9 +133,20 @@ pub enum MigrationError {
     /// nor a directory containing `vestige.db`.
     #[error("unsupported migration source: {0}")]
     UnsupportedSource(String),
-    /// Opening or exporting a live store failed.
+    /// Opening or reading the source failed.
     #[error("source store error: {0}")]
     Source(String),
+    /// The source has a non-empty `-wal`; rerun with `--accept-wal-snapshot`
+    /// to migrate from a consistent snapshot copy.
+    #[error("refusing non-empty WAL {path}; rerun with --accept-wal-snapshot")]
+    WalPresent {
+        /// Path of the offending `-wal` file.
+        path: String,
+    },
+    /// The `receipt_envelopes` hash chain is broken. The message names the
+    /// first break; nothing is written.
+    #[error("broken receipt_envelopes hash chain: {0}")]
+    BrokenEnvelopeChain(String),
     /// A source row could not be decoded into a record.
     #[error("corrupt source data: {0}")]
     Corrupt(String),
@@ -104,7 +164,7 @@ pub enum MigrationError {
 /// Outcome of one migration run.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MigrationReport {
-    /// NODE frames appended.
+    /// NODE frames appended (knowledge_nodes + walk_receipt references).
     pub nodes: u64,
     /// EDGE frames appended.
     pub edges: u64,
@@ -115,6 +175,17 @@ pub struct MigrationReport {
     /// Whether kernel replay verification AND log tail verification both
     /// passed over the finished log.
     pub verify_passed: bool,
+    /// `node_embeddings` rows whose vector values were never read.
+    pub dropped_vectors: u64,
+    /// Last verified `receipt_envelopes` entry digest (empty = none).
+    pub envelope_head: String,
+    /// BLAKE3 hex of the source files (identical before and after; the run
+    /// aborts otherwise). Empty for portable-archive sources.
+    pub source_blake3: String,
+    /// The sealed receipt digest, hex (`None` under `--dry-run`).
+    pub receipt_digest: Option<String>,
+    /// Whether the sealed receipt verifies against its body.
+    pub receipt_verified: bool,
     /// Wall-clock duration of the migration.
     #[serde(serialize_with = "ser_duration_secs", rename = "durationSeconds")]
     pub duration: Duration,
@@ -128,58 +199,168 @@ fn ser_duration_secs<S: serde::Serializer>(
 }
 
 /// Migrate from `<src>` (portable archive JSON, SQLite db file, or data
-/// directory containing `vestige.db`) into a STRATA log at `<dst>`.
+/// directory containing `vestige.db`) into a STRATA log at `<dst>`, with
+/// default options.
 pub fn migrate(source: &Path, strata_dir: &Path) -> Result<MigrationReport, MigrationError> {
-    let started = Instant::now();
-    let archive = source::load_archive(source)?;
-    let report = migrate_archive(&archive, strata_dir)?;
-    Ok(MigrationReport {
-        duration: started.elapsed(),
-        ..report
-    })
+    migrate_with_options(source, strata_dir, MigrateOptions::default())
 }
 
-/// Migrate an already-loaded portable archive into a STRATA log at `dst`.
-pub fn migrate_archive(
-    archive: &PortableArchive,
+/// Migrate with explicit options. See [`MigrateOptions`].
+pub fn migrate_with_options(
+    source: &Path,
     strata_dir: &Path,
+    options: MigrateOptions,
 ) -> Result<MigrationReport, MigrationError> {
-    std::fs::create_dir_all(strata_dir)?;
-    let log = StrataLog::open(strata_dir).map_err(|e| MigrationError::Strata(e.to_string()))?;
-    migrate_archive_into(archive, &log)
+    let started = Instant::now();
+    let scratch = tempfile::tempdir()?;
+    let (files, _snapshotted) =
+        source::prepare_source(source, options.accept_wal_snapshot, scratch.path())?;
+
+    if !source::is_sqlite_file(&files.db)? {
+        // Portable-archive JSON path: no SQLite, no guard, no source hash.
+        let snapshot = source::load_snapshot(&files)?;
+        if options.dry_run {
+            return Ok(dry_run_report(&snapshot, "", started));
+        }
+        let log = open_log(strata_dir, options.seed, "")?;
+        let outcome = migrate_snapshot_into(&snapshot, &log, "")?;
+        return finish(log, outcome, snapshot, "", started);
+    }
+
+    // ---- hash BEFORE any SQL read --------------------------------------
+    let blake3_before = files.blake3_hex()?;
+
+    // ---- read-only snapshot (verifies the envelope chain) ---------------
+    let snapshot = source::load_snapshot(&files)?;
+
+    if options.dry_run {
+        return Ok(dry_run_report(&snapshot, &blake3_before, started));
+    }
+
+    // ---- replay ----------------------------------------------------------
+    let log = open_log(strata_dir, options.seed, &blake3_before)?;
+    let outcome = migrate_snapshot_into(&snapshot, &log, &blake3_before)?;
+
+    // ---- re-hash the source: a single changed byte stops the seal -------
+    let blake3_after = files.blake3_hex()?;
+    assert_eq!(
+        blake3_before,
+        blake3_after,
+        "strata-migrate: source changed during migration — refusing to seal \
+         (before {blake3_before}, after {blake3_after}); the destination log \
+         at {} is incomplete and must not be trusted",
+        strata_dir.display(),
+    );
+
+    finish(log, outcome, snapshot, &blake3_after, started)
 }
 
-fn migrate_archive_into(
-    archive: &PortableArchive,
-    log: &StrataLog,
-) -> Result<MigrationReport, MigrationError> {
-    let mut nodes = 0u64;
-    let mut edges = 0u64;
-    let mut fsrs_events = 0u64;
+fn open_log(
+    strata_dir: &Path,
+    pinned_seed: Option<[u8; 32]>,
+    source_blake3: &str,
+) -> Result<StrataLog, MigrationError> {
+    let seed = pinned_seed.unwrap_or_else(|| {
+        let digest = blake3::Hasher::new_derive_key("vestige strata migrate log seed v1")
+            .update(source_blake3.as_bytes())
+            .finalize();
+        *digest.as_bytes()
+    });
+    StrataLog::open_seeded(strata_dir, seed).map_err(|e| MigrationError::Strata(e.to_string()))
+}
 
-    // ---- decode source rows -------------------------------------------
-    let (node_records, kernel_ids, supersessions) = extract_nodes(archive)?;
-    let edge_records = extract_edges(archive, &kernel_ids)?;
-    let tombstones = extract_tombstones(archive)?;
-    let skipped_tables = archive
+fn dry_run_report(
+    snapshot: &source::SourceSnapshot,
+    source_blake3: &str,
+    started: Instant,
+) -> MigrationReport {
+    MigrationReport {
+        nodes: table_rows(snapshot, "knowledge_nodes"),
+        edges: table_rows(snapshot, "memory_connections"),
+        fsrs_events: table_rows(snapshot, "fsrs_cards"),
+        skipped_tables: skipped_tables_for(snapshot),
+        // A dry run writes nothing; the envelope chain is verified during
+        // the read, so reaching this point means the chain held.
+        verify_passed: true,
+        dropped_vectors: snapshot.dropped_vectors,
+        envelope_head: snapshot.envelope_head.clone().unwrap_or_default(),
+        source_blake3: source_blake3.to_string(),
+        receipt_digest: None,
+        receipt_verified: false,
+        duration: started.elapsed(),
+    }
+}
+
+fn table_rows(snapshot: &source::SourceSnapshot, table: &str) -> u64 {
+    source::table(&snapshot.archive, table)
+        .map(|t| t.rows.len() as u64)
+        .unwrap_or(0)
+}
+
+fn skipped_tables_for(snapshot: &source::SourceSnapshot) -> Vec<String> {
+    snapshot
+        .archive
         .tables
         .iter()
         .filter(|t| !t.rows.is_empty() && !MAPPED_TABLES.contains(&t.name.as_str()))
         .map(|t| t.name.clone())
-        .collect::<Vec<_>>();
+        .collect()
+}
 
-    // ---- append records -------------------------------------------------
+/// Everything produced during one replay.
+struct ReplayOutcome {
+    nodes: u64,
+    edges: u64,
+    fsrs_events: u64,
+    /// Hash of the last fold checkpoint (the replay anchor), or `[0; 32]`
+    /// when the log carries no checkpoint.
+    anchor: [u8; 32],
+}
+
+/// Replay a snapshot into an already-open log: GENESIS/PARAMS on a fresh
+/// log, then nodes (+ walk-receipt reference nodes), edges, tombstones,
+/// supersessions, FSRS folds, and the fold checkpoint. The
+/// MIGRATION_RECEIPT is appended by [`finish`] once the source re-hash has
+/// been confirmed.
+fn migrate_snapshot_into(
+    snapshot: &source::SourceSnapshot,
+    log: &StrataLog,
+    source_blake3: &str,
+) -> Result<ReplayOutcome, MigrationError> {
+    let archive = &snapshot.archive;
+
+    let (node_records, kernel_ids, supersessions) = extract_nodes(archive)?;
+    let edge_records = extract_edges(archive, &kernel_ids)?;
+    let tombstones = extract_tombstones(archive)?;
+    let walk_nodes = extract_walk_receipts(snapshot, &kernel_ids)?;
+
+    let mut nodes = 0u64;
+    let mut edges = 0u64;
+    let mut fsrs_events = 0u64;
+
     let mut writer = Writer::new(log);
     if log.head().frames_total == 0 {
-        let meta = MigrationMeta {
-            record_version: RECORD_VERSION,
-            archive_format: archive.archive_format.clone(),
-            vestige_version: archive.vestige_version.clone(),
-            schema_version: archive.schema_version,
-        };
-        writer.push(records::KIND_MIGRATION_META, borsh::to_vec(&meta))?;
+        writer.push(
+            records::KIND_GENESIS,
+            borsh::to_vec(&GenesisRecord {
+                record_version: RECORD_VERSION,
+                archive_format: archive.archive_format.clone(),
+                vestige_version: archive.vestige_version.clone(),
+                schema_version: snapshot.schema_version,
+            }),
+        )?;
+        writer.push(
+            records::KIND_PARAMS,
+            borsh::to_vec(&ParamsRecord {
+                record_version: RECORD_VERSION,
+                params_id: PARAMS_ID.to_string(),
+                schema_version: snapshot.schema_version,
+                source_blake3: source_blake3.to_string(),
+                envelope_head: snapshot.envelope_head.clone().unwrap_or_default(),
+            }),
+        )?;
     }
-    for record in &node_records {
+    for record in node_records.iter().chain(walk_nodes.iter()) {
         writer.push(records::KIND_NODE, borsh::to_vec(record))?;
         nodes += 1;
     }
@@ -253,11 +434,53 @@ fn migrate_archive_into(
             .map_or([0u8; 32], checkpoint_hash)
     };
 
+    Ok(ReplayOutcome {
+        nodes,
+        edges,
+        fsrs_events,
+        anchor,
+    })
+}
+
+/// Append the sealed MIGRATION_RECEIPT, close the segment, verify the log,
+/// and assemble the report.
+fn finish(
+    log: StrataLog,
+    outcome: ReplayOutcome,
+    snapshot: source::SourceSnapshot,
+    source_blake3: &str,
+    started: Instant,
+) -> Result<MigrationReport, MigrationError> {
+    // Per-table source counts plus the walk receipts, sorted by table name
+    // (H6: ordered collections only in hashed state).
+    let mut table_counts = snapshot.table_counts.clone();
+    if !snapshot.walk_receipts.is_empty() {
+        table_counts.push((
+            "walk_receipts".to_string(),
+            snapshot.walk_receipts.len() as u64,
+        ));
+        table_counts.sort();
+    }
+
+    let receipt = MigrationReceipt::seal(ReceiptBody {
+        record_version: RECORD_VERSION,
+        source_blake3_before: source_blake3.to_string(),
+        source_blake3_after: source_blake3.to_string(),
+        schema_version: snapshot.schema_version,
+        envelope_head: snapshot.envelope_head.clone().unwrap_or_default(),
+        counts: table_counts,
+        dropped_vectors: snapshot.dropped_vectors,
+        signing_key_id: RECEIPT_SIGNING_KEY_ID.to_string(),
+    });
+    let receipt_bytes = borsh::to_vec(&receipt)
+        .map_err(|e| MigrationError::Corrupt(format!("borsh encode receipt: {e}")))?;
+    log.append(records::KIND_MIGRATION_RECEIPT, &receipt_bytes)
+        .map_err(|e| MigrationError::Strata(e.to_string()))?;
+
     log.seal()
         .map_err(|e| MigrationError::Strata(e.to_string()))?;
 
-    // ---- verify -------------------------------------------------------------
-    let verify_passed = match verify_migrated(log, anchor) {
+    let verify_passed = match verify_migrated(&log, outcome.anchor) {
         Ok(passed) => passed,
         Err(reason) => {
             eprintln!("strata-migrate: verification error: {reason}");
@@ -266,13 +489,22 @@ fn migrate_archive_into(
     };
 
     Ok(MigrationReport {
-        nodes,
-        edges,
-        fsrs_events,
-        skipped_tables,
+        nodes: outcome.nodes,
+        edges: outcome.edges,
+        fsrs_events: outcome.fsrs_events,
+        skipped_tables: skipped_tables_for(&snapshot),
         verify_passed,
-        duration: Duration::ZERO,
+        dropped_vectors: snapshot.dropped_vectors,
+        envelope_head: snapshot.envelope_head.unwrap_or_default(),
+        source_blake3: source_blake3.to_string(),
+        receipt_digest: Some(hex32(&receipt.digest)),
+        receipt_verified: receipt.verify(),
+        duration: started.elapsed(),
     })
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Batched append helper: predicts frame seqs from the log head, asserts the
@@ -382,6 +614,33 @@ fn fsrs_ratings_for(reps: i64, lapses: i64) -> Vec<u8> {
     ratings
 }
 
+/// V40 `walk_receipts` rows become reference nodes tagged `migrated_from_v4`
+/// (PR-0a spec 4d). Kernel ids continue after the knowledge nodes so the
+/// dense identity space stays total.
+fn extract_walk_receipts(
+    snapshot: &source::SourceSnapshot,
+    kernel_ids: &HashMap<String, u64>,
+) -> Result<Vec<NodeRecord>, MigrationError> {
+    let base_kernel_id = kernel_ids.values().copied().max().unwrap_or(0);
+    let records = snapshot
+        .walk_receipts
+        .iter()
+        .enumerate()
+        .map(|(offset, row)| NodeRecord {
+            record_version: RECORD_VERSION,
+            legacy_id: row.receipt_id.clone(),
+            kernel_id: base_kernel_id + offset as u64 + 1,
+            content: row.canonical_json.clone(),
+            node_type: "walk_receipt".to_string(),
+            tags: vec!["migrated_from_v4".to_string()],
+            created_ms: row.created_ms,
+            updated_ms: row.created_ms,
+            last_accessed_ms: row.created_ms,
+        })
+        .collect();
+    Ok(records)
+}
+
 /// Decoded `knowledge_nodes`: node records, the legacy→kernel id map (dense,
 /// 1-based, source row order), and supersession pointers.
 type NodeSet = (
@@ -447,6 +706,10 @@ fn extract_nodes(archive: &PortableArchive) -> Result<NodeSet, MigrationError> {
 /// Decode `memory_connections` into edge records. FK cascades make dangling
 /// edges impossible in a consistent store; a dangling edge in an archive is
 /// corruption and stops the migration (fail-stop, never silently dropped).
+///
+/// Legacy link types are folded into the 8-type STRATA vocabulary: anything
+/// outside [`STRATA_EDGE_VOCABULARY`] becomes `derived_from` with
+/// `legacy_inferred = 1` and the original type kept for provenance.
 fn extract_edges(
     archive: &PortableArchive,
     kernel_ids: &HashMap<String, u64>,
@@ -469,12 +732,21 @@ fn extract_edges(
                 "memory_connections row references unknown target {target_legacy_id}"
             ))
         })?;
+        let legacy_link_type = row.text("link_type")?.to_string();
+        let (link_type, legacy_inferred) =
+            if STRATA_EDGE_VOCABULARY.contains(&legacy_link_type.as_str()) {
+                (legacy_link_type.clone(), false)
+            } else {
+                ("derived_from".to_string(), true)
+            };
         records.push(EdgeRecord {
             record_version: RECORD_VERSION,
             source_kernel_id,
             target_kernel_id,
             strength_q32: strata_kernel::canonical::to_q32_32(row.real("strength")?),
-            link_type: row.text("link_type")?.to_string(),
+            link_type,
+            legacy_inferred,
+            legacy_link_type,
             created_ms: source::timestamp_ms(row.text("created_at")?)?,
             last_activated_ms: source::timestamp_ms(row.text("last_activated")?)?,
             activation_count: row.integer_or("activation_count", 0)? as i32,
@@ -595,5 +867,40 @@ mod tests {
         );
         assert_eq!(source::parse_tags(Some("null")), Vec::<String>::new());
         assert_eq!(source::parse_tags(Some("{broken")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn legacy_link_types_fold_into_derived_from() {
+        // Out-of-vocabulary legacy types rewrite to derived_from + flag.
+        for legacy in ["causal", "semantic", "temporal", "user_defined", "pattern"] {
+            assert!(!STRATA_EDGE_VOCABULARY.contains(&legacy));
+        }
+        // The 8 vocabulary types pass through untouched.
+        assert_eq!(STRATA_EDGE_VOCABULARY.len(), 8);
+    }
+
+    #[test]
+    fn receipt_seals_and_verifies() {
+        let body = ReceiptBody {
+            record_version: RECORD_VERSION,
+            source_blake3_before: "aa".repeat(32),
+            source_blake3_after: "aa".repeat(32),
+            schema_version: 38,
+            envelope_head: String::new(),
+            counts: vec![("knowledge_nodes".to_string(), 3)],
+            dropped_vectors: 7,
+            signing_key_id: RECEIPT_SIGNING_KEY_ID.to_string(),
+        };
+        let receipt = MigrationReceipt::seal(body);
+        assert!(receipt.verify());
+        let mutated = MigrationReceipt {
+            record_version: receipt.record_version,
+            body: ReceiptBody {
+                dropped_vectors: 8,
+                ..receipt.body.clone()
+            },
+            digest: receipt.digest,
+        };
+        assert!(!mutated.verify());
     }
 }

@@ -19,17 +19,22 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
+tempfile = "3"
+# DSSE payload/signature decoding for the receipt_envelopes chain check.
+base64 = "0.22"
+# Fixture generator bin error type.
+anyhow = "1"
+# Read-only source reader (mode=ro&immutable=1 URI). Same version/features
+# as vestige-core uses, so cargo unifies to a single bundled SQLite build.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 strata = { path = "../strata" }
 strata-kernel = { path = "../strata-kernel" }
 # Same dependency shape vestige-mcp uses: no default features so the git2 /
-# OpenSSL-heavy codebase-git feature never enters this build. Path B (direct
-# SQLite walk) reuses vestige-core's own export code.
+# OpenSSL-heavy codebase-git feature never enters this build. The migrator
+# reads sources through its own strictly read-only connection; vestige-core
+# supplies the portable types, the DSSE digest functions, and (through
+# bundled-sqlite) the v3 fixture tooling.
 vestige-core = { path = "../vestige-core", default-features = false, features = ["bundled-sqlite"] }
 
-[dev-dependencies]
-tempfile = "3"
-# Test-only direct SQL to plant fsrs_cards rows (the public ingest API does
-# not create review history). Same version/features as vestige-core uses, so
-# cargo unifies to a single bundled SQLite build.
-rusqlite = { version = "0.40", features = ["bundled"] }
+# `rusqlite` above is also used by tests to plant synthetic fixture rows.

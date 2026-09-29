@@ -13,13 +13,16 @@ use strata::StrataLog;
 use strata_kernel::event::ReviewEvent;
 use strata_kernel::fsrs::{CardPhase, ALGO_V1};
 use strata_kernel::kernel::Kernel;
-use vestige_core::{ConnectionRecord, IngestInput, Storage};
+use vestige_core::{ConnectionRecord, IngestInput, SqliteMemoryStore};
 
 use strata_migrate::{migrate, read_snapshot};
 
-/// Build a small populated store at `db` and return the ingested node ids.
-fn build_store(db: &std::path::Path) -> Vec<String> {
-    let storage = Storage::new(Some(db.to_path_buf())).expect("open store");
+/// Build a small populated store at `db`, optionally exporting its portable
+/// archive to `archive_out` while the (single, legitimate) read-write
+/// handle is open — a built store carries the SQLite magic, so 4.0 refuses
+/// any later read-write open by design. Returns the ingested node ids.
+fn build_store(db: &std::path::Path, archive_out: Option<&std::path::Path>) -> Vec<String> {
+    let storage = SqliteMemoryStore::new(Some(db.to_path_buf())).expect("open store");
 
     let inputs = [
         IngestInput {
@@ -59,34 +62,32 @@ fn build_store(db: &std::path::Path) -> Vec<String> {
             activation_count: 3,
         })
         .expect("save connection");
+
+    // Plant FSRS review history while the store handle is open: a separate
+    // raw connection commits the rows, and the export below must see them.
+    // (The public API does not create review history.)
+    {
+        let conn = rusqlite::Connection::open(db).expect("open raw sqlite");
+        for (memory_id, reps, lapses) in [(&ids[0], 4i64, 1i64), (&ids[1], 2, 0)] {
+            conn.execute(
+                "INSERT OR REPLACE INTO fsrs_cards (
+                     memory_id, difficulty, stability, state, reps, lapses,
+                     last_review, due_date, elapsed_days, scheduled_days
+                 ) VALUES (?1, 5.0, 3.2, 'review', ?2, ?3, ?4, ?4, 1, 1)",
+                rusqlite::params![memory_id, reps, lapses, now.to_rfc3339(),],
+            )
+            .expect("plant fsrs_cards");
+        }
+    }
+
+    if let Some(archive_path) = archive_out {
+        storage
+            .export_portable_archive_to_path(archive_path)
+            .expect("export archive");
+    }
     drop(storage);
 
-    // Plant FSRS review history: node0 = 4 reps / 1 lapse, node1 = 2 reps.
-    let conn = rusqlite::Connection::open(db).expect("open raw sqlite");
-    for (memory_id, reps, lapses) in [(&ids[0], 4i64, 1i64), (&ids[1], 2, 0)] {
-        conn.execute(
-            "INSERT OR REPLACE INTO fsrs_cards (
-                 memory_id, difficulty, stability, state, reps, lapses,
-                 last_review, due_date, elapsed_days, scheduled_days
-             ) VALUES (?1, 5.0, 3.2, 'review', ?2, ?3, ?4, ?4, 1, 1)",
-            rusqlite::params![memory_id, reps, lapses, now.to_rfc3339(),],
-        )
-        .expect("plant fsrs_cards");
-    }
-    drop(conn);
-
     ids
-}
-
-/// Export the store at `db` to a portable archive JSON at `archive`.
-fn export_archive(
-    db: &std::path::Path,
-    archive: &std::path::Path,
-) -> vestige_core::PortableArchive {
-    let storage = Storage::new(Some(db.to_path_buf())).expect("reopen store");
-    storage
-        .export_portable_archive_to_path(archive)
-        .expect("export archive")
 }
 
 /// Tables the migration maps (mirror of the crate's MAPPED_TABLES).
@@ -113,10 +114,12 @@ fn expected_skipped(archive: &vestige_core::PortableArchive) -> Vec<String> {
 fn path_a_archive_end_to_end() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db = tmp.path().join("vestige.db");
-    let ids = build_store(&db);
-
     let archive_path = tmp.path().join("portable.json");
-    let archive = export_archive(&db, &archive_path);
+    let ids = build_store(&db, Some(&archive_path));
+
+    let archive: vestige_core::PortableArchive =
+        serde_json::from_slice(&std::fs::read(&archive_path).expect("read archive"))
+            .expect("decode archive");
 
     let strata_dir = tmp.path().join("strata");
     let report = migrate(&archive_path, &strata_dir).expect("migrate");
@@ -135,8 +138,11 @@ fn path_a_archive_end_to_end() {
     let log = StrataLog::open(&strata_dir).expect("reopen strata log");
     let snapshot = read_snapshot(&log).expect("read snapshot");
 
-    assert!(snapshot.meta.is_some());
-    assert_eq!(snapshot.meta.unwrap().archive_format, "vestige.portable.v1");
+    assert!(snapshot.genesis.is_some());
+    assert_eq!(
+        snapshot.genesis.unwrap().archive_format,
+        "vestige.portable.v1"
+    );
 
     let legacy: HashSet<&str> = snapshot
         .nodes
@@ -163,7 +169,11 @@ fn path_a_archive_end_to_end() {
     let edge = &snapshot.edges[0];
     assert_eq!(edge.source_legacy_id, ids[0]);
     assert_eq!(edge.target_legacy_id, ids[1]);
-    assert_eq!(edge.link_type, "semantic", "legacy link types pass through");
+    // `semantic` is legacy vocabulary: it folds to derived_from with the
+    // legacy type kept for provenance only.
+    assert_eq!(edge.link_type, "derived_from");
+    assert!(edge.legacy_inferred);
+    assert_eq!(edge.legacy_link_type, "semantic");
     assert_eq!(edge.activation_count, 3);
     assert_eq!(
         edge.source_kernel_id,
@@ -213,7 +223,7 @@ fn path_a_archive_end_to_end() {
 fn path_b_direct_sqlite_matches_path_a() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db = tmp.path().join("vestige.db");
-    build_store(&db);
+    build_store(&db, None);
 
     let strata_dir = tmp.path().join("strata");
     let report = migrate(&db, &strata_dir).expect("migrate direct sqlite");
@@ -232,7 +242,7 @@ fn path_b_direct_sqlite_matches_path_a() {
 #[test]
 fn directory_source_resolves_vestige_db() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    build_store(&tmp.path().join("vestige.db"));
+    build_store(&tmp.path().join("vestige.db"), None);
 
     let report = migrate(tmp.path(), &tmp.path().join("strata")).expect("migrate dir");
     assert_eq!(report.nodes, 3);
@@ -245,7 +255,7 @@ fn empty_store_migrates_to_verifying_log() {
     let db = tmp.path().join("vestige.db");
     let archive_path = tmp.path().join("empty.json");
     {
-        let storage = Storage::new(Some(db)).expect("open");
+        let storage = SqliteMemoryStore::new(Some(db)).expect("open");
         storage
             .export_portable_archive_to_path(&archive_path)
             .expect("export");
@@ -269,8 +279,7 @@ fn re_migration_extends_the_log_and_keeps_the_chain() {
     let archive_path = tmp.path().join("portable.json");
     {
         let db = tmp.path().join("vestige.db");
-        build_store(&db);
-        export_archive(&db, &archive_path);
+        build_store(&db, Some(&archive_path));
     }
 
     let strata_dir = tmp.path().join("strata");

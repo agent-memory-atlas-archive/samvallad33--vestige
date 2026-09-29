@@ -2,7 +2,9 @@
 //!
 //! Kind-byte allocation: `strata-gate` owns codes `1..=7` and `0` is reserved
 //! ("unknown") by the log layer. The migration family starts at `0x1F`
-//! (`MIGRATION_META`) so it cannot collide with gate records in a shared log.
+//! (`GENESIS`) so it cannot collide with gate records in a shared log.
+//! `MIGRATION_RECEIPT` is frame kind 46 (`0x2E`) per the PR-0a spec; the
+//! `kinds.rs` registry adopts it in PR-0c.
 //!
 //! Every payload begins with a little-endian `u16` `record_version` so a
 //! future migration format can evolve without kind renegotiation. Version 1
@@ -19,10 +21,13 @@ use strata_kernel::checkpoint::Checkpoint;
 use strata_kernel::event::ReviewEvent;
 
 /// First frame of a fresh migration log: provenance for everything after it.
-pub const KIND_MIGRATION_META: u8 = 0x1F;
-/// One `knowledge_nodes` row.
+pub const KIND_GENESIS: u8 = 0x1F;
+/// Migration parameter set `v4-migrate/1`: schema version, source BLAKE3,
+/// envelope chain head. Written immediately after `GENESIS`.
+pub const KIND_PARAMS: u8 = 0x26;
+/// One `knowledge_nodes` row (or a V40 `walk_receipts` reference node).
 pub const KIND_NODE: u8 = 0x20;
-/// One `memory_connections` row (typed edge, legacy link_type verbatim).
+/// One `memory_connections` row mapped into the 8-type STRATA vocabulary.
 pub const KIND_EDGE: u8 = 0x21;
 /// One synthesized review event (payload = kernel `ReviewEvent`).
 pub const KIND_FSRS_REVIEW: u8 = 0x22;
@@ -32,13 +37,26 @@ pub const KIND_TOMBSTONE: u8 = 0x23;
 pub const KIND_SUPERSESSION: u8 = 0x24;
 /// Sealed fold checkpoint (payload = kernel `Checkpoint`).
 pub const KIND_CHECKPOINT: u8 = 0x25;
+/// Final frame of a migration: signed MIGRATION_RECEIPT (kind 46; PR-0c's
+/// `kinds.rs` adopts this code).
+pub const KIND_MIGRATION_RECEIPT: u8 = 46;
 
 /// Current wire version of every migration record below.
 pub const RECORD_VERSION: u16 = 1;
 
-/// Provenance header written as the first frame of a migration.
+/// Identity that signs the MIGRATION_RECEIPT. The receipt signature is a
+/// keyed BLAKE3 digest under this domain-separated context: deterministic
+/// across runs (two migrations of one source must produce identical logs)
+/// and tamper-binding over the receipt body. The log's own ed25519 segment
+/// chain is the integrity layer; this digest binds receipt contents.
+pub const RECEIPT_SIGNING_KEY_ID: &str = "vestige-migrate-receipt-v1";
+
+/// blake3 derive-key context for the receipt digest.
+const RECEIPT_DIGEST_CONTEXT: &str = "vestige strata migration receipt v1";
+
+/// First frame of a fresh migration log: provenance for everything after it.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct MigrationMeta {
+pub struct GenesisRecord {
     pub record_version: u16,
     /// Source archive format identifier (expected `vestige.portable.v1`).
     pub archive_format: String,
@@ -46,6 +64,22 @@ pub struct MigrationMeta {
     pub vestige_version: String,
     /// SQLite schema version of the source database.
     pub schema_version: u32,
+}
+
+/// Second frame of a fresh migration log: the parameter set actually used.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct ParamsRecord {
+    pub record_version: u16,
+    /// Parameter set id (`v4-migrate/1`).
+    pub params_id: String,
+    /// Schema version of the migrated source.
+    pub schema_version: u32,
+    /// BLAKE3 hex of the source files (db, then `-wal`, then `-shm` in
+    /// canonical order) taken before any byte was read through SQL.
+    pub source_blake3: String,
+    /// `entry_digest` of the last verified `receipt_envelopes` row
+    /// (empty string when the source kept no envelopes).
+    pub envelope_head: String,
 }
 
 /// A migrated knowledge node. `kernel_id` is the dense 1-based STRATA
@@ -65,9 +99,10 @@ pub struct NodeRecord {
     pub last_accessed_ms: i64,
 }
 
-/// A migrated typed edge. `link_type` passes the legacy vocabulary through
-/// VERBATIM: vocabulary enforcement is an admission-time concern for NEW
-/// writes; migration must never rewrite or reject history.
+/// A migrated typed edge. Legacy link types are folded into the 8-type
+/// STRATA vocabulary: any `link_type` outside the vocabulary becomes
+/// `derived_from` with `legacy_inferred = 1` (H4: only the 8 types exist;
+/// migration never invents new edge semantics for inferred history).
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct EdgeRecord {
     pub record_version: u16,
@@ -75,8 +110,12 @@ pub struct EdgeRecord {
     pub target_kernel_id: u64,
     pub source_legacy_id: String,
     pub target_legacy_id: String,
-    /// Legacy link type, verbatim (semantic/temporal/…/user-defined).
+    /// STRATA vocabulary type (`derived_from` when rewritten from legacy).
     pub link_type: String,
+    /// True when `link_type` was rewritten from the legacy vocabulary.
+    pub legacy_inferred: bool,
+    /// Original legacy link type, kept for provenance only.
+    pub legacy_link_type: String,
     /// Edge strength quantized to Q32.32 (`strata_kernel::canonical`).
     pub strength_q32: i64,
     pub created_ms: i64,
@@ -115,9 +154,75 @@ pub struct SupersessionRecord {
     pub superseded_by_kernel_id: u64,
 }
 
-/// Decode a `KIND_MIGRATION_META` payload.
-pub fn decode_meta(payload: &[u8]) -> Result<MigrationMeta, borsh::io::Error> {
-    MigrationMeta::try_from_slice(payload)
+/// Body of the signed MIGRATION_RECEIPT. All collections are ordered Vecs
+/// (H6: no HashMap in hashed state); `counts` is sorted by table name.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct ReceiptBody {
+    pub record_version: u16,
+    /// BLAKE3 hex of the source files before the migration read them.
+    pub source_blake3_before: String,
+    /// BLAKE3 hex of the same files re-hashed after the migration; the
+    /// migrator refuses to seal a receipt whose before != after, so a
+    /// sealed receipt always carries equal values.
+    pub source_blake3_after: String,
+    /// Schema version of the migrated source.
+    pub schema_version: u32,
+    /// Last verified `receipt_envelopes` entry digest (empty = none).
+    pub envelope_head: String,
+    /// Source row counts per table, sorted by table name.
+    pub counts: Vec<(String, u64)>,
+    /// `node_embeddings` rows whose vector values were never read (H1:
+    /// vectors do not survive into STRATA; this counts what was dropped).
+    pub dropped_vectors: u64,
+    /// [`RECEIPT_SIGNING_KEY_ID`].
+    pub signing_key_id: String,
+}
+
+/// Wire form of frame kind 46: body plus its keyed-BLAKE3 digest.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct MigrationReceipt {
+    pub record_version: u16,
+    pub body: ReceiptBody,
+    /// blake3 derive_key([`RECEIPT_DIGEST_CONTEXT`], borsh(body)).
+    pub digest: [u8; 32],
+}
+
+impl MigrationReceipt {
+    /// Seal a body into a signed receipt.
+    pub fn seal(body: ReceiptBody) -> Self {
+        let bytes = borsh::to_vec(&body).expect("borsh encode receipt body");
+        let digest = receipt_digest(&bytes);
+        Self {
+            record_version: RECORD_VERSION,
+            body,
+            digest,
+        }
+    }
+
+    /// Verify the receipt's digest binds its body.
+    pub fn verify(&self) -> bool {
+        match borsh::to_vec(&self.body) {
+            Ok(bytes) => receipt_digest(&bytes) == self.digest,
+            Err(_) => false,
+        }
+    }
+}
+
+fn receipt_digest(body_bytes: &[u8]) -> [u8; 32] {
+    *blake3::Hasher::new_derive_key(RECEIPT_DIGEST_CONTEXT)
+        .update(body_bytes)
+        .finalize()
+        .as_bytes()
+}
+
+/// Decode a `KIND_GENESIS` payload.
+pub fn decode_genesis(payload: &[u8]) -> Result<GenesisRecord, borsh::io::Error> {
+    GenesisRecord::try_from_slice(payload)
+}
+
+/// Decode a `KIND_PARAMS` payload.
+pub fn decode_params(payload: &[u8]) -> Result<ParamsRecord, borsh::io::Error> {
+    ParamsRecord::try_from_slice(payload)
 }
 
 /// Decode a `KIND_NODE` payload.
@@ -148,4 +253,9 @@ pub fn decode_supersession(payload: &[u8]) -> Result<SupersessionRecord, borsh::
 /// Decode a `KIND_CHECKPOINT` payload (kernel wire type).
 pub fn decode_checkpoint(payload: &[u8]) -> Result<Checkpoint, borsh::io::Error> {
     Checkpoint::try_from_slice(payload)
+}
+
+/// Decode a `KIND_MIGRATION_RECEIPT` payload.
+pub fn decode_receipt(payload: &[u8]) -> Result<MigrationReceipt, borsh::io::Error> {
+    MigrationReceipt::try_from_slice(payload)
 }

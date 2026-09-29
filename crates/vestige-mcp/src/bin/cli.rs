@@ -176,6 +176,26 @@ enum Commands {
         output: PathBuf,
     },
 
+    /// Migrate a v3 SQLite store into a STRATA log (read-only over the source)
+    MigrateToStrata {
+        /// Path to the v3 SQLite database (or its data directory)
+        #[arg(long)]
+        from: PathBuf,
+
+        /// Destination STRATA directory (defaults to <data-dir>/strata)
+        #[arg(long)]
+        to: Option<PathBuf>,
+
+        /// Verify the source and report counts without writing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Migrate a source with a non-empty WAL from a consistent snapshot
+        /// copy (the original is still never modified)
+        #[arg(long)]
+        accept_wal_snapshot: bool,
+    },
+
     /// Export memories in JSON or JSONL format
     Export {
         /// Output file path
@@ -512,6 +532,12 @@ fn main() -> anyhow::Result<()> {
         },
         Commands::Restore { file } => run_restore(file),
         Commands::Backup { output } => run_backup(output),
+        Commands::MigrateToStrata {
+            from,
+            to,
+            dry_run,
+            accept_wal_snapshot,
+        } => run_migrate_to_strata(from, to, dry_run, accept_wal_snapshot),
         Commands::Export {
             output,
             format,
@@ -540,7 +566,15 @@ fn main() -> anyhow::Result<()> {
             ago_days,
             created_at,
             allow_secrets,
-        } => run_ingest(content, tags, node_type, source, ago_days, created_at, allow_secrets),
+        } => run_ingest(
+            content,
+            tags,
+            node_type,
+            source,
+            ago_days,
+            created_at,
+            allow_secrets,
+        ),
         Commands::IngestGit {
             path,
             since,
@@ -2330,6 +2364,74 @@ fn get_default_db_path() -> anyhow::Result<PathBuf> {
 }
 
 /// Open storage using the CLI-selected data directory, if one was provided.
+/// Read-only migration of a v3 SQLite store into a STRATA log. The source
+/// is never opened read-write, migrated in place, or modified in any way;
+/// its path and BLAKE3 are printed and keeping the file is recommended.
+fn run_migrate_to_strata(
+    from: PathBuf,
+    to: Option<PathBuf>,
+    dry_run: bool,
+    accept_wal_snapshot: bool,
+) -> anyhow::Result<()> {
+    let destination = match to {
+        Some(dir) => dir,
+        None => cli_db_path()?.with_file_name("strata"),
+    };
+    let options = strata_migrate::MigrateOptions {
+        dry_run,
+        accept_wal_snapshot,
+        seed: None,
+    };
+    let report = strata_migrate::migrate_with_options(&from, &destination, options)?;
+
+    println!("{}", "=== Vestige migrate-to-strata ===".cyan().bold());
+    println!(
+        "{} {} (keep this file; it is your pre-migration record)",
+        "Source (never modified):".bold(),
+        from.display()
+    );
+    if !report.source_blake3.is_empty() {
+        println!("{} {}", "Source BLAKE3:".bold(), report.source_blake3);
+    }
+    println!("{} {}", "Destination:".bold(), destination.display());
+    println!(
+        "{} {} nodes, {} edges, {} fsrs events",
+        "Migrated:".green().bold(),
+        report.nodes,
+        report.edges,
+        report.fsrs_events
+    );
+    if report.dropped_vectors > 0 {
+        println!(
+            "{} {} (vector values were never read)",
+            "Dropped vectors:".yellow().bold(),
+            report.dropped_vectors
+        );
+    }
+    if !report.skipped_tables.is_empty() {
+        println!(
+            "{} {}",
+            "Skipped tables (counted, not mapped):".bold(),
+            report.skipped_tables.join(", ")
+        );
+    }
+    if dry_run {
+        println!("Dry run: nothing was written.");
+        return Ok(());
+    }
+    println!(
+        "{} {} (signature verified: {})",
+        "MIGRATION_RECEIPT:".green().bold(),
+        report.receipt_digest.clone().unwrap_or_default(),
+        report.receipt_verified
+    );
+    println!("{} {}", "Replay verification:".bold(), report.verify_passed);
+    if !report.verify_passed || !report.receipt_verified {
+        anyhow::bail!("migration log failed verification");
+    }
+    Ok(())
+}
+
 fn open_storage() -> anyhow::Result<std::sync::Arc<Storage>> {
     if let Some(path) = CLI_DB_PATH.get() {
         Ok(vestige_core::open_storage(Some(path.clone()))?)
@@ -2460,7 +2562,10 @@ fn run_forgotten_lesson(
     let args = serde_json::json!({"failure_id": failure_id, "scope": scope});
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt
-        .block_on(vestige_mcp::tools::forgotten_lesson::execute(&storage, Some(args)))
+        .block_on(vestige_mcp::tools::forgotten_lesson::execute(
+            &storage,
+            Some(args),
+        ))
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // Machine-readable path: the raw tool payload, byte-for-byte the MCP shape.
@@ -2471,9 +2576,15 @@ fn run_forgotten_lesson(
 
     println!("{}", "=== Forgotten Lessons ===".cyan().bold());
     println!();
-    let lessons = result["forgotten_lessons"].as_array().cloned().unwrap_or_default();
+    let lessons = result["forgotten_lessons"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     if lessons.is_empty() {
-        println!("{}", "No decayed lesson shares an anchor with this failure.".dimmed());
+        println!(
+            "{}",
+            "No decayed lesson shares an anchor with this failure.".dimmed()
+        );
     } else {
         for lesson in &lessons {
             println!(
@@ -2490,8 +2601,7 @@ fn run_forgotten_lesson(
         println!();
         println!(
             "{}",
-            "Recorded fixes the store can no longer retrieve — review before relearning."
-                .dimmed()
+            "Recorded fixes the store can no longer retrieve — review before relearning.".dimmed()
         );
     }
     Ok(())
@@ -3378,7 +3488,8 @@ fn run_backfill(
                     "     {} ranked #{} on similarity {}",
                     "🔍".magenta(),
                     r,
-                    "(quiet on similarity at backfill time; association, not proven cause)".dimmed()
+                    "(quiet on similarity at backfill time; association, not proven cause)"
+                        .dimmed()
                 );
             }
             if c["promoted"] == serde_json::json!(true) {
@@ -3402,7 +3513,10 @@ fn run_backfill(
     }
     // strongest rejections, so a miss is explainable instead of silent
     if let Some(rejected) = result["rejected"].as_array().filter(|r| !r.is_empty()) {
-        println!("{}", "Rejected (top candidates that failed a rule):".white());
+        println!(
+            "{}",
+            "Rejected (top candidates that failed a rule):".white()
+        );
         for r in rejected {
             println!(
                 "  {} {} — {}",
@@ -3538,8 +3652,7 @@ fn run_causal_walk(
     }
 
     if promote && !result.causes.is_empty() {
-        let written =
-        cw::persist_evidence_edges(&*storage, &result).map_err(anyhow::Error::msg)?;
+        let written = cw::persist_evidence_edges(&*storage, &result).map_err(anyhow::Error::msg)?;
         println!(
             "{} {} evidence_of trail edge{} persisted",
             "→".magenta(),
@@ -3631,9 +3744,8 @@ fn run_ingest_git(
     if !out.status.success() {
         anyhow::bail!("git log failed: {}", String::from_utf8_lossy(&out.stderr));
     }
-    let commits = vestige_core::advanced::git_records::parse_git_log(&String::from_utf8_lossy(
-        &out.stdout,
-    ));
+    let commits =
+        vestige_core::advanced::git_records::parse_git_log(&String::from_utf8_lossy(&out.stdout));
 
     let storage = open_storage()?;
     let mut created = 0usize;
@@ -3998,10 +4110,9 @@ fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Re
             cog.hydrate(&storage);
         }
 
-        let (event_tx, _) =
-            tokio::sync::broadcast::channel::<vestige_mcp::dashboard::events::VestigeEvent>(
-                vestige_mcp::dashboard::state::EVENT_CHANNEL_CAPACITY,
-            );
+        let (event_tx, _) = tokio::sync::broadcast::channel::<
+            vestige_mcp::dashboard::events::VestigeEvent,
+        >(vestige_mcp::dashboard::state::EVENT_CHANNEL_CAPACITY);
 
         // Optionally start dashboard
         if with_dashboard {
