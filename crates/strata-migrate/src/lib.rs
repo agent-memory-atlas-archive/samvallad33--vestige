@@ -148,17 +148,15 @@ pub enum MigrationError {
     /// first break; nothing is written.
     #[error("broken receipt_envelopes hash chain: {0}")]
     BrokenEnvelopeChain(String),
-    /// The destination directory is not empty and holds no receipt for this
-    /// source. A killed run must be cleared by the operator, never extended.
-    #[error(
-        "destination {path} is not empty; a killed run must be removed by hand, never extended"
-    )]
+    /// The destination exists and is not a finished migration of this source.
+    /// Decided before any file is created in the destination.
+    #[error("destination {path} is not empty and is not a completed migration of this source")]
     DestinationNotEmpty {
         /// The refusing destination directory.
         path: String,
     },
-    /// The source's BLAKE3 changed while frames were being appended. The
-    /// log is incomplete; the destination is poisoned (further runs refuse).
+    /// The source's BLAKE3 changed while frames were being appended into
+    /// the staging directory. Staging is removed; the destination is untouched.
     #[error("source changed during migration (before {before}, after {after}); the destination log is incomplete and must not be trusted")]
     SourceTampered {
         /// BLAKE3 taken before the first read.
@@ -244,21 +242,9 @@ pub fn migrate_with_options(
         if options.dry_run {
             return Ok(dry_run_report(&snapshot, "", started));
         }
-        let destination_has_content = std::fs::read_dir(strata_dir)
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .any(|e| !e.file_name().to_string_lossy().starts_with('.'))
-            })
-            .unwrap_or(false);
-        if destination_has_content {
-            return Err(MigrationError::DestinationNotEmpty {
-                path: strata_dir.display().to_string(),
-            });
-        }
-        let log = open_log(strata_dir, options.seed, "")?;
-        let outcome = migrate_snapshot_into(&snapshot, &log, "")?;
-        return finish(log, strata_dir, outcome, snapshot, "", started);
+        // Portable archives have no source hash, so a finished log is not
+        // treated as an idempotent re-run of "this" source.
+        return stage_import(strata_dir, options.seed, "", false, snapshot, started, None);
     }
 
     // ---- hash BEFORE any SQL read --------------------------------------
@@ -271,57 +257,176 @@ pub fn migrate_with_options(
         return Ok(dry_run_report(&snapshot, &blake3_before, started));
     }
 
-    // ---- destination policy (audit: killed run + re-run doubled rows) ----
-    // Empty destination: proceed. Non-empty destination: idempotent no-op
-    // when the log already carries a MIGRATION_RECEIPT for THIS source
-    // (return it, write nothing); any other non-empty destination is an
-    // error — a killed run must be cleared by the operator, never extended.
-    std::fs::create_dir_all(strata_dir)?;
-    let destination_has_content = std::fs::read_dir(strata_dir)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .any(|e| !e.file_name().to_string_lossy().starts_with('.'))
-        })
-        .unwrap_or(false);
-    if destination_has_content {
-        let existing =
-            StrataLog::open(strata_dir).map_err(|e| MigrationError::Strata(e.to_string()))?;
-        if let Some(receipt) = existing_receipt_for(&existing, &blake3_before) {
-            return Ok(idempotent_report(&snapshot, &receipt, started));
-        }
-        return Err(MigrationError::DestinationNotEmpty {
-            path: strata_dir.display().to_string(),
-        });
-    }
-
-    // ---- replay ----------------------------------------------------------
-    let log = open_log(strata_dir, options.seed, &blake3_before)?;
-    let outcome = migrate_snapshot_into(&snapshot, &log, &blake3_before)?;
-
-    // ---- re-hash the source: a single changed byte stops the seal -------
-    let blake3_after = files.blake3_hex()?;
-    if blake3_before != blake3_after {
-        // Frames already landed; the log is incomplete and the destination
-        // policy above refuses any further run into this directory. Report
-        // as an error instead of panicking past the write (audit finding).
-        return Err(MigrationError::SourceTampered {
-            before: blake3_before,
-            after: blake3_after,
-        });
-    }
-
-    finish(log, strata_dir, outcome, snapshot, &blake3_after, started)
+    // Writes go to a sibling staging directory and land in `strata_dir`
+    // only via rename, after the source re-hash. A non-empty destination
+    // is classified by reading it, never by opening a log in it.
+    stage_import(
+        strata_dir,
+        options.seed,
+        &blake3_before,
+        true,
+        snapshot,
+        started,
+        Some(files),
+    )
 }
 
-/// A prior receipt covering exactly this source: the idempotent re-run path.
-fn existing_receipt_for(log: &StrataLog, source_blake3: &str) -> Option<records::MigrationReceipt> {
-    let frames = log.read_frames(1).ok()?;
-    frames
-        .iter()
-        .find(|f| f.kind == records::KIND_MIGRATION_RECEIPT)
-        .and_then(|f| records::decode_receipt(&f.payload).ok())
-        .filter(|r| r.body.source_blake3_before == source_blake3)
+/// Sibling of `dest` that holds the log until the rename.
+fn staging_path(dest: &Path) -> std::path::PathBuf {
+    let name = dest.file_name().unwrap_or(std::ffi::OsStr::new("strata"));
+    let mut staging_name = name.to_os_string();
+    staging_name.push(".strata-staging");
+    dest.with_file_name(staging_name)
+}
+
+/// True when `dir` contains anything other than dotfiles. A missing path
+/// is empty. A non-directory is occupied.
+fn destination_occupied(dir: &Path) -> Result<bool, MigrationError> {
+    if !dir.exists() {
+        return Ok(false);
+    }
+    if !dir.is_dir() {
+        return Ok(true);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with('.') {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Read a MIGRATION_RECEIPT for `source_blake3` without opening the log.
+/// Opening would create `strata.key` and, on a sealed tail, a new segment.
+fn receipt_matching(dir: &Path, source_blake3: &str) -> Option<records::MigrationReceipt> {
+    use borsh::BorshDeserialize;
+
+    if !dir.is_dir() {
+        return None;
+    }
+    let mut segs: Vec<_> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .collect();
+    segs.sort();
+    for path in segs {
+        let bytes = std::fs::read(&path).ok()?;
+        let mut cursor = bytes.as_slice();
+        if strata::SegmentHeader::deserialize_reader(&mut cursor).is_err() {
+            return None;
+        }
+        loop {
+            if cursor.is_empty() {
+                break;
+            }
+            let frame = match strata::Frame::deserialize_reader(&mut cursor) {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            if frame.kind != records::KIND_MIGRATION_RECEIPT {
+                continue;
+            }
+            if let Ok(receipt) = records::decode_receipt(&frame.payload) {
+                if receipt.body.source_blake3_before == source_blake3 {
+                    return Some(receipt);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Import into `dest` via `dest.strata-staging`, then rename.
+///
+/// `allow_idempotent` is set for SQLite sources, whose receipt is keyed by
+/// the source BLAKE3. Nothing is written to `dest` until every pre-check
+/// has passed. A leftover staging directory (SIGKILL) is removed and the
+/// import starts over.
+fn stage_import(
+    dest: &Path,
+    seed: Option<[u8; 32]>,
+    source_blake3: &str,
+    allow_idempotent: bool,
+    snapshot: source::SourceSnapshot,
+    started: Instant,
+    files: Option<source::SourceFiles>,
+) -> Result<MigrationReport, MigrationError> {
+    if destination_occupied(dest)? {
+        if allow_idempotent {
+            if let Some(receipt) = receipt_matching(dest, source_blake3) {
+                return Ok(idempotent_report(&snapshot, &receipt, started));
+            }
+        }
+        return Err(MigrationError::DestinationNotEmpty {
+            path: dest.display().to_string(),
+        });
+    }
+
+    let staging = staging_path(dest);
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    std::fs::create_dir_all(&staging)?;
+
+    let log = open_log(&staging, seed, source_blake3)?;
+    let outcome = match migrate_snapshot_into(&snapshot, &log, source_blake3) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            drop(log);
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(err);
+        }
+    };
+
+    // Test seam: the kill-mid-import test sets this so SIGKILL lands after
+    // frames are durable in staging and before the receipt is sealed.
+    if std::env::var_os("STRATA_MIGRATE_SIGKILL_WINDOW").is_some() {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    let sealed_hash = if let Some(files) = &files {
+        let blake3_after = files.blake3_hex()?;
+        if source_blake3 != blake3_after {
+            drop(log);
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(MigrationError::SourceTampered {
+                before: source_blake3.to_string(),
+                after: blake3_after,
+            });
+        }
+        blake3_after
+    } else {
+        source_blake3.to_string()
+    };
+
+    let report = match finish(log, &staging, outcome, snapshot, &sealed_hash, started) {
+        Ok(report) => report,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(err);
+        }
+    };
+    publish(&staging, dest)?;
+    Ok(report)
+}
+
+fn publish(staging: &Path, dest: &Path) -> Result<(), MigrationError> {
+    if dest.exists() {
+        // Occupancy ignores dotfiles. Keep them; the rename replaces the shell.
+        for entry in std::fs::read_dir(dest)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                std::fs::rename(entry.path(), staging.join(&name))?;
+            }
+        }
+        std::fs::remove_dir_all(dest)?;
+    }
+    std::fs::rename(staging, dest)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
