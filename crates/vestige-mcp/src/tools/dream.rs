@@ -85,7 +85,9 @@ pub async fn execute(
         .map(|n| vestige_core::DreamMemory {
             id: n.id.clone(),
             content: n.content.clone(),
-            embedding: storage.get_node_embedding(&n.id).ok().flatten(),
+            // w1b: vector embeddings removed; the dreamer's content-word
+            // similarity path is the only connection scorer left.
+            embedding: None,
             tags: n.tags.clone(),
             created_at: n.created_at,
             access_count: n.reps as u32,

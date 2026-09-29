@@ -23,7 +23,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::cognitive::CognitiveEngine;
 use vestige_core::{
-    ContentType, DEFAULT_MEMORY_SCOPE, ImportanceContext, IngestInput, SecretPolicy, Storage,
+    DEFAULT_MEMORY_SCOPE, ImportanceContext, IngestInput, SecretPolicy, Storage,
     StorageError, SynapticCapturePolicy, SynapticImportanceEvent, SynapticIngestRequest,
     SynapticSignalSnapshot, SynapticTag, SynapticTaggingConfig, scan_secrets,
 };
@@ -925,9 +925,6 @@ async fn execute_verbose(
             };
             tags.push(intent_tag);
         }
-
-        // 4D. Adaptive embedding — detect content type for logging
-        let _content_type = ContentType::detect(&content);
     }
 
     let input = IngestInput {
@@ -1096,9 +1093,6 @@ async fn execute_verbose(
                 _ => "Memory processed successfully"
             }
         });
-        if !has_embedding && let Some(warming) = super::warming::embedding_warming(storage) {
-            response["warming"] = warming;
-        }
         match &reinforcement {
             Some(outcome) => {
                 response["actor"] = crate::actor_surface::actor_block(&outcome.endorsement);
@@ -1480,8 +1474,6 @@ async fn execute_batch(
                 };
                 tags.push(intent_tag);
             }
-
-            let _content_type = ContentType::detect(&item.content);
         }
 
         let input = IngestInput {

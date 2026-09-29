@@ -610,10 +610,7 @@ fn pr_kind_phrase(kind: vestige_core::MemoryPrKind) -> &'static str {
 
 /// Tools whose output warrants a retrieval receipt.
 fn is_retrieval_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        "recall" | "deep_reference" | "cross_reference" | "search" | "explore_connections"
-    )
+    matches!(tool, "recall" | "deep_reference" | "cross_reference" | "search")
 }
 
 /// Process-private key used to prevent replay item digests from becoming a
@@ -702,21 +699,6 @@ fn final_returned_replay_evidence<'a>(
             .get("evidence")
             .and_then(Value::as_array)
             .map(|items| ("evidence", items)),
-        "explore_connections" => match result.get("action").and_then(Value::as_str) {
-            Some("chain") => result
-                .get("steps")
-                .and_then(Value::as_array)
-                .map(|items| ("steps", items)),
-            Some("associations") => result
-                .get("associations")
-                .and_then(Value::as_array)
-                .map(|items| ("associations", items)),
-            Some("bridges") => result
-                .get("bridges")
-                .and_then(Value::as_array)
-                .map(|items| ("bridges", items)),
-            _ => None,
-        },
         _ => None,
     };
 
@@ -824,12 +806,6 @@ fn replay_evidence_collection(tool: &str, result: &Value) -> Option<&'static str
         }
         "search" => Some("results"),
         "deep_reference" | "cross_reference" => Some("evidence"),
-        "explore_connections" => match result.get("action").and_then(Value::as_str) {
-            Some("chain") => Some("steps"),
-            Some("associations") => Some("associations"),
-            Some("bridges") => Some("bridges"),
-            _ => None,
-        },
         _ => None,
     }
 }

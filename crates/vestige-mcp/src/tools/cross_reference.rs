@@ -949,20 +949,9 @@ let mut results =
         })?;
 results.truncate(depth);
 
-#[cfg(feature = "vector-search")]
-let mut ranked = results;
-#[cfg(not(feature = "vector-search"))]
+// w1b: vector reranking was removed with the embedding runtime; the
+// keyword-order ranking from Stage 1 stands as the final ranking.
 let ranked = results;
-#[cfg(feature = "vector-search")]
-if let Ok(mut cog) = _cognitive.try_lock() {
-    let candidates: Vec<_> = ranked
-        .iter()
-        .map(|r| (r.clone(), r.node.content.clone()))
-        .collect();
-    if let Ok(reranked) = cog.reranker.rerank(&args.query, candidates, Some(depth)) {
-        ranked = reranked.into_iter().map(|rr| rr.item).collect();
-    }
-}
         Ok(ranked)
     }
 

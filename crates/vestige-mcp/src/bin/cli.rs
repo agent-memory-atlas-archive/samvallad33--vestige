@@ -11,7 +11,7 @@
 #[path = "../glibc_compat.rs"]
 mod glibc_compat;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -104,68 +104,6 @@ enum SandwichCommands {
     },
 }
 
-/// Explicit, reversible, profile-scoped local embedding lifecycle commands.
-#[derive(Subcommand)]
-enum EmbeddingCommands {
-    List {
-        #[arg(long)]
-        json: bool,
-    },
-    Status {
-        #[arg(long)]
-        json: bool,
-    },
-    Install {
-        profile: String,
-        #[arg(long, value_name = "DIR")]
-        from: Option<PathBuf>,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    Evaluate {
-        profile: String,
-        #[arg(long, value_name = "DIR")]
-        from: Option<PathBuf>,
-        #[arg(long, value_name = "DIR")]
-        fixture_dir: Option<PathBuf>,
-        #[arg(long, default_value = "active")]
-        against: String,
-        #[arg(long)]
-        json: bool,
-    },
-    Migrate {
-        #[arg(long)]
-        to: String,
-        #[arg(long, value_name = "DIR")]
-        from: Option<PathBuf>,
-        #[arg(long, value_name = "MIGRATION_ID")]
-        resume: Option<String>,
-        #[arg(long, value_name = "COUNT", hide = true)]
-        interrupt_after: Option<u64>,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    Activate {
-        profile: String,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    Rollback {
-        #[arg(long)]
-        to: String,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
 #[derive(Subcommand)]
 enum Commands {
     /// Show memory statistics
@@ -224,12 +162,6 @@ enum Commands {
     Sandwich {
         #[command(subcommand)]
         command: SandwichCommands,
-    },
-
-    /// Manage explicit, reversible local embedding profiles.
-    Embeddings {
-        #[command(subcommand)]
-        command: EmbeddingCommands,
     },
 
     /// Restore memories from backup file
@@ -467,9 +399,6 @@ enum Commands {
         /// How many memories to analyze (candidate depth)
         #[arg(long, default_value = "20")]
         depth: i64,
-        /// Rehydrate an active Qwen profile from this verified local artifact directory.
-        #[arg(long, value_name = "DIR")]
-        embedding_from: Option<PathBuf>,
         /// Output raw JSON instead of the human-readable summary
         #[arg(long)]
         json: bool,
@@ -581,7 +510,6 @@ fn main() -> anyhow::Result<()> {
                 run_sandwich_install(version.as_deref(), &options)
             }
         },
-        Commands::Embeddings { command } => run_embeddings(command),
         Commands::Restore { file } => run_restore(file),
         Commands::Backup { output } => run_backup(output),
         Commands::Export {
@@ -673,12 +601,7 @@ fn main() -> anyhow::Result<()> {
             scope,
             json,
         ),
-        Commands::Recall {
-            query,
-            depth,
-            embedding_from,
-            json,
-        } => run_recall(query, depth, embedding_from, json),
+        Commands::Recall { query, depth, json } => run_recall(query, depth, json),
         Commands::Compose { limit, tags, json } => run_compose(limit, tags, json),
         Commands::Project {
             out,
@@ -701,348 +624,6 @@ fn main() -> anyhow::Result<()> {
             json,
         } => run_forgotten_lesson(failure_id, scope, json),
     }
-}
-
-fn run_embeddings(command: EmbeddingCommands) -> anyhow::Result<()> {
-    match command {
-        EmbeddingCommands::List { json } => run_embeddings_list(json),
-        EmbeddingCommands::Status { json } => run_embeddings_status(json),
-        EmbeddingCommands::Install {
-            profile,
-            from,
-            yes,
-            json,
-        } => run_embeddings_install(profile, from, yes, json),
-        EmbeddingCommands::Evaluate {
-            profile,
-            from,
-            fixture_dir,
-            against,
-            json,
-        } => run_embeddings_evaluate(profile, from, fixture_dir, against, json),
-        EmbeddingCommands::Migrate {
-            to,
-            from,
-            resume,
-            interrupt_after,
-            yes,
-            json,
-        } => run_embeddings_migrate(to, from, resume, interrupt_after, yes, json),
-        EmbeddingCommands::Activate { profile, yes, json } => {
-            run_embeddings_activate(profile, yes, json)
-        }
-        EmbeddingCommands::Rollback { to, yes, json } => run_embeddings_rollback(to, yes, json),
-    }
-}
-
-fn print_embedding_json(value: &serde_json::Value) -> anyhow::Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
-}
-
-fn resolve_embedding_profile_id(profile: &str) -> anyhow::Result<vestige_core::EmbeddingProfileId> {
-    vestige_core::EmbeddingProfileId::new(profile.to_string())
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
-}
-
-fn builtin_embedding_profile(profile: &str) -> anyhow::Result<vestige_core::EmbeddingProfile> {
-    vestige_core::builtin_embedding_profile_by_id(profile).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown embedding profile '{}'. Run `vestige embeddings list` for exact profile IDs.",
-            profile
-        )
-    })
-}
-
-/// Accept only an operator-provided, already-downloaded artifact directory.
-/// The path is used for this invocation only and is never persisted.
-fn require_embedding_artifact_root(from: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    let source = from.ok_or_else(|| {
-        anyhow::anyhow!(
-            "refusing network model access: pass --from DIR containing already-downloaded, pinned model artifacts"
-        )
-    })?;
-    if !source.is_dir() {
-        anyhow::bail!(
-            "local artifact directory does not exist or is not a directory: {}",
-            source.display()
-        );
-    }
-    Ok(source)
-}
-
-fn require_embedding_confirmation(yes: bool, action: &str, profile: &str) -> anyhow::Result<()> {
-    if yes {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "{} for '{}' requires explicit confirmation. Rerun with --yes. No profile state changed.",
-        action,
-        profile
-    );
-}
-
-fn default_embedding_eval_fixture_dir() -> anyhow::Result<PathBuf> {
-    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("benchmarks")
-        .join("agent-memory-eval")
-        .join("fixtures")
-        .join("v1");
-    if !directory.is_dir() {
-        anyhow::bail!(
-            "Agent Memory Eval fixtures are unavailable; pass --fixture-dir DIR with the pinned evaluation corpus"
-        );
-    }
-    Ok(directory)
-}
-
-fn run_embeddings_list(json: bool) -> anyhow::Result<()> {
-    let storage = open_storage()?;
-    let manifests = storage.list_embedding_profile_manifests()?;
-    let by_id: HashMap<String, vestige_core::EmbeddingProfileManifest> = manifests
-        .into_iter()
-        .map(|manifest| (manifest.profile.profile_id.to_string(), manifest))
-        .collect();
-    let profiles = vestige_core::builtin_embedding_profiles();
-    if json {
-        return print_embedding_json(
-            &serde_json::json!({"command":"embeddings.list", "profiles": profiles.iter().map(|profile| serde_json::json!({"profile":profile,"manifest":by_id.get(profile.profile_id.as_str())})).collect::<Vec<_>>(), "localOnly":true}),
-        );
-    }
-    for profile in profiles {
-        println!(
-            "{}  {}",
-            profile.profile_id,
-            by_id
-                .get(profile.profile_id.as_str())
-                .map(|manifest| format!("{:?}", manifest.state))
-                .unwrap_or_else(|| "NotInstalled".to_string())
-        );
-    }
-    Ok(())
-}
-
-fn run_embeddings_status(json: bool) -> anyhow::Result<()> {
-    let storage = open_storage()?;
-    let active = storage.active_embedding_profile()?;
-    let profiles = storage.list_embedding_profile_manifests()?;
-    if json {
-        return print_embedding_json(
-            &serde_json::json!({"command":"embeddings.status","activeProfile":active,"profiles":profiles,"localOnly":true}),
-        );
-    }
-    println!(
-        "Active profile: {}",
-        active
-            .map(|profile| profile.profile_id.to_string())
-            .unwrap_or_else(|| "none".to_string())
-    );
-    Ok(())
-}
-
-fn run_embeddings_install(
-    profile_id: String,
-    from: Option<PathBuf>,
-    yes: bool,
-    json: bool,
-) -> anyhow::Result<()> {
-    require_embedding_confirmation(yes, "Embedding profile installation", &profile_id)?;
-    let profile = builtin_embedding_profile(&profile_id)?;
-    // Route by what the profile contract actually requires, not by backend
-    // alone: FastembedOnnx covers both the released catalogue Nomic profile
-    // (no artifacts, not installable here) and artifact-pinned user-defined
-    // models like Granite (installable from a verified local directory).
-    let uses_local_artifacts = !profile.verified_model_artifact_hashes.is_empty();
-    if !uses_local_artifacts {
-        anyhow::bail!(
-            "'{}' is the released legacy Nomic profile and is not installable through the local-artifact workflow.\n\
-             Nomic is the built-in runtime, so it needs no install: a store on the legacy profile is repaired \
-             automatically when the MCP server starts (v1.x raw-768 vectors are Matryoshka-truncated to 256, \
-             issue #191) and any missing vectors are filled by the server's background backfill.\n\
-             `embeddings migrate --to <profile>` only accepts installed local-artifact profiles; \
-             run `vestige-cli embeddings list` to see legal targets, and `vestige-cli upgrade --dry-run` \
-             to rehearse an upgrade on a copy first.",
-            profile_id
-        );
-    }
-    let source = require_embedding_artifact_root(from)?;
-    let storage = open_storage()?;
-    let lifecycle = vestige_core::EmbeddingProfileLifecycle::new(&storage);
-    let manifest = match profile.runtime_backend {
-        vestige_core::EmbeddingRuntimeBackend::FastembedCandle => lifecycle
-            .install_qwen3_local(profile, &source)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
-        vestige_core::EmbeddingRuntimeBackend::FastembedOnnx => lifecycle
-            .install_granite_onnx(profile, &source)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
-    };
-    if json {
-        return print_embedding_json(
-            &serde_json::json!({"command":"embeddings.install","profile":manifest.profile.profile_id,"manifest":manifest,"activeProfileUnchanged":true,"localOnly":true}),
-        );
-    }
-    println!(
-        "Installed and verified '{}' locally. Retrieval remains unchanged.",
-        profile_id
-    );
-    Ok(())
-}
-
-fn run_embeddings_evaluate(
-    profile_id: String,
-    from: Option<PathBuf>,
-    fixture_dir: Option<PathBuf>,
-    against: String,
-    json: bool,
-) -> anyhow::Result<()> {
-    let storage = open_storage()?;
-    let profile = builtin_embedding_profile(&profile_id)?;
-    let source = require_embedding_artifact_root(from)?;
-    let fixture_dir = match fixture_dir {
-        Some(directory) if directory.is_dir() => directory,
-        Some(directory) => anyhow::bail!(
-            "Agent Memory Eval fixture directory does not exist: {}",
-            directory.display()
-        ),
-        None => default_embedding_eval_fixture_dir()?,
-    };
-    let baseline = if against == "active" {
-        storage
-            .active_embedding_profile()?
-            .ok_or_else(|| anyhow::anyhow!("no active embedding profile is configured"))?
-            .profile_id
-    } else {
-        resolve_embedding_profile_id(&against)?
-    };
-    if storage
-        .embedding_profile_manifest(&profile.profile_id)?
-        .is_none()
-    {
-        anyhow::bail!(
-            "'{}' is not installed. Install and hash-verify it before evaluation.",
-            profile_id
-        );
-    }
-    let lifecycle = vestige_core::EmbeddingProfileLifecycle::new(&storage);
-    let receipt = lifecycle
-        .evaluate_qwen3_local(
-            &profile.profile_id,
-            &source,
-            &fixture_dir,
-            baseline.clone(),
-            false,
-        )
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    if json {
-        return print_embedding_json(
-            &serde_json::json!({"command":"embeddings.evaluate","profile":profile.profile_id,"baselineProfile":baseline,"baselineAvailable":false,"receipt":receipt,"activeProfileUnchanged":true}),
-        );
-    }
-    println!("Evaluated '{}'. Retrieval remains unchanged.", profile_id);
-    Ok(())
-}
-
-fn run_embeddings_migrate(
-    destination: String,
-    from: Option<PathBuf>,
-    resume: Option<String>,
-    interrupt_after: Option<u64>,
-    yes: bool,
-    json: bool,
-) -> anyhow::Result<()> {
-    require_embedding_confirmation(yes, "Embedding profile migration", &destination)?;
-    let artifact_root = require_embedding_artifact_root(from)?;
-    let storage = open_storage()?;
-    let destination_id = resolve_embedding_profile_id(&destination)?;
-    let source = storage
-        .active_embedding_profile()?
-        .ok_or_else(|| anyhow::anyhow!("no active profile is available as a migration source"))?;
-    let migration_id = resume
-        .map(|value| {
-            uuid::Uuid::parse_str(&value).map_err(|error| {
-                anyhow::anyhow!("invalid --resume migration ID '{}': {}", value, error)
-            })
-        })
-        .transpose()?;
-    let lifecycle = vestige_core::EmbeddingProfileLifecycle::new(&storage);
-    let destination_backend = builtin_embedding_profile(destination_id.as_str())
-        .map(|profile| profile.runtime_backend)
-        .unwrap_or(vestige_core::EmbeddingRuntimeBackend::FastembedCandle);
-    let migration = match destination_backend {
-        vestige_core::EmbeddingRuntimeBackend::FastembedOnnx => lifecycle.migrate_granite_onnx(
-            &destination_id,
-            &source.profile_id,
-            &artifact_root,
-            migration_id,
-            interrupt_after,
-        ),
-        vestige_core::EmbeddingRuntimeBackend::FastembedCandle => lifecycle.migrate_qwen3_local(
-            &destination_id,
-            &source.profile_id,
-            &artifact_root,
-            migration_id,
-            interrupt_after,
-        ),
-    };
-    match migration {
-        Ok(receipt) => {
-            if json {
-                return print_embedding_json(
-                    &serde_json::json!({"command":"embeddings.migrate","destinationProfile":destination_id,"sourceProfile":source.profile_id,"receipt":receipt,"activeProfileUnchanged":true}),
-                );
-            }
-            println!(
-                "Migration '{}' completed. Retrieval remains unchanged.",
-                receipt.migration_id
-            );
-            Ok(())
-        }
-        Err(vestige_core::EmbeddingLifecycleError::Interrupted {
-            migration_id,
-            completed,
-        }) => {
-            let checkpoint = storage.profile_migration_checkpoint(migration_id)?;
-            if json {
-                print_embedding_json(
-                    &serde_json::json!({"command":"embeddings.migrate","receipt":{"migrationId":migration_id,"state":"paused","newlyCompletedMemories":completed,"checkpoint":checkpoint,"activeProfileUnchanged":true}}),
-                )?;
-            }
-            anyhow::bail!(
-                "migration '{}' paused safely; resume with --resume {}",
-                migration_id,
-                migration_id
-            )
-        }
-        Err(error) => Err(anyhow::anyhow!(error.to_string())),
-    }
-}
-
-fn run_embeddings_activate(profile: String, yes: bool, json: bool) -> anyhow::Result<()> {
-    require_embedding_confirmation(yes, "Embedding profile activation", &profile)?;
-    let storage = open_storage()?;
-    let active = storage.activate_embedding_profile(&resolve_embedding_profile_id(&profile)?)?;
-    if json {
-        return print_embedding_json(
-            &serde_json::json!({"command":"embeddings.activate","activeProfile":active,"atomic":true}),
-        );
-    }
-    println!("Activated '{}' atomically.", active.profile_id);
-    Ok(())
-}
-
-fn run_embeddings_rollback(destination: String, yes: bool, json: bool) -> anyhow::Result<()> {
-    require_embedding_confirmation(yes, "Embedding profile rollback", &destination)?;
-    let storage = open_storage()?;
-    let active =
-        storage.rollback_embedding_profile(&resolve_embedding_profile_id(&destination)?)?;
-    if json {
-        return print_embedding_json(
-            &serde_json::json!({"command":"embeddings.rollback","activeProfile":active,"atomic":true}),
-        );
-    }
-    println!("Rolled back atomically to '{}'.", active.profile_id);
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2321,20 +1902,13 @@ fn run_health() -> anyhow::Result<()> {
         "Active Embedding Coverage".white(),
         embedding_coverage
     );
-    // The CLI never starts an embedding runtime; the MCP server owns it. Saying
-    // "Not Ready" here read as a store-health verdict (issue #191) when it was
-    // only a statement about this process.
+    // w1b: the embedding runtime was removed; keyword search is the only
+    // engine. Saying anything else here would read as a store-health verdict
+    // (issue #191) when it is a statement about the build.
     println!(
         "{}: {}",
         "Embedding Service".white(),
-        if !vestige_mcp::embeddings_compiled_in() {
-            "not compiled into this build (built without embeddings: keyword search only)".yellow()
-        } else if storage.is_embedding_ready() {
-            "Ready".green()
-        } else {
-            "not started by the CLI (the MCP server runs the embedder; not a store-health verdict)"
-                .yellow()
-        }
+        "removed from this build (keyword search only)".yellow()
     );
 
     // Warnings
@@ -2427,10 +2001,6 @@ fn run_health() -> anyhow::Result<()> {
 }
 
 /// Run consolidation cycle
-/// Mirrors `vestige_core::storage::sqlite::LEGACY_EMBEDDING_PROFILE_ID`; the
-/// id is frozen by definition (it names a released, immutable profile).
-const LEGACY_NOMIC_PROFILE_ID: &str = "nomic-v1.5-legacy-raw-256";
-
 /// The database this CLI invocation targets (`--data-dir` wins, then the
 /// platform default).
 fn cli_db_path() -> anyhow::Result<PathBuf> {
@@ -2509,36 +2079,6 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
                 .map(|version| version.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         );
-        let mismatched: Vec<(String, i64, i64)> = preflight
-            .prepare(
-                "SELECT p.profile_id, p.embedding_dimension, COUNT(v.node_id) \
-                 FROM embedding_profiles p \
-                 JOIN embedding_profile_vectors v ON v.profile_id = p.profile_id \
-                 WHERE v.dimensions <> p.embedding_dimension \
-                    OR length(v.embedding) <> p.embedding_dimension * 4 \
-                 GROUP BY p.profile_id",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .unwrap_or_default();
-        if mismatched.is_empty() {
-            println!("Embedding profiles: no vector/dimension mismatches on disk");
-        } else {
-            for (profile, declared, count) in &mismatched {
-                let verdict = if profile == LEGACY_NOMIC_PROFILE_ID {
-                    "repaired automatically on open (Matryoshka-truncated, issue #191)".green()
-                } else {
-                    "hard error on open (pinned profile; re-embed before upgrading)".red()
-                };
-                println!(
-                    "Embedding profile '{}': {} vectors disagree with the declared {} dims -> {}",
-                    profile, count, declared, verdict
-                );
-            }
-        }
     }
     println!();
 
@@ -2606,15 +2146,11 @@ fn run_consolidate() -> anyhow::Result<()> {
         result.embeddings_generated
     );
     println!("{}: {}ms", "Duration".white().bold(), result.duration_ms);
-    if result.embeddings_generated == 0 && !storage.is_embedding_ready() {
+    if result.embeddings_generated == 0 {
+        // w1b: the embedding runtime was removed; there are no vectors to generate.
         println!(
             "  {}",
-            if vestige_mcp::embeddings_compiled_in() {
-                "(the CLI runs without an embedding runtime; missing vectors are generated by the MCP server's background backfill on its next start)"
-            } else {
-                "(this build has no embedding runtime, so there are no vectors to generate)"
-            }
-            .yellow()
+            "(this build has no embedding runtime, so there are no vectors to generate)".yellow()
         );
     }
 
@@ -3517,70 +3053,6 @@ fn run_ingest(
         SecretPolicy::Reject
     };
 
-    // Warm up the embedding model so smart_ingest's is_ready() gate passes and
-    // real vector search runs (instead of silently falling back to keyword-only
-    // regular ingest). is_ready() is side-effect free by design, so a fresh CLI
-    // process must init explicitly. Non-fatal: fall back to keyword on failure.
-    #[cfg(feature = "embeddings")]
-    {
-        if let Err(e) = storage.init_embeddings() {
-            eprintln!(
-                "  {} Embeddings unavailable: {} (ingest will use keyword-only)",
-                "!".yellow(),
-                e
-            );
-        }
-    }
-
-    // Try smart_ingest (PE Gating) if available, otherwise regular ingest
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-    {
-        let result = storage.smart_ingest_with_secret_policy(input, secret_policy)?;
-        if let Some(days) = ago_days {
-            // Duration::days panics on overflow for extreme inputs; try_days
-            // returns None instead. The subtraction itself can ALSO overflow the
-            // DateTime range, so use checked_sub_signed rather than `-` (which
-            // panics). Both the construction and the subtraction are guarded.
-            let delta = chrono::Duration::try_days(days).ok_or_else(|| {
-                anyhow::anyhow!("--ago-days value {days} is out of the supported range")
-            })?;
-            let when = chrono::Utc::now()
-                .checked_sub_signed(delta)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("--ago-days value {days} is out of the supported range")
-                })?;
-            storage.set_created_at(&result.node.id, when)?;
-        }
-        if let Some(when) = created_at_ts {
-            storage.set_created_at(&result.node.id, when)?;
-        }
-        println!("{}", "=== Vestige Ingest ===".cyan().bold());
-        println!();
-        println!("{}: {}", "Decision".white().bold(), result.decision.green());
-        println!("{}: {}", "Node ID".white().bold(), result.node.id);
-        if let Some(sim) = result.similarity {
-            println!("{}: {:.3}", "Similarity".white().bold(), sim);
-        }
-        if let Some(pe) = result.prediction_error {
-            println!("{}: {:.3}", "Prediction Error".white().bold(), pe);
-        }
-        if let Some(days) = ago_days {
-            println!("{}: {} days ago", "Backdated".white().bold(), days);
-        }
-        println!("{}: {}", "Reason".white().bold(), result.reason);
-        println!();
-        let confirmation = if allow_secrets {
-            format!(
-                "Memory {} with explicit credential override (content redacted)",
-                result.decision
-            )
-        } else {
-            format!("Memory {} ({})", result.decision, truncate(&content, 60))
-        };
-        println!("{}", confirmation.green().bold());
-    }
-
-    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
     {
         let node = storage.ingest_with_secret_policy(input, secret_policy)?;
         if let Some(days) = ago_days {
@@ -3746,10 +3218,6 @@ fn run_backfill(
     why_not: Option<String>,
 ) -> anyhow::Result<()> {
     let storage = std::sync::Arc::new(open_storage()?);
-    #[cfg(feature = "embeddings")]
-    {
-        let _ = storage.init_embeddings();
-    }
 
     // Resolve the failure text up front (used by the contrast baseline).
     // Use the SAME failure detector the backfill tool uses (content + tags, full
@@ -3769,8 +3237,7 @@ fn run_backfill(
 
     // CONTRAST: show what a SIMILARITY SEARCH returns for the failure first — the
     // lookalike it ranks at the top, which is NOT the cause. Same store, same
-    // query. Uses semantic (hybrid) search when embeddings exist, else keyword
-    // search — either way it ranks by RESEMBLANCE, which is exactly the blind spot.
+    // query. Keyword search ranks by RESEMBLANCE, which is exactly the blind spot.
     if contrast && let Some(ftext) = &failure_text {
         // Generic salient-words query: keep alphanumerics, drop a leading
         // "<word>:" label if present (e.g. "Service crashed:"). No hardcoding.
@@ -3779,28 +3246,10 @@ fn run_backfill(
             _ => ftext.as_str(),
         };
 
-        // Track which engine ACTUALLY ran so the label is honest (the audit's
-        // top finding: never present keyword search as "semantic"). A build
-        // without embeddings has exactly one engine, so it never needs to mutate.
-        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+        // w1b: keyword-only. The engine label stays explicit so the contrast
+        // never presents lexical resemblance as semantic ranking (the audit's
+        // top finding: never present keyword search as "semantic").
         let engine = "keyword (BM25)";
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        let engine = {
-            let mut engine = "keyword (BM25)";
-            if storage.is_embedding_ready()
-                && let Ok(hits) = storage.hybrid_search(query, 6, 0.3, 0.7)
-            {
-                let others: Vec<_> = hits
-                    .iter()
-                    .filter(|h| h.node.content != *ftext)
-                    .take(3)
-                    .collect();
-                if !others.is_empty() {
-                    engine = "semantic (vector + BM25 hybrid)";
-                }
-            }
-            engine
-        };
         let mut shown = false;
         println!(
             "{}",
@@ -3811,32 +3260,7 @@ fn run_backfill(
         println!("   query: {}", truncate(query, 60).dimmed());
 
         // best OTHER match (exclude the failure itself, which trivially matches).
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        {
-            if storage.is_embedding_ready()
-                && let Ok(hits) = storage.hybrid_search(query, 6, 0.3, 0.7)
-            {
-                let others: Vec<_> = hits
-                    .iter()
-                    .filter(|h| h.node.content != *ftext)
-                    .take(3)
-                    .collect();
-                for (i, h) in others.iter().enumerate() {
-                    let tag = if i == 0 {
-                        " ← top match".red().bold().to_string()
-                    } else {
-                        String::new()
-                    };
-                    println!(
-                        "   {}. {}{}",
-                        i + 1,
-                        truncate(&h.node.content, 60).normal(),
-                        tag
-                    );
-                    shown = true;
-                }
-            }
-        }
+        // keyword/BM25 — ranks by lexical resemblance.
         if !shown {
             // keyword/BM25 (always works) — still ranks by lexical resemblance.
             if let Ok(hits) = storage.search(query, 6) {
@@ -4277,69 +3701,10 @@ fn run_ingest_git(
 }
 
 /// Recall + reason across memories using the real deep_reference engine.
-fn run_recall(
-    query: String,
-    depth: i64,
-    embedding_from: Option<PathBuf>,
-    json: bool,
-) -> anyhow::Result<()> {
+fn run_recall(query: String, depth: i64, json: bool) -> anyhow::Result<()> {
     use vestige_mcp::cognitive::CognitiveEngine;
 
     let storage = open_storage()?;
-    // The public JSON result must name the profile that was active when the
-    // recall began. This makes profile-lifecycle E2E evidence auditable even
-    // if an independent process changes the active pointer immediately after
-    // this command returns.
-    let active_embedding_profile = storage.active_embedding_profile()?;
-    if let Some(active) = &active_embedding_profile {
-        let manifest = storage
-            .embedding_profile_manifest(&active.profile_id)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "active embedding profile '{}' has no persisted profile manifest",
-                    active.profile_id
-                )
-            })?;
-        match manifest.profile.runtime_backend {
-            vestige_core::EmbeddingRuntimeBackend::FastembedOnnx
-                if manifest.profile.verified_model_artifact_hashes.is_empty() =>
-            {
-                if embedding_from.is_some() {
-                    anyhow::bail!(
-                        "--embedding-from is only valid for a local-artifact profile; '{}' uses the Nomic catalogue runtime",
-                        active.profile_id
-                    );
-                }
-            }
-            vestige_core::EmbeddingRuntimeBackend::FastembedOnnx => {
-                let artifact_root = require_embedding_artifact_root(embedding_from)?;
-                let lifecycle = vestige_core::EmbeddingProfileLifecycle::new(&storage);
-                lifecycle
-                    .attach_active_granite_onnx(&artifact_root)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "cannot execute recall for active profile '{}': {}",
-                            active.profile_id,
-                            error
-                        )
-                    })?;
-            }
-            vestige_core::EmbeddingRuntimeBackend::FastembedCandle => {
-                let artifact_root = require_embedding_artifact_root(embedding_from)?;
-                let lifecycle = vestige_core::EmbeddingProfileLifecycle::new(&storage);
-                lifecycle
-                    .attach_active_qwen3_local(&artifact_root)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "cannot execute recall for active profile '{}': {}",
-                            active.profile_id,
-                            error
-                        )
-                    })?;
-            }
-        }
-    }
-
     let storage = Arc::new(storage);
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -4353,22 +3718,9 @@ fn run_recall(
         vestige_mcp::tools::cross_reference::execute(&storage, &cognitive, Some(args)).await
     });
 
-    let mut value = result.map_err(|e| anyhow::anyhow!("recall error: {}", e))?;
+    let value = result.map_err(|e| anyhow::anyhow!("recall error: {}", e))?;
 
     if json {
-        if let Some(object) = value.as_object_mut() {
-            object.insert(
-                "active_profile_id".to_string(),
-                active_embedding_profile
-                    .as_ref()
-                    .map(|profile| serde_json::Value::String(profile.profile_id.to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            object.insert(
-                "active_embedding_profile".to_string(),
-                serde_json::to_value(active_embedding_profile)?,
-            );
-        }
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }

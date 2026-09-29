@@ -1,45 +1,78 @@
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
 # SCOPE-HANDOFF — build/w2b-edge-schema (typed edge vocabulary)
 
-Branch `build/w2b-edge-schema`, base `main @ 5fbe1df`. Storage layer only;
-`tools/mcp` untouched. This file lists the exact interfaces other agents
-build against.
+# SCOPE-HANDOFF — build/w1d-absorb (vestige-mcp cleanup after core vector removal)
 
-## Migration
+Branch: `build/w1d-absorb` (off main tip ba94298). Scope: `crates/vestige-mcp`
+only; vestige-core untouched. Committed locally; nothing pushed.
+(Replaces the w2b-edge-schema handoff that was already merged at 45cd598.)
 
-**V39** (`crates/vestige-core/src/storage/migrations.rs`), schema version
-bumped 38 → 39. Non-destructive; existing rows keep NULL for the new columns:
+## Status
 
-- `memory_connections.edge_meta TEXT` — JSON payload `{"sha","span","run_id"}`
-- `memory_connections.created_by_run TEXT` — run provenance
-- `idx_connections_type_target` on `(link_type, target_id)`
-- new table `purge_tombstones(purged_id PK, purged_at, reason, prior_content_hash)`
-  (+ `idx_purge_tombstones_purged_at`)
+- `cargo check -p vestige-mcp` — 0 errors, 0 warnings for vestige-mcp
+  (1 remaining warning is vestige-core's dead `EmbeddingProfileMigrationRow`
+  alias, out of scope).
+- `cargo test -p vestige-mcp --lib` — 760 passed, 0 failed.
+- `cargo clippy -p vestige-mcp --all-targets` — clean for vestige-mcp
+  (remaining warnings are all in vestige-core).
 
-Vocabulary validation is app-level by design — no CHECK constraint, so legacy
-link types (`semantic`, `temporal`, ...) still validate through
-`save_connection`. `knowledge_nodes.superseded_by` (V14) was NOT migrated;
-`supersedes` exists only as an edge type.
+## Error classes fixed (37 lib errors + test-target fallout)
 
-## Public API — `vestige_core::storage` (new re-exports)
+1. `cognitive.rs` — removed `AdaptiveEmbedder` and `Reranker` import/field/init
+   (cfg'd reranker arm included); `COGNITIVE_MODULE_COUNT` now 16+10 (+1
+   vector-search-gated TemporalSearcher, which still exists in core); test
+   updated.
+2. `dashboard/handlers.rs` — deleted the entire embedding-profile section
+   (6 handlers, request type, snapshot/receipt helpers, ~420 lines) and their
+   6 routes in `dashboard/mod.rs`; dream builder now `embedding: None`.
+3. `tools/smart_ingest.rs` — removed `ContentType` import + both
+   `ContentType::detect` calls + the `warming` response block.
+4. `tools/dream.rs` — `embedding: None` (content-word similarity path stays).
+5. `resources/memory.rs` — `embeddingServiceReady` stubbed `false`.
+6. `src/main.rs` — removed the cfg'd embeddings init block
+   (embedding_model_cached / init_embeddings / generate_embeddings) and the
+   cross-encoder reranker load block (Reranker::load_cross_encoder); stale
+   comments updated.
+7. `bin/cli.rs` — deleted the `embeddings` subcommand tree (EmbeddingCommands,
+   dispatch, run_embeddings_* helpers, artifact-root/confirmation helpers), the
+   `--embedding-from` Recall flag and its profile-attach logic, the
+   `LEGACY_NOMIC_PROFILE_ID` preflight SQL, and all `is_embedding_ready` uses;
+   backfill contrast mode and `vestige ingest` are keyword-only (cfg'd semantic
+   branches removed); run_consolidate note simplified.
+8. Deleted `tools/context.rs` (match_context) and `tools/warming.rs`
+   (+ mod entries, server.rs dispatch arm, warming response blocks in
+   search_unified/smart_ingest, their tests).
+9. `server.rs` — removed the `explore_connections` hidden-alias dispatch arm
+   (graph tool + graph_unified's internal use of explore stay); removed its
+   three trace_recorder entries (is_retrieval_tool + two evidence maps).
+10. Remaining `hybrid_search(_filtered)` call sites compile against core's
+    keyword-only implementations — no mcp-side change needed.
+- `tools/search_unified.rs` — fixed E0382 duplicate `rerank_candidates` move
+  (leftover double `reranked_results` binding).
+- `tools/cross_reference.rs` — removed the cfg'd reranker block in
+  `retrieve_and_rank_candidates`.
+- `tools/maintenance.rs` — `embeddingReady: false`; consolidate phase
+  "embeddings" arm removed; maintain schema enum/error text updated.
+- `Cargo.toml` — declared `embeddings = []` / `vector-search = []` as always-off
+  stubs (mirrors core's stub) so legacy cfg sites don't trip `unexpected_cfgs`
+  (78 → 0 warnings).
 
-Types: `EdgeKind`, `EdgeDirection`, `EdgeMeta`, `TypedEdge`, `PurgeTombstone`,
-`TYPED_EDGE_VOCABULARY`. New error variant
-`StorageError::InvalidEdge(String)` (maps to
-`MemoryStoreError::InvalidInput`).
+## Test fallout fixed
 
-```rust
-pub const TYPED_EDGE_VOCABULARY: &[&str] = &[
-    "touched", "anchored_to", "derived_from", "supersedes", "corrects",
-    "closed_by", "projected_to", "evidence_of",
-];
+- Deleted 5 embedding-profile handler tests + test-mod imports in handlers.rs.
+- `maintain.rs`: embeddings-phase test rewritten as
+  `bounded_phases_preview_by_default_and_rejects_misapplied_controls`
+  (lifecycle phase previews by default; "embeddings" phase now rejected).
+- `server.rs::test_recall_lookup_matches_search_shape`: now compares
+  `recall(default)` vs `recall(mode=lookup)` — the `search` alias was already
+  a removal stub at base ba94298, so the old byte-comparison could never pass.
+- `tools/backfill.rs` live test: the "shares NO entity" distractor fixture
+  actually shared 4 word-tier entities under core's tiered extractor (w1c,
+  commit 7bc2516) and outranked the env-var cause (4 word-idf > 1 code-idf).
+  Reworded the distractor ("An outage hit the billing system last month") to
+  match its documented zero-shared-entity intent; all other assertions
+  unchanged.
+
+## Notes / not finished
 
 pub enum EdgeKind { Touched, AnchoredTo, DerivedFrom, Supersedes, Corrects,
                     ClosedBy, ProjectedTo, EvidenceOf }
@@ -119,7 +152,7 @@ impl SqliteMemoryStore {
 - Tests: `cargo test -p vestige-core --lib edges` — 4 tests (typed
   save/reject, diamond+cycle reachability, non-deleting retire, tombstone on
   simulated purge). Migration replay/idempotence guards pass (35 tests).
-=======
+
 # SCOPE-HANDOFF — w3d: selftest + forgotten_lesson
 
 Branch `build/w3d-selftest-forgotten` (base `main` @ `5fbe1df`). All additions
@@ -176,7 +209,6 @@ and dispatch arms themselves are append-only additions.
   `tools::backfill::tests::live_backfill_surfaces_root_cause_through_storage`)
   reproduce on the clean base commit (verified via stash) and are pre-existing.
 - `cargo clippy -p vestige-mcp --lib --bins`: clean.
->>>>>>> build/w3d-selftest-forgotten
 # SCOPE-HANDOFF — w3d: selftest + forgotten_lesson
 
 Branch `build/w3d-selftest-forgotten` (base `main` @ `5fbe1df`). All additions
@@ -233,7 +265,7 @@ and dispatch arms themselves are append-only additions.
   `tools::backfill::tests::live_backfill_surfaces_root_cause_through_storage`)
   reproduce on the clean base commit (verified via stash) and are pre-existing.
 - `cargo clippy -p vestige-mcp --lib --bins`: clean.
-=======
+
 # SCOPE-HANDOFF — build/w3c-session-sync
 
 Base: main @ 5fbe1df. Scope held: `crates/vestige-mcp/src/tools/session_context.rs`,
@@ -322,7 +354,6 @@ compile the new file). Nothing else touched.
   `server.rs` dispatch so the failed-calls section has a production producer.
 - Remote closing-PR lookup if ever wanted: needs a timeline-events fetch in
   the github connector (new API surface, deliberately not added).
->>>>>>> build/w3c-session-sync
 # SCOPE-HANDOFF — build/w3c-session-sync
 
 Base: main @ 5fbe1df. Scope held: `crates/vestige-mcp/src/tools/session_context.rs`,
@@ -411,7 +442,7 @@ compile the new file). Nothing else touched.
   `server.rs` dispatch so the failed-calls section has a production producer.
 - Remote closing-PR lookup if ever wanted: needs a timeline-events fetch in
   the github connector (new API surface, deliberately not added).
-=======
+
 # Scope Handoff — build/w3e-receipts-status
 
 Base: `main @ 5fbe1df`. Branch: `build/w3e-receipts-status`. Not pushed.
@@ -512,8 +543,7 @@ Verified by stashing this diff and re-running:
 `trace/receipt.rs` + `trace/mod.rs` + `lib.rs` (walk constants + re-exports),
 `crates/vestige-mcp/src/tools/receipt.rs`, `tools/memory_status.rs`,
 `server.rs` (receipt tool description string only — it enumerates actions).
->>>>>>> build/w3e-receipts-status
-=======
+
 # Scope handoff — build/w2a-hunk-lines
 
 Base: main @ 5fbe1df. Scope: `crates/vestige-core/src/advanced/git_records.rs` + tests only.
@@ -577,7 +607,6 @@ entries — find them with `git stash list | grep RESCUE`:
 Original dropped hashes are recoverable from the stash reflog if needed.
 Use hash-based `git stash apply <hash>` (resolved by message) in this repo,
 never positional `stash@{n}`.
->>>>>>> build/w2a-hunk-lines
 # Scope handoff — build/w2a-hunk-lines
 
 Base: main @ 5fbe1df. Scope: `crates/vestige-core/src/advanced/git_records.rs` + tests only.
@@ -641,7 +670,7 @@ entries — find them with `git stash list | grep RESCUE`:
 Original dropped hashes are recoverable from the stash reflog if needed.
 Use hash-based `git stash apply <hash>` (resolved by message) in this repo,
 never positional `stash@{n}`.
-=======
+
 # SCOPE-HANDOFF — Handle-Based Recall Resolver (build/w2c-resolver)
 
 Branch: `build/w2c-resolver`, base = `main` @ `5fbe1df`. Not pushed.
@@ -739,7 +768,6 @@ New schema property `handle` (string). Semantics in `recall::execute`:
   `5fbe1df` too): `vestige-mcp server::tests::test_recall_lookup_matches_search_shape`
   — it calls the removed `search` tool and compares against its error text.
   `server.rs` is outside this task's file scope.
->>>>>>> build/w2c-resolver
 # SCOPE-HANDOFF — Handle-Based Recall Resolver (build/w2c-resolver)
 
 Branch: `build/w2c-resolver`, base = `main` @ `5fbe1df`. Not pushed.
@@ -837,7 +865,7 @@ New schema property `handle` (string). Semantics in `recall::execute`:
   `5fbe1df` too): `vestige-mcp server::tests::test_recall_lookup_matches_search_shape`
   — it calls the removed `search` tool and compares against its error text.
   `server.rs` is outside this task's file scope.
-=======
+
 # W1E Test Cleanup — Scope Handoff
 
 Branch `build/w1e-tests-cleanup` (base: main @ 5fbe1df). Test hygiene ONLY, per
@@ -973,7 +1001,6 @@ keyword-path fixtures, not deletion):
 - `cargo test -p vestige-mcp --test e2e_real_binary -- contradictions
   correction`: 2 passed (the two keyword-path conversions).
 - `cargo check -p vestige-e2e-tests --tests`: clean.
->>>>>>> build/w1e-tests-cleanup
 # W1E Test Cleanup — Scope Handoff
 
 Branch `build/w1e-tests-cleanup` (base: main @ 5fbe1df). Test hygiene ONLY, per
@@ -1109,7 +1136,7 @@ keyword-path fixtures, not deletion):
 - `cargo test -p vestige-mcp --test e2e_real_binary -- contradictions
   correction`: 2 passed (the two keyword-path conversions).
 - `cargo check -p vestige-e2e-tests --tests`: clean.
-=======
+
 # SCOPE-HANDOFF — causal_walk (build/w3a-causal-walk)
 
 `causal_walk` REPLACES `backfill` as the advertised flagship. `backfill`
@@ -1238,7 +1265,6 @@ start-point-anchored record, else now) and within lookback_days (default 30).
   the per-cause link targets (serde-skipped).
 - Supersession is intentionally NOT followed in causal_walk (MVP bound);
   commit records upsert idempotently via `(git, repo#sha)`.
->>>>>>> build/w3a-causal-walk
 # SCOPE-HANDOFF — causal_walk (build/w3a-causal-walk)
 
 `causal_walk` REPLACES `backfill` as the advertised flagship. `backfill`
@@ -1367,7 +1393,7 @@ start-point-anchored record, else now) and within lookback_days (default 30).
   the per-cause link targets (serde-skipped).
 - Supersession is intentionally NOT followed in causal_walk (MVP bound);
   commit records upsert idempotently via `(git, repo#sha)`.
-=======
+
 # SCOPE HANDOFF — build/w1c-ingest-flip (ingest-flip: no similarity, exact-equality nomination)
 
 Branch: `build/w1c-ingest-flip`, base = `main @ 5fbe1df`. Not pushed.
@@ -1476,7 +1502,6 @@ entity-set equality); edges only from declared sources.
   backfill rework, not from this branch.
 - All in-scope test modules green: prediction_error (16), merge_supersede,
   dreams, sqlite::merge::exact_nomination_tests (6), mcp tools::dedup (12).
->>>>>>> build/w1c-ingest-flip
 # SCOPE HANDOFF — build/w1c-ingest-flip (ingest-flip: no similarity, exact-equality nomination)
 
 Branch: `build/w1c-ingest-flip`, base = `main @ 5fbe1df`. Not pushed.
@@ -1585,3 +1610,12 @@ entity-set equality); edges only from declared sources.
   backfill rework, not from this branch.
 - All in-scope test modules green: prediction_error (16), merge_supersede,
   dreams, sqlite::merge::exact_nomination_tests (6), mcp tools::dedup (12).
+
+- The sibling branch's selftest + forgotten_lesson tools (16→18) are NOT in
+  this base (ba94298 advertises 16 tools); catalog tests pin 16 here and pass.
+  Nothing to keep yet — they arrive with that branch's merge.
+- vestige-core still emits 3 clippy warnings (dead alias, doc-comment,
+  while-let) — out of scope, untouched.
+- Behavioral note: with keyword-only retrieval, four rare word-tier shared
+  entities can outscore one code-tier entity in backfill ranking (see the
+  backfill.rs test comment). That weighting lives in core.

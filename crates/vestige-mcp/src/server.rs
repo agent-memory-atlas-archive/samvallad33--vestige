@@ -2041,7 +2041,6 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
             }
             "find_tagged" => tools::tagging::execute_find(&self.storage, request.arguments).await,
             "tagging_stats" => tools::tagging::execute_stats(&self.storage).await,
-            "match_context" => tools::context::execute(&self.storage, request.arguments).await,
 
             // ================================================================
             // Feedback (internal, still used by request_feedback)
@@ -2193,13 +2192,6 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
             "graph" => {
                 tools::graph_unified::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
-            }
-            // DEPRECATED (v2.2): folded into `graph`. Hidden aliases.
-            "explore_connections" => {
-                warn!(
-                    "Tool 'explore_connections' is deprecated in v2.2. Use 'graph' (action='chain'|'associations'|'bridges')."
-                );
-                tools::explore::execute(&self.storage, &self.cognitive, request.arguments).await
             }
             "predict" => {
                 warn!("Tool 'predict' is deprecated in v2.2. Use 'graph' (action='predict').");
@@ -4960,31 +4952,35 @@ mod tests {
     }
 
     /// v2.2: `recall` mode='lookup' (the default) must produce the same result
-    /// shape as the former standalone `search` — i.e. the no-mode default is a
-    /// faithful pass-through, not a reasoning call.
+    /// as an explicit mode='lookup' call — i.e. the no-mode default is a
+    /// faithful pass-through, not a reasoning call. (The former standalone
+    /// `search` tool was removed with the vector runtime; the byte-for-byte
+    /// comparison now runs between the two `recall` spellings.)
     #[tokio::test]
     async fn test_recall_lookup_matches_search_shape() {
         let (server, _dir) = test_server().await;
         let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
-        let args = serde_json::json!({ "query": "anything" });
-        let via_recall = make_request(
+        let via_default = make_request(
             "tools/call",
-            Some(serde_json::json!({ "name": "recall", "arguments": args })),
+            Some(serde_json::json!({ "name": "recall", "arguments": { "query": "anything" } })),
         );
-        let via_search = make_request(
+        let via_explicit = make_request(
             "tools/call",
-            Some(serde_json::json!({ "name": "search", "arguments": args })),
+            Some(serde_json::json!({
+                "name": "recall",
+                "arguments": { "mode": "lookup", "query": "anything" }
+            })),
         );
-        let r1 = server.handle_request(via_recall).await.unwrap();
-        let r2 = server.handle_request(via_search).await.unwrap();
+        let r1 = server.handle_request(via_default).await.unwrap();
+        let r2 = server.handle_request(via_explicit).await.unwrap();
         assert!(r1.error.is_none() && r2.error.is_none());
-        // The unified-tool wrapper text (the search payload) must match.
+        // The default mode and the explicit lookup mode must be identical.
         assert_eq!(
             r1.result.unwrap()["content"][0]["text"],
             r2.result.unwrap()["content"][0]["text"],
-            "recall(mode=lookup) must equal search byte-for-byte"
+            "recall(default) must equal recall(mode=lookup) byte-for-byte"
         );
     }
 

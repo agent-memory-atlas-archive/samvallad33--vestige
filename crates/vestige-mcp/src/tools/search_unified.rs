@@ -860,9 +860,6 @@ if let Some(budget) = args.token_budget {
         response["tokenBudgetLimit"] = serde_json::json!(args.token_budget.unwrap());
     }
 
-    if let Some(warming) = super::warming::embedding_warming(storage) {
-        response["warming"] = warming;
-    }
     let response = super::lookup_packet::finish(
         response,
         args.token_budget,
@@ -1253,11 +1250,6 @@ pub async fn execute(
         });
 
         // Vector rerank REMOVED: candidates keep their keyword order.
-        let reranked_results: Vec<vestige_core::SearchResult> = rerank_candidates
-            .into_iter()
-            .map(|(result, _)| result)
-            .collect();
-        #[cfg(not(feature = "vector-search"))]
         let reranked_results: Vec<vestige_core::SearchResult> = rerank_candidates
             .into_iter()
             .map(|(result, _)| result)
@@ -1785,9 +1777,6 @@ pub async fn execute(
         response["tokensUsed"] = serde_json::json!(used);
     }
 
-    if let Some(warming) = super::warming::embedding_warming(storage) {
-        response["warming"] = warming;
-    }
     attach_prospective(storage, &mut response, &args, &scope_filter);
     let response = super::lookup_packet::finish(
         response,
