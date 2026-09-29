@@ -2939,6 +2939,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "strata-gate",
  "strata-migrate",
  "strata-store",
  "strata-verify",
