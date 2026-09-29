@@ -80,6 +80,7 @@ pub fn ensure_not_v3(path: &Path) -> Result<()> {
     }
 }
 
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(unused_variables))]
 fn read_schema_version(path: &Path, header: &[u8; 100]) -> u32 {
     #[cfg(feature = "legacy-sqlite")]
     if let Some(v) = query_schema_version_table(path) {

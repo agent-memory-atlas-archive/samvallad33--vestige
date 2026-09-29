@@ -434,8 +434,8 @@ async fn serve() {
     // storage constructor runs, so tools never see a half-open store. The
     // guard itself never writes; detection is a 100-byte header read. The
     // default-path case (None) is guarded inside the storage constructor.
-    if let Some(db_path) = storage_path.as_deref() {
-        if let Ok(Some(v3)) = vestige_core::detect_v3(db_path) {
+    if let Some(db_path) = storage_path.as_deref()
+        && let Ok(Some(v3)) = vestige_core::detect_v3(db_path) {
             error!(
                 "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
                 v3.path.display(),
@@ -450,7 +450,6 @@ async fn serve() {
             );
             std::process::exit(1);
         }
-    }
 
     // Initialize storage with optional custom data directory.
     // vestige_core::open_storage(Some(...)) expects a DB file path, so map data dirs to vestige.db here.
