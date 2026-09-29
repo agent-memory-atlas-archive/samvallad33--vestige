@@ -758,18 +758,11 @@ fn open_log(
         Some(seed) => seed,
         None => {
             let mut seed = [0u8; 32];
-            std::fs::File::open("/dev/urandom")
-                .and_then(|mut f| {
-                    use std::io::Read;
-                    f.read_exact(&mut seed)?;
-                    Ok(())
-                })
-                .map_err(|e| {
-                    MigrationError::Io(std::io::Error::new(
-                        e.kind(),
-                        format!("no OS entropy for the log signing seed: {e}"),
-                    ))
-                })?;
+            getrandom::fill(&mut seed).map_err(|e| {
+                MigrationError::Io(std::io::Error::other(format!(
+                    "no OS entropy for the log signing seed: {e}"
+                )))
+            })?;
             seed
         }
     };

@@ -490,3 +490,23 @@ fn merkle_tree_shapes() {
     assert_eq!(format::merkle_root(&l), reference(&leaves));
     assert_ne!(format::merkle_root(&l[..2]), format::merkle_root(&l[..3]));
 }
+
+/// The log signing key must come from the OS CSPRNG on every platform. A
+/// derivable seed (clock plus pid) would let anyone re-derive `strata.key`
+/// and forge segments, so two fresh logs must get distinct, non-trivial keys.
+#[test]
+fn fresh_logs_get_distinct_os_entropy_signing_keys() {
+    let _serial = serialize();
+    reset_failpoints();
+    let a = test_dir("entropy-a");
+    let b = test_dir("entropy-b");
+    drop(StrataLog::open(&a).unwrap());
+    drop(StrataLog::open(&b).unwrap());
+    let key_a = fs::read(a.join("strata.key")).unwrap();
+    let key_b = fs::read(b.join("strata.key")).unwrap();
+    assert_eq!(key_a.len(), 32);
+    assert_eq!(key_b.len(), 32);
+    assert_ne!(key_a, key_b, "two fresh logs shared a signing key");
+    assert!(key_a.iter().any(|&x| x != 0), "signing key is all zero");
+    assert!(key_b.iter().any(|&x| x != 0), "signing key is all zero");
+}

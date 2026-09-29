@@ -7,7 +7,7 @@
 //! I/O — so there is no lock-order cycle anywhere.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -228,41 +228,10 @@ fn halt_err(
 // ---------------------------------------------------------------------------
 
 fn fill_random(buf: &mut [u8]) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let mut f = File::open("/dev/urandom")?;
-        f.read_exact(buf)
-    }
-    #[cfg(not(unix))]
-    {
-        // Weak std-only fallback for non-target platforms.
-        let mut seed = blake3::Hasher::new();
-        // SystemTimeError is not an io::Error. A clock before the epoch just
-        // yields a zero seed; this path is a weak fallback, not entropy.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .to_le_bytes();
-        seed.update(&nanos);
-        seed.update(&(std::process::id() as u64).to_le_bytes());
-        seed.update(&(buf.len() as u64).to_le_bytes());
-        let mut block = seed.finalize().as_slice().to_vec();
-        let mut taken = 0;
-        while taken < buf.len() {
-            for b in block.iter() {
-                if taken == buf.len() {
-                    break;
-                }
-                buf[taken] = *b;
-                taken += 1;
-            }
-            let mut h = blake3::Hasher::new();
-            h.update(&block);
-            block = h.finalize().as_slice().to_vec();
-        }
-        Ok(())
-    }
+    // OS CSPRNG on every platform (getrandom(2)/getentropy/BCryptGenRandom).
+    // No weak fallback: a platform without entropy fails the open instead of
+    // minting a derivable log signing key.
+    getrandom::fill(buf).map_err(|e| io::Error::other(e.to_string()))
 }
 
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {

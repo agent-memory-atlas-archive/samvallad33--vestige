@@ -25,6 +25,8 @@ sqlite-reader = ["dep:rusqlite"]
 [dependencies]
 borsh = { version = "1", features = ["derive"] }
 blake3 = "1"
+# OS CSPRNG for the receipt key and log signing seed (works on Windows too).
+getrandom = "0.4"
 # MIGRATION_RECEIPT signatures (non-derivable key, verified via the public
 # key recorded in the log).
 ed25519-dalek = { version = "3", default-features = false, features = ["fast", "rand_core"] }

@@ -309,7 +309,7 @@ pub fn load_or_create_receipt_key(
         return Ok(ed25519_dalek::SigningKey::from_bytes(&seed));
     }
     let mut seed = [0u8; 32];
-    urandom_fill(&mut seed)?;
+    os_entropy_fill(&mut seed)?;
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -326,11 +326,11 @@ pub fn load_or_create_receipt_key(
     Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
 }
 
-/// Read OS entropy (unix /dev/urandom). No weak fallback: a platform
-/// without urandom fails the migration instead of shipping a derivable key.
-fn urandom_fill(buf: &mut [u8]) -> Result<(), std::io::Error> {
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom")?.read_exact(buf)
+/// Read OS entropy through the platform CSPRNG (getrandom(2), getentropy,
+/// BCryptGenRandom). No weak fallback: a platform without entropy fails the
+/// migration instead of shipping a derivable key.
+fn os_entropy_fill(buf: &mut [u8]) -> Result<(), std::io::Error> {
+    getrandom::fill(buf).map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Decode a `KIND_GENESIS` payload.
