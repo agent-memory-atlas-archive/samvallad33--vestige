@@ -2282,6 +2282,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "strata"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "borsh",
+ "ed25519-dalek",
+ "libc",
+]
+
+[[package]]
 name = "strata-gate"
 version = "0.1.0"
 dependencies = [
@@ -2296,6 +2306,21 @@ dependencies = [
  "blake3",
  "borsh",
  "libm",
+]
+
+[[package]]
+name = "strata-migrate"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "borsh",
+ "chrono",
+ "serde",
+ "serde_json",
+ "strata",
+ "strata-kernel",
+ "thiserror",
+ "vestige-core",
 ]
 
 [[package]]
@@ -2857,6 +2882,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "strata-migrate",
  "strata-verify",
  "subtle",
  "tempfile",

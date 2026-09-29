@@ -10,14 +10,17 @@ members = [
 ]
 exclude = [
     "fastembed-rs",
-    # Strata determinism stack: standalone crates with their own workspace
-    # tables by design (see their Cargo.toml comments). Excluded here so the
-    # root workspace can path-depend on them without absorbing them; the
-    # crates/strata integration will drop their [workspace] tables and move
-    # them into `members` deliberately.
-    "crates/strata-kernel",
+    # Strata Causal Proof Engine crates: standalone with empty [workspace]
+    # tables by design (parallel-agent construction). Excluded so root members
+    # can path-depend without cargo seeing multiple workspace roots;
+    # re-parent deliberately at integration time.
+    "crates/strata",
     "crates/strata-gate",
+    "crates/strata-kernel",
+    "crates/strata-migrate",
+    "crates/strata-store",
     "crates/strata-verify",
+
 ]
 
 [workspace.package]
