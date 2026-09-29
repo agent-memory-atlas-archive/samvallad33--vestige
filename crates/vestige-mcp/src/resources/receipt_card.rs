@@ -226,7 +226,7 @@ fn render_html(receipt: &Receipt) -> String {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use vestige_core::{DecayRisk, Receipt, SuppressedReceiptEntry};

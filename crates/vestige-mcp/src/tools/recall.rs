@@ -404,7 +404,7 @@ fn one_hop_neighbors(storage: &Arc<Storage>, ids: &[String]) -> Vec<Value> {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
 

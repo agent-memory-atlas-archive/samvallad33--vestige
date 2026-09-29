@@ -12,13 +12,10 @@ repository = "https://github.com/samvallad33/vestige"
 publish = false
 
 [features]
-# legacy-sqlite stays in the default set FOR COMPILATION ONLY: every
-# Storage-shaped module (server, tools, dashboard, autopilot, cognitive)
-# still binds vestige-core's Storage until the Strata runtime boot
-# (build/wire-strata) lands. Creation is blocked at runtime (see
-# vestige-core admin.rs): a fresh 4.0 install writes NO SQLite file
-# (audit blocker 1).
-default = ["legacy-sqlite", "connectors", "cloud-sync", "codebase-git"]
+# The shipped binary boots a Strata log. `legacy-sqlite` stays available for
+# the SQLite unit tests and the v3-engine harness; it is not in the default
+# feature set, so the default feature graph names neither legacy-sqlite nor bundled-sqlite.
+default = ["connectors", "cloud-sync", "codebase-git"]
 # LEGACY SQLITE QUARANTINE (build/t5-legacy-isolation), mirroring
 # vestige-core. Gates every Storage/sqlite-touching module (server, tools,
 # dashboard, cognitive, resources, trace_recorder, autopilot,
@@ -91,6 +88,9 @@ strata-verify = { path = "../strata-verify" }
 
 # One-shot SQLite -> STRATA migration (standalone crate; `migrate-to-strata` CLI).
 strata-migrate = { path = "../strata-migrate" }
+
+# Strata log the shipped MCP server boots. Workspace-excluded; path dep only.
+strata-store = { path = "../strata-store" }
 
 # ============================================================================
 # MCP Server Dependencies

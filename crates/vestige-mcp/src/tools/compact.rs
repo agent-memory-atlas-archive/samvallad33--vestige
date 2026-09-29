@@ -275,7 +275,7 @@ pub fn full_schema(name: &str) -> Option<Value> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
 

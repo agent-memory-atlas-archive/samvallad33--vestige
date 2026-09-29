@@ -429,6 +429,19 @@ impl StrataStore {
         Ok(id)
     }
 
+    /// Gate-space effect seq of the write that created `id`, if it exists.
+    pub fn origin_seq(&self, id: &str) -> Option<u64> {
+        self.origins.get(id).copied()
+    }
+
+    /// Every node id and the effect seq that admitted it, in id order.
+    pub fn origins(&self) -> Vec<(String, u64)> {
+        self.origins
+            .iter()
+            .map(|(id, seq)| (id.clone(), *seq))
+            .collect()
+    }
+
     /// Fetch one node by id.
     pub fn get_node(&self, id: &str) -> Option<NodeRecord> {
         self.nodes.get(id).cloned()
@@ -776,6 +789,16 @@ impl StrataStore {
     /// The durable log handle.
     pub fn log(&self) -> &StrataLog {
         &self.log
+    }
+
+    /// Every node record, in id order (includes superseded).
+    pub fn nodes(&self) -> Vec<NodeRecord> {
+        self.nodes.values().cloned().collect()
+    }
+
+    /// Every typed edge, in landing order.
+    pub fn edges(&self) -> Vec<ConnectionRecord> {
+        self.edges.clone()
     }
 
     /// Number of live nodes (any scope).

@@ -196,21 +196,19 @@ pub use trace::{
 // Storage layer
 // Storage: backend-agnostic surface (always available).
 pub use storage::LegacySqliteDisabled;
+pub use storage::{
+    ACCESS_LOG_RETENTION_DAYS, ClassificationResult, DEFAULT_MEMORY_SCOPE, Domain, HealthStatus,
+    LocalMemoryStore, MemoryEdge, MemoryRecord, MemoryStore, MemoryStoreError, MemoryStoreResult,
+    MemoryStoreSend, ModelSignature, SchedulingState, SearchQuery, Storage, StorageError,
+    StoreStats, default_db_path, open_storage,
+};
 // v3 SQLite guard: refuses the legacy engine at every 4.0 entry point
 // (ungated — the refusal must fire in Strata-only builds too).
 pub use storage::v3_guard::{MIGRATION_HINT, SQLITE_MAGIC, V3Info, detect_v3, ensure_not_v3};
-#[cfg(feature = "legacy-sqlite")]
-pub use storage::{
-    ClassificationResult, Domain, HealthStatus, LocalMemoryStore, MemoryEdge, MemoryRecord,
-    MemoryStore, MemoryStoreError, MemoryStoreResult, ModelSignature, SchedulingState, SearchQuery,
-    StoreStats, open_storage,
-};
 
-// Storage: legacy SQLite surface (quarantined behind `legacy-sqlite`,
-// build/t5-legacy-isolation; default ON, flips off when STRATA lands).
-#[cfg(feature = "legacy-sqlite")]
+// Storage types live in the ungated `storage::types` module. Names that only
+// exist in the legacy engine stay behind `legacy-sqlite` further down.
 pub use storage::{
-    ACCESS_LOG_RETENTION_DAYS,
     AgentRunSummary,
     BLAST_LINK_TYPES,
     BLAST_MAX_DEPTH,
@@ -225,17 +223,11 @@ pub use storage::{
     ConnectorCursor,
     ConsolidationHistoryRecord,
     CounterfactualReplayResult,
-    DEFAULT_MEMORY_SCOPE,
     DreamHistoryRecord,
     DurableCounterfactualReplay,
     DurableRetrievalReplayCapsule,
     DurableSynapticCapture,
     DurableSynapticPairReceipt,
-    EmbeddingProfileIntegrityManifest,
-    EmbeddingProfileMigrationNodeCheckpoint,
-    EmbeddingProfileMigrationRecord,
-    EmbeddingProfileVector,
-    FrozenReplayItem,
     HygieneNodeSummary,
     HygieneSnapshot,
     InsightRecord,
@@ -253,14 +245,10 @@ pub use storage::{
     REPLAY_SCHEMA_VERSION,
     REPLAY_SELECTION_BOUNDARY,
     ReconcileReport,
-    ReplayBuildError,
     ReplayDecayRisk,
     ReplayEvidenceItemSummary,
     ReplayEvidenceSetSummary,
     ReplayInfluence,
-    ReplayInvalidationReason,
-    ReplayMaterializationCheck,
-    ReplayPrivacyInvalidation,
     ReplayPrivacyState,
     Result,
     RetireOutcome,
@@ -279,10 +267,7 @@ pub use storage::{
     SmartIngestResult,
     SourceUpsertOutcome,
     SourceUpsertResult,
-    SqliteMemoryStore,
     StateTransitionRecord,
-    Storage,
-    StorageError,
     StoredCounterfactualReplay,
     SynapticCapturePolicy,
     SynapticCaptureRequest,
@@ -291,14 +276,20 @@ pub use storage::{
     SynapticIngestRequest,
     SynapticSignalSnapshot,
     TagVocabulary,
-    ablate_frozen_context,
     commit_sha_of,
     db_path_for_data_dir,
-    default_db_path,
     private_evidence_digest,
     replay_evidence_slot,
     replay_idempotency_key,
     replay_policy_digest,
+};
+
+#[cfg(feature = "legacy-sqlite")]
+pub use storage::{
+    EmbeddingProfileIntegrityManifest, EmbeddingProfileMigrationNodeCheckpoint,
+    EmbeddingProfileMigrationRecord, EmbeddingProfileVector, FrozenReplayItem, ReplayBuildError,
+    ReplayInvalidationReason, ReplayMaterializationCheck, ReplayPrivacyInvalidation,
+    SqliteMemoryStore, ablate_frozen_context,
 };
 
 // Embedding profile contracts are feature-independent so profile discovery,
@@ -311,8 +302,6 @@ pub use consolidation::{
     CreativeConnection, CreativeConnectionType, DreamEngine, DreamInsight, DreamPhase,
     FourPhaseDreamResult, PhaseResult, TriageCategory, TriagedMemory,
 };
-// Dream compile is wired to the legacy SQLite store (`build/t5-legacy-isolation`).
-#[cfg(feature = "legacy-sqlite")]
 pub use consolidation::{
     DreamCompileConfig, DreamCompilePhase, DreamCompilePr, DreamCompileReport, run_dream_compile,
 };

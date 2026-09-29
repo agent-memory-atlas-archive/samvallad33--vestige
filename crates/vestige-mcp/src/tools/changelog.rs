@@ -296,7 +296,7 @@ fn execute_system_wide(
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;

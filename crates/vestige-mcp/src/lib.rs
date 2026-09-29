@@ -17,6 +17,7 @@ pub mod dashboard;
 pub mod protocol;
 pub mod resources;
 pub mod server;
+pub mod strata_memory;
 pub mod tools;
 pub mod trace_recorder;
 

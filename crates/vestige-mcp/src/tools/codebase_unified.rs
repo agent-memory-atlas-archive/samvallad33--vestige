@@ -753,7 +753,7 @@ async fn execute_verify(storage: &Arc<Storage>, args: &CodebaseArgs) -> Result<V
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
 

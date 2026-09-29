@@ -829,18 +829,6 @@ impl SqliteMemoryStore {
 // `IntentionRecord` is defined in (and re-exported from)
 // `crate::storage::types`.
 
-impl IntentionRecord {
-    /// Normalized namespace for this intention: blank/None -> "user",
-    /// matching the `COALESCE(NULLIF(trim(scope), ''), 'user')` convention
-    /// used by the scoped knowledge-node queries.
-    pub fn effective_scope(&self) -> &str {
-        match self.scope.as_deref() {
-            Some(scope) if !scope.trim().is_empty() => scope.trim(),
-            _ => "user",
-        }
-    }
-}
-
 // `InsightRecord` is defined in (and re-exported from)
 // `crate::storage::types`.
 

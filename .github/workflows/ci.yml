@@ -110,6 +110,8 @@ jobs:
 
       - name: strata-verify (migrated-log verification)
         run: cargo test --manifest-path crates/strata-verify/Cargo.toml
+      - name: Test strata-store
+        run: cargo test --manifest-path crates/strata-store/Cargo.toml
 
       - name: Test paid cloud-sync path
         run: cargo test --locked --package vestige-core --features cloud-sync cloud --lib

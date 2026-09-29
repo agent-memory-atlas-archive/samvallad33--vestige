@@ -26,21 +26,7 @@ pub const WALK_RECEIPT_SCHEMA_V1: &str = "https://vestige.dev/schemas/receipt/wa
 // defined in (and re-exported from) `crate::storage::types`.
 pub use crate::storage::types::{CoverageSnapshot, StoredWalkReceipt, WalkReceiptHandle};
 
-/// Canonicalize a walk parameter envelope with the codebase's canonical JSON
-/// helper (RFC 8785 JCS via `serde_json_canonicalizer`, the same encoder the
-/// receipt DSSE chain uses). Key order and whitespace of the input never
-/// affect the output.
-pub fn canonical_walk_json(params: &Value) -> Result<String> {
-    if !params.is_object() {
-        return Err(StorageError::Init(
-            "walk receipt params must be a JSON object".into(),
-        ));
-    }
-    let bytes = serde_json_canonicalizer::to_vec(params)
-        .map_err(|error| StorageError::Init(format!("walk params canonicalization: {error}")))?;
-    String::from_utf8(bytes)
-        .map_err(|error| StorageError::Init(format!("canonical walk params not UTF-8: {error}")))
-}
+pub use super::contracts::canonical_walk_json;
 
 /// blake3 hex digest of canonical bytes — same primitive the anchor store
 /// and the replay policy digests use.
