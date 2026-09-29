@@ -20,6 +20,8 @@ pub(crate) struct ScannedFrame {
 pub(crate) struct Scan {
     pub frames: Vec<ScannedFrame>,
     pub segments: u32,
+    /// Public half of `strata.key`, the key that signed segment trailers.
+    pub segment_key: [u8; 32],
 }
 
 /// True when `dir` itself (not a child) contains a `*.seg` file.
@@ -83,6 +85,7 @@ pub(crate) fn scan_log(dir: &Path) -> Result<Scan, String> {
     Ok(Scan {
         frames,
         segments: segs.len() as u32,
+        segment_key: verifying.to_bytes(),
     })
 }
 

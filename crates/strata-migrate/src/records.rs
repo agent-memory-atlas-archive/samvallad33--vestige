@@ -51,8 +51,8 @@ pub const RECEIPT_SIGNING_KEY_ID: &str = "vestige-migrate-receipt-v1";
 
 /// The receipt-signing key file, written next to the destination log with
 /// 0600 permissions. It is NOT part of the log: the log itself carries only
-/// the verifying key. Losing it only loses the ability to sign further
-/// receipts for that destination; verification uses the in-log public key.
+/// the verifying key. Verification trusts a receipt only when this file's
+/// public half matches that embedded key.
 pub const RECEIPT_KEY_FILE: &str = "receipt-signing.key";
 
 /// ed25519 signing domain for the MIGRATION_RECEIPT signature.
