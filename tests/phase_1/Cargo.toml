@@ -4,6 +4,13 @@ version = "0.0.1"
 edition = "2024"
 publish = false
 
+[features]
+# Phase-1 tests round-trip through the legacy SQLite store; the raw
+# domain-column migration test reads the SQLite file directly. Skipped in a
+# legacy-sqlite-free build (build/t5-legacy-isolation).
+default = ["legacy-sqlite"]
+legacy-sqlite = ["vestige-core/legacy-sqlite", "dep:rusqlite"]
+
 [dependencies]
 vestige-core = { path = "../../crates/vestige-core" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -11,21 +18,25 @@ tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 serde_json = "1"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 
 [[test]]
 name = "trait_round_trip"
+required-features = ["legacy-sqlite"]
 path = "trait_round_trip.rs"
 
 [[test]]
 name = "domain_column_migration"
+required-features = ["legacy-sqlite"]
 path = "domain_column_migration.rs"
 
 [[test]]
 name = "cognitive_module_isolation"
+required-features = ["legacy-sqlite"]
 path = "cognitive_module_isolation.rs"
 
 [[test]]
 name = "send_bound_variant"
+required-features = ["legacy-sqlite"]
 path = "send_bound_variant.rs"
 

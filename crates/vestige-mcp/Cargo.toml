@@ -12,7 +12,14 @@ repository = "https://github.com/samvallad33/vestige"
 publish = false
 
 [features]
-default = ["connectors", "cloud-sync", "codebase-git"]
+default = ["legacy-sqlite", "connectors", "cloud-sync", "codebase-git"]
+# LEGACY SQLITE QUARANTINE (build/t5-legacy-isolation), mirroring
+# vestige-core. Gates every Storage/sqlite-touching module (server, tools,
+# dashboard, cognitive, resources, trace_recorder, autopilot,
+# actor_surface), this crate's own rusqlite use (backup WAL checkpoint),
+# and forwards to vestige-core's `legacy-sqlite` + `bundled-sqlite`.
+# Default ON; flips off when the STRATA backend lands.
+legacy-sqlite = ["vestige-core/legacy-sqlite", "vestige-core/bundled-sqlite", "dep:rusqlite"]
 # w1b vector removal: `embeddings` and `vector-search` no longer select any
 # dependencies — they exist only as declared (always-off) stubs so legacy
 # `#[cfg(feature = ...)]` sites in this crate don't trip `unexpected_cfgs`.
@@ -62,10 +69,11 @@ path = "src/bin/cli.rs"
 # Includes: FSRS-6, spreading activation, synaptic tagging, hippocampal indexing,
 # memory states, context memory, importance signals, dreams, and more.
 #
-# Only `bundled-sqlite` is always on. `embeddings` and `vector-search` are
-# toggled via vestige-mcp's own feature flags below so `--no-default-features`
-# actually works (previously hardcoded here, which silently defeated the flag).
-vestige-core = { version = "3.0.0", path = "../vestige-core", default-features = false, features = ["bundled-sqlite"] }
+# Only `bundled-sqlite` used to be hardcoded here; it now arrives via the
+# `legacy-sqlite` feature so `--no-default-features` builds a sqlite-free
+# crate (build/t5-legacy-isolation). `embeddings` and `vector-search` are
+# always-off stubs (w1b).
+vestige-core = { version = "3.0.0", path = "../vestige-core", default-features = false }
 
 # ============================================================================
 # MCP Server Dependencies
@@ -107,8 +115,9 @@ directories = "6"
 clap = { version = "4", features = ["derive"] }
 colored = "3"
 
-# SQLite (for backup WAL checkpoint)
-rusqlite = { version = "0.40", features = ["bundled"] }
+# SQLite (for backup WAL checkpoint) — only in `legacy-sqlite` builds
+# (build/t5-legacy-isolation).
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 
 # Dashboard (v2.0) - HTTP server + WebSocket + embedded SvelteKit
 axum = { version = "0.8", default-features = false, features = ["json", "query", "tokio", "http1", "ws"] }
@@ -124,3 +133,22 @@ mime_guess = "2"
 tempfile = "3"
 
 [dev-dependencies]
+
+# Integration tests drive the Storage-backed server/tools; the e2e binary
+# test also reads the SQLite file directly (backup WAL). Skipped in a
+# legacy-sqlite-free build (build/t5-legacy-isolation).
+[[test]]
+name = "e2e_failure_cases"
+required-features = ["legacy-sqlite"]
+
+[[test]]
+name = "e2e_real_binary"
+required-features = ["legacy-sqlite"]
+
+[[test]]
+name = "stdio_shutdown"
+required-features = ["legacy-sqlite"]
+
+[[test]]
+name = "views_sized_store"
+required-features = ["legacy-sqlite"]

@@ -34,6 +34,9 @@
 use chrono::{DateTime, Utc};
 
 use crate::memory::{IngestInput, SourceEnvelope};
+// Connector cursor state persists through the legacy SQLite store
+// (build/t5-legacy-isolation).
+#[cfg(feature = "legacy-sqlite")]
 use crate::storage::ConnectorCursor;
 
 #[cfg(feature = "connectors")]
@@ -216,6 +219,7 @@ pub struct SyncReport {
 ///
 /// `max_pages` bounds a single run (so a first sync of a 15-year tracker can be
 /// resumed across calls rather than blocking on one enormous fetch).
+#[cfg(feature = "legacy-sqlite")]
 pub async fn run_sync<C: Connector>(
     store: &crate::storage::SqliteMemoryStore,
     connector: &C,
@@ -423,7 +427,7 @@ pub fn content_hash(fields: &[(&str, &str)]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
 
@@ -484,7 +488,7 @@ mod tests {
 // failure clamping, rate-limit retry, and reconcile routing. Until now only its
 // pure helpers and the storage layer had tests; these pin the driver itself.
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod driver_tests {
     use super::*;
     use crate::storage::SqliteMemoryStore;

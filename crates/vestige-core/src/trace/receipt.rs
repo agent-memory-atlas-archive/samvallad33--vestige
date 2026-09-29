@@ -215,7 +215,9 @@ impl Receipt {
                     }
                 }
             }
-            Some(ReceiptEvidence::CounterfactualReplay { .. }) | None => {}
+            None => {}
+            #[cfg(feature = "legacy-sqlite")]
+            Some(ReceiptEvidence::CounterfactualReplay { .. }) => {}
         }
     }
 
@@ -312,6 +314,8 @@ pub enum ReceiptEvidence {
     SynapticCapture(SynapticCaptureEvidence),
     /// One controlled post-retrieval context-ablation replay. The nested
     /// result is identity-free and carries the exact non-causal claim boundary.
+    /// Variant type is quarantined with the SQLite store (build/t5-legacy-isolation).
+    #[cfg(feature = "legacy-sqlite")]
     CounterfactualReplay {
         schema: String,
         schema_version: u32,

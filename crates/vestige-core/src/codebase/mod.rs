@@ -68,6 +68,9 @@
 //! # }
 //! ```
 
+// `anchor` persists/verifies code anchors through the legacy SQLite store:
+// quarantined behind `legacy-sqlite` (build/t5-legacy-isolation).
+#[cfg(feature = "legacy-sqlite")]
 pub mod anchor;
 pub mod context;
 #[cfg(feature = "codebase-git")]
@@ -83,6 +86,7 @@ pub mod types;
 pub mod watcher;
 
 // Re-export main types
+#[cfg(feature = "legacy-sqlite")]
 pub use anchor::{
     AnchorDraft, AnchorStatus, AnchorVerification, CodeAnchor, MAX_ANCHORED_FILE_BYTES,
     MAX_SPAN_LINES, capture_anchor, find_symbol_definition, hash_span, verify_anchor,

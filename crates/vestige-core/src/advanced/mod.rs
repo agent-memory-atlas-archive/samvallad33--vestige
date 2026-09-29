@@ -82,8 +82,8 @@ pub use reconsolidation::{
 pub use retroactive_backfill::{
     BackfillCandidate, BackfillResult, BackfilledCause, FailureEvent, RetroactiveBackfill,
 };
-pub use causal_walk::{
-    CausalWalkRequest, CausalWalkResult, EVIDENCE_LINK_TYPE, NeedsReport, PathHop, StartPoint,
-    persist_evidence_edges, walk_storage,
-};
+pub use causal_walk::{CausalWalkRequest, CausalWalkResult, EVIDENCE_LINK_TYPE, NeedsReport, PathHop, StartPoint};
+// Storage-backed walk entry points: behind `legacy-sqlite` (build/t5-legacy-isolation).
+#[cfg(feature = "legacy-sqlite")]
+pub use causal_walk::{persist_evidence_edges, walk_storage};
 pub use speculative::{PredictedMemory, PredictionContext, SpeculativeRetriever, UsagePattern};

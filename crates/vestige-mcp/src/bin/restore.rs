@@ -8,7 +8,8 @@
 mod glibc_compat;
 
 use std::path::PathBuf;
-use vestige_core::{IngestInput, Storage};
+#[cfg(feature = "legacy-sqlite")]
+use vestige_core::IngestInput;
 
 #[derive(serde::Deserialize)]
 struct BackupWrapper {
@@ -24,6 +25,7 @@ struct RecallResult {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 struct MemoryBackup {
     content: String,
     node_type: Option<String>,
@@ -67,56 +69,71 @@ fn main() -> anyhow::Result<()> {
 
     println!("Found {} memories to restore", memories.len());
 
-    // Initialize storage (uses default path)
+    // Initialize storage (uses default path). open_storage() is the
+    // sanctioned constructor path (build/t5-legacy-isolation); a
+    // legacy-sqlite-free build fails here with its clear error.
     println!("Initializing storage...");
-    let storage = Storage::new(None)?;
-
-    println!("Generating embeddings and ingesting memories...\n");
-
-    let total = memories.len();
-    let mut success_count = 0;
-
-    for (i, memory) in memories.into_iter().enumerate() {
-        let input = IngestInput {
-            content: memory.content.clone(),
-            node_type: memory.node_type.unwrap_or_else(|| "fact".to_string()),
-            source: memory.source,
-            sentiment_score: 0.0,
-            sentiment_magnitude: 0.0,
-            tags: memory.tags.unwrap_or_default(),
-            valid_from: None,
-            valid_until: None,
-            validity_inferred: false,
-            source_envelope: None,
-        };
-
-        match storage.ingest(input) {
-            Ok(_node) => {
-                success_count += 1;
-                println!(
-                    "[{}/{}] OK: {}",
-                    i + 1,
-                    total,
-                    truncate(&memory.content, 60)
-                );
-            }
-            Err(e) => {
-                println!("[{}/{}] FAIL: {}", i + 1, total, e);
-            }
-        }
+    #[cfg(feature = "legacy-sqlite")]
+    let storage = vestige_core::open_storage(None)?;
+    #[cfg(not(feature = "legacy-sqlite"))]
+    {
+        return Err(anyhow::anyhow!(
+            "cannot restore: {}",
+            vestige_core::storage::LegacySqliteDisabled
+        ));
     }
 
-    println!(
-        "\nRestore complete: {}/{} memories restored",
-        success_count, total
-    );
+    #[cfg(feature = "legacy-sqlite")]
+    {
+        println!("Generating embeddings and ingesting memories...\n");
 
-    // Show stats
-    let stats = storage.get_stats()?;
-    println!("Total nodes: {}", stats.total_nodes);
-    println!("With embeddings: {}", stats.nodes_with_embeddings);
+        let total = memories.len();
+        let mut success_count = 0;
 
-    Ok(())
+        for (i, memory) in memories.into_iter().enumerate() {
+            let input = IngestInput {
+                content: memory.content.clone(),
+                node_type: memory.node_type.unwrap_or_else(|| "fact".to_string()),
+                source: memory.source,
+                sentiment_score: 0.0,
+                sentiment_magnitude: 0.0,
+                tags: memory.tags.unwrap_or_default(),
+                valid_from: None,
+                valid_until: None,
+                validity_inferred: false,
+                source_envelope: None,
+            };
+
+            match storage.ingest(input) {
+                Ok(_node) => {
+                    success_count += 1;
+                    println!(
+                        "[{}/{}] OK: {}",
+                        i + 1,
+                        total,
+                        truncate(&memory.content, 60)
+                    );
+                }
+                Err(e) => {
+                    println!("[{}/{}] FAIL: {}", i + 1, total, e);
+                }
+            }
+        }
+
+        println!(
+            "\nRestore complete: {}/{} memories restored",
+            success_count, total
+        );
+
+        // Show stats
+        let stats = storage.get_stats()?;
+        println!("Total nodes: {}", stats.total_nodes);
+        println!("With embeddings: {}", stats.nodes_with_embeddings);
+
+        Ok(())
+
+    }
+
 }
 
 fn print_usage_stdout() {
@@ -132,6 +149,7 @@ fn usage() -> &'static str {
 }
 
 /// Truncate a string for display (UTF-8 safe)
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 fn truncate(s: &str, max_chars: usize) -> String {
     let s = s.replace('\n', " ");
     if s.chars().count() <= max_chars {

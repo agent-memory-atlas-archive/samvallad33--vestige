@@ -34,8 +34,11 @@
 #[path = "glibc_compat.rs"]
 mod glibc_compat;
 
+#[cfg(feature = "legacy-sqlite")]
 use vestige_mcp::cognitive;
+#[cfg(feature = "legacy-sqlite")]
 use vestige_mcp::protocol;
+#[cfg(feature = "legacy-sqlite")]
 use vestige_mcp::server;
 
 use directories::BaseDirs;
@@ -43,22 +46,29 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Component, PathBuf};
+#[cfg(feature = "legacy-sqlite")]
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(feature = "legacy-sqlite")]
 use tokio::sync::Mutex;
-use tracing::{Level, debug, error, info, warn};
+#[cfg(feature = "legacy-sqlite")]
+use tracing::debug;
+use tracing::{Level, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 // Use vestige-core for the cognitive science engine
-use vestige_core::Storage;
 
+#[cfg(feature = "legacy-sqlite")]
 use protocol::stdio::{Notifier, StdioTransport};
+#[cfg(feature = "legacy-sqlite")]
 use server::McpServer;
 
 const DATA_DIR_ENV: &str = "VESTIGE_DATA_DIR";
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 const DATABASE_FILE: &str = "vestige.db";
 
 /// Parsed CLI configuration.
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 struct Config {
     data_dir: Option<PathBuf>,
     http_port: u16,
@@ -226,6 +236,7 @@ fn parse_args_from(args: Vec<OsString>, env_data_dir: Option<PathBuf>) -> Config
     }
 }
 
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 fn expand_tilde(path: PathBuf) -> PathBuf {
     let rest = {
         let mut components = path.components();
@@ -245,6 +256,7 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
     }
 }
 
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 fn prepare_storage_path(data_dir: Option<PathBuf>) -> io::Result<Option<PathBuf>> {
     let Some(data_dir) = data_dir else {
         return Ok(None);
@@ -423,350 +435,373 @@ async fn serve() {
         env!("CARGO_PKG_VERSION")
     );
 
-    let storage_path = match prepare_storage_path(config.data_dir) {
-        Ok(path) => path,
-        Err(e) => {
-            error!("Failed to prepare storage data directory: {}", e);
-            std::process::exit(1);
-        }
-    };
+    // ------------------------------------------------------------------------
+    // Legacy SQLite quarantine (build/t5-legacy-isolation): everything below
+    // needs the `Storage` store. In a `legacy-sqlite`-free build the server
+    // has no backend yet (STRATA lands in the next merge), so it exits with
+    // the clear open_storage() error instead of failing to compile.
+    // ------------------------------------------------------------------------
+    #[cfg(not(feature = "legacy-sqlite"))]
+    let _ = &config;
 
-    // Initialize storage with optional custom data directory.
-    // Storage::new(Some(...)) expects a DB file path, so map data dirs to vestige.db here.
-    let storage = match Storage::new(storage_path) {
-        Ok(s) => {
-            info!("Storage initialized successfully");
-            Arc::new(s)
-        }
-        Err(e) => {
-            error!("Failed to initialize storage: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    // Preserve the released Nomic default in the background so MCP clients can
-    // finish their stdio handshake before a first-run model download. Optional
-    // profiles reject this compatibility path: their artifact verification,
-    // evaluation, migration, and activation remain explicit local operations.
-    // The stdio transport and the notifier that lets background work tell the
-    // client what it is doing. Created before the warm-up tasks so a first-run
-    // model download can announce itself as MCP logging instead of dying on
-    // stderr, which stdio clients hide.
-    let (transport, notifier) = StdioTransport::with_notifications();
-
-    // Wave-S UX: start-time version hint (canonical pattern per the Sep 2026
-    // ecosystem scan — check-and-hint, never self-update). One stderr line,
-    // spawned off the critical path so the handshake budget is untouched.
-    // Compare against npm's registry metadata for vestige-mcp-server; any
-    // network failure or timeout is silently skipped.
-    #[cfg(feature = "cloud-sync")]
+    #[cfg(feature = "legacy-sqlite")]
     {
-        let notifier = notifier.clone();
-        tokio::spawn(async move {
-            // reqwest reaches vestige-mcp only through vestige-core's
-            // cloud-sync/connectors feature; the guard above keeps builds
-            // without it compiling.
-            // Offline / rate-limited / parse failure: None, silently skipped.
-            if let Some(latest_version) = vestige_core::latest_npm_version().await {
-                let current = env!("CARGO_PKG_VERSION");
-                if latest_version != current {
-                    notifier.log(
-                        "info",
-                        "vestige.update",
-                        serde_json::json!({
-                            "event": "newer_version_available",
-                            "current": current,
-                            "latest": latest_version,
-                            "hint": "npm install -g vestige-mcp-server@latest  (or brew upgrade vestige)",
-                        }),
+        let storage_path = match prepare_storage_path(config.data_dir) {
+            Ok(path) => path,
+            Err(e) => {
+                error!("Failed to prepare storage data directory: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        // Initialize storage with optional custom data directory.
+        // open_storage() (the sanctioned constructor path) expects a DB file
+        // path, so map data dirs to vestige.db here.
+        let storage = match vestige_core::open_storage(storage_path) {
+            Ok(s) => {
+                info!("Storage initialized successfully");
+                Arc::new(s)
+            }
+            Err(e) => {
+                error!("Failed to initialize storage: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        // Preserve the released Nomic default in the background so MCP clients can
+        // finish their stdio handshake before a first-run model download. Optional
+        // profiles reject this compatibility path: their artifact verification,
+        // evaluation, migration, and activation remain explicit local operations.
+        // The stdio transport and the notifier that lets background work tell the
+        // client what it is doing. Created before the warm-up tasks so a first-run
+        // model download can announce itself as MCP logging instead of dying on
+        // stderr, which stdio clients hide.
+        let (transport, notifier) = StdioTransport::with_notifications();
+
+        // Wave-S UX: start-time version hint (canonical pattern per the Sep 2026
+        // ecosystem scan — check-and-hint, never self-update). One stderr line,
+        // spawned off the critical path so the handshake budget is untouched.
+        // Compare against npm's registry metadata for vestige-mcp-server; any
+        // network failure or timeout is silently skipped.
+        #[cfg(feature = "cloud-sync")]
+        {
+            let notifier = notifier.clone();
+            tokio::spawn(async move {
+                // reqwest reaches vestige-mcp only through vestige-core's
+                // cloud-sync/connectors feature; the guard above keeps builds
+                // without it compiling.
+                // Offline / rate-limited / parse failure: None, silently skipped.
+                if let Some(latest_version) = vestige_core::latest_npm_version().await {
+                    let current = env!("CARGO_PKG_VERSION");
+                    if latest_version != current {
+                        notifier.log(
+                            "info",
+                            "vestige.update",
+                            serde_json::json!({
+                                "event": "newer_version_available",
+                                "current": current,
+                                "latest": latest_version,
+                                "hint": "npm install -g vestige-mcp-server@latest  (or brew upgrade vestige)",
+                            }),
+                        );
+                    }
+                }
+            });
+        }
+        // Nothing warms up at startup anymore (the embedding runtime was removed),
+        // so the notifier has no sender beyond this scope; dropping it parks the channel.
+        let _notifier: Notifier = notifier.clone();
+
+        // Startup hygiene: sweep Black Box traces past VESTIGE_TRACE_RETENTION_DAYS
+        // now, not only when the consolidation cycle next runs. Best-effort.
+        match storage.prune_agent_traces() {
+            Ok(deleted) if deleted > 0 => info!(deleted, "Pruned expired agent trace events at startup"),
+            Ok(_) => {}
+            Err(e) => warn!("Startup trace retention sweep failed: {}", e),
+        }
+
+        // Periodic WAL checkpoint. `wal_autocheckpoint` already runs on commit, but
+        // a PASSIVE checkpoint every 60 s (never blocks readers or writers) folds
+        // the .wal back into the main file across long uptimes and reports a WAL
+        // that keeps growing instead of letting it reach gigabytes unnoticed.
+        {
+            let storage_clone = storage.clone();
+            tokio::spawn(async move {
+                // Roughly 40 MB at the 4 KiB default page size, 80 MB at 8 KiB.
+                const WAL_WARN_FRAMES: i64 = 10_000;
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                ticker.tick().await; // the first tick completes immediately; skip it
+                loop {
+                    ticker.tick().await;
+                    let storage = storage_clone.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        storage.checkpoint_wal(vestige_core::storage::WalCheckpointMode::Passive)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(status)) if status.log_frames > WAL_WARN_FRAMES => warn!(
+                            log_frames = status.log_frames,
+                            checkpointed_frames = status.checkpointed_frames,
+                            busy = status.busy,
+                            "WAL is large after a passive checkpoint; a long-running reader may be pinning it"
+                        ),
+                        Ok(Ok(status)) => debug!(
+                            log_frames = status.log_frames,
+                            checkpointed_frames = status.checkpointed_frames,
+                            "Periodic WAL checkpoint"
+                        ),
+                        Ok(Err(e)) => warn!("Periodic WAL checkpoint failed: {}", e),
+                        Err(e) => warn!("Periodic WAL checkpoint task failed to run: {}", e),
+                    }
+                }
+            });
+        }
+
+        // Spawn periodic auto-consolidation so FSRS-6 decay scores stay fresh.
+        // Runs on startup (if needed) and then every N hours (default: 6).
+        // Configurable via VESTIGE_CONSOLIDATION_INTERVAL_HOURS env var.
+        {
+            let storage_clone = storage.clone();
+            tokio::spawn(async move {
+                let interval_hours: u64 = std::env::var("VESTIGE_CONSOLIDATION_INTERVAL_HOURS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(6);
+
+                // Small delay so we don't block server startup / stdio handshake
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                loop {
+                    // Check whether consolidation is actually needed
+                    let should_run = match storage_clone.get_last_consolidation() {
+                        Ok(Some(last)) => {
+                            let elapsed = chrono::Utc::now() - last;
+                            let stale = elapsed > chrono::Duration::hours(interval_hours as i64);
+                            if !stale {
+                                info!(
+                                    last_consolidation = %last,
+                                    "Skipping auto-consolidation (last run was < {} hours ago)",
+                                    interval_hours
+                                );
+                            }
+                            stale
+                        }
+                        Ok(None) => {
+                            info!("No previous consolidation found — running first auto-consolidation");
+                            true
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Could not read consolidation history: {} — running anyway",
+                                e
+                            );
+                            true
+                        }
+                    };
+
+                    if should_run {
+                        match storage_clone.run_consolidation() {
+                            Ok(result) => {
+                                info!(
+                                    nodes_processed = result.nodes_processed,
+                                    decay_applied = result.decay_applied,
+                                    embeddings_generated = result.embeddings_generated,
+                                    duplicates_merged = result.duplicates_merged,
+                                    activations_computed = result.activations_computed,
+                                    duration_ms = result.duration_ms,
+                                    "Periodic auto-consolidation complete"
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Periodic auto-consolidation failed: {}", e);
+                            }
+                        }
+
+                        // v2.0.5: Rac1 cascade sweep — walk recently-suppressed
+                        // memories and fade their co-activated neighbors
+                        // (Cervantes-Sandoval & Davis 2020, PMC7477079).
+                        match storage_clone.run_rac1_cascade_sweep() {
+                            Ok((seeds, affected)) if seeds > 0 || affected > 0 => {
+                                info!(
+                                    suppressed_seeds = seeds,
+                                    neighbors_affected = affected,
+                                    "Rac1 cascade sweep complete"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!("Rac1 cascade sweep failed: {}", e);
+                            }
+                        }
+                    }
+
+                    // v2.3: optional review-gated dream compile riding the same
+                    // loop. Off by default (VESTIGE_DREAM_COMPILE_AUTOFIRE=1 to
+                    // enable) because it files Memory PRs and an unattended store
+                    // should not accumulate an unread review queue. Every change
+                    // it produces is a reviewable PR — it never mutates a memory
+                    // row — so enabling it is safe, just not silent.
+                    if std::env::var("VESTIGE_DREAM_COMPILE_AUTOFIRE")
+                        .map(|v| {
+                            let v = v.trim();
+                            v.eq_ignore_ascii_case("1")
+                                || v.eq_ignore_ascii_case("true")
+                                || v.eq_ignore_ascii_case("on")
+                        })
+                        .unwrap_or(false)
+                    {
+                        let config = vestige_core::DreamCompileConfig::default();
+                        match vestige_core::run_dream_compile(&storage_clone, &config) {
+                            Ok(report) if report.status == "compiled" => {
+                                info!(
+                                    memories_replayed = report.memories_replayed,
+                                    edges_strengthened = report.edges_strengthened,
+                                    edges_downscaled = report.edges_downscaled,
+                                    contradictions_found = report.contradictions_found,
+                                    prs_filed = report.prs_filed.len(),
+                                    "Auto dream compile complete (all changes held as review PRs)"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!("Auto dream compile failed: {}", e);
+                            }
+                        }
+                    }
+
+                    // Sleep until next check
+                    tokio::time::sleep(std::time::Duration::from_secs(interval_hours * 3600)).await;
+                }
+            });
+        }
+
+        // Create cognitive engine (stateful neuroscience modules)
+        let cognitive = Arc::new(Mutex::new(cognitive::CognitiveEngine::new()));
+        // Hydrate cognitive modules from persisted connections
+        {
+            let mut cog = cognitive.lock().await;
+            cog.hydrate(&storage);
+        }
+        info!("CognitiveEngine initialized and hydrated");
+
+        // Create shared event broadcast channel for dashboard <-> MCP tool events
+        let (event_tx, _) =
+            tokio::sync::broadcast::channel::<vestige_mcp::dashboard::events::VestigeEvent>(
+                vestige_mcp::dashboard::state::EVENT_CHANNEL_CAPACITY,
+            );
+
+        // v2.0.9 "Autopilot" — spawn the backend event-subscriber that routes
+        // every live WebSocket event into the cognitive modules that already
+        // have trigger methods implemented. Without this, the 20 event types
+        // terminate at the dashboard and the cognitive engine is a passive
+        // library that only responds to MCP tool queries.
+        //
+        // See `crates/vestige-mcp/src/autopilot.rs` for the routing table and
+        // `docs/VESTIGE_STATE_AND_PLAN.md` §15 for the architectural rationale.
+        vestige_mcp::autopilot::spawn(
+            Arc::clone(&cognitive),
+            Arc::clone(&storage),
+            event_tx.clone(),
+        );
+
+        // Spawn dashboard HTTP server alongside MCP server (now with CognitiveEngine access)
+        if config.dashboard_enabled {
+            let dashboard_port = std::env::var("VESTIGE_DASHBOARD_PORT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(3927);
+            let dashboard_storage = Arc::clone(&storage);
+            let dashboard_cognitive = Arc::clone(&cognitive);
+            let dashboard_event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                match vestige_mcp::dashboard::start_background_with_event_tx(
+                    dashboard_storage,
+                    Some(dashboard_cognitive),
+                    dashboard_event_tx,
+                    dashboard_port,
+                )
+                .await
+                {
+                    Ok(_state) => {
+                        info!("Dashboard started with WebSocket + CognitiveEngine + shared event bus");
+                    }
+                    Err(e) => {
+                        warn!("Dashboard failed to start: {}", e);
+                    }
+                }
+            });
+        } else {
+            info!("Dashboard disabled by VESTIGE_DASHBOARD_ENABLED=false");
+        }
+
+        // Start optional HTTP MCP transport for clients that need Streamable HTTP.
+        if config.http_enabled {
+            let http_storage = Arc::clone(&storage);
+            let http_cognitive = Arc::clone(&cognitive);
+            let http_event_tx = event_tx.clone();
+            let http_port = config.http_port;
+
+            match protocol::auth::get_or_create_auth_token() {
+                Ok(token) => {
+                    let bind =
+                        std::env::var("VESTIGE_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+                    eprintln!("Vestige HTTP transport: http://{}:{}/mcp", bind, http_port);
+                    if let Ok(path) = protocol::auth::token_path() {
+                        eprintln!("Auth token file: {}", path.display());
+                    }
+                    tokio::spawn(async move {
+                        if let Err(e) = protocol::http::start_http_transport(
+                            http_storage,
+                            http_cognitive,
+                            http_event_tx,
+                            token,
+                            http_port,
+                        )
+                        .await
+                        {
+                            warn!("HTTP transport failed to start: {}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        "Could not create auth token, HTTP transport disabled: {}",
+                        e
                     );
                 }
             }
-        });
-    }
-    // Nothing warms up at startup anymore (the embedding runtime was removed),
-    // so the notifier has no sender beyond this scope; dropping it parks the channel.
-    let _notifier: Notifier = notifier.clone();
-
-    // Startup hygiene: sweep Black Box traces past VESTIGE_TRACE_RETENTION_DAYS
-    // now, not only when the consolidation cycle next runs. Best-effort.
-    match storage.prune_agent_traces() {
-        Ok(deleted) if deleted > 0 => info!(deleted, "Pruned expired agent trace events at startup"),
-        Ok(_) => {}
-        Err(e) => warn!("Startup trace retention sweep failed: {}", e),
-    }
-
-    // Periodic WAL checkpoint. `wal_autocheckpoint` already runs on commit, but
-    // a PASSIVE checkpoint every 60 s (never blocks readers or writers) folds
-    // the .wal back into the main file across long uptimes and reports a WAL
-    // that keeps growing instead of letting it reach gigabytes unnoticed.
-    {
-        let storage_clone = storage.clone();
-        tokio::spawn(async move {
-            // Roughly 40 MB at the 4 KiB default page size, 80 MB at 8 KiB.
-            const WAL_WARN_FRAMES: i64 = 10_000;
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ticker.tick().await; // the first tick completes immediately; skip it
-            loop {
-                ticker.tick().await;
-                let storage = storage_clone.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    storage.checkpoint_wal(vestige_core::storage::WalCheckpointMode::Passive)
-                })
-                .await;
-                match result {
-                    Ok(Ok(status)) if status.log_frames > WAL_WARN_FRAMES => warn!(
-                        log_frames = status.log_frames,
-                        checkpointed_frames = status.checkpointed_frames,
-                        busy = status.busy,
-                        "WAL is large after a passive checkpoint; a long-running reader may be pinning it"
-                    ),
-                    Ok(Ok(status)) => debug!(
-                        log_frames = status.log_frames,
-                        checkpointed_frames = status.checkpointed_frames,
-                        "Periodic WAL checkpoint"
-                    ),
-                    Ok(Err(e)) => warn!("Periodic WAL checkpoint failed: {}", e),
-                    Err(e) => warn!("Periodic WAL checkpoint task failed to run: {}", e),
-                }
-            }
-        });
-    }
-
-    // Spawn periodic auto-consolidation so FSRS-6 decay scores stay fresh.
-    // Runs on startup (if needed) and then every N hours (default: 6).
-    // Configurable via VESTIGE_CONSOLIDATION_INTERVAL_HOURS env var.
-    {
-        let storage_clone = storage.clone();
-        tokio::spawn(async move {
-            let interval_hours: u64 = std::env::var("VESTIGE_CONSOLIDATION_INTERVAL_HOURS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(6);
-
-            // Small delay so we don't block server startup / stdio handshake
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-            loop {
-                // Check whether consolidation is actually needed
-                let should_run = match storage_clone.get_last_consolidation() {
-                    Ok(Some(last)) => {
-                        let elapsed = chrono::Utc::now() - last;
-                        let stale = elapsed > chrono::Duration::hours(interval_hours as i64);
-                        if !stale {
-                            info!(
-                                last_consolidation = %last,
-                                "Skipping auto-consolidation (last run was < {} hours ago)",
-                                interval_hours
-                            );
-                        }
-                        stale
-                    }
-                    Ok(None) => {
-                        info!("No previous consolidation found — running first auto-consolidation");
-                        true
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Could not read consolidation history: {} — running anyway",
-                            e
-                        );
-                        true
-                    }
-                };
-
-                if should_run {
-                    match storage_clone.run_consolidation() {
-                        Ok(result) => {
-                            info!(
-                                nodes_processed = result.nodes_processed,
-                                decay_applied = result.decay_applied,
-                                embeddings_generated = result.embeddings_generated,
-                                duplicates_merged = result.duplicates_merged,
-                                activations_computed = result.activations_computed,
-                                duration_ms = result.duration_ms,
-                                "Periodic auto-consolidation complete"
-                            );
-                        }
-                        Err(e) => {
-                            warn!("Periodic auto-consolidation failed: {}", e);
-                        }
-                    }
-
-                    // v2.0.5: Rac1 cascade sweep — walk recently-suppressed
-                    // memories and fade their co-activated neighbors
-                    // (Cervantes-Sandoval & Davis 2020, PMC7477079).
-                    match storage_clone.run_rac1_cascade_sweep() {
-                        Ok((seeds, affected)) if seeds > 0 || affected > 0 => {
-                            info!(
-                                suppressed_seeds = seeds,
-                                neighbors_affected = affected,
-                                "Rac1 cascade sweep complete"
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            warn!("Rac1 cascade sweep failed: {}", e);
-                        }
-                    }
-                }
-
-                // v2.3: optional review-gated dream compile riding the same
-                // loop. Off by default (VESTIGE_DREAM_COMPILE_AUTOFIRE=1 to
-                // enable) because it files Memory PRs and an unattended store
-                // should not accumulate an unread review queue. Every change
-                // it produces is a reviewable PR — it never mutates a memory
-                // row — so enabling it is safe, just not silent.
-                if std::env::var("VESTIGE_DREAM_COMPILE_AUTOFIRE")
-                    .map(|v| {
-                        let v = v.trim();
-                        v.eq_ignore_ascii_case("1")
-                            || v.eq_ignore_ascii_case("true")
-                            || v.eq_ignore_ascii_case("on")
-                    })
-                    .unwrap_or(false)
-                {
-                    let config = vestige_core::DreamCompileConfig::default();
-                    match vestige_core::run_dream_compile(&storage_clone, &config) {
-                        Ok(report) if report.status == "compiled" => {
-                            info!(
-                                memories_replayed = report.memories_replayed,
-                                edges_strengthened = report.edges_strengthened,
-                                edges_downscaled = report.edges_downscaled,
-                                contradictions_found = report.contradictions_found,
-                                prs_filed = report.prs_filed.len(),
-                                "Auto dream compile complete (all changes held as review PRs)"
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            warn!("Auto dream compile failed: {}", e);
-                        }
-                    }
-                }
-
-                // Sleep until next check
-                tokio::time::sleep(std::time::Duration::from_secs(interval_hours * 3600)).await;
-            }
-        });
-    }
-
-    // Create cognitive engine (stateful neuroscience modules)
-    let cognitive = Arc::new(Mutex::new(cognitive::CognitiveEngine::new()));
-    // Hydrate cognitive modules from persisted connections
-    {
-        let mut cog = cognitive.lock().await;
-        cog.hydrate(&storage);
-    }
-    info!("CognitiveEngine initialized and hydrated");
-
-    // Create shared event broadcast channel for dashboard <-> MCP tool events
-    let (event_tx, _) =
-        tokio::sync::broadcast::channel::<vestige_mcp::dashboard::events::VestigeEvent>(
-            vestige_mcp::dashboard::state::EVENT_CHANNEL_CAPACITY,
-        );
-
-    // v2.0.9 "Autopilot" — spawn the backend event-subscriber that routes
-    // every live WebSocket event into the cognitive modules that already
-    // have trigger methods implemented. Without this, the 20 event types
-    // terminate at the dashboard and the cognitive engine is a passive
-    // library that only responds to MCP tool queries.
-    //
-    // See `crates/vestige-mcp/src/autopilot.rs` for the routing table and
-    // `docs/VESTIGE_STATE_AND_PLAN.md` §15 for the architectural rationale.
-    vestige_mcp::autopilot::spawn(
-        Arc::clone(&cognitive),
-        Arc::clone(&storage),
-        event_tx.clone(),
-    );
-
-    // Spawn dashboard HTTP server alongside MCP server (now with CognitiveEngine access)
-    if config.dashboard_enabled {
-        let dashboard_port = std::env::var("VESTIGE_DASHBOARD_PORT")
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(3927);
-        let dashboard_storage = Arc::clone(&storage);
-        let dashboard_cognitive = Arc::clone(&cognitive);
-        let dashboard_event_tx = event_tx.clone();
-        tokio::spawn(async move {
-            match vestige_mcp::dashboard::start_background_with_event_tx(
-                dashboard_storage,
-                Some(dashboard_cognitive),
-                dashboard_event_tx,
-                dashboard_port,
-            )
-            .await
-            {
-                Ok(_state) => {
-                    info!("Dashboard started with WebSocket + CognitiveEngine + shared event bus");
-                }
-                Err(e) => {
-                    warn!("Dashboard failed to start: {}", e);
-                }
-            }
-        });
-    } else {
-        info!("Dashboard disabled by VESTIGE_DASHBOARD_ENABLED=false");
-    }
-
-    // Start optional HTTP MCP transport for clients that need Streamable HTTP.
-    if config.http_enabled {
-        let http_storage = Arc::clone(&storage);
-        let http_cognitive = Arc::clone(&cognitive);
-        let http_event_tx = event_tx.clone();
-        let http_port = config.http_port;
-
-        match protocol::auth::get_or_create_auth_token() {
-            Ok(token) => {
-                let bind =
-                    std::env::var("VESTIGE_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
-                eprintln!("Vestige HTTP transport: http://{}:{}/mcp", bind, http_port);
-                if let Ok(path) = protocol::auth::token_path() {
-                    eprintln!("Auth token file: {}", path.display());
-                }
-                tokio::spawn(async move {
-                    if let Err(e) = protocol::http::start_http_transport(
-                        http_storage,
-                        http_cognitive,
-                        http_event_tx,
-                        token,
-                        http_port,
-                    )
-                    .await
-                    {
-                        warn!("HTTP transport failed to start: {}", e);
-                    }
-                });
-            }
-            Err(e) => {
-                warn!(
-                    "Could not create auth token, HTTP transport disabled: {}",
-                    e
-                );
-            }
+        } else {
+            info!("HTTP MCP transport disabled; set VESTIGE_HTTP_ENABLED=1 or pass --http to enable");
         }
-    } else {
-        info!("HTTP MCP transport disabled; set VESTIGE_HTTP_ENABLED=1 or pass --http to enable");
+
+
+        // Create MCP server with shared event channel for dashboard broadcasts
+        let server = McpServer::new_with_events(storage, cognitive, event_tx);
+
+        info!("Starting MCP server on stdio...");
+
+        // Run the server
+        if let Err(e) = transport.run(server).await {
+            error!("Server error: {}", e);
+            // Not `std::process::exit`: this runs on a runtime thread with the
+            // warm-up tasks possibly still inside ONNX Runtime, which is the state
+            // `leave_without_running_exit_handlers` documents. The status stays 1.
+            leave_without_running_exit_handlers(1);
+        }
+
+        info!("Vestige MCP Server shutting down");
+
     }
 
-
-    // Create MCP server with shared event channel for dashboard broadcasts
-    let server = McpServer::new_with_events(storage, cognitive, event_tx);
-
-    info!("Starting MCP server on stdio...");
-
-    // Run the server
-    if let Err(e) = transport.run(server).await {
-        error!("Server error: {}", e);
-        // Not `std::process::exit`: this runs on a runtime thread with the
-        // warm-up tasks possibly still inside ONNX Runtime, which is the state
-        // `leave_without_running_exit_handlers` documents. The status stays 1.
-        leave_without_running_exit_handlers(1);
+    #[cfg(not(feature = "legacy-sqlite"))]
+    {
+        // The clear quarantine error, verbatim from the feature-off
+        // open_storage(): "built without legacy-sqlite; STRATA default
+        // lands in the next merge".
+        error!("Storage unavailable: {}", vestige_core::storage::LegacySqliteDisabled);
+        std::process::exit(1);
     }
-
-    info!("Vestige MCP Server shutting down");
 }
 
 #[cfg(test)]

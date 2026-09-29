@@ -14,16 +14,23 @@ mod glibc_compat;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{BufWriter, Write};
+#[cfg(feature = "legacy-sqlite")]
+use std::io::BufWriter;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(feature = "legacy-sqlite")]
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
-use chrono::{NaiveDate, Utc};
+#[cfg(feature = "legacy-sqlite")]
+use chrono::NaiveDate;
+use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use colored::Colorize;
+// Legacy SQLite store surface: behind `legacy-sqlite` (build/t5-legacy-isolation).
+#[cfg(feature = "legacy-sqlite")]
 use vestige_core::{
     IngestInput, PortableImportMode, SecretConfidence, SecretPolicy, SourceEnvelope,
     SourceUpsertOutcome, Storage, scan_secrets,
@@ -50,6 +57,7 @@ struct Cli {
     command: Commands,
 }
 
+#[cfg(feature = "legacy-sqlite")]
 static CLI_DB_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Args)]
@@ -478,6 +486,7 @@ enum Commands {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    #[cfg(feature = "legacy-sqlite")]
     if let Some(data_dir) = cli.data_dir {
         let db_path = Storage::db_path_for_data_dir(data_dir)?;
         CLI_DB_PATH
@@ -485,6 +494,7 @@ fn main() -> anyhow::Result<()> {
             .map_err(|_| anyhow::anyhow!("data directory was initialized more than once"))?;
     }
 
+    #[cfg(feature = "legacy-sqlite")]
     match cli.command {
         Commands::Stats { tagging, states } => run_stats(tagging, states),
         Commands::Health => run_health(),
@@ -623,6 +633,38 @@ fn main() -> anyhow::Result<()> {
             scope,
             json,
         } => run_forgotten_lesson(failure_id, scope, json),
+    }
+
+    // Legacy-sqlite-free build (build/t5-legacy-isolation): only the
+    // self-update family works without the store. Every store-backed
+    // subcommand fails with the clear open_storage() error; the STRATA
+    // backend becomes the default in the next merge.
+    #[cfg(not(feature = "legacy-sqlite"))]
+    match cli.command {
+        Commands::Update {
+            version,
+            install_dir,
+            dry_run,
+            no_sandwich,
+            sandwich_companion,
+            sandwich,
+        } => run_update(
+            version,
+            install_dir,
+            dry_run,
+            no_sandwich,
+            sandwich_companion,
+            sandwich,
+        ),
+        Commands::Sandwich { command } => match command {
+            SandwichCommands::Install { version, options } => {
+                run_sandwich_install(version.as_deref(), &options)
+            }
+        },
+        _ => Err(anyhow::anyhow!(
+            "{}",
+            vestige_core::storage::LegacySqliteDisabled
+        )),
     }
 }
 
@@ -1326,6 +1368,7 @@ fn run_command(command: &mut Command, action: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 fn create_private_file(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(unix)]
     {
@@ -1655,6 +1698,7 @@ fn run_update(
 }
 
 /// Run stats command
+#[cfg(feature = "legacy-sqlite")]
 fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
     let storage = open_storage()?;
     let stats = storage.get_stats()?;
@@ -1797,6 +1841,7 @@ fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
 }
 
 /// Compute cognitive state distribution for memories
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 fn compute_state_distribution(
     memories: &[vestige_core::KnowledgeNode],
 ) -> (usize, usize, usize, usize) {
@@ -1826,6 +1871,7 @@ fn compute_state_distribution(
 }
 
 /// Print a distribution bar
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 fn print_distribution_bar(label: &str, count: usize, total: usize, color: &str) {
     let percentage = if total > 0 {
         (count as f64 / total as f64) * 100.0
@@ -1853,6 +1899,7 @@ fn print_distribution_bar(label: &str, count: usize, total: usize, color: &str) 
 }
 
 /// Run health check
+#[cfg(feature = "legacy-sqlite")]
 fn run_health() -> anyhow::Result<()> {
     let storage = open_storage()?;
     let stats = storage.get_stats()?;
@@ -2003,6 +2050,7 @@ fn run_health() -> anyhow::Result<()> {
 /// Run consolidation cycle
 /// The database this CLI invocation targets (`--data-dir` wins, then the
 /// platform default).
+#[cfg(feature = "legacy-sqlite")]
 fn cli_db_path() -> anyhow::Result<PathBuf> {
     if let Some(path) = CLI_DB_PATH.get() {
         return Ok(path.clone());
@@ -2018,6 +2066,7 @@ fn cli_db_path() -> anyhow::Result<PathBuf> {
 /// that rehearsal as a command: copy the store and its WAL/SHM sidecars into
 /// a temp directory, report what the strict checks see on disk today, open the
 /// copy so every migration actually runs, and never touch the original.
+#[cfg(feature = "legacy-sqlite")]
 fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
     let source = cli_db_path()?;
     if !source.exists() {
@@ -2110,6 +2159,7 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "legacy-sqlite")]
 fn run_consolidate() -> anyhow::Result<()> {
     println!("{}", "=== Vestige Consolidation ===".cyan().bold());
     println!();
@@ -2168,6 +2218,7 @@ fn run_consolidate() -> anyhow::Result<()> {
 }
 
 /// Run restore from backup
+#[cfg(feature = "legacy-sqlite")]
 fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
     println!("{}", "=== Vestige Restore ===".cyan().bold());
     println!();
@@ -2319,6 +2370,7 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
 }
 
 /// Get the default database path
+#[cfg(feature = "legacy-sqlite")]
 fn get_default_db_path() -> anyhow::Result<PathBuf> {
     if let Some(path) = CLI_DB_PATH.get() {
         Ok(path.clone())
@@ -2328,6 +2380,7 @@ fn get_default_db_path() -> anyhow::Result<PathBuf> {
 }
 
 /// Open storage using the CLI-selected data directory, if one was provided.
+#[cfg(feature = "legacy-sqlite")]
 fn open_storage() -> anyhow::Result<Storage> {
     if let Some(path) = CLI_DB_PATH.get() {
         Ok(Storage::new(Some(path.clone()))?)
@@ -2337,6 +2390,7 @@ fn open_storage() -> anyhow::Result<Storage> {
 }
 
 /// Fetch all nodes from storage using pagination
+#[cfg(feature = "legacy-sqlite")]
 fn fetch_all_nodes(storage: &Storage) -> anyhow::Result<Vec<vestige_core::KnowledgeNode>> {
     let mut all_nodes = Vec::new();
     let page_size = 500;
@@ -2356,6 +2410,7 @@ fn fetch_all_nodes(storage: &Storage) -> anyhow::Result<Vec<vestige_core::Knowle
 }
 
 /// Run backup command using SQLite's consistent-snapshot export.
+#[cfg(feature = "legacy-sqlite")]
 fn run_backup(output: PathBuf) -> anyhow::Result<()> {
     println!("{}", "=== Vestige Backup ===".cyan().bold());
     println!();
@@ -2407,6 +2462,7 @@ fn run_backup(output: PathBuf) -> anyhow::Result<()> {
 /// Snapshots the store to a tempdir copy, plants causes/failures there, runs
 /// the real backfill against the copy, and prints the same payload the MCP
 /// tool returns. The live store is only read.
+#[cfg(feature = "legacy-sqlite")]
 fn run_selftest() -> anyhow::Result<()> {
     println!("{}", "=== Planted-Cause Selftest ===".cyan().bold());
     println!();
@@ -2449,6 +2505,7 @@ fn run_selftest() -> anyhow::Result<()> {
 
 /// Run the forgotten-lesson scan (the MCP `forgotten_lesson` tool) from the
 /// CLI: decayed fix/lesson memories sharing an exact anchor with a failure.
+#[cfg(feature = "legacy-sqlite")]
 fn run_forgotten_lesson(
     failure_id: String,
     scope: Option<String>,
@@ -2496,6 +2553,7 @@ fn run_forgotten_lesson(
 }
 
 /// Run export command - exports memories in JSON or JSONL format
+#[cfg(feature = "legacy-sqlite")]
 fn run_export(
     output: PathBuf,
     format: String,
@@ -2629,6 +2687,7 @@ fn run_export(
 }
 
 /// Run exact portable archive export.
+#[cfg(feature = "legacy-sqlite")]
 fn run_portable_export(output: PathBuf) -> anyhow::Result<()> {
     println!("{}", "=== Vestige Portable Export ===".cyan().bold());
     println!();
@@ -2672,6 +2731,7 @@ fn run_portable_export(output: PathBuf) -> anyhow::Result<()> {
 }
 
 /// Run exact portable archive import.
+#[cfg(feature = "legacy-sqlite")]
 fn run_portable_import(input: PathBuf, merge: bool) -> anyhow::Result<()> {
     println!("{}", "=== Vestige Portable Import ===".cyan().bold());
     println!();
@@ -2728,6 +2788,7 @@ fn run_portable_import(input: PathBuf, merge: bool) -> anyhow::Result<()> {
 }
 
 /// Run file-backed two-way sync.
+#[cfg(feature = "legacy-sqlite")]
 fn run_sync(archive: Option<PathBuf>, cloud: bool, endpoint: Option<String>) -> anyhow::Result<()> {
     if cloud {
         run_sync_cloud(endpoint)
@@ -2741,6 +2802,7 @@ fn run_sync(archive: Option<PathBuf>, cloud: bool, endpoint: Option<String>) -> 
     }
 }
 
+#[cfg(feature = "legacy-sqlite")]
 fn run_sync_file(archive: PathBuf) -> anyhow::Result<()> {
     println!("{}", "=== Vestige File Sync ===".cyan().bold());
     println!();
@@ -2753,6 +2815,7 @@ fn run_sync_file(archive: PathBuf) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "cloud-sync")]
+#[cfg(feature = "legacy-sqlite")]
 fn run_sync_cloud(endpoint: Option<String>) -> anyhow::Result<()> {
     let endpoint = endpoint
         .or_else(|| std::env::var("VESTIGE_CLOUD_ENDPOINT").ok())
@@ -2805,6 +2868,7 @@ fn run_sync_cloud(endpoint: Option<String>) -> anyhow::Result<()> {
 }
 
 #[cfg(not(feature = "cloud-sync"))]
+#[cfg(feature = "legacy-sqlite")]
 fn run_sync_cloud(_endpoint: Option<String>) -> anyhow::Result<()> {
     anyhow::bail!(
         "this build was compiled without the `cloud-sync` feature. Official binaries from \
@@ -2813,6 +2877,7 @@ fn run_sync_cloud(_endpoint: Option<String>) -> anyhow::Result<()> {
     )
 }
 
+#[cfg(feature = "legacy-sqlite")]
 fn print_sync_report(report: &vestige_core::PortableSyncReport) {
     if let Some(pull) = &report.pull {
         println!("{}", "Pull: merged remote archive".yellow());
@@ -2844,6 +2909,7 @@ fn print_sync_report(report: &vestige_core::PortableSyncReport) {
 }
 
 /// Run garbage collection command
+#[cfg(feature = "legacy-sqlite")]
 fn run_gc(
     min_retention: f64,
     max_age_days: Option<u64>,
@@ -2998,6 +3064,7 @@ fn run_gc(
 }
 
 /// Ingest a memory via CLI (routes through smart_ingest / PE Gating)
+#[cfg(feature = "legacy-sqlite")]
 fn run_ingest(
     content: String,
     tags: Option<String>,
@@ -3093,6 +3160,7 @@ fn run_ingest(
 ///
 /// Deliberately emits IDs, detector classes, and short fingerprints only. It
 /// never prints the matching content, source, or surrounding context.
+#[cfg(feature = "legacy-sqlite")]
 fn run_scan_secrets(
     include_suspected: bool,
     json_output: bool,
@@ -3205,6 +3273,7 @@ fn run_scan_secrets(
 
 /// Run Retroactive Salience Backfill from the CLI (the demo's payoff command).
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "legacy-sqlite")]
 fn run_backfill(
     failure_id: Option<String>,
     manual: bool,
@@ -3427,6 +3496,7 @@ fn run_backfill(
 /// edges -> ranked suspect change records. Mirrors the MCP `causal_walk`
 /// tool (same core engine); `--json` prints the raw result for tooling.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "legacy-sqlite")]
 fn run_causal_walk(
     failing_test: Option<String>,
     stack_frame: Option<String>,
@@ -3557,6 +3627,7 @@ fn run_causal_walk(
 /// Normalized remote identity for a repo: `git config remote.origin.url`
 /// stripped of protocol and `.git` (`https://github.com/a/b.git`,
 /// `git@github.com:a/b` -> `github.com/a/b`). None when no remote is set.
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 fn git_repo_identity(path: &Path) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -3586,6 +3657,7 @@ fn git_repo_identity(path: &Path) -> Option<String> {
 /// query-time entity extractor turns those into the causal join keys. Records
 /// upsert on `(git, "<repo>#<sha>")`, so re-running is free, and created_at is
 /// the commit time so the backward reach is exact.
+#[cfg(feature = "legacy-sqlite")]
 fn run_ingest_git(
     path: PathBuf,
     since: Option<String>,
@@ -3701,6 +3773,7 @@ fn run_ingest_git(
 }
 
 /// Recall + reason across memories using the real deep_reference engine.
+#[cfg(feature = "legacy-sqlite")]
 fn run_recall(query: String, depth: i64, json: bool) -> anyhow::Result<()> {
     use vestige_mcp::cognitive::CognitiveEngine;
 
@@ -3778,6 +3851,7 @@ fn run_recall(query: String, depth: i64, json: bool) -> anyhow::Result<()> {
 }
 
 /// Compose: surface never-composed memory pairs + the testable question they imply.
+#[cfg(feature = "legacy-sqlite")]
 fn run_project(
     out: PathBuf,
     format: String,
@@ -3866,6 +3940,7 @@ fn run_project(
     Ok(())
 }
 
+#[cfg(feature = "legacy-sqlite")]
 fn run_compose(limit: i32, tags: Option<String>, json: bool) -> anyhow::Result<()> {
     let storage = open_storage()?;
 
@@ -3953,6 +4028,7 @@ fn run_compose(limit: i32, tags: Option<String>, json: bool) -> anyhow::Result<(
 }
 
 /// Run the dashboard web server
+#[cfg(feature = "legacy-sqlite")]
 fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
     use vestige_mcp::cognitive::CognitiveEngine;
 
@@ -3983,6 +4059,7 @@ fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
 }
 
 /// Start standalone HTTP MCP server (no stdio transport)
+#[cfg(feature = "legacy-sqlite")]
 fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Result<()> {
     use vestige_mcp::cognitive::CognitiveEngine;
 
@@ -4068,6 +4145,7 @@ fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Re
 }
 
 /// Truncate a string for display (UTF-8 safe)
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 fn truncate(s: &str, max_chars: usize) -> String {
     let s = s.replace('\n', " ");
     if s.chars().count() <= max_chars {

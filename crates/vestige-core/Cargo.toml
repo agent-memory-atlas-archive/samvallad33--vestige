@@ -13,10 +13,23 @@ keywords = ["memory", "spaced-repetition", "fsrs", "knowledge-graph"]
 categories = ["science", "database"]
 
 [features]
-default = ["bundled-sqlite", "codebase-git"]
+default = ["legacy-sqlite", "bundled-sqlite", "codebase-git"]
+
+# LEGACY SQLITE QUARANTINE (build/t5-legacy-isolation).
+#
+# Every line of SQLite code lives behind this feature: the
+# `storage/sqlite/` module tree, the rusqlite-dependent sibling modules in
+# `storage/` (edges, blast, session_queries, trace_store, portable, ...),
+# `fts.rs` (SQLite FTS5 query sanitization), the `Storage =
+# SqliteMemoryStore` alias, and the `SqliteMemoryStore::new` constructor
+# path. Default ON for now; the flip to default-off happens after the
+# STRATA migration lands. Code outside this boundary must not name
+# rusqlite; open `Storage` handles through `storage::open_storage()`,
+# which fails with a clear error when this feature is off.
+legacy-sqlite = ["dep:rusqlite"]
 
 # SQLite backend (default, unencrypted)
-bundled-sqlite = ["rusqlite/bundled"]
+bundled-sqlite = ["legacy-sqlite", "rusqlite/bundled"]
 
 # Git history analysis for codebase memory. Pulls git2 + libgit2, which drag
 # OpenSSL and libssh2 into the build. On by default. Off for targets where
@@ -28,7 +41,7 @@ codebase-git = ["dep:git2"]
 # Encrypted SQLite via SQLCipher (mutually exclusive with bundled-sqlite)
 # Use: --no-default-features --features encryption,bundled-sqlite
 # Set VESTIGE_ENCRYPTION_KEY env var to enable encryption
-encryption = ["rusqlite/bundled-sqlcipher"]
+encryption = ["legacy-sqlite", "rusqlite/bundled-sqlcipher"]
 
 # ---------------------------------------------------------------------------
 # DEPRECATED NO-OP STUBS (vector/embedding removal).
@@ -86,8 +99,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 
 # Database - SQLite with FTS5 full-text search and JSON
-# Note: "bundled" or "bundled-sqlcipher" added via feature flags above
-rusqlite = { version = "0.40", features = ["chrono", "serde_json"] }
+# Note: "bundled" or "bundled-sqlcipher" added via feature flags above.
+# Optional: present only in `legacy-sqlite` builds (see feature block).
+rusqlite = { version = "0.40", features = ["chrono", "serde_json"], optional = true }
 
 # Platform-specific directories
 directories = "6"

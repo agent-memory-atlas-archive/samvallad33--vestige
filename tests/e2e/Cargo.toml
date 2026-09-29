@@ -4,8 +4,15 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+# The e2e harness drives the legacy SQLite store end to end. Default ON;
+# a legacy-sqlite-free workspace build skips these targets
+# (build/t5-legacy-isolation).
+default = ["legacy-sqlite"]
+legacy-sqlite = ["vestige-core/legacy-sqlite", "vestige-core/bundled-sqlite"]
+
 [dependencies]
-vestige-core = { path = "../../crates/vestige-core", features = [] }
+vestige-core = { path = "../../crates/vestige-core", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"
@@ -17,86 +24,107 @@ tokio = { version = "1", features = ["full"] }
 
 [[test]]
 name = "cognitive_tests"
+required-features = ["legacy-sqlite"]
 path = "tests/cognitive/mod.rs"
 
 [[test]]
 name = "spreading_activation"
+required-features = ["legacy-sqlite"]
 path = "tests/cognitive/spreading_activation_tests.rs"
 
 [[test]]
 name = "dreams"
+required-features = ["legacy-sqlite"]
 path = "tests/cognitive/dreams_tests.rs"
 
 [[test]]
 name = "psychology_tests"
+required-features = ["legacy-sqlite"]
 path = "tests/cognitive/psychology_tests.rs"
 
 [[test]]
 name = "neuroscience_tests"
+required-features = ["legacy-sqlite"]
 path = "tests/cognitive/neuroscience_tests.rs"
 
 [[test]]
 name = "comparative_benchmarks"
+required-features = ["legacy-sqlite"]
 path = "tests/cognitive/comparative_benchmarks.rs"
 
 [[test]]
 name = "mcp_tests"
+required-features = ["legacy-sqlite"]
 path = "tests/mcp/mod.rs"
 
 [[test]]
 name = "mcp_protocol"
+required-features = ["legacy-sqlite"]
 path = "tests/mcp/protocol_tests.rs"
 
 [[test]]
 name = "mcp_tools"
+required-features = ["legacy-sqlite"]
 path = "tests/mcp/tool_tests.rs"
 
 # Journey tests - complete user workflow validation
 [[test]]
 name = "journey_tests"
+required-features = ["legacy-sqlite"]
 path = "tests/journeys/mod.rs"
 
 [[test]]
 name = "ingest_recall_review"
+required-features = ["legacy-sqlite"]
 path = "tests/journeys/ingest_recall_review.rs"
 
 [[test]]
 name = "consolidation_workflow"
+required-features = ["legacy-sqlite"]
 path = "tests/journeys/consolidation_workflow.rs"
 
 [[test]]
 name = "intentions_workflow"
+required-features = ["legacy-sqlite"]
 path = "tests/journeys/intentions_workflow.rs"
 
 [[test]]
 name = "spreading_activation_journey"
+required-features = ["legacy-sqlite"]
 path = "tests/journeys/spreading_activation.rs"
 
 [[test]]
 name = "import_export"
+required-features = ["legacy-sqlite"]
 path = "tests/journeys/import_export.rs"
 
 # Extreme tests - chaos, adversarial, mathematical, research validation
 [[test]]
 name = "extreme_tests"
+required-features = ["legacy-sqlite"]
 path = "tests/extreme/mod.rs"
 
 [[test]]
 name = "chaos_tests"
+required-features = ["legacy-sqlite"]
 path = "tests/extreme/chaos_tests.rs"
 
 [[test]]
 name = "adversarial_tests"
+required-features = ["legacy-sqlite"]
 path = "tests/extreme/adversarial_tests.rs"
 
 [[test]]
 name = "mathematical_tests"
+required-features = ["legacy-sqlite"]
 path = "tests/extreme/mathematical_tests.rs"
 
 [[test]]
 name = "research_validation_tests"
+required-features = ["legacy-sqlite"]
 path = "tests/extreme/research_validation_tests.rs"
 
 [[test]]
 name = "proof_of_superiority"
+required-features = ["legacy-sqlite"]
 path = "tests/extreme/proof_of_superiority.rs"
