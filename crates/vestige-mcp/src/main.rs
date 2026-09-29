@@ -50,7 +50,6 @@ use tracing::{Level, debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 // Use vestige-core for the cognitive science engine
-use vestige_core::Storage;
 
 use protocol::stdio::{Notifier, StdioTransport};
 use server::McpServer;
@@ -432,11 +431,11 @@ async fn serve() {
     };
 
     // Initialize storage with optional custom data directory.
-    // Storage::new(Some(...)) expects a DB file path, so map data dirs to vestige.db here.
-    let storage = match Storage::new(storage_path) {
+    // vestige_core::open_storage(Some(...)) expects a DB file path, so map data dirs to vestige.db here.
+    let storage = match vestige_core::open_storage(storage_path) {
         Ok(s) => {
             info!("Storage initialized successfully");
-            Arc::new(s)
+            s
         }
         Err(e) => {
             error!("Failed to initialize storage: {}", e);
@@ -628,7 +627,7 @@ async fn serve() {
                     .unwrap_or(false)
                 {
                     let config = vestige_core::DreamCompileConfig::default();
-                    match vestige_core::run_dream_compile(&storage_clone, &config) {
+                    match vestige_core::run_dream_compile(&*storage_clone, &config) {
                         Ok(report) if report.status == "compiled" => {
                             info!(
                                 memories_replayed = report.memories_replayed,

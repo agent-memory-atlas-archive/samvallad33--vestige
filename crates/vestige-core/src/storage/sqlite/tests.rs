@@ -1165,7 +1165,7 @@ fn test_storage_creation() {
 // Post-retrieval failure feedback (Heinbockel 2025)
 // =========================================================================
 
-fn set_retrieval_strength(storage: &Storage, id: &str, value: f64) {
+fn set_retrieval_strength(storage: &SqliteMemoryStore, id: &str, value: f64) {
     storage
         .writer
         .lock()
@@ -1177,7 +1177,7 @@ fn set_retrieval_strength(storage: &Storage, id: &str, value: f64) {
         .unwrap();
 }
 
-fn retrieval_strength(storage: &Storage, id: &str) -> f64 {
+fn retrieval_strength(storage: &SqliteMemoryStore, id: &str) -> f64 {
     storage
         .reader
         .lock()
@@ -1190,7 +1190,7 @@ fn retrieval_strength(storage: &Storage, id: &str) -> f64 {
         .unwrap()
 }
 
-fn save_test_receipt(storage: &Storage, retrieved: Vec<String>) -> String {
+fn save_test_receipt(storage: &SqliteMemoryStore, retrieved: Vec<String>) -> String {
     let trust: Vec<f64> = retrieved.iter().map(|_| 0.9).collect();
     let receipt = crate::trace::Receipt::build(
         Utc::now(),
@@ -1311,7 +1311,7 @@ fn failure_feedback_respects_scope_and_window() {
 }
 
 fn ingest_tagged_in_scope(
-    storage: &Storage,
+    storage: &SqliteMemoryStore,
     scope: &str,
     content: &str,
     tags: &[&str],
@@ -4614,7 +4614,7 @@ fn purge_fails_closed_when_a_referencing_row_cannot_be_read() {
 /// Ingest a node and seed it with a controllable embedding under the active
 /// model so similarity is deterministic in tests.
 #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-fn seed_node(storage: &Storage, content: &str, tags: &[&str], vector: Vec<f32>) -> String {
+fn seed_node(storage: &SqliteMemoryStore, content: &str, tags: &[&str], vector: Vec<f32>) -> String {
     let node = storage
         .ingest(IngestInput {
             content: content.to_string(),
@@ -5329,7 +5329,7 @@ fn test_protect_blocks_merge_away() {
 /// Force a node's retention_strength so the keeper tiebreak in
 /// `auto_dedup_consolidation` is deterministic regardless of insertion order.
 #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-fn set_retention(storage: &Storage, id: &str, value: f64) {
+fn set_retention(storage: &SqliteMemoryStore, id: &str, value: f64) {
     let writer = storage.writer.lock().unwrap();
     writer
         .execute(
@@ -6157,10 +6157,11 @@ fn trait_get_stats_reports_registered_model() {
     rt.block_on(async {
         use crate::storage::memory_store::MemoryStore;
         // Cast to &dyn MemoryStore so the async trait method is called
-        // instead of the inherent sync get_stats() on SqliteMemoryStore.
+        // (get_store_stats) instead of the inherent sync get_stats() on
+        // SqliteMemoryStore.
         let dyn_s: &dyn MemoryStore = &s;
         dyn_s.register_model(&sig).await.unwrap();
-        let stats = dyn_s.get_stats().await.unwrap();
+        let stats = dyn_s.get_store_stats().await.unwrap();
         assert_eq!(stats.registered_model_name, Some("test-model".to_string()));
         assert_eq!(stats.registered_model_dim, Some(256));
     });
@@ -7047,7 +7048,7 @@ fn single_memory_retrievals_link_nothing() {
 
 #[cfg(all(feature = "embeddings", feature = "vector-search"))]
 fn reconsolidation_candidate(
-    storage: &Storage,
+    storage: &SqliteMemoryStore,
     node_id: &str,
     window_secs: i64,
 ) -> crate::advanced::LabileCandidate {

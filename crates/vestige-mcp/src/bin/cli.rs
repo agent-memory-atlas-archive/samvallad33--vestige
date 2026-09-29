@@ -479,7 +479,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if let Some(data_dir) = cli.data_dir {
-        let db_path = Storage::db_path_for_data_dir(data_dir)?;
+        let db_path = vestige_core::db_path_for_data_dir(data_dir)?;
         CLI_DB_PATH
             .set(db_path)
             .map_err(|_| anyhow::anyhow!("data directory was initialized more than once"))?;
@@ -2007,7 +2007,7 @@ fn cli_db_path() -> anyhow::Result<PathBuf> {
     if let Some(path) = CLI_DB_PATH.get() {
         return Ok(path.clone());
     }
-    Ok(Storage::default_db_path()?)
+    Ok(vestige_core::default_db_path()?)
 }
 
 /// Apply pending migrations, or rehearse them on a throwaway copy of the store.
@@ -2026,7 +2026,7 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
 
     if !dry_run {
         println!("{}", "=== Vestige Upgrade ===".cyan().bold());
-        let storage = Storage::new(Some(source.clone()))?;
+        let storage = vestige_core::open_storage(Some(source.clone()))?;
         let stats = storage.get_stats()?;
         println!("{} {}", "Migrated:".green().bold(), source.display());
         println!("Total memories: {}", stats.total_nodes);
@@ -2082,7 +2082,7 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
     }
     println!();
 
-    match Storage::new(Some(copy.clone())) {
+    match vestige_core::open_storage(Some(copy.clone())) {
         Ok(storage) => {
             let stats = storage.get_stats()?;
             println!("{}", "Migration on the copy: OK".green().bold());
@@ -2323,21 +2323,21 @@ fn get_default_db_path() -> anyhow::Result<PathBuf> {
     if let Some(path) = CLI_DB_PATH.get() {
         Ok(path.clone())
     } else {
-        Ok(Storage::default_db_path()?)
+        Ok(vestige_core::default_db_path()?)
     }
 }
 
 /// Open storage using the CLI-selected data directory, if one was provided.
-fn open_storage() -> anyhow::Result<Storage> {
+fn open_storage() -> anyhow::Result<std::sync::Arc<Storage>> {
     if let Some(path) = CLI_DB_PATH.get() {
-        Ok(Storage::new(Some(path.clone()))?)
+        Ok(vestige_core::open_storage(Some(path.clone()))?)
     } else {
-        Ok(Storage::new(None)?)
+        Ok(vestige_core::open_storage(None)?)
     }
 }
 
 /// Fetch all nodes from storage using pagination
-fn fetch_all_nodes(storage: &Storage) -> anyhow::Result<Vec<vestige_core::KnowledgeNode>> {
+fn fetch_all_nodes(storage: &Arc<Storage>) -> anyhow::Result<Vec<vestige_core::KnowledgeNode>> {
     let mut all_nodes = Vec::new();
     let page_size = 500;
     let mut offset = 0;
@@ -2411,7 +2411,7 @@ fn run_selftest() -> anyhow::Result<()> {
     println!("{}", "=== Planted-Cause Selftest ===".cyan().bold());
     println!();
 
-    let storage = std::sync::Arc::new(open_storage()?);
+    let storage = open_storage()?;
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt
         .block_on(vestige_mcp::tools::selftest::execute(&storage, None))
@@ -2454,7 +2454,7 @@ fn run_forgotten_lesson(
     scope: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let storage = std::sync::Arc::new(open_storage()?);
+    let storage = open_storage()?;
     let args = serde_json::json!({"failure_id": failure_id, "scope": scope});
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt
@@ -3217,7 +3217,7 @@ fn run_backfill(
     broke_in: Option<String>,
     why_not: Option<String>,
 ) -> anyhow::Result<()> {
-    let storage = std::sync::Arc::new(open_storage()?);
+    let storage = open_storage()?;
 
     // Resolve the failure text up front (used by the contrast baseline).
     // Use the SAME failure detector the backfill tool uses (content + tags, full
@@ -3477,13 +3477,13 @@ fn run_causal_walk(
         lookback_days,
         scan_limit: 500,
     };
-    let result = cw::walk_storage(&storage, &request).map_err(anyhow::Error::msg)?;
+    let result = cw::walk_storage(&*storage, &request).map_err(anyhow::Error::msg)?;
 
     if json {
         let mut payload = serde_json::to_value(&result)?;
         if promote && !result.causes.is_empty() {
             payload["promoted_edges"] = serde_json::to_value(
-                cw::persist_evidence_edges(&storage, &result).unwrap_or_default(),
+                cw::persist_evidence_edges(&*storage, &result).unwrap_or_default(),
             )?;
         }
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -3537,7 +3537,7 @@ fn run_causal_walk(
 
     if promote && !result.causes.is_empty() {
         let written =
-        cw::persist_evidence_edges(&storage, &result).map_err(anyhow::Error::msg)?;
+        cw::persist_evidence_edges(&*storage, &result).map_err(anyhow::Error::msg)?;
         println!(
             "{} {} evidence_of trail edge{} persisted",
             "→".magenta(),
@@ -3705,7 +3705,6 @@ fn run_recall(query: String, depth: i64, json: bool) -> anyhow::Result<()> {
     use vestige_mcp::cognitive::CognitiveEngine;
 
     let storage = open_storage()?;
-    let storage = Arc::new(storage);
 
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(async move {
@@ -3965,8 +3964,6 @@ fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
 
     let storage = open_storage()?;
 
-    let storage = std::sync::Arc::new(storage);
-
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         // Initialize cognitive engine for dream and other cognitive features
@@ -3990,8 +3987,6 @@ fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Re
     println!();
 
     let storage = open_storage()?;
-
-    let storage = Arc::new(storage);
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {

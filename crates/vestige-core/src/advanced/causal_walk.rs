@@ -953,7 +953,7 @@ fn git_lines(repo: &str, git_args: &[&str]) -> Option<Vec<String>> {
 /// the pure walk. `Err` only for storage/IO failures; refusals are
 /// `needs_report`, not errors.
 pub fn walk_storage(
-    storage: &crate::Storage,
+    storage: &crate::storage::Storage,
     req: &CausalWalkRequest,
 ) -> Result<CausalWalkResult, String> {
     let scope = req.scope.trim();
@@ -1061,7 +1061,7 @@ pub fn walk_storage(
 /// Persist the trail as `evidence_of` edges (cause → evidence records).
 /// Called ONLY on promote; preview writes nothing. Returns the edges written.
 pub fn persist_evidence_edges(
-    storage: &crate::Storage,
+    storage: &crate::storage::Storage,
     result: &CausalWalkResult,
 ) -> Result<Vec<(String, String)>, String> {
     let mut written = Vec::new();
@@ -1106,7 +1106,7 @@ pub fn persist_evidence_edges(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Storage;
+    use crate::storage::SqliteMemoryStore as Storage;
     use crate::{IngestInput, KnowledgeNode};
     use tempfile::TempDir;
 

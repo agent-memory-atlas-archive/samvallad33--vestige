@@ -221,7 +221,7 @@ impl ScopeFilter {
         })
     }
 
-    fn matches(&self, storage: &Storage, node_id: &str) -> Result<bool, String> {
+    fn matches(&self, storage: &Arc<Storage>, node_id: &str) -> Result<bool, String> {
         if self.include_cross_scope {
             Ok(true)
         } else {
@@ -369,7 +369,7 @@ fn node_matches_source(node: &KnowledgeNode, filter: &SourceFilter) -> bool {
 
 #[allow(clippy::too_many_arguments)] // Explicit immutable filter inputs shared by seed and expansion paths.
 fn node_matches_reason_filters(
-    storage: &Storage,
+    storage: &Arc<Storage>,
     node: &KnowledgeNode,
     semantic_score: Option<f32>,
     args: &DeepRefArgs,
@@ -2197,8 +2197,8 @@ mod tests {
 
     async fn test_storage() -> (Arc<Storage>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        (storage, dir)
     }
 
     async fn ingest_one(storage: &Arc<Storage>, content: &str, tags: &[&str]) -> String {
@@ -2846,15 +2846,15 @@ mod reason_envelope_tests {
 
     fn test_storage() -> (Arc<Storage>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        (storage, dir)
     }
 
     fn test_cognitive() -> Arc<Mutex<CognitiveEngine>> {
         Arc::new(Mutex::new(CognitiveEngine::new()))
     }
 
-    fn ingest_in_scope(storage: &Storage, scope: &str, content: &str, node_type: &str) -> String {
+    fn ingest_in_scope(storage: &Arc<Storage>, scope: &str, content: &str, node_type: &str) -> String {
         storage
             .ingest_in_scope(
                 vestige_core::IngestInput {

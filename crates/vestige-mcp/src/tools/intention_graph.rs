@@ -59,7 +59,7 @@ fn field<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("Missing string field '{key}'"))
 }
 
-fn execute_graph(storage: &Storage, args: &Value) -> Result<Value, String> {
+fn execute_graph(storage: &Arc<Storage>, args: &Value) -> Result<Value, String> {
     if args.to_string().len() > 128 * 1024 {
         return Err("graph arguments exceed 128 KiB".into());
     }
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn graph_memory_bridge_derives_values_and_replays_recorded_snapshot() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         let node = storage
             .ingest_in_scope(
                 vestige_core::IngestInput {
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn graph_rejects_invalid_clock_and_reserved_memory_assertions() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         assert!(
             execute_graph(
                 &storage,
@@ -215,12 +215,12 @@ mod tests {
     fn graph_plan_round_trips_through_public_adapter_and_replay() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let storage = Storage::new(Some(path.clone())).unwrap();
+        let storage = vestige_core::open_storage(Some(path.clone())).unwrap();
         let result=execute_graph(&storage,&json!({"action":"graph","at":"2026-10-01T09:00:00Z",
             "command":{"action":"plan","id":"projector","description":"Buy the selected projector", "requirements":[],"conflict_keys":[]}})).unwrap();
         assert!(result["journal_seq"].as_i64().is_some());
         drop(storage);
-        let reopened = Storage::new(Some(path)).unwrap();
+        let reopened = vestige_core::open_storage(Some(path)).unwrap();
         let result = execute_graph(
             &reopened,
             &json!({"action":"graph","command":{"action":"replay"}}),

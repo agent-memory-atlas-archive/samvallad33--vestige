@@ -2232,7 +2232,8 @@ fn disposition_label(value: SynapticCaptureDisposition) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{IngestInput, Storage};
+    use crate::IngestInput;
+    use crate::storage::SqliteMemoryStore as Storage;
     // Only the blocker fixture drives a transaction by hand; production
     // writers go through SqliteMemoryStore::begin_write_transaction.
     use rusqlite::TransactionBehavior;

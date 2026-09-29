@@ -143,7 +143,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_content_fails() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("importance.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("importance.db"))).unwrap();
         let result = execute(
             &storage,
             &test_cognitive(),
@@ -156,7 +156,7 @@ mod tests {
     #[tokio::test]
     async fn test_basic_importance_score() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("importance.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("importance.db"))).unwrap();
         let result = execute(
             &storage,
             &test_cognitive(),

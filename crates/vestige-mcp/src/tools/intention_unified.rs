@@ -1726,7 +1726,7 @@ fn recall_channel_trigger(trigger: &ProspectiveTrigger) -> ProspectiveTrigger {
 ///   triggers re-arm instead of repeating. A lost CAS (concurrent check)
 ///   drops the hit rather than double-delivering.
 pub(crate) fn surface_prospective(
-    storage: &Storage,
+    storage: &Arc<Storage>,
     cue: &ProspectiveCue,
     scope: &str,
 ) -> Option<Value> {
@@ -1864,8 +1864,8 @@ mod tests {
     /// Create a test storage instance with a temporary database
     async fn test_storage() -> (Arc<Storage>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        (storage, dir)
     }
 
     /// Helper to create an intention and return its ID

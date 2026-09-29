@@ -2874,8 +2874,8 @@ mod tests {
     /// Create a test storage instance with a temporary database
     async fn test_storage() -> (Arc<Storage>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        (storage, dir)
     }
 
     /// Create a test server with temporary storage

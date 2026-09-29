@@ -1818,7 +1818,7 @@ fn attach_prospective(
     }
 }
 
-fn record_shown(storage: &Storage, response: &Value) {
+fn record_shown(storage: &Arc<Storage>, response: &Value) {
     let ids: Vec<&str> = response["results"]
         .as_array()
         .into_iter()
@@ -1963,7 +1963,7 @@ impl ScopeFilter {
         !self.include_cross_scope
     }
 
-    fn matches(&self, storage: &Storage, node_id: &str) -> Result<bool, String> {
+    fn matches(&self, storage: &Arc<Storage>, node_id: &str) -> Result<bool, String> {
         if self.include_cross_scope {
             Ok(true)
         } else {
@@ -1975,7 +1975,7 @@ impl ScopeFilter {
 }
 
 fn filter_results_to_scope(
-    storage: &Storage,
+    storage: &Arc<Storage>,
     results: Vec<vestige_core::SearchResult>,
     scope_filter: &ScopeFilter,
 ) -> Result<Vec<vestige_core::SearchResult>, String> {
@@ -2552,8 +2552,8 @@ mod tests {
     /// Create a test storage instance with a temporary database
     async fn test_storage() -> (Arc<Storage>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        (storage, dir)
     }
 
     /// Helper to ingest test content
@@ -4293,8 +4293,8 @@ mod prospective_resurfacing_tests {
 
     async fn test_storage() -> (Arc<Storage>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        (storage, dir)
     }
 
     fn test_cognitive() -> Arc<Mutex<CognitiveEngine>> {

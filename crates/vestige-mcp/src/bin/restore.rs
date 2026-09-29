@@ -8,7 +8,7 @@
 mod glibc_compat;
 
 use std::path::PathBuf;
-use vestige_core::{IngestInput, Storage};
+use vestige_core::IngestInput;
 
 #[derive(serde::Deserialize)]
 struct BackupWrapper {
@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
 
     // Initialize storage (uses default path)
     println!("Initializing storage...");
-    let storage = Storage::new(None)?;
+    let storage = vestige_core::open_storage(None)?;
 
     println!("Generating embeddings and ingesting memories...\n");
 

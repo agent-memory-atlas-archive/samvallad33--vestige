@@ -862,8 +862,8 @@ mod tests {
 
     async fn test_storage() -> (Arc<Storage>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        (storage, dir)
     }
 
     #[test]
@@ -1203,7 +1203,7 @@ mod tests {
     fn test_storage_schema_introspection_method() {
         // Direct test on the Storage method, independent of the MCP layer.
         let dir = TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         let intro = storage
             .schema_introspection()
             .expect("schema_introspection must succeed on a fresh DB");

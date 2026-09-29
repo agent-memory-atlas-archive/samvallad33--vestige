@@ -427,7 +427,7 @@ mod tests {
     #[tokio::test]
     async fn test_lookup_is_default_and_resolves() {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
         let oc = OutputConfig::default();
         // No mode → lookup → behaves like search (query required by search).
@@ -439,7 +439,7 @@ mod tests {
     #[tokio::test]
     async fn test_contradictions_mode_resolves_without_query() {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
         let oc = OutputConfig::default();
         // contradictions uses topic, not query — must resolve with no query.
@@ -452,7 +452,7 @@ mod tests {
 
     use vestige_core::{ConnectionRecord, IngestInput};
 
-    fn connect(storage: &Storage, from: &str, to: &str, link_type: &str, strength: f64) {
+    fn connect(storage: &Arc<Storage>, from: &str, to: &str, link_type: &str, strength: f64) {
         let now = chrono::Utc::now();
         storage
             .save_connection(&ConnectionRecord {
@@ -472,7 +472,7 @@ mod tests {
 
     async fn handle_store() -> (Arc<Storage>, tempfile::TempDir, String) {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("handle.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("handle.db"))).unwrap();
         let memory = storage
             .ingest(IngestInput {
                 content: "Set API_TIMEOUT=2 in the deploy env".into(),

@@ -45,13 +45,13 @@ fn make_ingest_input(
 /// let mut storage = Storage::new(Some(path))?;
 ///
 /// // Create a single memory
-/// let node = TestDataFactory::create_memory(&mut storage, "test content");
+/// let node = TestDataFactory::create_memory(&*storage, "test content");
 ///
 /// // Create a batch
-/// let nodes = TestDataFactory::create_batch(&mut storage, 100);
+/// let nodes = TestDataFactory::create_batch(&*storage, 100);
 ///
 /// // Create a specific scenario
-/// let scenario = TestDataFactory::create_decay_scenario(&mut storage);
+/// let scenario = TestDataFactory::create_decay_scenario(&*storage);
 /// ```
 pub struct TestDataFactory;
 
@@ -102,7 +102,7 @@ impl TestDataFactory {
     // ========================================================================
 
     /// Create a simple memory with content
-    pub fn create_memory(storage: &mut Storage, content: &str) -> Option<KnowledgeNode> {
+    pub fn create_memory(storage: &Storage, content: &str) -> Option<KnowledgeNode> {
         let input = make_ingest_input(
             content.to_string(),
             "fact".to_string(),
@@ -118,7 +118,7 @@ impl TestDataFactory {
 
     /// Create a memory with full configuration
     pub fn create_memory_full(
-        storage: &mut Storage,
+        storage: &Storage,
         content: &str,
         node_type: &str,
         source: Option<&str>,
@@ -141,7 +141,7 @@ impl TestDataFactory {
 
     /// Create a memory with temporal validity
     pub fn create_temporal_memory(
-        storage: &mut Storage,
+        storage: &Storage,
         content: &str,
         valid_from: Option<DateTime<Utc>>,
         valid_until: Option<DateTime<Utc>>,
@@ -161,7 +161,7 @@ impl TestDataFactory {
 
     /// Create an emotional memory
     pub fn create_emotional_memory(
-        storage: &mut Storage,
+        storage: &Storage,
         content: &str,
         sentiment: f64,
         magnitude: f64,
@@ -184,7 +184,7 @@ impl TestDataFactory {
     // ========================================================================
 
     /// Create a batch of memories
-    pub fn create_batch(storage: &mut Storage, count: usize) -> Vec<String> {
+    pub fn create_batch(storage: &Storage, count: usize) -> Vec<String> {
         Self::create_batch_with_config(
             storage,
             BatchConfig {
@@ -195,7 +195,7 @@ impl TestDataFactory {
     }
 
     /// Create a batch with custom configuration
-    pub fn create_batch_with_config(storage: &mut Storage, config: BatchConfig) -> Vec<String> {
+    pub fn create_batch_with_config(storage: &Storage, config: BatchConfig) -> Vec<String> {
         let node_types = ["fact", "concept", "procedure", "event", "code"];
         let mut ids = Vec::with_capacity(config.count);
 
@@ -260,7 +260,7 @@ impl TestDataFactory {
     // ========================================================================
 
     /// Create a scenario for testing memory decay
-    pub fn create_decay_scenario(storage: &mut Storage) -> TestScenario {
+    pub fn create_decay_scenario(storage: &Storage) -> TestScenario {
         let mut ids = Vec::new();
         let mut metadata = std::collections::HashMap::new();
 
@@ -301,7 +301,7 @@ impl TestDataFactory {
     }
 
     /// Create a scenario for testing review scheduling
-    pub fn create_scheduling_scenario(storage: &mut Storage) -> TestScenario {
+    pub fn create_scheduling_scenario(storage: &Storage) -> TestScenario {
         let mut ids = Vec::new();
         let mut metadata = std::collections::HashMap::new();
 
@@ -344,7 +344,7 @@ impl TestDataFactory {
     }
 
     /// Create a scenario for testing search
-    pub fn create_search_scenario(storage: &mut Storage) -> TestScenario {
+    pub fn create_search_scenario(storage: &Storage) -> TestScenario {
         let mut ids = Vec::new();
         let mut metadata = std::collections::HashMap::new();
 
@@ -415,7 +415,7 @@ impl TestDataFactory {
     }
 
     /// Create a scenario for testing temporal queries
-    pub fn create_temporal_scenario(storage: &mut Storage) -> TestScenario {
+    pub fn create_temporal_scenario(storage: &Storage) -> TestScenario {
         let now = Utc::now();
         let mut ids = Vec::new();
         let mut metadata = std::collections::HashMap::new();
@@ -544,16 +544,14 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn create_test_storage() -> Storage {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        Storage::new(Some(db_path)).unwrap()
+    fn create_test_storage() -> std::sync::Arc<Storage> {
+        vestige_core::open_storage(None).expect("test storage")
     }
 
     #[test]
     fn test_create_memory() {
         let mut storage = create_test_storage();
-        let node = TestDataFactory::create_memory(&mut storage, "test content");
+        let node = TestDataFactory::create_memory(&*storage, "test content");
 
         assert!(node.is_some());
         assert_eq!(node.unwrap().content, "test content");
@@ -562,7 +560,7 @@ mod tests {
     #[test]
     fn test_create_batch() {
         let mut storage = create_test_storage();
-        let ids = TestDataFactory::create_batch(&mut storage, 10);
+        let ids = TestDataFactory::create_batch(&*storage, 10);
 
         assert_eq!(ids.len(), 10);
 
@@ -573,7 +571,7 @@ mod tests {
     #[test]
     fn test_create_decay_scenario() {
         let mut storage = create_test_storage();
-        let scenario = TestDataFactory::create_decay_scenario(&mut storage);
+        let scenario = TestDataFactory::create_decay_scenario(&*storage);
 
         assert!(!scenario.node_ids.is_empty());
         assert!(scenario.metadata.contains_key("high_stability"));
@@ -584,7 +582,7 @@ mod tests {
     #[test]
     fn test_create_scheduling_scenario() {
         let mut storage = create_test_storage();
-        let scenario = TestDataFactory::create_scheduling_scenario(&mut storage);
+        let scenario = TestDataFactory::create_scheduling_scenario(&*storage);
 
         assert!(!scenario.node_ids.is_empty());
         assert!(scenario.metadata.contains_key("new"));

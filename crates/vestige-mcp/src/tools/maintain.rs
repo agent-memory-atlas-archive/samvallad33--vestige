@@ -142,9 +142,9 @@ mod tests {
 
     fn test_storage() -> Arc<Storage> {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         std::mem::forget(dir);
-        Arc::new(storage)
+        storage
     }
 
     #[test]

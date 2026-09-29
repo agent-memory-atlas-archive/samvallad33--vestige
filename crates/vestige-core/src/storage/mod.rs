@@ -72,7 +72,8 @@ pub use sqlite::{
     EmbeddingProfileMigrationNodeCheckpoint, EmbeddingProfileMigrationRecord,
     EmbeddingProfileVector, EndorsementEventRecord, FilePortableSyncBackend, HygieneNodeSummary,
     HygieneSnapshot, InsightRecord, IntentionRecord, NeverComposedCandidate,
-    PortableSyncBackend, PortableSyncReport, ReconcileReport, Result, SmartIngestResult,
+    PortableSyncBackend, PortableSyncReport, PurgeReport, ReconcileReport, Result,
+    SmartIngestResult,
     SourceUpsertOutcome, SourceUpsertResult, SqliteMemoryStore, StateTransitionRecord,
     StorageError, TagVocabulary,
 };
@@ -109,7 +110,28 @@ pub use unlearning_store::{
     V25_UNLEARNING_STORAGE_SCHEMA_VERSION,
 };
 
-/// Backwards-compatibility alias. Retained until Phase 4 completes so every
-/// existing `Arc<Storage>` call site keeps compiling. Scheduled for removal
-/// once no downstream source file references it.
-pub type Storage = SqliteMemoryStore;
+/// Phase 4 storage wall: the product-wide seam.
+///
+/// Every tool, server, CLI entry point, and cognitive module holds the store
+/// through this trait object (`Arc<Storage>`, `&Storage`). `SqliteMemoryStore`
+/// is one implementation of it, constructed only via [`open_storage`] (and
+/// direct backend construction inside `vestige-core`'s own tests). A second
+/// engine implements `MemoryStoreSend` and drops in behind the same alias.
+pub type Storage = dyn MemoryStore;
+
+/// Default database artifact path for the SQLite backend.
+pub fn default_db_path() -> Result<std::path::PathBuf> {
+    SqliteMemoryStore::default_db_path()
+}
+
+/// Database artifact path for a given data directory (SQLite backend).
+pub fn db_path_for_data_dir(data_dir: std::path::PathBuf) -> Result<std::path::PathBuf> {
+    SqliteMemoryStore::db_path_for_data_dir(data_dir)
+}
+
+/// Construct the default local backend (SQLite reference implementation)
+/// behind the Phase 4 storage trait. This is the only constructor the MCP
+/// layer is allowed to call.
+pub fn open_storage(path: Option<std::path::PathBuf>) -> Result<std::sync::Arc<dyn MemoryStore>> {
+    Ok(std::sync::Arc::new(SqliteMemoryStore::new(path)?))
+}

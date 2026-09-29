@@ -217,7 +217,7 @@ pub struct SyncReport {
 /// `max_pages` bounds a single run (so a first sync of a 15-year tracker can be
 /// resumed across calls rather than blocking on one enormous fetch).
 pub async fn run_sync<C: Connector>(
-    store: &crate::storage::SqliteMemoryStore,
+    store: &crate::storage::Storage,
     connector: &C,
     reconcile: bool,
     max_pages: usize,

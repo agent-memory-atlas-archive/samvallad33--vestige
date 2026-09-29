@@ -129,7 +129,7 @@ async fn count_and_stats_track_inserts() {
         store.insert(&rec).await.expect("insert");
     }
     assert_eq!(store.count().await.expect("count"), 10);
-    let stats = store.get_stats().await.expect("stats");
+    let stats = store.get_store_stats().await.expect("stats");
     assert_eq!(stats.total_memories, 10);
 }
 
@@ -207,7 +207,7 @@ async fn search_hybrid_returns_results() {
         limit: 10,
         ..Default::default()
     };
-    let results = store.search(&query).await.expect("search");
+    let results = store.search_records(&query).await.expect("search");
     // FTS results should include our inserted record
     assert!(
         !results.is_empty(),

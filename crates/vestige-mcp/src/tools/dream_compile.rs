@@ -49,7 +49,7 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
 
     // Synchronous DB work goes to the blocking pool, matching consolidate.
     let storage = Arc::clone(storage);
-    let report = tokio::task::spawn_blocking(move || run_dream_compile(&storage, &config))
+    let report = tokio::task::spawn_blocking(move || run_dream_compile(&*storage, &config))
         .await
         .map_err(|e| format!("dream compile task failed: {e}"))??;
 
@@ -63,8 +63,8 @@ mod tests {
 
     async fn test_storage() -> (Arc<Storage>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        (storage, dir)
     }
 
     async fn ingest_n(storage: &Arc<Storage>, n: usize) {

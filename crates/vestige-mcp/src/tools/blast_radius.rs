@@ -283,11 +283,11 @@ mod tests {
 
     fn test_storage() -> (Arc<Storage>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        (storage, dir)
     }
 
-    fn set_mode(storage: &Storage, mode: &str) {
+    fn set_mode(storage: &Arc<Storage>, mode: &str) {
         std::fs::write(
             storage.data_dir().join("review_mode.json"),
             json!({"mode": mode}).to_string(),
@@ -295,7 +295,7 @@ mod tests {
         .unwrap();
     }
 
-    fn ingest(storage: &Storage, content: &str) -> String {
+    fn ingest(storage: &Arc<Storage>, content: &str) -> String {
         storage
             .ingest(IngestInput {
                 content: content.to_string(),
@@ -306,7 +306,7 @@ mod tests {
             .id
     }
 
-    fn link(storage: &Storage, source: &str, target: &str, link_type: &str) {
+    fn link(storage: &Arc<Storage>, source: &str, target: &str, link_type: &str) {
         storage
             .save_connection(&ConnectionRecord {
                 source_id: source.to_string(),
@@ -320,7 +320,7 @@ mod tests {
             .unwrap();
     }
 
-    fn seeded_cause_failure(storage: &Storage) -> (String, String) {
+    fn seeded_cause_failure(storage: &Arc<Storage>) -> (String, String) {
         let cause = ingest(storage, "deploy shipped with stale config cache");
         let failure = ingest(storage, "prod outage: config never reloaded");
         let dependent = ingest(storage, "postmortem cites stale cache");

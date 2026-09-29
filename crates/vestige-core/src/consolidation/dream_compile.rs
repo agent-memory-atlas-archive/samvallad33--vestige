@@ -34,7 +34,7 @@ use crate::advanced::contradiction::{SubjectIdentity, appears_contradictory};
 use crate::neuroscience::emotional_memory::EmotionalMemory;
 use crate::neuroscience::importance_signals::ImportanceSignals;
 use crate::neuroscience::synaptic_tagging::SynapticTaggingSystem;
-use crate::storage::{DreamHistoryRecord, SqliteMemoryStore};
+use crate::storage::DreamHistoryRecord;
 use crate::trace::{MemoryPr, MemoryPrKind, MemoryPrStatus, RiskSignal};
 
 use super::phases::{DreamEngine, DreamInsight, DreamPhase};
@@ -117,7 +117,7 @@ pub struct DreamCompileReport {
 /// Errors only on storage or configuration failure; a dream that finds
 /// nothing is a successful run with zero PRs.
 pub fn run_dream_compile(
-    storage: &SqliteMemoryStore,
+    storage: &crate::storage::Storage,
     config: &DreamCompileConfig,
 ) -> Result<DreamCompileReport, String> {
     let run_started = std::time::Instant::now();
@@ -474,13 +474,13 @@ mod tests {
     use crate::storage::ConnectionRecord;
     use chrono::Duration;
 
-    fn test_storage() -> (SqliteMemoryStore, tempfile::TempDir) {
+    fn test_storage() -> (std::sync::Arc<crate::storage::SqliteMemoryStore>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = SqliteMemoryStore::new(Some(dir.path().join("test.db"))).unwrap();
+        let storage = std::sync::Arc::new(crate::storage::SqliteMemoryStore::new(Some(dir.path().join("test.db"))).unwrap());
         (storage, dir)
     }
 
-    fn ingest(storage: &SqliteMemoryStore, content: &str, tags: &[&str]) -> String {
+    fn ingest(storage: &crate::storage::SqliteMemoryStore, content: &str, tags: &[&str]) -> String {
         storage
             .ingest(crate::IngestInput {
                 content: content.to_string(),
@@ -498,7 +498,7 @@ mod tests {
             .id
     }
 
-    fn seed_connection(storage: &SqliteMemoryStore, a: &str, b: &str, strength: f64) {
+    fn seed_connection(storage: &crate::storage::SqliteMemoryStore, a: &str, b: &str, strength: f64) {
         let now = Utc::now();
         storage
             .save_connection(&ConnectionRecord {
@@ -513,7 +513,7 @@ mod tests {
             .unwrap();
     }
 
-    fn edge(storage: &SqliteMemoryStore, a: &str, b: &str) -> Option<ConnectionRecord> {
+    fn edge(storage: &crate::storage::SqliteMemoryStore, a: &str, b: &str) -> Option<ConnectionRecord> {
         storage
             .get_connections_for_memory(a)
             .unwrap()
@@ -529,12 +529,12 @@ mod tests {
     }
 
     /// Ten related memories: a replay-able corpus.
-    fn store_with_corpus() -> (SqliteMemoryStore, tempfile::TempDir, Vec<String>) {
+    fn store_with_corpus() -> (std::sync::Arc<crate::storage::SqliteMemoryStore>, tempfile::TempDir, Vec<String>) {
         let (storage, dir) = test_storage();
         let mut ids = Vec::new();
         for i in 0..10 {
             ids.push(ingest(
-                &storage,
+                &*storage,
                 &format!("Dream compile test memory number {i} about the deploy pipeline"),
                 &["dream-compile-test"],
             ));
@@ -546,7 +546,7 @@ mod tests {
     /// the run. Deterministic way to place an edge OUTSIDE the replay set
     /// (fresh memories all tie at retention 1.0, so tiny stores would select
     /// everything and co-replay every edge).
-    fn expired_anchor(storage: &SqliteMemoryStore, content: &str) -> String {
+    fn expired_anchor(storage: &crate::storage::SqliteMemoryStore, content: &str) -> String {
         storage
             .ingest(crate::IngestInput {
                 content: content.to_string(),
@@ -567,7 +567,7 @@ mod tests {
     #[test]
     fn empty_store_reports_insufficient_memories() {
         let (storage, _dir) = test_storage();
-        let report = run_dream_compile(&storage, &config("user")).unwrap();
+        let report = run_dream_compile(&*storage, &config("user")).unwrap();
         assert_eq!(report.status, "insufficient_memories");
         assert!(report.prs_filed.is_empty());
         assert!(!report.dream_history_recorded);
@@ -577,7 +577,7 @@ mod tests {
     fn compile_runs_all_four_phases_and_records_history() {
         let (storage, _dir, _ids) = store_with_corpus();
 
-        let report = run_dream_compile(&storage, &config("user")).unwrap();
+        let report = run_dream_compile(&*storage, &config("user")).unwrap();
         assert_eq!(report.status, "compiled");
         assert_eq!(report.memories_selected, 10);
         assert_eq!(report.memories_replayed, 10);
@@ -602,7 +602,7 @@ mod tests {
         seed_connection(&storage, &ids[0], &ids[1], 0.6);
         let before = edge(&storage, &ids[0], &ids[1]).unwrap().strength;
 
-        let report = run_dream_compile(&storage, &config("user")).unwrap();
+        let report = run_dream_compile(&*storage, &config("user")).unwrap();
         assert_eq!(report.edges_strengthened, 1);
         let after = edge(&storage, &ids[0], &ids[1]).unwrap().strength;
         assert!(after > before, "co-replayed edge must strengthen: {before} -> {after}");
@@ -620,7 +620,7 @@ mod tests {
         let outside_2 = expired_anchor(&storage, "Another expired strong anchor note");
         seed_connection(&storage, &ids[3], &outside_2, 0.90);
 
-        let report = run_dream_compile(&storage, &config("user")).unwrap();
+        let report = run_dream_compile(&*storage, &config("user")).unwrap();
         assert_eq!(report.edges_downscaled, 1, "only the weak edge downscales");
         let weak = edge(&storage, &ids[2], &outside).unwrap();
         assert!((weak.strength - 0.40 * 0.95).abs() < 1e-9);
@@ -633,19 +633,19 @@ mod tests {
         let (storage, _dir) = test_storage();
         // Shared substantive vocabulary + a ("never", "always") polarity flip.
         let _a = ingest(
-            &storage,
+            &*storage,
             "Deployments to production always use the blue pipeline on friday",
             &["deploys"],
         );
         let _b = ingest(
-            &storage,
+            &*storage,
             "Deployments to production never use the blue pipeline on friday",
             &["deploys"],
         );
         // Corpus padding so the 5-memory floor passes.
         for i in 0..4 {
             ingest(
-                &storage,
+                &*storage,
                 &format!("Deployment pipeline note {i} about staging checks"),
                 &["deploys"],
             );
@@ -660,7 +660,7 @@ mod tests {
             "fixture must be a detected contradiction"
         );
 
-        let report = run_dream_compile(&storage, &config("user")).unwrap();
+        let report = run_dream_compile(&*storage, &config("user")).unwrap();
         assert_eq!(report.status, "compiled");
         assert!(report.contradictions_found >= 1, "{report:?}");
         assert!(report.prs_filed.iter().any(|p| p.kind == "dream_consolidation"));
@@ -701,7 +701,7 @@ mod tests {
             ingest(&storage, content, tags);
         }
 
-        let report = run_dream_compile(&storage, &config("user")).unwrap();
+        let report = run_dream_compile(&*storage, &config("user")).unwrap();
         assert_eq!(report.status, "compiled");
         assert!(
             report.prs_filed.iter().any(|p| p.kind == "dream_consolidation"),
@@ -734,7 +734,7 @@ mod tests {
             created_at: chrono::DateTime<Utc>,
             updated_at: chrono::DateTime<Utc>,
         }
-        let snapshot = |storage: &SqliteMemoryStore| -> Vec<NodeSnapshot> {
+        let snapshot = |storage: &crate::storage::SqliteMemoryStore| -> Vec<NodeSnapshot> {
             storage
                 .get_all_nodes(1000, 0)
                 .unwrap()
@@ -752,7 +752,7 @@ mod tests {
         };
         let before = snapshot(&storage);
 
-        let report = run_dream_compile(&storage, &config("user")).unwrap();
+        let report = run_dream_compile(&*storage, &config("user")).unwrap();
 
         let after = snapshot(&storage);
         assert_eq!(
@@ -780,25 +780,25 @@ mod tests {
     fn max_prs_budget_is_respected() {
         let (storage, _dir) = test_storage();
         let _a = ingest(
-            &storage,
+            &*storage,
             "Deployments to production always use the blue pipeline on friday",
             &["deploys"],
         );
         let _b = ingest(
-            &storage,
+            &*storage,
             "Deployments to production never use the blue pipeline on friday",
             &["deploys"],
         );
         for i in 0..4 {
             ingest(
-                &storage,
+                &*storage,
                 &format!("Deployment pipeline note {i} about staging checks"),
                 &["deploys"],
             );
         }
 
         let report = run_dream_compile(
-            &storage,
+            &*storage,
             &DreamCompileConfig {
                 max_prs: 1,
                 ..config("user")
@@ -810,7 +810,7 @@ mod tests {
         assert!(report.contradictions_found >= 1 || report.insights_generated >= 1);
 
         let zero = run_dream_compile(
-            &storage,
+            &*storage,
             &DreamCompileConfig {
                 max_prs: 0,
                 ..config("user")
@@ -826,7 +826,7 @@ mod tests {
         for i in 0..10 {
             ingest(&storage, &format!("Scoped item {i} about the deploy pipeline"), &["work"]);
         }
-        let report = run_dream_compile(&storage, &config("user")).unwrap();
+        let report = run_dream_compile(&*storage, &config("user")).unwrap();
         assert_eq!(report.scope, "user");
         assert!(report.memories_selected >= 10, "{report:?}");
     }
@@ -851,13 +851,13 @@ mod tests {
             .unwrap();
         for i in 0..10 {
             ingest(
-                &storage,
+                &*storage,
                 &format!("Current dream note {i} about the deploy pipeline"),
                 &["current"],
             );
         }
 
-        let report = run_dream_compile(&storage, &config("user")).unwrap();
+        let report = run_dream_compile(&*storage, &config("user")).unwrap();
         assert_eq!(report.status, "compiled");
         // 11 ingested, 1 expired: the dream set must be the 10 current ones.
         assert_eq!(report.memories_selected, 10, "{report:?}");
@@ -867,7 +867,7 @@ mod tests {
     fn empty_scope_is_rejected() {
         let (storage, _dir) = test_storage();
         let err = run_dream_compile(
-            &storage,
+            &*storage,
             &DreamCompileConfig {
                 scope: "  ".to_string(),
                 ..DreamCompileConfig::default()

@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn tag_reflog_exposes_source_target_and_normalized_scope() {
         let directory = tempfile::tempdir().unwrap();
-        let storage = Arc::new(Storage::new(Some(directory.path().join("reflog.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(directory.path().join("reflog.db"))).unwrap();
         storage
             .ingest(vestige_core::IngestInput {
                 content: "tag reflog fixture".to_string(),

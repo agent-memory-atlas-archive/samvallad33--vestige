@@ -133,7 +133,7 @@ mod tests {
     #[tokio::test]
     async fn never_composed_obeys_namespace_and_explains_novelty_boundary() {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
         let mut own = Vec::new();
         let mut other = Vec::new();

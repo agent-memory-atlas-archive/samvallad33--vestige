@@ -120,7 +120,7 @@ pub async fn execute(storage: &Arc<Storage>, _args: Option<Value>) -> Result<Val
 
     // 2. Open the copy as its own storage. Everything below mutates only this.
     let copy = Arc::new(
-        Storage::new(Some(copy_path))
+        vestige_core::open_storage(Some(copy_path))
             .map_err(|e| format!("opening the selftest copy failed: {e}"))?,
     );
 
@@ -224,8 +224,8 @@ mod tests {
 
     fn live_store() -> (Arc<Storage>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("live.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("live.db"))).unwrap();
+        (storage, dir)
     }
 
     /// The full planted-cause flow against a seeded (non-empty) store: every
