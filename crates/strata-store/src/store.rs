@@ -5,7 +5,7 @@
 //! is a derived index rebuilt by replay on open — proven bit-identical by
 //! [`StrataStore::state_digest`] across open/close/open cycles.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -24,7 +24,8 @@ use crate::error::StoreError;
 use crate::gate_log::StrataEventLog;
 use crate::op::{StoreOp, KIND_STORE_CHECKPOINT, KIND_STORE_WRITE};
 use crate::types::{
-    ConnectionRecord, EdgeDirection, EdgeKind, IngestInput, NodeRecord, VALID_FOREVER_MS,
+    ConnectionRecord, EdgeDirection, EdgeKind, IngestInput, IntentionRecord, NodeRecord,
+    VALID_FOREVER_MS,
 };
 
 /// Subdirectory holding the durable log.
@@ -110,6 +111,7 @@ struct StateDigest<'a> {
     orphan_writes: u64,
     /// card handle → latest explicit `reviewed_at_ms`.
     reviewed_at: Vec<(u64, i64)>,
+    intentions: Vec<(&'a str, &'a IntentionRecord)>,
 }
 
 /// A payload is this type only when borsh consumes it exactly. Kind bytes
@@ -184,9 +186,11 @@ pub struct StrataStore {
     policy: Policy,
     /// Node registry (derived).
     nodes: BTreeMap<String, NodeRecord>,
-    /// node id -> gate-space effect seq of the WRITE that created it (gate
-    /// context ids; keeps the gate's `ReadNoReceipt` duty clean).
+    /// id -> gate-space effect seq of the WRITE that last admitted it (node
+    /// or intention). Gate context ids; keeps `ReadNoReceipt` clean.
     origins: BTreeMap<String, u64>,
+    /// Intention registry (derived). Not FSRS cards.
+    intentions: BTreeMap<String, IntentionRecord>,
     /// Edge list in landing order (derived).
     edges: Vec<ConnectionRecord>,
     /// source id -> edge indexes (forward).
@@ -238,6 +242,7 @@ impl StrataStore {
             reviewed_at: BTreeMap::new(),
             checkpoints: Vec::new(),
             orphan_writes: 0,
+            intentions: BTreeMap::new(),
         };
         store.replay()?;
         store.verify_checkpoint_chain()?;
@@ -381,6 +386,12 @@ impl StrataStore {
                     None => {
                         self.reviewed_at.remove(card_id);
                     }
+                }
+            }
+            StoreOp::UpsertIntentions { records } => {
+                for record in records {
+                    self.origins.insert(record.id.clone(), gate_effect_seq);
+                    self.intentions.insert(record.id.clone(), record.clone());
                 }
             }
         }
@@ -585,6 +596,49 @@ impl StrataStore {
             Vec::new(),
         )?;
         Ok(id)
+    }
+
+    /// Insert or replace intentions through one admitted write.
+    ///
+    /// Returns the gate-space effect seq. The caller has already checked a
+    /// compare-and-swap when the batch is a check claim; this method does
+    /// not re-read the previous rows.
+    pub fn upsert_intentions(&mut self, records: Vec<IntentionRecord>) -> Result<u64, StoreError> {
+        if records.is_empty() {
+            return Err(StoreError::InvalidInput("intention batch is empty".into()));
+        }
+        let mut seen = BTreeSet::new();
+        for record in &records {
+            if record.id.is_empty() {
+                return Err(StoreError::InvalidInput(
+                    "intention id must not be empty".into(),
+                ));
+            }
+            if !seen.insert(record.id.as_str()) {
+                let id = &record.id;
+                return Err(StoreError::InvalidInput(format!(
+                    "duplicate intention id {id}"
+                )));
+            }
+        }
+        let ids: Vec<&str> = records.iter().map(|record| record.id.as_str()).collect();
+        let context = self.context_for(&ids);
+        let (effect_seq, _) = self.admit_write(
+            StoreOp::UpsertIntentions { records },
+            action_kind::WRITE,
+            context,
+        )?;
+        Ok(effect_seq)
+    }
+
+    /// One intention by id.
+    pub fn get_intention(&self, id: &str) -> Option<IntentionRecord> {
+        self.intentions.get(id).cloned()
+    }
+
+    /// Every intention, in id order.
+    pub fn intentions(&self) -> Vec<IntentionRecord> {
+        self.intentions.values().cloned().collect()
     }
 
     /// Gate-space effect seq of the write that created `id`, if it exists.
@@ -966,8 +1020,8 @@ impl StrataStore {
 
     /// blake3 digest over the canonical projection of every derived map
     /// (nodes, origins, edges, FSRS state root, checkpoint hashes, orphan
-    /// count, explicit review clocks). Two stores replaying the same log
-    /// produce the same digest.
+    /// count, explicit review clocks, intentions). Two stores replaying the
+    /// same log produce the same digest.
     pub fn state_digest(&self) -> [u8; 32] {
         let digest = StateDigest {
             nodes: self.nodes.iter().map(|(k, v)| (k.as_str(), v)).collect(),
@@ -977,6 +1031,11 @@ impl StrataStore {
             checkpoints: self.checkpoints.iter().map(checkpoint_hash).collect(),
             orphan_writes: self.orphan_writes,
             reviewed_at: self.reviewed_at.iter().map(|(k, v)| (*k, *v)).collect(),
+            intentions: self
+                .intentions
+                .iter()
+                .map(|(id, record)| (id.as_str(), record))
+                .collect(),
         };
         hash32(&borsh_vec(&digest).expect("state digest serialization is infallible"))
     }

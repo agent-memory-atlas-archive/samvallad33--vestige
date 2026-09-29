@@ -1004,3 +1004,122 @@ fn review_without_clock_replays_as_unset() {
     assert!(reopened.reviewed_at_ms(&id).is_none());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+fn intention(id: &str, content: &str) -> crate::IntentionRecord {
+    crate::IntentionRecord {
+        id: id.to_string(),
+        content: content.to_string(),
+        trigger_type: "time".into(),
+        trigger_data: r#"{"type":"time","at":"2020-01-01T00:00:00Z"}"#.into(),
+        priority: 2,
+        status: "active".into(),
+        created_at_ms: 1_700_000_000_000,
+        deadline_ms: None,
+        fulfilled_at_ms: None,
+        reminder_count: 0,
+        last_reminded_at_ms: None,
+        notes: None,
+        tags: vec!["fixture".into()],
+        related_memories: Vec::new(),
+        snoozed_until_ms: None,
+        source_type: "mcp".into(),
+        source_data: None,
+        scope: Some("user".into()),
+    }
+}
+
+#[test]
+fn intention_upsert_replays_and_rejects_an_empty_id() {
+    let dir = temp_dir("intention");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let effect = store
+        .upsert_intentions(vec![intention("int-1", "Synthetic reminder")])
+        .expect("admit");
+    assert!(effect > 0);
+    assert_eq!(store.origin_seq("int-1"), Some(effect));
+    let err = store
+        .upsert_intentions(vec![intention("", "no id")])
+        .expect_err("empty id");
+    assert!(err.to_string().contains("id must not be empty"), "{err}");
+    let digest = store.state_digest();
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    let row = reopened.get_intention("int-1").expect("replayed");
+    assert_eq!(row.content, "Synthetic reminder");
+    assert_eq!(row.trigger_type, "time");
+    assert_eq!(reopened.state_digest(), digest);
+    assert_eq!(reopened.intentions().len(), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn upsert_intentions_op_round_trips_through_borsh_and_replay() {
+    let records = vec![intention("int-a", "one"), intention("int-b", "two")];
+    let op = StoreOp::UpsertIntentions {
+        records: records.clone(),
+    };
+    let bytes = borsh::to_vec(&op).expect("encode");
+    let decoded = StoreOp::try_from_slice(&bytes).expect("decode");
+    assert_eq!(decoded, op);
+
+    let dir = temp_dir("intention-roundtrip");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let effect = store.upsert_intentions(records).expect("admit");
+    let digest = store.state_digest();
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    assert_eq!(reopened.origin_seq("int-a"), Some(effect));
+    assert_eq!(reopened.origin_seq("int-b"), Some(effect));
+    assert_eq!(reopened.get_intention("int-a").expect("a").content, "one");
+    assert_eq!(reopened.get_intention("int-b").expect("b").content, "two");
+    assert_eq!(reopened.state_digest(), digest);
+    let writes: Vec<_> = reopened
+        .log()
+        .read_frames(1)
+        .expect("frames")
+        .into_iter()
+        .filter(|frame| frame.kind == KIND_STORE_WRITE)
+        .collect();
+    assert_eq!(writes.len(), 1, "one op, one data frame");
+    assert_eq!(
+        StoreOp::try_from_slice(&writes[0].payload).expect("payload"),
+        op
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn intention_batch_is_one_admitted_write_and_a_bad_batch_writes_nothing() {
+    let dir = temp_dir("intention-atomic");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let before = store.log().head().frames_total;
+    let effect = store
+        .upsert_intentions(vec![intention("a", "one"), intention("b", "two")])
+        .expect("admit");
+    let after = store.log().head().frames_total;
+    assert_eq!(after - before, 4, "propose, gate, effect, one data frame");
+    assert_eq!(store.origin_seq("a"), Some(effect));
+    assert_eq!(store.origin_seq("b"), Some(effect));
+    let writes = store
+        .log()
+        .read_frames(1)
+        .expect("frames")
+        .into_iter()
+        .filter(|frame| frame.kind == KIND_STORE_WRITE)
+        .count();
+    assert_eq!(writes, 1);
+
+    let head = store.log().head().frames_total;
+    let digest = store.state_digest();
+    let err = store
+        .upsert_intentions(vec![intention("a", "changed"), intention("a", "again")])
+        .expect_err("duplicate id");
+    assert!(err.to_string().contains("duplicate"), "{err}");
+    assert_eq!(store.log().head().frames_total, head);
+    assert_eq!(store.state_digest(), digest);
+    assert_eq!(store.get_intention("a").expect("a").content, "one");
+    assert_eq!(store.get_intention("b").expect("b").content, "two");
+    std::fs::remove_dir_all(&dir).ok();
+}
