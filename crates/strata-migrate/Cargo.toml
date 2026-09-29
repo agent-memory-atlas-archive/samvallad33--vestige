@@ -12,6 +12,13 @@ publish = false
 # crates/strata-gate). Drop this table when the integration lands.
 [workspace]
 
+[features]
+# SQLite source reader. Default for this crate's own test/bin builds.
+# vestige-mcp and strata-verify depend with default-features = false so the
+# 4.0 binaries do not link rusqlite unless they opt into legacy-sqlite.
+default = ["sqlite-source"]
+sqlite-source = ["dep:rusqlite"]
+
 [dependencies]
 borsh = { version = "1", features = ["derive"] }
 blake3 = "1"
@@ -29,7 +36,7 @@ base64 = "0.22"
 anyhow = "1"
 # Read-only source reader (mode=ro&immutable=1 URI). Same version/features
 # as vestige-core uses, so cargo unifies to a single bundled SQLite build.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 
 strata = { path = "../strata" }
 strata-kernel = { path = "../strata-kernel" }

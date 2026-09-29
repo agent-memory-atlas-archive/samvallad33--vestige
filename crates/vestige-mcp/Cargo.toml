@@ -10,22 +10,26 @@ categories = ["command-line-utilities", "database"]
 repository = "https://github.com/samvallad33/vestige"
 # crates.io already has this name under conorluddy/Vestige. Do not publish.
 publish = false
+autobins = false
 
 [features]
-# legacy-sqlite stays in the default set FOR COMPILATION ONLY: every
-# Storage-shaped module (server, tools, dashboard, autopilot, cognitive)
-# still binds vestige-core's Storage until the Strata runtime boot
-# (build/wire-strata) lands. Creation is blocked at runtime (see
-# vestige-core admin.rs): a fresh 4.0 install writes NO SQLite file
-# (audit blocker 1).
-default = ["legacy-sqlite", "connectors", "cloud-sync", "codebase-git"]
+# Not a default. The 4.0 binaries (vestige-mcp and vestige) must not link
+# rusqlite. Opt in with `--features legacy-sqlite` for the SQLite harness
+# and the migrate reader. Strata boot is the product store.
+default = ["connectors", "cloud-sync", "codebase-git"]
 # LEGACY SQLITE QUARANTINE (build/t5-legacy-isolation), mirroring
 # vestige-core. Gates every Storage/sqlite-touching module (server, tools,
 # dashboard, cognitive, resources, trace_recorder, autopilot,
 # actor_surface), this crate's own rusqlite use (backup WAL checkpoint),
 # and forwards to vestige-core's `legacy-sqlite` + `bundled-sqlite`.
-# Default ON; flips off when the STRATA backend lands.
-legacy-sqlite = ["vestige-core/legacy-sqlite", "vestige-core/bundled-sqlite", "dep:rusqlite"]
+# Off by default: the 4.0 binaries must not link rusqlite. Opt in with
+# `--features legacy-sqlite`.
+legacy-sqlite = [
+    "vestige-core/legacy-sqlite",
+    "vestige-core/bundled-sqlite",
+    "dep:rusqlite",
+    "strata-migrate/sqlite-source",
+]
 # Raw engine test harness for THIS crate's own test builds (feature-gated
 # restart/creation tests). Never in default; the shipped binary keeps the
 # guard + creation block armed.
@@ -90,7 +94,7 @@ vestige-core = { version = "3.0.0", path = "../vestige-core", default-features =
 strata-verify = { path = "../strata-verify" }
 
 # One-shot SQLite -> STRATA migration (standalone crate; `migrate-to-strata` CLI).
-strata-migrate = { path = "../strata-migrate" }
+strata-migrate = { path = "../strata-migrate", default-features = false }
 
 # ============================================================================
 # MCP Server Dependencies
@@ -157,6 +161,10 @@ tempfile = "3"
 # the guard must be armed in test builds too (audit finding: a fresh install
 # created a SQLite store and then refused to open it, invisible while the
 # guard was test-disabled).
+[[test]]
+name = "backfill_trait_wall"
+required-features = ["legacy-sqlite"]
+
 [[test]]
 name = "e2e_failure_cases"
 required-features = ["legacy-sqlite"]
