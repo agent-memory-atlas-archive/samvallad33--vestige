@@ -9,8 +9,9 @@ mod hybrid;
 mod temporal;
 
 // Re-exported so `vestige_core::search::sanitize_fts5_query` keeps resolving
-// (downstream code uses this path); the implementation lives in the
-// always-available `crate::fts`.
+// (downstream code uses this path); the implementation lives in `crate::fts`,
+// quarantined behind `legacy-sqlite` (build/t5-legacy-isolation).
+#[cfg(feature = "legacy-sqlite")]
 pub use crate::fts::sanitize_fts5_query;
 
 pub use hybrid::{HybridSearchConfig, HybridSearcher, linear_combination, reciprocal_rank_fusion};

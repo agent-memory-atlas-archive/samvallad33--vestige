@@ -952,6 +952,7 @@ fn git_lines(repo: &str, git_args: &[&str]) -> Option<Vec<String>> {
 /// Assemble the record pool + out-of-band evidence from `storage`, then run
 /// the pure walk. `Err` only for storage/IO failures; refusals are
 /// `needs_report`, not errors.
+#[cfg(feature = "legacy-sqlite")]
 pub fn walk_storage(
     storage: &crate::Storage,
     req: &CausalWalkRequest,
@@ -1060,6 +1061,7 @@ pub fn walk_storage(
 
 /// Persist the trail as `evidence_of` edges (cause → evidence records).
 /// Called ONLY on promote; preview writes nothing. Returns the edges written.
+#[cfg(feature = "legacy-sqlite")]
 pub fn persist_evidence_edges(
     storage: &crate::Storage,
     result: &CausalWalkResult,
@@ -1103,7 +1105,7 @@ pub fn persist_evidence_edges(
 // real IngestInput + record_content pipeline.
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use crate::storage::Storage;

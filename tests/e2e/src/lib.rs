@@ -41,9 +41,12 @@ pub mod prelude {
     pub use crate::harness::{TestDatabaseManager, TimeTravelEnvironment};
     pub use crate::mocks::TestDataFactory;
 
-    // Re-export vestige-core essentials
+    // Re-export vestige-core essentials. The SQLite-backed surface is
+    // behind this crate's `legacy-sqlite` feature (build/t5-legacy-isolation).
     pub use vestige_core::{
         FSRSScheduler, FSRSState, IngestInput, KnowledgeNode, NodeType, Rating, RecallInput,
-        Result, SearchMode, Storage, StorageError,
+        SearchMode,
     };
+    #[cfg(feature = "legacy-sqlite")]
+    pub use vestige_core::{Result, Storage, StorageError};
 }

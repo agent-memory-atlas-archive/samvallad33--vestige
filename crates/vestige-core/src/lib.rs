@@ -88,6 +88,9 @@ pub mod connectors;
 pub mod consolidation;
 /// Durable profile contracts for local embedding vector spaces.
 pub mod fsrs;
+/// SQLite FTS5 query sanitization — quarantined with the SQLite backend
+/// behind `legacy-sqlite` (build/t5-legacy-isolation).
+#[cfg(feature = "legacy-sqlite")]
 pub mod fts;
 pub mod memory;
 /// Evidence-aware future intentions with deterministic local evaluation.
@@ -191,10 +194,31 @@ pub use trace::{
 pub use trace::ActorProvenance;
 
 // Storage layer
+// Storage: backend-agnostic surface (always available).
+pub use storage::{
+    ClassificationResult,
+    Domain,
+    HealthStatus,
+    LocalMemoryStore,
+    MemoryEdge,
+    MemoryRecord,
+    MemoryStore,
+    MemoryStoreError,
+    MemoryStoreResult,
+    ModelSignature,
+    SchedulingState,
+    SearchQuery,
+    StoreStats,
+    LegacySqliteDisabled,
+    open_storage,
+};
+
+// Storage: legacy SQLite surface (quarantined behind `legacy-sqlite`,
+// build/t5-legacy-isolation; default ON, flips off when STRATA lands).
+#[cfg(feature = "legacy-sqlite")]
 pub use storage::{
     ACCESS_LOG_RETENTION_DAYS,
     AgentRunSummary,
-    ClassificationResult,
     BLAST_LINK_TYPES,
     BLAST_MAX_DEPTH,
     BLAST_SCAN_NODE_CAP,
@@ -211,7 +235,6 @@ pub use storage::{
     ConsolidationHistoryRecord,
     CounterfactualReplayResult,
     DEFAULT_MEMORY_SCOPE,
-    Domain,
     DreamHistoryRecord,
     DurableCounterfactualReplay,
     DurableRetrievalReplayCapsule,
@@ -222,18 +245,10 @@ pub use storage::{
     EmbeddingProfileMigrationRecord,
     EmbeddingProfileVector,
     FrozenReplayItem,
-    HealthStatus,
     HygieneNodeSummary,
     HygieneSnapshot,
     InsightRecord,
     IntentionRecord,
-    LocalMemoryStore,
-    MemoryEdge,
-    MemoryRecord,
-    MemoryStore,
-    MemoryStoreError,
-    MemoryStoreResult,
-    ModelSignature,
     NeverComposedCandidate,
     PORTABLE_ARCHIVE_FORMAT,
     PendingMemoryMutationDecision,
@@ -269,8 +284,6 @@ pub use storage::{
     SYNAPTIC_CONTEXT_THRESHOLD_V1,
     // Note: storage::SearchResult is intentionally not re-exported here to avoid
     // collision with memory::SearchResult. Use vestige_core::storage::SearchResult directly.
-    SchedulingState,
-    SearchQuery,
     SmartIngestResult,
     SourceUpsertOutcome,
     SourceUpsertResult,
@@ -278,7 +291,6 @@ pub use storage::{
     StateTransitionRecord,
     Storage,
     StorageError,
-    StoreStats,
     StoredCounterfactualReplay,
     SynapticCapturePolicy,
     SynapticCaptureRequest,
@@ -301,9 +313,13 @@ pub use storage::{
 // Consolidation (sleep-inspired memory processing)
 pub use consolidation::SleepConsolidation;
 pub use consolidation::{
-    CreativeConnection, CreativeConnectionType, DreamCompileConfig, DreamCompilePhase,
-    DreamCompilePr, DreamCompileReport, DreamEngine, DreamInsight, DreamPhase,
-    FourPhaseDreamResult, PhaseResult, TriageCategory, TriagedMemory, run_dream_compile,
+    CreativeConnection, CreativeConnectionType, DreamEngine, DreamInsight, DreamPhase,
+    FourPhaseDreamResult, PhaseResult, TriageCategory, TriagedMemory,
+};
+// Dream compile is wired to the legacy SQLite store (`build/t5-legacy-isolation`).
+#[cfg(feature = "legacy-sqlite")]
+pub use consolidation::{
+    DreamCompileConfig, DreamCompilePhase, DreamCompilePr, DreamCompileReport, run_dream_compile,
 };
 
 // Advanced features (bleeding edge 2026)
@@ -565,8 +581,12 @@ pub const FSRS_VERSION: u8 = 6;
 pub mod prelude {
     pub use crate::{
         ConsolidationResult, FSRSScheduler, FSRSState, IngestInput, KnowledgeNode, MemoryStats,
-        NodeType, Rating, RecallInput, Result, SearchMode, Storage, StorageError,
+        NodeType, Rating, RecallInput, SearchMode,
     };
+
+    // Legacy SQLite surface (behind `legacy-sqlite`, build/t5-legacy-isolation).
+    #[cfg(feature = "legacy-sqlite")]
+    pub use crate::{Result, Storage, StorageError};
 
     pub use crate::HybridSearcher;
 
