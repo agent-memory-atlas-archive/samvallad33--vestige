@@ -1687,43 +1687,16 @@ impl MemoryStoreSend for StrataMemory {
 
     fn concrete_search_filtered(
         &self,
-        query: &str,
-        limit: i32,
-        include_types: Option<&[String]>,
-        exclude_types: Option<&[String]>,
+        _query: &str,
+        _limit: i32,
+        _include_types: Option<&[String]>,
+        _exclude_types: Option<&[String]>,
     ) -> Result<Vec<vestige_core::memory::SearchResult>, StorageError> {
-        // Exact id or exact content. No token match, no BM25, no embeddings.
-        let literal = query.trim().trim_matches(|c| c == '"' || c == '\'');
-        if literal.is_empty() || limit <= 0 {
-            return Ok(Vec::new());
-        }
-        let store = self.lock();
-        let mut out = Vec::new();
-        for record in store.nodes() {
-            if record.id != literal && record.content != literal {
-                continue;
-            }
-            if include_types.is_some_and(|types| {
-                !types.is_empty() && !types.iter().any(|kind| kind == &record.node_type)
-            }) {
-                continue;
-            }
-            if exclude_types.is_some_and(|types| types.iter().any(|kind| kind == &record.node_type))
-            {
-                continue;
-            }
-            out.push(vestige_core::memory::SearchResult {
-                node: project_node(&store, &record),
-                keyword_score: Some(1.0),
-                semantic_score: None,
-                combined_score: 1.0,
-                match_type: vestige_core::memory::MatchType::Keyword,
-            });
-            if out.len() >= limit as usize {
-                break;
-            }
-        }
-        Ok(out)
+        // Query recall is not a Strata operation, even when the text happens
+        // to equal a node's content: discovery is by exact handle only
+        // (recall with `handle`). Refusing here keeps the auto-routed
+        // "concrete" path from answering what the hybrid path refuses.
+        Err(similarity("recall"))
     }
 
     fn blast_radius(
@@ -2044,7 +2017,7 @@ impl MemoryStoreSend for StrataMemory {
         &self,
         limit: usize,
     ) -> Result<Vec<vestige_core::advanced::MergeOperation>, StorageError> {
-        let mut writes = self.lock().node_writes();
+        let mut writes = live_node_writes(&self.lock());
         writes.sort_by_key(|write| std::cmp::Reverse(write.frame_seq));
         writes.truncate(limit);
         Ok(writes.into_iter().map(merge_operation).collect())
@@ -2057,9 +2030,7 @@ impl MemoryStoreSend for StrataMemory {
         let Some(frame) = parse_op_frame(operation_id) else {
             return Ok(None);
         };
-        Ok(self
-            .lock()
-            .node_writes()
+        Ok(live_node_writes(&self.lock())
             .into_iter()
             .find(|write| write.frame_seq == frame)
             .map(merge_operation))
@@ -2626,6 +2597,21 @@ fn parse_op_frame(operation_id: &str) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(rest, 16).ok()
+}
+
+/// Node writes whose node is still live. The changelog and operation reads
+/// are read tools, so a retired node's id stays out of them like every other
+/// read; the frames themselves remain on the log.
+fn live_node_writes(store: &strata_store::StrataStore) -> Vec<strata_store::NodeWrite> {
+    store
+        .node_writes()
+        .into_iter()
+        .filter(|write| {
+            store
+                .get_node(&write.record.id)
+                .is_some_and(|node| node.is_live())
+        })
+        .collect()
 }
 
 fn merge_operation(write: strata_store::NodeWrite) -> vestige_core::advanced::MergeOperation {
