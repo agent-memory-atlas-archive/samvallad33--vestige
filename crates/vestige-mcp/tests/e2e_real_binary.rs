@@ -2006,6 +2006,82 @@ fn maintain_scores_importance_dry_runs_gc_consolidates_and_restore_needs_a_path(
     server.shutdown();
 }
 
+/// `maintain(action=dream)` on a Strata log consolidates recorded edges and
+/// FSRS state. Shared wording across memories does not create a review, and
+/// an edge under the strength floor does not either.
+#[test]
+fn dream_over_stdio_completes_from_recorded_edges_and_fsrs() {
+    let dir = data_dir();
+    let (strong, quiet, reps_before) = {
+        let storage = vestige_mcp::strata_memory::open(dir.path()).expect("seed strata log");
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            let node = storage
+                .ingest(vestige_core::IngestInput {
+                    content: format!("shared token salad {i} alpha beta gamma"),
+                    ..vestige_core::IngestInput::default()
+                })
+                .unwrap();
+            ids.push(node.id);
+        }
+        let now = storage.get_node(&ids[0]).unwrap().unwrap().created_at;
+        let link = |source: &str, target: &str, kind: &str, strength: f64| {
+            storage
+                .save_connection(&vestige_core::ConnectionRecord {
+                    source_id: source.to_string(),
+                    target_id: target.to_string(),
+                    strength,
+                    link_type: kind.to_string(),
+                    created_at: now,
+                    last_activated: now,
+                    activation_count: 1,
+                })
+                .unwrap();
+        };
+        link(&ids[0], &ids[1], "derived_from", 1.0);
+        link(&ids[1], &ids[2], "evidence_of", 0.8);
+        link(&ids[3], &ids[4], "touched", 0.1);
+        let reps = storage.get_node(&ids[0]).unwrap().unwrap().reps;
+        (
+            vec![ids[0].clone(), ids[1].clone(), ids[2].clone()],
+            ids[5].clone(),
+            reps,
+        )
+    };
+
+    let mut server = Server::spawn(dir.path());
+    server.handshake();
+    let value = server.call_tool_ok("maintain", json!({ "action": "dream" }));
+    assert_eq!(value["status"], json!("completed"), "{value}");
+    assert_eq!(value["basis"], json!("recorded_edges_fsrs"), "{value}");
+    assert_eq!(value["edgesConsolidated"], json!(2), "{value}");
+    assert_eq!(value["connectionsPersisted"], json!(0), "{value}");
+    let text = serde_json::to_string(&value).unwrap();
+    assert!(!text.contains("pending_strata"), "{value}");
+    assert!(!text.contains("not implemented"), "{value}");
+    assert!(!text.contains("token salad"), "{value}");
+    let mut reviewed: Vec<String> = value["reviews"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|review| review["id"].as_str().unwrap().to_string())
+        .collect();
+    let mut expected = strong.clone();
+    expected.sort();
+    reviewed.sort();
+    assert_eq!(reviewed, expected, "{value}");
+
+    let strengthened = server.call_tool_ok("memory", json!({ "action": "get", "id": strong[0] }));
+    assert_eq!(
+        strengthened["node"]["reps"],
+        json!(reps_before + 1),
+        "{strengthened}"
+    );
+    let untouched = server.call_tool_ok("memory", json!({ "action": "get", "id": quiet }));
+    assert_eq!(untouched["node"]["reps"], json!(reps_before), "{untouched}");
+    server.shutdown();
+}
+
 #[test]
 fn codebase_remembers_a_decision_returns_context_verifies_and_needs_its_fields() {
     let dir = data_dir();
