@@ -23,10 +23,11 @@
 //!   it and `agent_traces` ordering is preserved.
 //!
 //! `source_sync`'s `closed_by` linking is local-only and deterministic: the
-//! GitHub connector payload does not carry the closing PR (it fetches issues
-//! and comments, no timeline events), so the link is built from what is already
-//! ingested — closed issue nodes and git-commit records. These queries hand
-//! over the raw pairs; the keyword matcher and edge writing live in the tool.
+//! GitHub connector payload does not carry the closing PR (it fetches
+//! issues with their comments but no timeline events), so the link is built
+//! from the rows the store already holds: closed issue nodes and
+//! git-commit records.  These queries hand the raw pairs to the caller;
+//! the keyword matcher and edge writing live in the tool.
 
 use rusqlite::{OptionalExtension, params};
 
@@ -51,49 +52,10 @@ const ERROR_EXCERPT_MAX_CHARS: usize = 160;
 /// Bound on commit records considered by the `closed_by` lookup.
 const COMMIT_LOOKUP_LIMIT: i64 = 1_000;
 
-/// One failure-like memory whose recorded files intersect the changed set.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct OpenFailureTouching {
-    /// The failure memory's node id.
-    pub id: String,
-    /// First line/sentence of its content, capped.
-    pub content_preview: String,
-    /// Where it matched: `path` or `path:symbol` for a code anchor, the bare
-    /// path for a git-commit `files:` line entry. `None` never occurs today
-    /// (a row exists only because something matched) but keeps the struct
-    /// forward-compatible with anchor-less sources.
-    pub anchor: Option<String>,
-}
-
-/// One failed tool call (`mcp.call` payload with `success: false`).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct FailedToolCall {
-    pub run_id: String,
-    pub tool: String,
-    /// Wall-clock millis, straight from the `agent_traces.at` column.
-    pub at: i64,
-    /// Capped excerpt of the payload's `error` field (string, or the
-    /// `message`/`detail` member of an error object). Empty when the payload
-    /// recorded no error text.
-    pub error_excerpt: String,
-}
-
-/// One closed external-issue node, keyed by its source id (the bare issue
-/// number as recorded by the connector).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct ClosedIssueNode {
-    pub node_id: String,
-    pub issue_number: String,
-}
-
-/// One locally ingested git-commit record (tag `git-commit`).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct GitCommitNode {
-    pub node_id: String,
-    /// Full record content: `commit <sha> <subject>` header plus
-    /// `files:`/`modules:`/`symbols:`/`mentions:` lines.
-    pub content: String,
-}
+// `OpenFailureTouching`, `FailedToolCall`, `ClosedIssueNode`, and
+// `GitCommitNode` are defined in (and re-exported from)
+// `crate::storage::types`.
+pub use crate::storage::types::{ClosedIssueNode, FailedToolCall, GitCommitNode, OpenFailureTouching};
 
 /// Cut `text` to at most `max` chars on a UTF-8 boundary.
 fn cap_chars(text: &str, max: usize) -> String {

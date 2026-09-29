@@ -117,6 +117,10 @@ struct Inner {
     dir: PathBuf,
     _lock: DirLock,
     signing: SigningKey,
+    /// Deterministic-log seed (`open_seeded`). `None` = ordinary random-key,
+    /// random-segment-id log. Present: the key and every segment id derive
+    /// from it, so two runs over identical frames produce identical bytes.
+    seed: Option<[u8; 32]>,
     files: Mutex<WriterState>,
     group: Mutex<Group>,
     cv: Condvar,
@@ -141,11 +145,7 @@ impl Inner {
             Err(_) => panic!("strata: group lock poisoned after a fail-stop abort"),
         }
     }
-    fn wait_until<'a>(
-        &self,
-        g: MutexGuard<'a, Group>,
-        deadline: Instant,
-    ) -> MutexGuard<'a, Group> {
+    fn wait_until<'a>(&self, g: MutexGuard<'a, Group>, deadline: Instant) -> MutexGuard<'a, Group> {
         let timeout = deadline.saturating_duration_since(Instant::now());
         if timeout.is_zero() {
             return g;
@@ -209,7 +209,12 @@ fn fail_stop_msg(last_acked_seq: u64, op: &str, detail: &str) -> ! {
     )
 }
 
-fn halt_err(last_acked_seq: u64, segment: u32, offset: u64, reason: impl Into<String>) -> StrataError {
+fn halt_err(
+    last_acked_seq: u64,
+    segment: u32,
+    offset: u64,
+    reason: impl Into<String>,
+) -> StrataError {
     StrataError::Halt(HaltDetail {
         last_acked_seq,
         segment,
@@ -232,7 +237,12 @@ fn fill_random(buf: &mut [u8]) -> io::Result<()> {
     {
         // Weak std-only fallback for non-target platforms.
         let mut seed = blake3::Hasher::new();
-        seed.update(&std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos().to_le_bytes());
+        seed.update(
+            &std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+                .to_le_bytes(),
+        );
         seed.update(&(std::process::id() as u64).to_le_bytes());
         seed.update(&(buf.len() as u64).to_le_bytes());
         let mut block = seed.finalize().as_slice().to_vec();
@@ -268,7 +278,7 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     }
 }
 
-fn load_or_create_key(dir: &Path) -> Result<SigningKey, StrataError> {
+fn load_or_create_key(dir: &Path, log_seed: Option<&[u8; 32]>) -> Result<SigningKey, StrataError> {
     let path = dir.join(KEY_FILE);
     if path.exists() {
         let bytes = fs::read(&path)?;
@@ -277,8 +287,13 @@ fn load_or_create_key(dir: &Path) -> Result<SigningKey, StrataError> {
             .map_err(|_| StrataError::Corrupt(format!("{KEY_FILE} is not 32 bytes")))?;
         Ok(SigningKey::from_bytes(&seed))
     } else {
+        // Seeded logs derive the signing key from the caller-supplied seed so
+        // two seeded runs produce identical signatures and segment bytes.
         let mut seed = [0u8; 32];
-        fill_random(&mut seed)?;
+        match log_seed {
+            Some(s) => seed.copy_from_slice(s),
+            None => fill_random(&mut seed)?,
+        }
         #[cfg(unix)]
         let mut f = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -289,7 +304,10 @@ fn load_or_create_key(dir: &Path) -> Result<SigningKey, StrataError> {
                 .open(&path)?
         };
         #[cfg(not(unix))]
-        let mut f = OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
         f.write_all(&seed)?;
         sync::sync_file(&f, SyncPurpose::Metadata)?;
         sync::sync_dir(dir)?;
@@ -320,7 +338,9 @@ fn read_head_state(dir: &Path) -> Result<Option<u64>, StrataError> {
 pub(crate) fn write_head_state(dir: &Path, seq: u64) -> io::Result<()> {
     let tmp = dir.join(HEAD_STATE_TMP);
     let mut f = File::create(&tmp)?;
-    f.write_all(&borsh::to_vec(&HeadState { last_acked_seq: seq })?)?;
+    f.write_all(&borsh::to_vec(&HeadState {
+        last_acked_seq: seq,
+    })?)?;
     sync::sync_file(&f, SyncPurpose::Metadata)?;
     drop(f);
     fs::rename(&tmp, dir.join(HEAD_STATE))?;
@@ -346,9 +366,9 @@ pub(crate) fn list_segments(dir: &Path) -> Result<Vec<(u32, PathBuf)>, StrataErr
         let Some(stem) = name.strip_suffix(".seg") else {
             continue;
         };
-        let (num, hex) = stem.split_once('-').ok_or_else(|| {
-            StrataError::Corrupt(format!("bad segment name: {name}"))
-        })?;
+        let (num, hex) = stem
+            .split_once('-')
+            .ok_or_else(|| StrataError::Corrupt(format!("bad segment name: {name}")))?;
         if num.len() != 8
             || !num.bytes().all(|b| b.is_ascii_digit())
             || hex.len() != 32
@@ -372,13 +392,33 @@ pub(crate) fn list_segments(dir: &Path) -> Result<Vec<(u32, PathBuf)>, StrataErr
     Ok(out)
 }
 
+/// Deterministic segment id for seeded logs: derived from the log seed and
+/// the segment number so two seeded runs produce byte-identical segments.
+fn seeded_segment_id(seed: &[u8; 32], no: u32) -> [u8; 16] {
+    let hash = blake3::Hasher::new_derive_key("vestige strata segment id v1")
+        .update(seed)
+        .update(&no.to_be_bytes())
+        .finalize();
+    let full = *hash.as_bytes();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&full[..16]);
+    id
+}
+
 fn create_segment(
     dir: &Path,
     no: u32,
     prev_segment_hash: [u8; 32],
+    seed: Option<&[u8; 32]>,
 ) -> Result<(PathBuf, SegmentHeader, File), StrataError> {
-    let mut id = [0u8; 16];
-    fill_random(&mut id)?;
+    let id = match seed {
+        Some(seed) => seeded_segment_id(seed, no),
+        None => {
+            let mut id = [0u8; 16];
+            fill_random(&mut id)?;
+            id
+        }
+    };
     let header = SegmentHeader {
         magic: SEGMENT_MAGIC,
         version: SEGMENT_VERSION,
@@ -431,7 +471,10 @@ enum TailStop {
     /// Frames run cleanly to EOF with no trailer.
     Clean,
     /// Exactly TRAILER_WIRE_SIZE bytes remain and they parse as a trailer.
-    Trailer { trailer: SegmentTrailer, offset: usize },
+    Trailer {
+        trailer: SegmentTrailer,
+        offset: usize,
+    },
     /// First bad frame: torn, short, zero, blake3 mismatch, or chain break.
     Torn { offset: usize, reason: String },
 }
@@ -453,7 +496,13 @@ fn scan_frames(bytes: &[u8], header_hash: [u8; 32]) -> (TailStop, ScanState) {
         if rem == TRAILER_WIRE_SIZE {
             st.end_offset = off;
             if let Ok(trailer) = borsh::from_slice::<SegmentTrailer>(&bytes[off..]) {
-                return (TailStop::Trailer { trailer, offset: off }, st);
+                return (
+                    TailStop::Trailer {
+                        trailer,
+                        offset: off,
+                    },
+                    st,
+                );
             }
             return (
                 TailStop::Torn {
@@ -686,15 +735,30 @@ impl StrataLog {
     /// watermark, otherwise [`StrataError::Halt`] is returned and nothing is
     /// modified.
     pub fn open(dir: impl AsRef<Path>) -> Result<StrataLog, StrataError> {
+        Self::open_inner(dir, None)
+    }
+
+    /// Open a deterministic log: the signing key and every segment id derive
+    /// from `seed`, so two seeded runs over identical frames produce
+    /// byte-identical segments. Used by the migration tool (replay equality)
+    /// and by tests that pin log bytes.
+    ///
+    /// If the directory already carries a `strata.key`, that key wins and the
+    /// seed is ignored (existing logs are never re-keyed).
+    pub fn open_seeded(dir: impl AsRef<Path>, seed: [u8; 32]) -> Result<StrataLog, StrataError> {
+        Self::open_inner(dir, Some(seed))
+    }
+
+    fn open_inner(dir: impl AsRef<Path>, seed: Option<[u8; 32]>) -> Result<StrataLog, StrataError> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
         let lock = DirLock::acquire(&dir)?;
-        let signing = load_or_create_key(&dir)?;
+        let signing = load_or_create_key(&dir, seed.as_ref())?;
         let last_acked_seq = read_head_state(&dir)?.unwrap_or(0);
 
         let mut segs = list_segments(&dir)?;
         if segs.is_empty() {
-            create_segment(&dir, 0, GENESIS_PREV_SEGMENT_HASH)?;
+            create_segment(&dir, 0, GENESIS_PREV_SEGMENT_HASH, seed.as_ref())?;
             segs = list_segments(&dir)?;
         }
 
@@ -749,9 +813,7 @@ impl StrataLog {
                     last_acked_seq,
                     *no,
                     0,
-                    format!(
-                        "segment chain: prev_segment_hash does not match segment {no}'s hash"
-                    ),
+                    format!("segment chain: prev_segment_hash does not match segment {no}'s hash"),
                 ));
             }
 
@@ -866,30 +928,29 @@ impl StrataLog {
             ));
         }
 
-        let (w_no, w_path, w_header, w_state, w_file) = match active
-            .expect("recovery always terminates on the last segment")
-        {
-            ActiveSetup::Existing {
-                no,
-                path,
-                header,
-                state,
-            } => {
-                let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-                file.seek(SeekFrom::Start(state.end_offset as u64))?;
-                (no, path, header, state, file)
-            }
-            ActiveSetup::New { no, prev } => {
-                let (path, header, file) = create_segment(&dir, no, prev)?;
-                let state = ScanState {
-                    frame_count: 0,
-                    last_frame_hash: format::header_hash(&header),
-                    leaves: Vec::new(),
-                    end_offset: HEADER_WIRE_SIZE,
-                };
-                (no, path, header, state, file)
-            }
-        };
+        let (w_no, w_path, w_header, w_state, w_file) =
+            match active.expect("recovery always terminates on the last segment") {
+                ActiveSetup::Existing {
+                    no,
+                    path,
+                    header,
+                    state,
+                } => {
+                    let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+                    file.seek(SeekFrom::Start(state.end_offset as u64))?;
+                    (no, path, header, state, file)
+                }
+                ActiveSetup::New { no, prev } => {
+                    let (path, header, file) = create_segment(&dir, no, prev, seed.as_ref())?;
+                    let state = ScanState {
+                        frame_count: 0,
+                        last_frame_hash: format::header_hash(&header),
+                        leaves: Vec::new(),
+                        end_offset: HEADER_WIRE_SIZE,
+                    };
+                    (no, path, header, state, file)
+                }
+            };
 
         let writer = WriterState {
             file: w_file,
@@ -916,6 +977,7 @@ impl StrataLog {
                 dir,
                 _lock: lock,
                 signing,
+                seed,
                 files: Mutex::new(writer),
                 group: Mutex::new(group),
                 cv: Condvar::new(),
@@ -1080,11 +1142,7 @@ impl StrataLog {
         // Trailer phase — files lock only (all appenders are parked on the cv).
         let mut files = self.inner.lock_files();
         let merkle = format::merkle_root(&files.leaves);
-        let msg = format::signature_message(
-            &files.segment_id,
-            &files.prev_segment_hash,
-            &merkle,
-        );
+        let msg = format::signature_message(&files.segment_id, &files.prev_segment_hash, &merkle);
         let signature: Signature = self.inner.signing.sign(&msg);
         let trailer = SegmentTrailer {
             frame_count: files.frame_count,
@@ -1104,7 +1162,11 @@ impl StrataLog {
             fail_stop_io(wm, "seal-verify", &e);
         }
         if readback != wire {
-            fail_stop_msg(wm, "seal-verify", "trailer readback differs from written bytes");
+            fail_stop_msg(
+                wm,
+                "seal-verify",
+                "trailer readback differs from written bytes",
+            );
         }
         files.offset += wire.len() as u64;
         let mut whole = vec![0u8; files.offset as usize];
@@ -1118,7 +1180,12 @@ impl StrataLog {
         let frame_count = files.frame_count;
         drop(files);
 
-        let (path, header, file) = create_segment(&self.inner.dir, sealed_no + 1, segment_hash)?;
+        let (path, header, file) = create_segment(
+            &self.inner.dir,
+            sealed_no + 1,
+            segment_hash,
+            self.inner.seed.as_ref(),
+        )?;
         let mut files = self.inner.lock_files();
         files.file = file;
         files.path = path;
@@ -1213,7 +1280,12 @@ impl StrataLog {
         let f = self.inner.lock_files();
         let bytes = fs::read(&f.path)?;
         let Some(header) = parse_header(&bytes) else {
-            return Err(halt_err(wm, f.segment_no, 0, "verify_tail: header unreadable"));
+            return Err(halt_err(
+                wm,
+                f.segment_no,
+                0,
+                "verify_tail: header unreadable",
+            ));
         };
         let hh = format::header_hash(&header);
         let (stop, st) = scan_frames(&bytes, hh);
@@ -1228,26 +1300,28 @@ impl StrataLog {
                 last_frame_hash: st.last_frame_hash,
                 trailer: None,
             }),
-            TailStop::Trailer { trailer, offset } => match validate_trailer(&trailer, &st, &header, &self.inner.signing) {
-                Ok(()) => Ok(TailReport {
-                    segment_no: f.segment_no,
-                    frames_verified: st.frame_count,
-                    first_seq,
-                    last_seq,
-                    last_frame_hash: st.last_frame_hash,
-                    trailer: Some(TrailerCheck {
-                        frame_count: trailer.frame_count,
-                        merkle_root: trailer.merkle_root,
-                        signature_valid: true,
+            TailStop::Trailer { trailer, offset } => {
+                match validate_trailer(&trailer, &st, &header, &self.inner.signing) {
+                    Ok(()) => Ok(TailReport {
+                        segment_no: f.segment_no,
+                        frames_verified: st.frame_count,
+                        first_seq,
+                        last_seq,
+                        last_frame_hash: st.last_frame_hash,
+                        trailer: Some(TrailerCheck {
+                            frame_count: trailer.frame_count,
+                            merkle_root: trailer.merkle_root,
+                            signature_valid: true,
+                        }),
                     }),
-                }),
-                Err(reason) => Err(halt_err(
-                    wm,
-                    f.segment_no,
-                    offset as u64,
-                    format!("verify_tail: trailer: {reason}"),
-                )),
-            },
+                    Err(reason) => Err(halt_err(
+                        wm,
+                        f.segment_no,
+                        offset as u64,
+                        format!("verify_tail: trailer: {reason}"),
+                    )),
+                }
+            }
             TailStop::Torn { offset, reason } => Err(halt_err(
                 wm,
                 f.segment_no,

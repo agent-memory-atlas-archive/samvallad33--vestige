@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, v4]
   pull_request:
-    branches: [main]
+    branches: [main, v4]
 
 env:
   CARGO_TERM_COLOR: always
@@ -105,6 +105,12 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: strata-migrate acceptance tests (workspace-excluded crate; own CI job per audit)
+        run: cargo test --manifest-path crates/strata-migrate/Cargo.toml
+
+      - name: strata-verify (migrated-log verification)
+        run: cargo test --manifest-path crates/strata-verify/Cargo.toml
+
       - name: Test paid cloud-sync path
         # `cloud_sync` is cfg'd on cloud-sync AND legacy-sqlite. The sqlite
         # wipe dropped both sqlite features from the default set, and this
@@ -139,16 +145,19 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-noembed-v1-
 
       - name: Clippy without embeddings, vector search or git2 (warnings are errors)
-        run: cargo clippy -p vestige-mcp -p vestige-core --no-default-features --features vestige-mcp/connectors,vestige-mcp/cloud-sync --all-targets -- -D warnings
+        run: cargo clippy -p vestige-mcp -p vestige-core --no-default-features --features vestige-mcp/connectors,vestige-mcp/cloud-sync,vestige-mcp/legacy-sqlite --all-targets -- -D warnings
 
       - name: Test vestige-core without embeddings
         run: cargo test -p vestige-core --no-default-features --features bundled-sqlite --lib
 
       - name: Test vestige-mcp without embeddings
-        run: cargo test -p vestige-mcp --no-default-features --features connectors,cloud-sync --lib
+        # Tests are the raw engine harness (v3-engine): they create synthetic
+      # stores. The later build step omits it — the shipped binary stays
+      # creation-blocked.
+      run: cargo test -p vestige-mcp --no-default-features --features connectors,cloud-sync,legacy-sqlite,vestige-mcp/v3-engine --lib
 
       - name: Build disposable context-contract test server
-        run: cargo build -p vestige-mcp --no-default-features --features connectors,cloud-sync --bin vestige-mcp
+        run: cargo build -p vestige-mcp --no-default-features --features connectors,cloud-sync,legacy-sqlite --bin vestige-mcp
 
       - name: Verify evidence parity through MCP
         run: python3 scripts/test-context-evidence.py --binary target/debug/vestige-mcp

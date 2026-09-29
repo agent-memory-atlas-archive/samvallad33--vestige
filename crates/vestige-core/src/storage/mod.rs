@@ -8,24 +8,31 @@
 //! with the STRATA backend. Builders must open stores through
 //! [`open_storage`] so a `legacy-sqlite`-free build fails with the clear
 //! [`LegacySqliteDisabled`] error instead of a compile error.
+//!
+//! Type definitions shared by the trait surface and every backend live in
+//! [`types`] UNGATED, so the workspace compiles with AND without
+//! `legacy-sqlite` (dual-mode rule, strata/fix-00a).
 
 #[cfg(feature = "legacy-sqlite")]
 mod attestation_store;
-#[cfg(feature = "cloud-sync")]
+#[cfg(feature = "legacy-sqlite")]
+mod blast;
+// cloud_crypto's only consumer is cloud_sync, which needs the legacy
+// engine; ungating it made the whole module dead code in the
+// no-embeddings profile.
+#[cfg(all(feature = "cloud-sync", feature = "legacy-sqlite"))]
 mod cloud_crypto;
 #[cfg(all(feature = "cloud-sync", feature = "legacy-sqlite"))]
 mod cloud_sync;
 #[cfg(feature = "legacy-sqlite")]
 mod edges;
 #[cfg(feature = "legacy-sqlite")]
-mod blast;
-#[cfg(feature = "legacy-sqlite")]
 mod intention_claim;
 #[cfg(feature = "legacy-sqlite")]
 mod intention_graph_store;
-mod memory_store;
 #[cfg(feature = "legacy-sqlite")]
 mod maintenance_batches;
+mod memory_store;
 #[cfg(feature = "legacy-sqlite")]
 mod migrations;
 #[cfg(feature = "legacy-sqlite")]
@@ -48,26 +55,38 @@ mod sqlite;
 mod synaptic_store;
 #[cfg(feature = "legacy-sqlite")]
 mod trace_store;
-#[cfg(feature = "legacy-sqlite")]
-mod walk_receipts;
+/// Feature-independent type definitions shared by every backend and the
+/// `LocalMemoryStore` trait surface. Available with AND without
+/// `legacy-sqlite` — dual-mode compilation (strata/fix-00a).
+pub mod types;
 pub mod unlearning;
 #[cfg(feature = "legacy-sqlite")]
 mod unlearning_store;
+/// Feature-independent v3 SQLite guard: detects the legacy engine by magic
+/// bytes and refuses read-write opens (PR 0a). Available with AND without
+/// `legacy-sqlite`.
+pub mod v3_guard;
+#[cfg(feature = "legacy-sqlite")]
+mod walk_receipts;
+
+// Every type the backend-agnostic `LocalMemoryStore` trait names is defined
+// in `types` and re-exported here UNGATED so the trait (and its callers)
+// compile with or without `legacy-sqlite`.
+pub use types::*;
 
 #[cfg(all(feature = "cloud-sync", feature = "legacy-sqlite"))]
 pub use cloud_sync::HttpPortableSyncBackend;
 
 #[cfg(feature = "legacy-sqlite")]
 pub use attestation_store::{
-    DurableSignedReceipt, DurableSignedRetrievalReceipt, ProvisionedReceiptSigningKey,
-    ReceiptAttestationStatus, ReceiptSigningKeyTransition, SignedReceiptWrite,
-    StoredReceiptAttestationVerification, load_receipt_signing_seed,
+    ProvisionedReceiptSigningKey, ReceiptSigningKeyTransition, load_receipt_signing_seed,
     provision_receipt_signing_key_sidecar,
 };
 #[cfg(feature = "legacy-sqlite")]
-pub use blast::{
-    BLAST_LINK_TYPES, BLAST_MAX_DEPTH, BLAST_SCAN_NODE_CAP, BlastAffected, BlastReport,
-    RetireOutcome, commit_sha_of,
+pub use blast::{BLAST_LINK_TYPES, BLAST_MAX_DEPTH, BLAST_SCAN_NODE_CAP, commit_sha_of};
+#[cfg(feature = "legacy-sqlite")]
+pub use edges::{
+    EdgeDirection, EdgeKind, EdgeMeta, PurgeTombstone, TYPED_EDGE_VOCABULARY, TypedEdge,
 };
 pub use memory_store::{
     ClassificationResult, Domain, HealthStatus, LocalMemoryStore, MemoryEdge, MemoryRecord,
@@ -75,82 +94,29 @@ pub use memory_store::{
     SchedulingState, SearchQuery, SearchResult, StoreStats,
 };
 #[cfg(feature = "legacy-sqlite")]
-pub use edges::{
-    EdgeDirection, EdgeKind, EdgeMeta, PurgeTombstone, TYPED_EDGE_VOCABULARY, TypedEdge,
-};
-#[cfg(feature = "legacy-sqlite")]
 pub use migrations::MIGRATIONS;
 #[cfg(feature = "legacy-sqlite")]
-pub use portable::{
-    PORTABLE_ARCHIVE_FORMAT, PortableArchive, PortableImportMode, PortableImportReport,
-    PortableTable, PortableValue,
-};
-#[cfg(feature = "legacy-sqlite")]
-pub use resolver::{HANDLE_REQUIRED_DETAIL, HandleKind, HandleResolution, MAX_CANDIDATES};
+pub use portable::PORTABLE_ARCHIVE_FORMAT;
 #[cfg(feature = "legacy-sqlite")]
 pub use replay_store::{
-    CounterfactualReplayResult, DurableCounterfactualReplay, DurableRetrievalReplayCapsule,
     FrozenReplayItem, REPLAY_ALGORITHM_VERSION, REPLAY_CLAIM_BOUNDARY, REPLAY_SCHEMA_VERSION,
-    REPLAY_SELECTION_BOUNDARY, ReplayBuildError, ReplayDecayRisk, ReplayEvidenceItemSummary,
-    ReplayEvidenceSetSummary, ReplayInfluence, ReplayInvalidationReason,
-    ReplayMaterializationCheck, ReplayPrivacyInvalidation, ReplayPrivacyState,
-    RetrievalReplayCapsuleDraft, RetrievalReplayCapsuleSummary, RetrievalReplayItemDraft,
-    StoredCounterfactualReplay, ablate_frozen_context, private_evidence_digest,
-    replay_evidence_slot, replay_idempotency_key, replay_policy_digest,
+    REPLAY_SELECTION_BOUNDARY, ReplayBuildError, ReplayInvalidationReason,
+    ReplayMaterializationCheck, ReplayPrivacyInvalidation, ablate_frozen_context,
+    private_evidence_digest, replay_evidence_slot, replay_idempotency_key, replay_policy_digest,
 };
 #[cfg(feature = "legacy-sqlite")]
-pub use sqlite::{WalCheckpointMode, WalCheckpointStatus};
-#[cfg(not(feature = "legacy-sqlite"))]
-pub use sqlite::{
-    ActorMutationOutcome, AgentRunSummary, BlastReport, ClosedIssueNode, CompositionEventRecord,
-    CompositionMemberRecord, CompositionNeighborRecord, CompositionOutcomeRecord,
-    ConnectionRecord, ConnectorCursor, ConsolidationHistoryRecord, CoverageSnapshot,
-    DreamHistoryRecord, DurableCounterfactualReplay, DurableRetrievalReplayCapsule,
-    DurableSignedRetrievalReceipt, DurableSynapticCapture, EndorsementEventRecord,
-    FailedToolCall, GitCommitNode, HandleResolution, HygieneSnapshot, InsightRecord,
-    IntentionRecord, NeverComposedCandidate, OpenFailureTouching, PendingMemoryMutationDecision,
-    PortableArchive, PortableImportMode, PortableImportReport, PortableSyncReport, PurgeReport,
-    ReceiptAttestationStatus, ReconcileReport, Result, RetireOutcome, RetrievalReplayCapsuleDraft,
-    RetrievalReplayCapsuleSummary, SignedReceiptWrite, SmartIngestResult, SourceUpsertResult,
-    StateTransitionRecord, StorageError, StoredCounterfactualReplay,
-    StoredReceiptAttestationVerification, StoredWalkReceipt, SynapticCaptureRequest,
-    SynapticIngestOutcome, SynapticIngestRequest, TagVocabulary, WalkReceiptHandle,
-    WalCheckpointMode, WalCheckpointStatus,
-};
+pub use session_queries::FAILED_CALLS_MAX;
 #[cfg(feature = "legacy-sqlite")]
 pub use sqlite::{
-    ACCESS_LOG_RETENTION_DAYS, ActorMutationOutcome, CompositionEventRecord,
-    CompositionMemberRecord, CompositionNeighborRecord, CompositionOutcomeRecord,
-    ConnectionRecord, ConnectorCursor, ConsolidationHistoryRecord, DEFAULT_MEMORY_SCOPE,
-    DreamHistoryRecord, EmbeddingProfileIntegrityManifest,
+    ACCESS_LOG_RETENTION_DAYS, DEFAULT_MEMORY_SCOPE, EmbeddingProfileIntegrityManifest,
     EmbeddingProfileMigrationNodeCheckpoint, EmbeddingProfileMigrationRecord,
-    EmbeddingProfileVector, EndorsementEventRecord, FilePortableSyncBackend, HygieneNodeSummary,
-    HygieneSnapshot, InsightRecord, IntentionRecord, NeverComposedCandidate,
-    PortableSyncBackend, PortableSyncReport, PurgeReport, ReconcileReport, Result,
-    SmartIngestResult,
-    SourceUpsertOutcome, SourceUpsertResult, SqliteMemoryStore, StateTransitionRecord,
-    StorageError, TagVocabulary,
+    EmbeddingProfileVector, FilePortableSyncBackend, PortableSyncBackend, SqliteMemoryStore,
 };
 #[cfg(feature = "legacy-sqlite")]
 pub use synaptic_store::{
-    DurableSynapticCapture, DurableSynapticPairReceipt, SYNAPTIC_CAPTURE_ALGORITHM_V1,
-    SYNAPTIC_CAPTURE_ALGORITHM_V2, SYNAPTIC_CAPTURE_CLAIM_BOUNDARY, SYNAPTIC_CAPTURE_SCHEMA_V1,
-    SYNAPTIC_CAPTURE_SCHEMA_V2, SYNAPTIC_CONTEXT_ALGORITHM_V1, SYNAPTIC_CONTEXT_THRESHOLD_V1,
-    SynapticCapturePolicy, SynapticCaptureRequest, SynapticImportanceEvent, SynapticIngestOutcome,
-    SynapticIngestRequest, SynapticSignalSnapshot,
-};
-#[cfg(feature = "legacy-sqlite")]
-pub use session_queries::{
-    ClosedIssueNode, FailedToolCall, GitCommitNode, OpenFailureTouching, FAILED_CALLS_MAX,
-};
-#[cfg(feature = "legacy-sqlite")]
-pub use trace_store::{
-    AgentRunSummary, PendingMemoryMutationDecision, PendingMemoryMutationEffect,
-};
-#[cfg(feature = "legacy-sqlite")]
-pub use walk_receipts::{
-    CoverageSnapshot, StoredWalkReceipt, WalkReceiptHandle, WALK_RECEIPT_SCHEMA_V1,
-    canonical_walk_json,
+    SYNAPTIC_CAPTURE_ALGORITHM_V1, SYNAPTIC_CAPTURE_ALGORITHM_V2, SYNAPTIC_CAPTURE_CLAIM_BOUNDARY,
+    SYNAPTIC_CAPTURE_SCHEMA_V1, SYNAPTIC_CAPTURE_SCHEMA_V2, SYNAPTIC_CONTEXT_ALGORITHM_V1,
+    SYNAPTIC_CONTEXT_THRESHOLD_V1,
 };
 pub use unlearning::{
     AntiResurrectionCommitments, ArtifactKind, ArtifactRef, CheckStatus, Commitment, CommitmentKey,
@@ -168,6 +134,8 @@ pub use unlearning_store::{
     V25_REQUIRED_LOCAL_CANARY_TABLES, V25_UNLEARNING_STORAGE_SCHEMA_EXPECTATION,
     V25_UNLEARNING_STORAGE_SCHEMA_VERSION,
 };
+#[cfg(feature = "legacy-sqlite")]
+pub use walk_receipts::{WALK_RECEIPT_SCHEMA_V1, canonical_walk_json};
 
 /// Error returned by [`open_storage`] when the binary was built without the
 /// `legacy-sqlite` feature. Exists in every build so callers can name it

@@ -20,48 +20,9 @@ use crate::actor::{ActorPolicySnapshot, RoleResolution, endorsement_event_id, re
 use crate::trace::{ActorProvenance, Receipt, ReceiptMutation};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// One recorded actor endorsement, bound to the exact content revision it
-/// supported. Mirrors a row of `actor_endorsement_events` (migration V38).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct EndorsementEventRecord {
-    pub event_id: String,
-    pub memory_id: String,
-    pub actor_did: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub claimed_role: Option<String>,
-    pub effective_role: String,
-    pub resolved_weight: f64,
-    pub resolution_disposition: String,
-    pub policy_version: u64,
-    /// `support`, `oppose`, or `self_support`.
-    pub endorsement_kind: String,
-    /// SHA-256 hex of the exact content revision this stance binds to.
-    pub revision_digest: String,
-    /// The prior this event contributes to Phase B aggregation. Exactly 0.0
-    /// for self-support; same-actor retries do not add rows.
-    pub independent_prior: f64,
-    pub tool: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub receipt_id: Option<String>,
-    pub created_at: String,
-}
-
-/// Outcome of one actor-attributed mutation: the mutated node, its receipt
-/// (persisted in the same transaction), and the endorsement event.
-#[derive(Debug, Clone)]
-pub struct ActorMutationOutcome {
-    /// The node state before the mutation.
-    pub before: KnowledgeNode,
-    /// The node state after the mutation committed.
-    pub node: KnowledgeNode,
-    /// The receipt persisted inside the same transaction.
-    pub receipt: Receipt,
-    /// The endorsement event recorded inside the same transaction.
-    pub endorsement: EndorsementEventRecord,
-    /// True when this actor had already recorded the same stance on the same
-    /// revision: the mutation applies, but no second vote was created.
-    pub already_recorded: bool,
-}
+// `EndorsementEventRecord` and `ActorMutationOutcome` are defined in (and
+// re-exported from) `crate::storage::types`.
+pub use crate::storage::types::{ActorMutationOutcome, EndorsementEventRecord};
 
 const ACTOR_FEEDBACK_OPERATION: &str = "actor_feedback_mutation";
 

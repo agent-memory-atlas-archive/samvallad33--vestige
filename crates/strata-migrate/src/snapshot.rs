@@ -1,9 +1,8 @@
 //! Reading a migrated STRATA log back into typed records.
 //!
-//! This is the log-level reopen path: until the sibling `strata-store` crate
-//! lands and is mergeable, consumers (and the migration tests) assert against
-//! the log itself via `strata::StrataLog::read_frames`, decoded here into the
-//! migration record types.
+//! This is the log-level reopen path: consumers (and the migration tests)
+//! assert against the log itself via `strata::StrataLog::read_frames`,
+//! decoded here into the migration record types.
 
 use strata::StrataLog;
 use strata_kernel::checkpoint::Checkpoint;
@@ -15,13 +14,16 @@ use crate::MigrationError;
 /// Everything a migration wrote, decoded from log frames.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
-    pub meta: Option<MigrationMeta>,
+    pub genesis: Option<GenesisRecord>,
+    pub params: Option<ParamsRecord>,
     pub nodes: Vec<NodeRecord>,
     pub edges: Vec<EdgeRecord>,
     pub reviews: Vec<ReviewEvent>,
     pub tombstones: Vec<TombstoneRecord>,
     pub supersessions: Vec<SupersessionRecord>,
     pub checkpoints: Vec<Checkpoint>,
+    /// The final signed MIGRATION_RECEIPT, when the log carries one.
+    pub receipt: Option<MigrationReceipt>,
     /// Count of frames whose kind is not part of the migration family
     /// (e.g. gate records sharing the log).
     pub other_frames: usize,
@@ -42,9 +44,10 @@ pub fn read_snapshot(log: &StrataLog) -> Result<Snapshot, MigrationError> {
             ))
         };
         match frame.kind {
-            KIND_MIGRATION_META => {
-                snapshot.meta = Some(decode_meta(&frame.payload).map_err(decode)?)
+            KIND_GENESIS => {
+                snapshot.genesis = Some(decode_genesis(&frame.payload).map_err(decode)?)
             }
+            KIND_PARAMS => snapshot.params = Some(decode_params(&frame.payload).map_err(decode)?),
             KIND_NODE => snapshot
                 .nodes
                 .push(decode_node(&frame.payload).map_err(decode)?),
@@ -63,6 +66,9 @@ pub fn read_snapshot(log: &StrataLog) -> Result<Snapshot, MigrationError> {
             KIND_CHECKPOINT => snapshot
                 .checkpoints
                 .push(decode_checkpoint(&frame.payload).map_err(decode)?),
+            KIND_MIGRATION_RECEIPT => {
+                snapshot.receipt = Some(decode_receipt(&frame.payload).map_err(decode)?)
+            }
             _ => snapshot.other_frames += 1,
         }
     }

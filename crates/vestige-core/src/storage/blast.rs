@@ -39,44 +39,9 @@ pub const BLAST_MAX_DEPTH: u32 = 5;
 /// root resolution (guards against prose false positives).
 const MIN_SHA_CHARS: usize = 6;
 
-/// One record inside a blast report.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct BlastAffected {
-    /// The affected memory id.
-    pub id: String,
-    /// How it was reached: "root", "shared_commit:<sha>", or the edge
-    /// link_type ("derived_from" | "backfill_candidate" | "evidence_of").
-    pub via: String,
-    /// BFS depth from the root. Root and shared-sha siblings sit at 0;
-    /// direct edge targets at 1; capped at [`BLAST_MAX_DEPTH`].
-    pub depth: u32,
-}
-
-/// Exact downstream reach of one root memory.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BlastReport {
-    /// The root (cause/source) memory id the traversal started from.
-    pub root_id: String,
-    /// Root itself (depth 0), shared-sha siblings (depth 0), then edge
-    /// descendants by ascending (depth, id). Sorted deterministically.
-    pub affected: Vec<BlastAffected>,
-    /// `affected.len()`.
-    pub total: usize,
-}
-
-/// Per-id outcome of a retire pass. Retire NEVER deletes: each id is
-/// suppressed through the existing storage mechanism, so the row survives,
-/// the suppression is journaled, and the 24h reversal window applies.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RetireOutcome {
-    pub id: String,
-    /// true when the suppression flip was applied.
-    pub suppressed: bool,
-    /// Suppression count after the flip (0 when it failed).
-    pub suppression_count: i32,
-    /// Human-readable failure reason ("not found", storage error, ...).
-    pub error: Option<String>,
-}
+// `BlastAffected`, `BlastReport`, and `RetireOutcome` are defined in (and
+// re-exported from) `crate::storage::types`.
+pub use crate::storage::types::{BlastAffected, BlastReport, RetireOutcome};
 
 /// Extract the sha from a record's `commit <sha> ...` line, if any.
 ///

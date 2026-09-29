@@ -12,7 +12,7 @@ default = ["legacy-sqlite"]
 legacy-sqlite = ["vestige-core/legacy-sqlite", "vestige-core/bundled-sqlite"]
 
 [dependencies]
-vestige-core = { path = "../../crates/vestige-core", default-features = false }
+vestige-core = { path = "../../crates/vestige-core", default-features = false, features = ["v3-engine"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"

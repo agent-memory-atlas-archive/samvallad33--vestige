@@ -12,7 +12,7 @@ default = ["legacy-sqlite"]
 legacy-sqlite = ["vestige-core/legacy-sqlite", "dep:rusqlite"]
 
 [dependencies]
-vestige-core = { path = "../../crates/vestige-core" }
+vestige-core = { path = "../../crates/vestige-core", features = ["v3-engine"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }

@@ -13,13 +13,16 @@ use strata::StrataLog;
 use strata_kernel::event::ReviewEvent;
 use strata_kernel::fsrs::{CardPhase, ALGO_V1};
 use strata_kernel::kernel::Kernel;
-use vestige_core::{ConnectionRecord, IngestInput, Storage};
+use vestige_core::{ConnectionRecord, IngestInput, SqliteMemoryStore};
 
 use strata_migrate::{migrate, read_snapshot};
 
-/// Build a small populated store at `db` and return the ingested node ids.
-fn build_store(db: &std::path::Path) -> Vec<String> {
-    let storage = Storage::new(Some(db.to_path_buf())).expect("open store");
+/// Build a small populated store at `db`, optionally exporting its portable
+/// archive to `archive_out` while the (single, legitimate) read-write
+/// handle is open — a built store carries the SQLite magic, so 4.0 refuses
+/// any later read-write open by design. Returns the ingested node ids.
+fn build_store(db: &std::path::Path, archive_out: Option<&std::path::Path>) -> Vec<String> {
+    let storage = SqliteMemoryStore::new(Some(db.to_path_buf())).expect("open store");
 
     let inputs = [
         IngestInput {
@@ -59,34 +62,32 @@ fn build_store(db: &std::path::Path) -> Vec<String> {
             activation_count: 3,
         })
         .expect("save connection");
+
+    // Plant FSRS review history while the store handle is open: a separate
+    // raw connection commits the rows, and the export below must see them.
+    // (The public API does not create review history.)
+    {
+        let conn = rusqlite::Connection::open(db).expect("open raw sqlite");
+        for (memory_id, reps, lapses) in [(&ids[0], 4i64, 1i64), (&ids[1], 2, 0)] {
+            conn.execute(
+                "INSERT OR REPLACE INTO fsrs_cards (
+                     memory_id, difficulty, stability, state, reps, lapses,
+                     last_review, due_date, elapsed_days, scheduled_days
+                 ) VALUES (?1, 5.0, 3.2, 'review', ?2, ?3, ?4, ?4, 1, 1)",
+                rusqlite::params![memory_id, reps, lapses, now.to_rfc3339(),],
+            )
+            .expect("plant fsrs_cards");
+        }
+    }
+
+    if let Some(archive_path) = archive_out {
+        storage
+            .export_portable_archive_to_path(archive_path)
+            .expect("export archive");
+    }
     drop(storage);
 
-    // Plant FSRS review history: node0 = 4 reps / 1 lapse, node1 = 2 reps.
-    let conn = rusqlite::Connection::open(db).expect("open raw sqlite");
-    for (memory_id, reps, lapses) in [(&ids[0], 4i64, 1i64), (&ids[1], 2, 0)] {
-        conn.execute(
-            "INSERT OR REPLACE INTO fsrs_cards (
-                 memory_id, difficulty, stability, state, reps, lapses,
-                 last_review, due_date, elapsed_days, scheduled_days
-             ) VALUES (?1, 5.0, 3.2, 'review', ?2, ?3, ?4, ?4, 1, 1)",
-            rusqlite::params![memory_id, reps, lapses, now.to_rfc3339(),],
-        )
-        .expect("plant fsrs_cards");
-    }
-    drop(conn);
-
     ids
-}
-
-/// Export the store at `db` to a portable archive JSON at `archive`.
-fn export_archive(
-    db: &std::path::Path,
-    archive: &std::path::Path,
-) -> vestige_core::PortableArchive {
-    let storage = Storage::new(Some(db.to_path_buf())).expect("reopen store");
-    storage
-        .export_portable_archive_to_path(archive)
-        .expect("export archive")
 }
 
 /// Tables the migration maps (mirror of the crate's MAPPED_TABLES).
@@ -98,25 +99,52 @@ const MAPPED: &[&str] = &[
     "deletion_tombstones",
 ];
 
-fn expected_skipped(archive: &vestige_core::PortableArchive) -> Vec<String> {
-    let mut tables: Vec<String> = archive
-        .tables
-        .iter()
-        .filter(|t| !t.rows.is_empty() && !MAPPED.contains(&t.name.as_str()))
-        .map(|t| t.name.clone())
+/// The sqlite_master-driven expectation: every nonempty user table without
+/// a STRATA mapping (mirrors the migrator's own skipped_tables logic — the
+/// audit required skipped_tables to be schema-driven, not hand-listed).
+fn expected_skipped(db: &std::path::Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        format!("file:{}?mode=ro&immutable=1", db.display()),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .expect("readonly open");
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type='table'
+             AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'knowledge_fts%'
+             ORDER BY name",
+        )
+        .unwrap();
+    let names: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .filter_map(Result::ok)
         .collect();
-    tables.sort();
-    tables
+    let mut out: Vec<String> = names
+        .into_iter()
+        .filter(|name| !MAPPED.contains(&name.as_str()))
+        .filter(|name| {
+            let quoted = format!("\"{name}\"");
+            conn.query_row(&format!("SELECT COUNT(*) FROM {quoted}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|n| n > 0)
+            .unwrap_or(false)
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 #[test]
 fn path_a_archive_end_to_end() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db = tmp.path().join("vestige.db");
-    let ids = build_store(&db);
-
     let archive_path = tmp.path().join("portable.json");
-    let archive = export_archive(&db, &archive_path);
+    let ids = build_store(&db, Some(&archive_path));
+    let archive: vestige_core::PortableArchive =
+        serde_json::from_slice(&std::fs::read(&archive_path).expect("read archive"))
+            .expect("decode archive");
 
     let strata_dir = tmp.path().join("strata");
     let report = migrate(&archive_path, &strata_dir).expect("migrate");
@@ -125,18 +153,29 @@ fn path_a_archive_end_to_end() {
     assert_eq!(report.edges, 1);
     assert_eq!(report.fsrs_events, 6); // 4 + 2 synthetic reviews
     assert!(report.verify_passed, "kernel verify must pass: {report:?}");
-    let mut expected = expected_skipped(&archive);
+    // Path A input is a portable archive: skipped_tables can only reflect
+    // the archive's own tables (the schema-driven sqlite_master list is the
+    // direct-SQLite path's contract — asserted in path_b).
     let mut got = report.skipped_tables.clone();
-    expected.sort();
     got.sort();
+    let mut expected: Vec<String> = archive
+        .tables
+        .iter()
+        .filter(|t| !t.rows.is_empty() && !MAPPED.contains(&t.name.as_str()))
+        .map(|t| t.name.clone())
+        .collect();
+    expected.sort();
     assert_eq!(got, expected);
 
     // ---- reopen at the log level and assert identity fidelity ------------
     let log = StrataLog::open(&strata_dir).expect("reopen strata log");
     let snapshot = read_snapshot(&log).expect("read snapshot");
 
-    assert!(snapshot.meta.is_some());
-    assert_eq!(snapshot.meta.unwrap().archive_format, "vestige.portable.v1");
+    assert!(snapshot.genesis.is_some());
+    assert_eq!(
+        snapshot.genesis.unwrap().archive_format,
+        "vestige.portable.v1"
+    );
 
     let legacy: HashSet<&str> = snapshot
         .nodes
@@ -163,7 +202,11 @@ fn path_a_archive_end_to_end() {
     let edge = &snapshot.edges[0];
     assert_eq!(edge.source_legacy_id, ids[0]);
     assert_eq!(edge.target_legacy_id, ids[1]);
-    assert_eq!(edge.link_type, "semantic", "legacy link types pass through");
+    // `semantic` is legacy vocabulary: it folds to derived_from with the
+    // legacy type kept for provenance only.
+    assert_eq!(edge.link_type, "derived_from");
+    assert!(edge.legacy_inferred);
+    assert_eq!(edge.legacy_link_type, "semantic");
     assert_eq!(edge.activation_count, 3);
     assert_eq!(
         edge.source_kernel_id,
@@ -213,7 +256,7 @@ fn path_a_archive_end_to_end() {
 fn path_b_direct_sqlite_matches_path_a() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db = tmp.path().join("vestige.db");
-    build_store(&db);
+    build_store(&db, None);
 
     let strata_dir = tmp.path().join("strata");
     let report = migrate(&db, &strata_dir).expect("migrate direct sqlite");
@@ -227,12 +270,22 @@ fn path_b_direct_sqlite_matches_path_a() {
     let snapshot = read_snapshot(&log).expect("snapshot");
     assert_eq!(snapshot.nodes.len(), 3);
     assert_eq!(snapshot.edges.len(), 1);
+
+    // Direct-SQLite path: skipped_tables is sqlite_master-driven (audit 17/18).
+    let expected = expected_skipped(&db);
+    assert!(
+        expected.contains(&"schema_version".to_string()),
+        "sanity: the real schema names schema_version"
+    );
+    let mut got = report.skipped_tables.clone();
+    got.sort();
+    assert_eq!(got, expected, "skipped tables must be schema-driven");
 }
 
 #[test]
 fn directory_source_resolves_vestige_db() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    build_store(&tmp.path().join("vestige.db"));
+    build_store(&tmp.path().join("vestige.db"), None);
 
     let report = migrate(tmp.path(), &tmp.path().join("strata")).expect("migrate dir");
     assert_eq!(report.nodes, 3);
@@ -245,7 +298,7 @@ fn empty_store_migrates_to_verifying_log() {
     let db = tmp.path().join("vestige.db");
     let archive_path = tmp.path().join("empty.json");
     {
-        let storage = Storage::new(Some(db)).expect("open");
+        let storage = SqliteMemoryStore::new(Some(db)).expect("open");
         storage
             .export_portable_archive_to_path(&archive_path)
             .expect("export");
@@ -269,27 +322,25 @@ fn re_migration_extends_the_log_and_keeps_the_chain() {
     let archive_path = tmp.path().join("portable.json");
     {
         let db = tmp.path().join("vestige.db");
-        build_store(&db);
-        export_archive(&db, &archive_path);
+        build_store(&db, Some(&archive_path));
     }
 
     let strata_dir = tmp.path().join("strata");
     let first = migrate(&archive_path, &strata_dir).expect("first run");
     assert!(first.verify_passed);
 
-    // Re-running is append-only: records duplicate, but the checkpoint chain
-    // extends and verification still passes (strictly increasing log_seq).
-    let second = migrate(&archive_path, &strata_dir).expect("second run");
-    assert_eq!(second.nodes, 3);
-    assert_eq!(second.fsrs_events, 6);
-    assert!(second.verify_passed, "chained verify must pass: {second:?}");
-
+    // A second run into a non-empty destination is refused: a killed run
+    // followed by a re-run must never double the rows (audit finding).
+    let second = migrate(&archive_path, &strata_dir);
+    assert!(
+        matches!(
+            second,
+            Err(strata_migrate::MigrationError::DestinationNotEmpty { .. })
+        ),
+        "non-empty destination must refuse: {second:?}"
+    );
     let log = StrataLog::open(&strata_dir).expect("reopen");
     let snapshot = read_snapshot(&log).expect("snapshot");
-    assert_eq!(snapshot.nodes.len(), 6);
-    assert_eq!(
-        snapshot.checkpoints.len(),
-        2,
-        "each run seals exactly one checkpoint"
-    );
+    assert_eq!(snapshot.nodes.len(), 3, "the refusal wrote nothing");
+    assert_eq!(snapshot.checkpoints.len(), 1);
 }

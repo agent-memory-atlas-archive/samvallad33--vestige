@@ -34,10 +34,14 @@ impl SqliteMemoryStore {
 
     pub(super) fn prepare_data_dir(data_dir: PathBuf) -> Result<PathBuf> {
         let data_dir = Self::expand_tilde(data_dir);
+        // Owner-only 0700 applies ONLY to a directory this call created.
+        // Tightening a pre-existing data directory happened before the v3
+        // guard could refuse, narrowing the user's whole data dir as a side
+        // effect of a refused command (audit finding).
+        let existed = data_dir.exists();
         std::fs::create_dir_all(&data_dir)?;
-        // Restrict directory permissions to owner-only on Unix
         #[cfg(unix)]
-        {
+        if !existed {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o700);
             let _ = std::fs::set_permissions(&data_dir, perms);
@@ -649,10 +653,28 @@ impl SqliteMemoryStore {
             None => Self::default_db_path()?,
         };
 
+        // PR 0a: a v3 SQLite file is never opened read-write. Detect by
+        // magic bytes first — before the write handle, the chmod, and the
+        // migration pass can touch it — and refuse with the migration hint.
+        // The only escape is the `v3-engine` raw engine harness (restart /
+        // durability tests that reopen synthetic stores); test builds are
+        // NOT exempt (audit: a fresh install created a SQLite store and then
+        // refused to open it, invisible while the guard was test-disabled).
+        #[cfg(all(feature = "legacy-sqlite", not(feature = "v3-engine")))]
+        {
+            // A missing path is not a v3 store. Refusing to create it exits
+            // before the stdio handshake. Existing SQLite files stay refused.
+            crate::storage::v3_guard::ensure_not_v3(&path)?;
+        }
+
         // Open writer connection
         let writer_conn = Connection::open(&path)?;
 
-        // Restrict database file permissions to owner-only on Unix
+        // Restrict database file permissions to owner-only on Unix — the
+        // database FILE only. Chmodding a pre-existing data DIRECTORY here
+        // narrowed the user's whole data dir before the guard could refuse
+        // (audit finding); directories are only chmod'd when this call
+        // created them (see prepare_data_dir).
         #[cfg(unix)]
         if path.exists() {
             use std::os::unix::fs::PermissionsExt;
@@ -1021,14 +1043,15 @@ impl SqliteMemoryStore {
                 FROM knowledge_nodes
              )",
         )?;
-        let (active, dormant, silent, unavailable): (i64, i64, i64, i64) = stmt.query_row([], |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-            ))
-        })?;
+        let (active, dormant, silent, unavailable): (i64, i64, i64, i64) =
+            stmt.query_row([], |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                ))
+            })?;
         Ok((active, dormant, silent, unavailable))
     }
 

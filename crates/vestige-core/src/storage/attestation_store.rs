@@ -17,9 +17,9 @@ use uuid::Uuid;
 
 use super::receipt_attestation::{
     ChainEntry, DisclosureMapping, DisclosureVerification, DsseEnvelope, ExpectedTerminalHead,
-    MAX_TRUSTED_SIGNING_KEYS, PredecessorExpectation, ReceiptAttestationV1,
-    RedactionSafeReceiptBindingV1, SignedReceiptAttestation, SigningKeyStatus,
-    TrustedPredecessorAnchor, TrustedSigningKey, VerificationContext, VerificationReport,
+    MAX_TRUSTED_SIGNING_KEYS, PredecessorExpectation,
+    RedactionSafeReceiptBindingV1, SigningKeyStatus,
+    TrustedPredecessorAnchor, TrustedSigningKey, VerificationContext,
     public_key_fingerprint, validate_receipt_signing_key_id, verify_disclosure,
     verify_envelope_with_keys,
 };
@@ -28,54 +28,13 @@ use super::sqlite::SqliteMemoryStore;
 use super::{Result, StorageError};
 use crate::trace::{Receipt, ReceiptEvidence};
 
-/// Public state of a receipt at the V24 boundary. Absence of an immutable
-/// envelope is deliberately explicit rather than silently treated as valid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReceiptAttestationStatus {
-    LegacyUnsigned,
-    SignedV1,
-}
-
-/// One all-or-nothing signed-receipt write.
-pub struct SignedReceiptWrite<'a> {
-    pub receipt: &'a Receipt,
-    pub attestation: &'a ReceiptAttestationV1,
-    pub signed: &'a SignedReceiptAttestation,
-    pub disclosures: &'a [DisclosureMapping],
-    pub run_id: Option<&'a str>,
-    pub tool: Option<&'a str>,
-    pub query: Option<&'a str>,
-}
-
-/// Durable identifiers returned only after the SQLite commit succeeds.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DurableSignedReceipt {
-    pub receipt_id: String,
-    pub chain_id: String,
-    pub sequence: u64,
-    pub payload_digest: String,
-    pub entry_digest: String,
-    pub signing_key_id: String,
-    pub signer_key_fingerprint: String,
-}
-
-/// Commit result for a signed retrieval receipt and its frozen replay capsule.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DurableSignedRetrievalReceipt {
-    pub receipt: DurableSignedReceipt,
-    pub replay_capsule: DurableRetrievalReplayCapsule,
-}
-
-/// Locally re-verified stored receipt state. This establishes cryptographic
-/// integrity against the local trusted-key registry and current database rows;
-/// it is not an independently published checkpoint or trusted timestamp.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredReceiptAttestationVerification {
-    pub report: VerificationReport,
-    pub receipt_binding_valid: bool,
-}
+// `ReceiptAttestationStatus`, `SignedReceiptWrite`, `DurableSignedReceipt`,
+// `DurableSignedRetrievalReceipt`, and `StoredReceiptAttestationVerification`
+// are defined in (and re-exported from) `crate::storage::types`.
+pub use crate::storage::types::{
+    DurableSignedReceipt, DurableSignedRetrievalReceipt, ReceiptAttestationStatus,
+    SignedReceiptWrite, StoredReceiptAttestationVerification,
+};
 
 impl StoredReceiptAttestationVerification {
     pub fn is_valid(&self) -> bool {
@@ -1184,7 +1143,7 @@ mod tests {
     use crate::IngestInput;
     use crate::storage::receipt_attestation::{
         AttestationChainPosition, CaptureDirection, ProducerIdentity,
-        RedactionSafeDecisionProjectionV1, sign_attestation,
+        RedactionSafeDecisionProjectionV1, sign_attestation, ReceiptAttestationV1,
     };
     use crate::trace::{DecayRisk, Receipt};
     use ed25519_dalek::SigningKey;
