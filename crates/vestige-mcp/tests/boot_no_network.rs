@@ -150,7 +150,12 @@ fn default_boot_opens_no_outbound_socket_or_dns() {
         !names.contains(&"source_sync"),
         "source_sync is absent unless --features connectors: {names:?}"
     );
-    assert_eq!(names.len(), 17, "default tools/list: {names:?}");
+    // 4.0 withholds purge and suppress on Strata until erasure ships.
+    assert!(
+        !names.contains(&"purge") && !names.contains(&"suppress"),
+        "erasure tools are withheld on Strata: {names:?}"
+    );
+    assert_eq!(names.len(), 15, "default tools/list: {names:?}");
 
     let called = session.result(
         "tools/call",

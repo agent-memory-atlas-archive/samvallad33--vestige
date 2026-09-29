@@ -95,8 +95,11 @@ def run(binary, output):
             handshake()
             catalog = rpc("tools/list", {})["tools"]
             names = [x["name"] for x in catalog]
-            assert len(names) == 17, names
+            assert len(names) == 15, names
             assert "source_sync" not in names, names
+            assert "purge" not in names and "suppress" not in names, names
+            memory_actions = next(x for x in catalog if x["name"] == "memory")["inputSchema"]["properties"]["action"]["enum"]
+            assert "purge" not in memory_actions and "delete" not in memory_actions, memory_actions
             guide = tool("memory_status", {"view": "tools"})["tools"]
             assert [x["name"] for x in guide] == names
             for entry, definition in zip(guide, catalog):
@@ -120,7 +123,6 @@ def run(binary, output):
             annotations = {x["name"]: x["annotations"] for x in catalog}
             assert annotations["recall"]["readOnlyHint"] is False
             assert annotations["recall"]["idempotentHint"] is False
-            assert annotations["suppress"]["idempotentHint"] is False
             passed("all installed tool and action definitions match progressive discovery")
 
             typed("maintain", {"action": "consolidate", "phase": "embeddings", "batchSize": 2},
@@ -216,13 +218,13 @@ def run(binary, output):
             typed("memory", {"action": "edit", "id": "mem-ffffffffffffffff", "content": "nope"}, "not found")
             doomed = tool("smart_ingest", {"content": "STRATA_PURGE_DOOMED", "forceCreate": True})
             doomed_id = doomed["nodeId"]
-            typed("purge", {"id": doomed_id, "confirm": False}, "confirm=true")
-            purged = tool("purge", {"id": doomed_id, "confirm": True})
-            assert purged["rule"] == "purge" and purged["nodeId"] == doomed_id
-            assert str(purged["receiptId"]).startswith("eff-")
-            hidden = tool("memory", {"action": "get", "id": doomed_id})
-            assert "STRATA_PURGE_DOOMED" not in json.dumps(hidden)
-            assert hidden["message"] == "retired, can't be retrieved"
+            # 4.0 withholds erasure on Strata: every route refuses, the node stays.
+            typed("purge", {"id": doomed_id, "confirm": True}, "unavailable_in_4_0")
+            typed("memory", {"action": "purge", "id": doomed_id, "confirm": True}, "unavailable_in_4_0")
+            typed("memory", {"action": "delete", "id": doomed_id, "confirm": True}, "unavailable_in_4_0")
+            typed("delete_knowledge", {"id": doomed_id, "confirm": True}, "unavailable_in_4_0")
+            still = tool("memory", {"action": "get", "id": doomed_id})
+            assert "STRATA_PURGE_DOOMED" in json.dumps(still)
             context = tool("codebase", {"action": "get_context", "codebase": "fixture"})
             assert marker not in json.dumps(context)
             project_preview = tool("project", {"action": "preview"})
@@ -328,16 +330,11 @@ def run(binary, output):
             typed("session_start", {"queries": [marker], "include_predictions": False, "include_intentions": False}, "similarity_disabled")
             doomed_suppress = tool("smart_ingest", {"content": "STRATA_SUPPRESS_DOOMED", "forceCreate": True})
             suppress_id = doomed_suppress["nodeId"]
-            suppressed = tool("suppress", {"id": suppress_id, "reason": "fixture"})
-            assert suppressed["success"] is True and suppressed["rule"] == "suppress"
-            assert suppressed["id"] == suppress_id
-            assert str(suppressed["receiptId"]).startswith("eff-")
-            assert "STRATA_SUPPRESS_DOOMED" not in json.dumps(suppressed)
-            hidden_suppress = tool("memory", {"action": "get", "id": suppress_id})
-            assert hidden_suppress["message"] == "retired, can't be retrieved"
-            assert "STRATA_SUPPRESS_DOOMED" not in json.dumps(hidden_suppress)
-            hidden_recall = tool("recall", {"handle": suppress_id})
-            assert "STRATA_SUPPRESS_DOOMED" not in json.dumps(hidden_recall)
+            typed("suppress", {"id": suppress_id, "reason": "fixture"}, "unavailable_in_4_0")
+            typed("blast_radius", {"action": "retire", "ids": [suppress_id], "reason": "fixture"}, "unavailable_in_4_0")
+            kept_suppress = tool("memory", {"action": "get", "id": suppress_id})
+            assert "STRATA_SUPPRESS_DOOMED" in json.dumps(kept_suppress)
+            passed("purge, delete and suppress are withheld on Strata and change nothing")
             unanchored = tool("causal_walk", {"scope": "user"})
             assert unanchored["status"] == "completed" and unanchored["causes"] == []
             assert unanchored["needs_report"]["missing"] == ["node_id"], unanchored
@@ -354,7 +351,7 @@ def run(binary, output):
             missing = [name for name in names if name not in called]
             assert not missing, missing
             assert_no_sqlite()
-            passed("all 17 tools answered on Strata: real writes, or a typed error")
+            passed(f"all {len(names)} tools answered on Strata: real writes, or a typed error")
         finally:
             if proc and proc.poll() is None:
                 proc.terminate()

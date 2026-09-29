@@ -252,6 +252,49 @@ const DISCOVER_TTL_MS: u64 = 3_600_000;
 ///
 /// `null` and `""` are treated as absent, so a client that always serialises
 /// the field is not punished for a cursor it never really set.
+/// The erasure-class call a Strata log withholds in 4.0, with its refusal.
+/// Covers every advertised and hidden route to purge, delete or suppress.
+fn strata_withheld_call(tool: &str, arguments: Option<&serde_json::Value>) -> Option<String> {
+    let action = arguments
+        .and_then(|args| args.get("action"))
+        .and_then(|value| value.as_str());
+    let what = match (tool, action) {
+        ("purge", _) => "purge",
+        ("suppress", _) => "suppress",
+        ("delete_knowledge", _) => "delete_knowledge",
+        ("memory", Some("purge")) => "memory action 'purge'",
+        ("memory", Some("delete")) => "memory action 'delete'",
+        ("blast_radius", Some("retire")) => "blast_radius action 'retire'",
+        _ => return None,
+    };
+    Some(crate::strata_memory::withheld_message(what))
+}
+
+/// Drop the withheld tools and memory actions from a Strata tool list, so
+/// the advertised surface matches what the log can honestly do.
+fn withhold_erasure_from_catalog(tools: &mut Vec<ToolDescription>) {
+    tools.retain(|tool| tool.name != "purge" && tool.name != "suppress");
+    for tool in tools.iter_mut().filter(|tool| tool.name == "memory") {
+        strip_withheld_memory_actions(&mut tool.input_schema);
+        tool.description = Some("Manage one memory: 'get', 'get_batch', 'state', 'promote' / 'demote' (demote never deletes), 'edit' (admit a successor, retire the previous node). Erasure is withheld on Strata in 4.0.".to_string());
+    }
+}
+
+/// Remove `purge` and `delete` from a memory schema's action selector.
+fn strip_withheld_memory_actions(schema: &mut serde_json::Value) {
+    if let Some(values) = schema
+        .pointer_mut("/properties/action/enum")
+        .and_then(|values| values.as_array_mut())
+    {
+        values.retain(|value| value != "purge" && value != "delete");
+    }
+    if let Some(description) = schema.pointer_mut("/properties/action/description") {
+        *description = serde_json::json!(
+            "'get', 'get_batch' (ids), 'state', 'promote' / 'demote' (retrieval strength; demote never deletes), 'edit' (admit a successor under rule edit, then retire the previous node). Erasure is withheld on Strata in 4.0."
+        );
+    }
+}
+
 fn reject_unknown_cursor(params: Option<&serde_json::Value>) -> Result<(), JsonRpcError> {
     let Some(cursor) = params.and_then(|p| p.get("cursor")) else {
         return Ok(());
@@ -1121,6 +1164,9 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
         // hidden redirects in handle_tools_call. See
         // docs/launch/tool-consolidation-v2.2.0.md.
         let mut tools = Self::tool_catalog();
+        if crate::strata_memory::is_strata_backend(self.storage.as_ref()) {
+            withhold_erasure_from_catalog(&mut tools);
+        }
 
         // Per-tool result-size annotation `_meta["anthropic/maxResultSizeChars"]`.
         //
@@ -1217,6 +1263,26 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
             return Err(JsonRpcError::invalid_params(
                 "tools/call arguments must be an object",
             ));
+        }
+
+        // 4.0: erasure-class calls are withheld on a Strata log. Refuse before
+        // tracing and before the Memory-PR review gate, so a withheld call
+        // cannot open a pending purge or suppress review either.
+        if crate::strata_memory::is_strata_backend(self.storage.as_ref())
+            && let Some(message) = strata_withheld_call(&request.name, request.arguments.as_ref())
+        {
+            let error_content = serde_json::json!({ "error": message });
+            let call_result = CallToolResult {
+                content: vec![crate::protocol::messages::ToolResultContent {
+                    content_type: "text".to_string(),
+                    text: serde_json::to_string_pretty(&error_content)
+                        .unwrap_or_else(|_| error_content.to_string()),
+                }],
+                structured_content: Some(error_content),
+                is_error: Some(true),
+            };
+            return serde_json::to_value(call_result)
+                .map_err(|e| JsonRpcError::internal_error(&e.to_string()));
         }
 
         // Record activity on every tool call (non-blocking)
@@ -1770,7 +1836,19 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
                 // does not apply here; the catalog rides with the same hints
                 // it has always carried.
                 let catalog = self.handle_tools_list(None, Era::LegacyHandshake).await?;
-                tools::memory_status::tool_guide(&catalog, request.arguments.as_ref().unwrap())
+                let mut guide =
+                    tools::memory_status::tool_guide(&catalog, request.arguments.as_ref().unwrap());
+                if crate::strata_memory::is_strata_backend(self.storage.as_ref())
+                    && let Ok(guide) = guide.as_mut()
+                    && let Some(entries) = guide["tools"].as_array_mut()
+                {
+                    for entry in entries.iter_mut().filter(|entry| entry["name"] == "memory") {
+                        if let Some(schema) = entry.get_mut("inputSchema") {
+                            strip_withheld_memory_actions(schema);
+                        }
+                    }
+                }
+                guide
             }
             "memory_status" => {
                 tools::memory_status::execute(
