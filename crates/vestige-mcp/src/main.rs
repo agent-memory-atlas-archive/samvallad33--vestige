@@ -246,18 +246,9 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
 
 fn exit_if_v3(db_path: &Path) {
     if let Ok(Some(v3)) = vestige_core::detect_v3(db_path) {
-        error!(
-            "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
-            v3.path.display(),
-            v3.schema_version,
-            vestige_core::MIGRATION_HINT
-        );
-        eprintln!(
-            "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
-            v3.path.display(),
-            v3.schema_version,
-            vestige_core::MIGRATION_HINT
-        );
+        let message = v3.refusal_message();
+        error!("{message}");
+        eprintln!("{message}");
         std::process::exit(1);
     }
 }

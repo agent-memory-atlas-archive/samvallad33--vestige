@@ -2088,12 +2088,7 @@ fn refuse_v3_sqlite(data_dir: &Path) -> anyhow::Result<()> {
     let Some(v3) = vestige_core::detect_v3(&db)? else {
         return Ok(());
     };
-    anyhow::bail!(
-        "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
-        v3.path.display(),
-        v3.schema_version,
-        vestige_core::MIGRATION_HINT
-    );
+    anyhow::bail!("{}", v3.refusal_message());
 }
 
 /// Apply pending migrations, or rehearse them on a throwaway copy of the store.
