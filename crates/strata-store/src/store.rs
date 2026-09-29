@@ -5,7 +5,7 @@
 //! is a derived index rebuilt by replay on open — proven bit-identical by
 //! [`StrataStore::state_digest`] across open/close/open cycles.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -42,6 +42,23 @@ struct StoreMeta {
     magic: [u8; 8],
     head_checkpoint_hash: [u8; 32],
     head_log_seq: u64,
+}
+
+/// Policy that admits `RETIRE` (supersede) as well as writes.
+///
+/// The MCP server pins [`default_policy`], which holds every retire. Tests
+/// that need a recorded supersession chain open with this policy instead.
+pub fn permissive_policy() -> Policy {
+    Policy {
+        rules: vec![Rule {
+            match_kind: ANY_KIND,
+            match_params_hash_prefix: WILDCARD_PREFIX,
+            max_blast_radius: u32::MAX,
+            forbid_forgotten_lessons: false,
+            require_human: false,
+            verdict: Verdict::Allow,
+        }],
+    }
 }
 
 /// The default pinned policy: allow writes, hold destructive actions.
@@ -100,6 +117,50 @@ struct StateDigest<'a> {
     fsrs_root: [u8; 32],
     checkpoints: Vec<[u8; 32]>,
     orphan_writes: u64,
+}
+
+/// One recorded supersession hop, in log order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersedeHop {
+    /// Node that was superseded.
+    pub id: String,
+    /// Node that replaced `id`.
+    pub superseded_by: String,
+    /// Log seq of the frame that recorded the hop.
+    pub frame_seq: u64,
+    /// Chain hash of that frame.
+    pub frame_hash: [u8; 32],
+    /// `SupersedeNode` for a retire op, `supersedes` for a typed edge.
+    pub recorded_as: &'static str,
+}
+
+/// Creating frame of one node, plus the supersession chain that names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedOrigin {
+    /// Log seq of the first admitted `UpsertNode` for this id.
+    pub frame_seq: u64,
+    /// Frame kind byte (`KIND_STORE_WRITE`).
+    pub frame_kind: u8,
+    /// Chain hash of the creating frame.
+    pub frame_hash: [u8; 32],
+    /// `payload_blake3` of the creating frame.
+    pub payload_blake3: [u8; 32],
+    /// Log seq of the admitting `PROPOSE`, when present.
+    pub propose_frame_seq: Option<u64>,
+    /// Log seq of the admitting `GATE`, when present.
+    pub gate_frame_seq: Option<u64>,
+    /// Log seq of the admitting `EFFECT`, when present.
+    pub effect_frame_seq: Option<u64>,
+    /// Node record carried by the creating frame.
+    pub record: NodeRecord,
+    /// Recorded supersession hops in the connected component of this node.
+    pub supersede_chain: Vec<SupersedeHop>,
+}
+
+struct AdmittedEffect {
+    effect_log_seq: u64,
+    propose_seq: u64,
+    gate_seq: u64,
 }
 
 /// The STRATA-native memory store.
@@ -432,6 +493,129 @@ impl StrataStore {
     /// Gate-space effect seq of the write that created `id`, if it exists.
     pub fn origin_seq(&self, id: &str) -> Option<u64> {
         self.origins.get(id).copied()
+    }
+
+    /// Origin of `id` read from the log: the first admitted `UpsertNode`
+    /// frame, the gate frames that admitted it, and every recorded
+    /// supersession hop in that node's chain.
+    ///
+    /// `None` when no admitted upsert names `id`. The log records no actor
+    /// and no source envelope; callers surface those as absent.
+    pub fn recorded_origin(&self, id: &str) -> Result<Option<RecordedOrigin>, StoreError> {
+        let frames = self.log.read_frames(1)?;
+        let mut propose_at: HashMap<u64, Propose> = HashMap::new();
+        let mut gates_for: HashMap<u64, Vec<(u64, GateRecord)>> = HashMap::new();
+        let mut propose_log: HashMap<u64, u64> = HashMap::new();
+        let mut gate_log: HashMap<u64, u64> = HashMap::new();
+        let mut pending: HashMap<[u8; 32], VecDeque<AdmittedEffect>> = HashMap::new();
+        let mut gate_seq_counter: u64 = 0;
+        let mut origin: Option<RecordedOrigin> = None;
+        let mut hops: Vec<SupersedeHop> = Vec::new();
+
+        for frame in &frames {
+            let seq = frame.seq;
+            if let Some(kind) = RecordKind::from_u8(frame.kind) {
+                let gseq = gate_seq_counter;
+                gate_seq_counter += 1;
+                match kind {
+                    RecordKind::Propose => {
+                        propose_log.insert(gseq, seq);
+                        if let Ok(propose) = Propose::try_from_slice(&frame.payload) {
+                            propose_at.insert(gseq, propose);
+                        }
+                    }
+                    RecordKind::Gate => {
+                        gate_log.insert(gseq, seq);
+                        if let Ok(gate) = GateRecord::try_from_slice(&frame.payload) {
+                            gates_for
+                                .entry(gate.propose_seq)
+                                .or_default()
+                                .push((gseq, gate));
+                        }
+                    }
+                    RecordKind::Effect => {
+                        if let Ok(effect) = EffectRecord::try_from_slice(&frame.payload) {
+                            let covering = propose_at
+                                .get(&effect.propose_seq)
+                                .is_some_and(|propose| propose.action_hash == effect.action_hash);
+                            let admitting =
+                                gates_for.get(&effect.propose_seq).is_some_and(|gates| {
+                                    gates.iter().any(|(gate_seq, gate)| {
+                                        *gate_seq == effect.gate_seq
+                                            && gate.verdict == Verdict::Allow
+                                            && *gate_seq < gseq
+                                    })
+                                });
+                            if covering && admitting {
+                                pending.entry(effect.payload_digest).or_default().push_back(
+                                    AdmittedEffect {
+                                        effect_log_seq: seq,
+                                        propose_seq: effect.propose_seq,
+                                        gate_seq: effect.gate_seq,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if frame.kind != KIND_STORE_WRITE {
+                continue;
+            }
+            let digest = hash32(&frame.payload);
+            let admitted = pending.get_mut(&digest).and_then(|queue| queue.pop_front());
+            let Some(admitted) = admitted else {
+                continue;
+            };
+            let Ok(op) = StoreOp::try_from_slice(&frame.payload) else {
+                continue;
+            };
+            match op {
+                StoreOp::UpsertNode { record } if record.id == id && origin.is_none() => {
+                    origin = Some(RecordedOrigin {
+                        frame_seq: seq,
+                        frame_kind: frame.kind,
+                        frame_hash: frame.frame_hash,
+                        payload_blake3: frame.payload_blake3,
+                        propose_frame_seq: propose_log.get(&admitted.propose_seq).copied(),
+                        gate_frame_seq: gate_log.get(&admitted.gate_seq).copied(),
+                        effect_frame_seq: Some(admitted.effect_log_seq),
+                        record,
+                        supersede_chain: Vec::new(),
+                    });
+                }
+                StoreOp::SupersedeNode {
+                    id: sid,
+                    superseded_by,
+                } => {
+                    hops.push(SupersedeHop {
+                        id: sid,
+                        superseded_by,
+                        frame_seq: seq,
+                        frame_hash: frame.frame_hash,
+                        recorded_as: "SupersedeNode",
+                    });
+                }
+                StoreOp::SaveEdge { edge } if edge.link_type == EdgeKind::Supersedes.as_str() => {
+                    hops.push(SupersedeHop {
+                        id: edge.target_id,
+                        superseded_by: edge.source_id,
+                        frame_seq: seq,
+                        frame_hash: frame.frame_hash,
+                        recorded_as: "supersedes",
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let Some(mut origin) = origin else {
+            return Ok(None);
+        };
+        origin.supersede_chain = supersede_component(&hops, id);
+        Ok(Some(origin))
     }
 
     /// Every node id and the effect seq that admitted it, in id order.
@@ -825,4 +1009,26 @@ impl StrataStore {
     pub fn review_event_count(&self) -> usize {
         self.review_events.len()
     }
+}
+
+/// Hops in the undirected supersession component of `id`, in log order.
+fn supersede_component(hops: &[SupersedeHop], id: &str) -> Vec<SupersedeHop> {
+    let mut ids = BTreeSet::new();
+    ids.insert(id.to_string());
+    loop {
+        let mut grew = false;
+        for hop in hops {
+            if ids.contains(&hop.id) || ids.contains(&hop.superseded_by) {
+                grew |= ids.insert(hop.id.clone());
+                grew |= ids.insert(hop.superseded_by.clone());
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    hops.iter()
+        .filter(|hop| ids.contains(&hop.id) && ids.contains(&hop.superseded_by))
+        .cloned()
+        .collect()
 }

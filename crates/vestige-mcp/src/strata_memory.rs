@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -35,7 +35,114 @@ pub fn is_strata_backend(storage: &Storage) -> bool {
 
 /// Open (or create) a Strata log under `dir`. Creates no SQLite file.
 pub fn open(dir: impl AsRef<Path>) -> Result<Arc<Storage>, StorageError> {
-    Ok(Arc::new(StrataMemory::open(dir)?))
+    let memory = Arc::new(StrataMemory::open(dir)?);
+    register_open(&memory);
+    Ok(memory)
+}
+
+static OPEN_LOGS: Mutex<Vec<(PathBuf, Weak<StrataMemory>)>> = Mutex::new(Vec::new());
+
+fn register_open(memory: &Arc<StrataMemory>) {
+    let mut open = OPEN_LOGS.lock().unwrap_or_else(|err| err.into_inner());
+    open.retain(|(_, weak)| weak.strong_count() > 0);
+    open.push((memory.log_dir.clone(), Arc::downgrade(memory)));
+}
+
+fn live_memory(storage: &Storage) -> Option<Arc<StrataMemory>> {
+    if !is_strata_backend(storage) {
+        return None;
+    }
+    let path = storage.db_path().to_path_buf();
+    let mut open = OPEN_LOGS.lock().unwrap_or_else(|err| err.into_inner());
+    open.retain(|(_, weak)| weak.strong_count() > 0);
+    open.iter()
+        .find(|(log_dir, _)| log_dir == &path)
+        .and_then(|(_, weak)| weak.upgrade())
+}
+
+/// `memory_status` view `provenance` on a Strata log.
+///
+/// The creating frame and any recorded supersede chain, read from the log.
+/// The log records no actor and no source envelope; both are null.
+pub fn execute_node_provenance(storage: &Storage, args: Option<&Value>) -> Result<Value, String> {
+    let id = args
+        .and_then(|value| value.get("memoryId").or_else(|| value.get("id")))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or("provenance requires memoryId")?;
+    let memory = live_memory(storage)
+        .ok_or_else(|| "provenance: strata log is not open in this process".to_string())?;
+    let store = memory.lock();
+    let origin = store.recorded_origin(id).map_err(|err| err.to_string())?;
+    let Some(origin) = origin else {
+        return Ok(json!({
+            "view": "provenance",
+            "status": "completed",
+            "found": false,
+            "memoryId": id,
+        }));
+    };
+    let record = &origin.record;
+    let valid_until = (record.valid_until_ms != VALID_FOREVER_MS).then_some(record.valid_until_ms);
+    let chain: Vec<Value> = origin
+        .supersede_chain
+        .iter()
+        .map(|hop| {
+            json!({
+                "id": hop.id,
+                "supersededBy": hop.superseded_by,
+                "frameSeq": hop.frame_seq,
+                "frameHash": hex32(&hop.frame_hash),
+                "recordedAs": hop.recorded_as,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "view": "provenance",
+        "status": "completed",
+        "found": true,
+        "memoryId": record.id,
+        "origin": {
+            "frame": {
+                "seq": origin.frame_seq,
+                "kind": origin.frame_kind,
+                "kindName": "STORE_WRITE",
+                "op": "UpsertNode",
+                "frameHash": hex32(&origin.frame_hash),
+                "payloadBlake3": hex32(&origin.payload_blake3),
+                "proposeSeq": origin.propose_frame_seq,
+                "gateSeq": origin.gate_frame_seq,
+                "effectSeq": origin.effect_frame_seq,
+            },
+            "actor": Value::Null,
+            "timestamps": {
+                "createdAtMs": record.created_at_ms,
+                "validFromMs": record.valid_from_ms,
+                "validUntilMs": valid_until,
+            },
+            "source": Value::Null,
+            "record": {
+                "id": record.id,
+                "scope": record.scope,
+                "content": record.content,
+                "nodeType": record.node_type,
+                "tags": record.tags,
+                "kernelId": record.kernel_id,
+            },
+        },
+        "supersedeChain": chain,
+    }))
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 pub struct StrataMemory {
