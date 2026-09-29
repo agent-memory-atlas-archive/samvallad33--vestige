@@ -155,6 +155,7 @@ mime_guess = "2"
 tempfile = "3"
 
 [dev-dependencies]
+blake3 = "1"
 ctor = "0.4"
 
 # Integration tests drive the Storage-backed server/tools; the e2e binary
