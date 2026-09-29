@@ -102,6 +102,67 @@ struct StateDigest<'a> {
     orphan_writes: u64,
 }
 
+/// A payload is this type only when borsh consumes it exactly. Kind bytes
+/// 0x20 and 0x21 are shared by store frames and migration frames.
+pub(crate) fn decode_exact<T>(payload: &[u8]) -> Option<T>
+where
+    T: BorshDeserialize + BorshSerialize,
+{
+    let value = T::try_from_slice(payload).ok()?;
+    let encoded = borsh::to_vec(&value).ok()?;
+    (encoded == payload).then_some(value)
+}
+
+/// What a kind-0x20 payload is. A store write wins when both decoders accept it.
+#[derive(Debug)]
+pub(crate) enum WritePayload {
+    StoreOp(StoreOp),
+    ImportedNode(strata_migrate::NodeRecord),
+    Neither,
+}
+
+/// What a kind-0x21 payload is. A checkpoint whose magic matches wins when both accept it.
+#[derive(Debug)]
+pub(crate) enum CheckpointPayload {
+    Checkpoint(Checkpoint),
+    ImportedEdge(strata_migrate::EdgeRecord),
+    Neither,
+}
+
+/// A migration node only when the payload round-trips and its version is current.
+pub(crate) fn migration_node(payload: &[u8]) -> Option<strata_migrate::NodeRecord> {
+    decode_exact::<strata_migrate::NodeRecord>(payload)
+        .filter(|node| node.record_version == strata_migrate::RECORD_VERSION)
+}
+
+/// A migration edge only when the payload round-trips and its version is current.
+pub(crate) fn migration_edge(payload: &[u8]) -> Option<strata_migrate::EdgeRecord> {
+    decode_exact::<strata_migrate::EdgeRecord>(payload)
+        .filter(|edge| edge.record_version == strata_migrate::RECORD_VERSION)
+}
+
+pub(crate) fn classify_write_payload(payload: &[u8]) -> WritePayload {
+    if let Some(op) = decode_exact::<StoreOp>(payload) {
+        WritePayload::StoreOp(op)
+    } else if let Some(node) = migration_node(payload) {
+        WritePayload::ImportedNode(node)
+    } else {
+        WritePayload::Neither
+    }
+}
+
+pub(crate) fn classify_checkpoint_payload(payload: &[u8]) -> CheckpointPayload {
+    if let Some(cp) = decode_exact::<Checkpoint>(payload)
+        .filter(|cp| cp.magic == strata_kernel::checkpoint::MAGIC)
+    {
+        CheckpointPayload::Checkpoint(cp)
+    } else if let Some(edge) = migration_edge(payload) {
+        CheckpointPayload::ImportedEdge(edge)
+    } else {
+        CheckpointPayload::Neither
+    }
+}
+
 /// The STRATA-native memory store.
 ///
 /// See the crate docs for the write path and determinism contract. v1 is
@@ -223,15 +284,26 @@ impl StrataStore {
                     _ => {}
                 }
             } else if frame.kind == KIND_STORE_WRITE {
-                let digest = hash32(&frame.payload);
-                let admitted = pending.get_mut(&digest).and_then(|queue| queue.pop_front());
-                match (admitted, StoreOp::try_from_slice(&frame.payload).ok()) {
-                    (Some(gseq), Some(op)) => self.apply_op(&op, gseq, seq)?,
-                    _ => self.orphan_writes += 1,
+                // 0x20 is also a migration KIND_NODE.
+                match classify_write_payload(&frame.payload) {
+                    WritePayload::StoreOp(op) => {
+                        let digest = hash32(&frame.payload);
+                        let admitted = pending.get_mut(&digest).and_then(|queue| queue.pop_front());
+                        if let Some(gseq) = admitted {
+                            self.apply_op(&op, gseq, seq)?;
+                        } else {
+                            self.orphan_writes += 1;
+                        }
+                    }
+                    WritePayload::ImportedNode(node) => self.apply_imported_node(&node),
+                    WritePayload::Neither => self.orphan_writes += 1,
                 }
             } else if frame.kind == KIND_STORE_CHECKPOINT {
-                if let Ok(cp) = Checkpoint::try_from_slice(&frame.payload) {
-                    self.checkpoints.push(cp);
+                // 0x21 is also a migration KIND_EDGE.
+                match classify_checkpoint_payload(&frame.payload) {
+                    CheckpointPayload::Checkpoint(cp) => self.checkpoints.push(cp),
+                    CheckpointPayload::ImportedEdge(edge) => self.apply_imported_edge(&edge),
+                    CheckpointPayload::Neither => {}
                 }
             }
             // Unknown kinds are ignored: forward compatibility.
@@ -285,6 +357,56 @@ impl StrataStore {
             }
         }
         Ok(())
+    }
+
+    /// Imported node. Kind stays on the edge records; this only fills the registry.
+    fn apply_imported_node(&mut self, node: &strata_migrate::NodeRecord) {
+        let record = NodeRecord {
+            id: node.legacy_id.clone(),
+            kernel_id: ALGO_V2,
+            scope: "user".to_string(),
+            content: node.content.clone(),
+            node_type: if node.node_type.is_empty() {
+                DEFAULT_NODE_TYPE.to_string()
+            } else {
+                node.node_type.clone()
+            },
+            tags: node.tags.clone(),
+            created_at_ms: node.created_ms,
+            valid_from_ms: node.created_ms,
+            valid_until_ms: VALID_FOREVER_MS,
+            superseded_by: None,
+        };
+        self.nodes.insert(record.id.clone(), record);
+    }
+
+    /// Imported edge. `link_type` is copied, including `legacy_inferred`.
+    fn apply_imported_edge(&mut self, edge: &strata_migrate::EdgeRecord) {
+        let milli = (strata_kernel::canonical::from_q32_32(edge.strength_q32) * 1000.0).round();
+        let strength_milli = if milli.is_finite() && milli >= 0.0 {
+            milli as i64
+        } else {
+            0
+        };
+        let record = ConnectionRecord {
+            source_id: edge.source_legacy_id.clone(),
+            target_id: edge.target_legacy_id.clone(),
+            strength_milli,
+            link_type: edge.link_type.clone(),
+            meta_sha: None,
+            created_at_ms: edge.created_ms,
+            activation_count: i64::from(edge.activation_count),
+        };
+        let idx = self.edges.len();
+        self.forward
+            .entry(record.source_id.clone())
+            .or_default()
+            .push(idx);
+        self.reverse
+            .entry(record.target_id.clone())
+            .or_default()
+            .push(idx);
+        self.edges.push(record);
     }
 
     fn fold_review(

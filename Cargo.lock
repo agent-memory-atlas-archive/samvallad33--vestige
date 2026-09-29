@@ -2374,6 +2374,7 @@ dependencies = [
  "strata",
  "strata-gate",
  "strata-kernel",
+ "strata-migrate",
 ]
 
 [[package]]

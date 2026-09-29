@@ -1094,6 +1094,7 @@ pub fn walk_storage(
                 .map_err(|e| e.to_string())?;
             let neighbours: Vec<String> = conns
                 .iter()
+                .filter(|c| c.link_type != "legacy_inferred")
                 .map(|c| {
                     if c.source_id == *node_id {
                         c.target_id.clone()
