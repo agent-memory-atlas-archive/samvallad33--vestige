@@ -1123,3 +1123,44 @@ fn intention_batch_is_one_admitted_write_and_a_bad_batch_writes_nothing() {
     assert_eq!(store.get_intention("b").expect("b").content, "two");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn recorded_origin_reads_the_creating_frame_and_supersede_chain() {
+    let dir = temp_dir("origin");
+    let mut store = StrataStore::open_with_policy(&dir, permissive_policy()).expect("open");
+    let old = store
+        .ingest_in_scope(input("older fact", &["seed"]), "user")
+        .expect("old");
+    let new = store
+        .ingest_in_scope(input("newer fact", &[]), "user")
+        .expect("new");
+    store.supersede(&old, &new).expect("supersede");
+    store
+        .save_connection(&ConnectionRecord {
+            source_id: new.clone(),
+            target_id: old.clone(),
+            link_type: EdgeKind::Supersedes.as_str().to_string(),
+            ..ConnectionRecord::default()
+        })
+        .expect("edge");
+
+    let origin = store.recorded_origin(&old).expect("read").expect("origin");
+    assert_eq!(origin.record.id, old);
+    assert_eq!(origin.record.content, "older fact");
+    assert_eq!(origin.record.tags, vec!["seed".to_string()]);
+    assert_eq!(origin.record.created_at_ms, 1_700_000_000_000);
+    assert_eq!(origin.frame_kind, KIND_STORE_WRITE);
+    assert_eq!(origin.effect_frame_seq.unwrap() + 1, origin.frame_seq);
+    assert_eq!(origin.supersede_chain.len(), 2);
+    assert_eq!(origin.supersede_chain[0].id, old);
+    assert_eq!(origin.supersede_chain[0].superseded_by, new);
+    assert_eq!(origin.supersede_chain[0].recorded_as, "SupersedeNode");
+    assert_eq!(origin.supersede_chain[1].recorded_as, "supersedes");
+    assert_eq!(origin.supersede_chain[1].id, old);
+    assert_eq!(origin.supersede_chain[1].superseded_by, new);
+    assert!(store
+        .recorded_origin("mem-missing")
+        .expect("read")
+        .is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
