@@ -141,16 +141,16 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-noembed-v1-
 
       - name: Clippy without embeddings, vector search or git2 (warnings are errors)
-        run: cargo clippy -p vestige-mcp -p vestige-core --no-default-features --features vestige-mcp/connectors,vestige-mcp/cloud-sync --all-targets -- -D warnings
+        run: cargo clippy -p vestige-mcp -p vestige-core --no-default-features --features vestige-mcp/connectors,vestige-mcp/cloud-sync,vestige-mcp/legacy-sqlite --all-targets -- -D warnings
 
       - name: Test vestige-core without embeddings
         run: cargo test -p vestige-core --no-default-features --features bundled-sqlite --lib
 
       - name: Test vestige-mcp without embeddings
-        run: cargo test -p vestige-mcp --no-default-features --features connectors,cloud-sync --lib
+        run: cargo test -p vestige-mcp --no-default-features --features connectors,cloud-sync,legacy-sqlite --lib
 
       - name: Build disposable context-contract test server
-        run: cargo build -p vestige-mcp --no-default-features --features connectors,cloud-sync --bin vestige-mcp
+        run: cargo build -p vestige-mcp --no-default-features --features connectors,cloud-sync,legacy-sqlite --bin vestige-mcp
 
       - name: Verify evidence parity through MCP
         run: python3 scripts/test-context-evidence.py --binary target/debug/vestige-mcp
