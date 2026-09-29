@@ -160,7 +160,10 @@ def run(binary, output):
 
             typed("recall", {"mode": "reason", "query": marker}, "similarity_disabled")
             typed("recall", {"mode": "contradictions"}, "similarity_disabled")
-            typed("receipt", {"action": "replay", "receipt_id": node_id, "withheld_slots": []}, "pending_strata")
+            replayed = tool("receipt", {"action": "replay", "receipt_id": node_id, "withheld_slots": []})
+            assert replayed["kind"] == "strata" and replayed["matched"] is True
+            assert replayed["mismatches"] == [] and replayed["readOnly"] is True
+            assert replayed["nodeId"] == node_id and replayed["stateDigest"] == replayed["replayedDigest"]
             typed("memory", {"action": "promote", "id": node_id, "reason": "fixture"}, "pending_strata")
             typed("memory", {"action": "edit", "id": node_id, "content": "edited"}, "pending_strata")
             typed("purge", {"id": node_id, "confirm": True}, "pending_strata")

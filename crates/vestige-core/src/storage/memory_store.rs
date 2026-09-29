@@ -15,7 +15,6 @@ use serde_json::Value;
 use uuid::Uuid;
 
 // Phase 4 wall: types referenced by the product-wide sync seam below.
-use crate::SchemaIntrospection;
 use crate::actor::{ActorPolicySnapshot, RoleResolution};
 use crate::advanced::reconsolidation::LabileCandidate;
 use crate::advanced::{MergeCandidate, MergeOperation, MergePlan, MergePolicy};
@@ -26,6 +25,7 @@ use crate::memory::{ConsolidationResult, IngestInput, KnowledgeNode, MemoryStats
 use crate::neuroscience::SynapticTag;
 use crate::security::SecretPolicy;
 use crate::trace::{MemoryPr, MemoryPrAction, MemoryPrStatus, MemoryTraceEvent, Receipt};
+use crate::SchemaIntrospection;
 // Dual-mode rule (strata/fix-00a): every storage type this trait names is
 // defined in the UNGATED `super::types` module, so the trait compiles with
 // AND without `legacy-sqlite`. The pure receipt-attestation trio is
@@ -620,6 +620,18 @@ pub trait LocalMemoryStore: Sync + 'static {
         Err(StorageError::Init(
             concat!(
                 stringify!(create_context_ablation_replay),
+                " is not implemented by this backend"
+            )
+            .into(),
+        ))
+    }
+
+    /// Re-derive a Strata log from its frames and compare that fold to one receipt.
+    /// Read-only. SQLite backends do not implement it.
+    fn replay_receipt(&self, _receipt_id: &str) -> StoreResult<Value> {
+        Err(StorageError::Init(
+            concat!(
+                stringify!(replay_receipt),
                 " is not implemented by this backend"
             )
             .into(),
@@ -2763,6 +2775,7 @@ pub trait MemoryStore: Send + Sync + 'static {
         source_receipt_id: &str,
         withheld_slots: &[String],
     ) -> StoreResult<DurableCounterfactualReplay>;
+    fn replay_receipt(&self, receipt_id: &str) -> StoreResult<Value>;
     fn current_code_context_nodes(
         &self,
         node_type: &str,
@@ -2819,7 +2832,7 @@ pub trait MemoryStore: Send + Sync + 'static {
     ) -> StoreResult<Vec<CompositionEventRecord>>;
     fn get_connections_for_memory(&self, memory_id: &str) -> StoreResult<Vec<ConnectionRecord>>;
     fn get_consolidation_history(&self, limit: i32)
-    -> StoreResult<Vec<ConsolidationHistoryRecord>>;
+        -> StoreResult<Vec<ConsolidationHistoryRecord>>;
     fn get_context_ablation_replay(
         &self,
         replay_id: &str,
@@ -2859,7 +2872,7 @@ pub trait MemoryStore: Send + Sync + 'static {
         receipt_id: &str,
     ) -> StoreResult<Option<DsseEnvelope>>;
     fn get_recent_composition_events(&self, limit: i32)
-    -> StoreResult<Vec<CompositionEventRecord>>;
+        -> StoreResult<Vec<CompositionEventRecord>>;
     fn get_recent_composition_events_page(
         &self,
         limit: i32,
@@ -2884,7 +2897,7 @@ pub trait MemoryStore: Send + Sync + 'static {
     fn get_walk_receipt(&self, receipt_id: &str) -> StoreResult<Option<StoredWalkReceipt>>;
     fn git_commit_nodes(&self, limit: usize) -> StoreResult<Vec<GitCommitNode>>;
     fn grant_actor_role(&self, actor_did: &str, role: &str, note: Option<&str>)
-    -> StoreResult<u64>;
+        -> StoreResult<u64>;
     fn hybrid_search(
         &self,
         query: &str,
@@ -3446,6 +3459,9 @@ where
             source_receipt_id,
             withheld_slots,
         )
+    }
+    fn replay_receipt(&self, receipt_id: &str) -> StoreResult<Value> {
+        <T as MemoryStoreSend>::replay_receipt(self, receipt_id)
     }
     fn current_code_context_nodes(
         &self,

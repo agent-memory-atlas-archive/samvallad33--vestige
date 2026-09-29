@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use strata_store::VALID_FOREVER_MS;
 use vestige_core::storage::{
     CompositionEventRecord, ConnectionRecord as VestigeEdge, ConsolidationHistoryRecord,
@@ -27,6 +27,48 @@ use vestige_core::{
 
 const Q32_SCALE: f64 = 4294967296.0;
 const RECEIPT_PREFIX: &str = "eff-";
+const STRATA_REPLAY_BOUNDARY: &str = "Replay re-derives state from the Strata log and compares it to the receipt. A match checks the log; it is not a claim about the world.";
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn node_field_mismatches(
+    id: &str,
+    live: &strata_store::NodeRecord,
+    folded: &strata_store::NodeRecord,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |field: &str| out.push(format!("node:{id}:{field}"));
+    if live.content != folded.content {
+        push("content");
+    }
+    if live.node_type != folded.node_type {
+        push("node_type");
+    }
+    if live.tags != folded.tags {
+        push("tags");
+    }
+    if live.scope != folded.scope {
+        push("scope");
+    }
+    if live.kernel_id != folded.kernel_id {
+        push("kernel_id");
+    }
+    if live.created_at_ms != folded.created_at_ms {
+        push("created_at_ms");
+    }
+    if live.valid_from_ms != folded.valid_from_ms {
+        push("valid_from_ms");
+    }
+    if live.valid_until_ms != folded.valid_until_ms {
+        push("valid_until_ms");
+    }
+    if live.superseded_by != folded.superseded_by {
+        push("superseded_by");
+    }
+    out
+}
 
 /// The durable directory this process opened is a Strata log, not a SQLite file.
 pub fn is_strata_backend(storage: &Storage) -> bool {
@@ -150,9 +192,16 @@ fn to_store_input(input: &IngestInput) -> strata_store::IngestInput {
     }
 }
 
-fn project_node(store: &strata_store::StrataStore, record: &strata_store::NodeRecord) -> KnowledgeNode {
+fn project_node(
+    store: &strata_store::StrataStore,
+    record: &strata_store::NodeRecord,
+) -> KnowledgeNode {
     let card = store.card_state(&record.id);
-    let retrieval = store.retrievability(&record.id).ok().flatten().unwrap_or(0.0);
+    let retrieval = store
+        .retrievability(&record.id)
+        .ok()
+        .flatten()
+        .unwrap_or(0.0);
     let mut node = KnowledgeNode::default();
     node.id = record.id.clone();
     node.content = record.content.clone();
@@ -162,7 +211,8 @@ fn project_node(store: &strata_store::StrataStore, record: &strata_store::NodeRe
     node.last_accessed = node.created_at;
     node.tags = record.tags.clone();
     node.valid_from = Some(ms_to_dt(record.valid_from_ms));
-    node.valid_until = (record.valid_until_ms != VALID_FOREVER_MS).then(|| ms_to_dt(record.valid_until_ms));
+    node.valid_until =
+        (record.valid_until_ms != VALID_FOREVER_MS).then(|| ms_to_dt(record.valid_until_ms));
     // Kernel retrievability is the only strength the log can justify.
     node.stability = card.as_ref().map(|c| q32(c.stability_q)).unwrap_or(0.0);
     node.difficulty = card.as_ref().map(|c| q32(c.difficulty_q)).unwrap_or(0.0);
@@ -328,11 +378,7 @@ impl MemoryStoreSend for StrataMemory {
         Err(pending_async("get_edges"))
     }
 
-    async fn remove_edge(
-        &self,
-        _source: uuid::Uuid,
-        _target: uuid::Uuid,
-    ) -> MemoryStoreResult<()> {
+    async fn remove_edge(&self, _source: uuid::Uuid, _target: uuid::Uuid) -> MemoryStoreResult<()> {
         Err(pending_async("remove_edge"))
     }
 
@@ -413,7 +459,8 @@ impl MemoryStoreSend for StrataMemory {
         *self
             .actor
             .lock()
-            .unwrap_or_else(|err| panic!("strata actor lock poisoned: {err}")) = Some(did.to_string());
+            .unwrap_or_else(|err| panic!("strata actor lock poisoned: {err}")) =
+            Some(did.to_string());
         Ok(())
     }
 
@@ -425,7 +472,12 @@ impl MemoryStoreSend for StrataMemory {
 
     fn resolve_handle(&self, query: &str) -> HandleResolution {
         let query = query.trim();
-        let ids: Vec<String> = self.lock().origins().into_iter().map(|(id, _)| id).collect();
+        let ids: Vec<String> = self
+            .lock()
+            .origins()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         if query.is_empty() {
             return HandleResolution {
                 kind: HandleKind::Unknown,
@@ -497,7 +549,10 @@ impl MemoryStoreSend for StrataMemory {
         self.lock().backup_to(path).map_err(map_store)
     }
 
-    fn checkpoint_wal(&self, _mode: WalCheckpointMode) -> Result<WalCheckpointStatus, StorageError> {
+    fn checkpoint_wal(
+        &self,
+        _mode: WalCheckpointMode,
+    ) -> Result<WalCheckpointStatus, StorageError> {
         Ok(WalCheckpointStatus {
             busy: 0,
             log_frames: 0,
@@ -518,7 +573,11 @@ impl MemoryStoreSend for StrataMemory {
     }
 
     fn ingest(&self, input: IngestInput) -> Result<KnowledgeNode, StorageError> {
-        self.ingest_in_scope_with_secret_policy(input, vestige_core::DEFAULT_MEMORY_SCOPE, SecretPolicy::Reject)
+        self.ingest_in_scope_with_secret_policy(
+            input,
+            vestige_core::DEFAULT_MEMORY_SCOPE,
+            SecretPolicy::Reject,
+        )
     }
 
     fn ingest_in_scope(
@@ -564,7 +623,10 @@ impl MemoryStoreSend for StrataMemory {
 
     fn get_node(&self, id: &str) -> Result<Option<KnowledgeNode>, StorageError> {
         let store = self.lock();
-        Ok(store.get_node(id).as_ref().map(|record| project_node(&store, record)))
+        Ok(store
+            .get_node(id)
+            .as_ref()
+            .map(|record| project_node(&store, record)))
     }
 
     fn get_all_nodes(&self, limit: i32, offset: i32) -> Result<Vec<KnowledgeNode>, StorageError> {
@@ -626,7 +688,13 @@ impl MemoryStoreSend for StrataMemory {
         let nodes = store.nodes();
         let strengths: Vec<f64> = nodes
             .iter()
-            .map(|record| store.retrievability(&record.id).ok().flatten().unwrap_or(0.0))
+            .map(|record| {
+                store
+                    .retrievability(&record.id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0.0)
+            })
             .collect();
         let total = strengths.len() as i64;
         let average = if strengths.is_empty() {
@@ -753,6 +821,54 @@ impl MemoryStoreSend for StrataMemory {
         Err(pending("create_context_ablation_replay"))
     }
 
+    fn replay_receipt(&self, receipt_id: &str) -> Result<Value, StorageError> {
+        let store = self.lock();
+        let folded = store.refold().map_err(map_store)?;
+        let Some((node_id, seq)) = lookup_origin(&store, receipt_id) else {
+            return Err(StorageError::NotFound(format!(
+                "Receipt '{receipt_id}' was not found"
+            )));
+        };
+        let mut mismatches = Vec::new();
+        let live_digest = store.state_digest();
+        if live_digest != folded.state_digest {
+            mismatches.push("state_digest".to_string());
+        }
+        match (store.get_node(&node_id), folded.nodes.get(&node_id)) {
+            (Some(live), Some(replayed)) => {
+                mismatches.extend(node_field_mismatches(&node_id, &live, replayed));
+            }
+            _ => mismatches.push(format!("node:{node_id}:missing")),
+        }
+        if folded.origins.get(&node_id).copied() != Some(seq) {
+            mismatches.push(format!("origin:{node_id}"));
+        }
+        let live_score = store.retrievability(&node_id).ok().flatten().unwrap_or(0.0);
+        let folded_score = folded.retrievability.get(&node_id).copied().unwrap_or(0.0);
+        if live_score.to_bits() != folded_score.to_bits() {
+            mismatches.push(format!("retrievability:{node_id}"));
+        }
+        mismatches.extend(folded.gate_mismatches);
+        mismatches.extend(folded.gaps);
+        mismatches.sort();
+        mismatches.dedup();
+        let matched = mismatches.is_empty();
+        Ok(json!({
+            "action": "replay",
+            "kind": "strata",
+            "readOnly": true,
+            "receiptId": receipt_id_for(seq),
+            "nodeId": node_id,
+            "effectSeq": seq,
+            "matched": matched,
+            "mismatches": mismatches,
+            "stateDigest": hex32(&live_digest),
+            "replayedDigest": hex32(&folded.state_digest),
+            "frames": folded.frames,
+            "claimBoundary": STRATA_REPLAY_BOUNDARY,
+        }))
+    }
+
     fn current_code_context_nodes(
         &self,
         node_type: &str,
@@ -781,8 +897,10 @@ impl MemoryStoreSend for StrataMemory {
     fn code_anchors_for_nodes(
         &self,
         _node_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, Vec<vestige_core::codebase::CodeAnchor>>, StorageError>
-    {
+    ) -> Result<
+        std::collections::HashMap<String, Vec<vestige_core::codebase::CodeAnchor>>,
+        StorageError,
+    > {
         // Anchors are not admitted on this log, so the recorded set is empty.
         Ok(std::collections::HashMap::new())
     }
@@ -977,7 +1095,11 @@ impl MemoryStoreSend for StrataMemory {
         tag_filter: Option<&[String]>,
         scope: Option<&str>,
     ) -> Result<Vec<NeverComposedCandidate>, StorageError> {
-        self.never_composed(scope.or(Some(vestige_core::DEFAULT_MEMORY_SCOPE)), limit, tag_filter)
+        self.never_composed(
+            scope.or(Some(vestige_core::DEFAULT_MEMORY_SCOPE)),
+            limit,
+            tag_filter,
+        )
     }
 
     fn get_recent_composition_events(
@@ -1014,7 +1136,9 @@ impl MemoryStoreSend for StrataMemory {
                     && node_type.is_none_or(|kind| record.node_type == kind)
                     && tags.is_none_or(|tags| {
                         tags.is_empty()
-                            || tags.iter().any(|tag| record.tags.iter().any(|stored| stored == tag))
+                            || tags
+                                .iter()
+                                .any(|tag| record.tags.iter().any(|stored| stored == tag))
                     })
             })
             .map(|record| project_node(&store, record))
@@ -1224,7 +1348,10 @@ impl StrataMemory {
             };
             if let Some(tags) = tag_filter.filter(|tags| !tags.is_empty()) {
                 let has = |record: &strata_store::NodeRecord| {
-                    record.tags.iter().any(|tag| tags.iter().any(|want| want == tag))
+                    record
+                        .tags
+                        .iter()
+                        .any(|tag| tags.iter().any(|want| want == tag))
                 };
                 if !has(a) || !has(b) {
                     continue;
@@ -1258,7 +1385,10 @@ impl StrataMemory {
     }
 }
 
-fn lookup_origin(store: &strata_store::StrataStore, receipt_or_node: &str) -> Option<(String, u64)> {
+fn lookup_origin(
+    store: &strata_store::StrataStore,
+    receipt_or_node: &str,
+) -> Option<(String, u64)> {
     if let Some(seq) = parse_receipt_seq(receipt_or_node) {
         return store
             .origins()
@@ -1330,5 +1460,28 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("similarity_disabled"), "{err}");
+    }
+
+    #[test]
+    fn node_field_mismatch_names_only_the_changed_field() {
+        let live = strata_store::NodeRecord {
+            id: "mem-0000000000000001".into(),
+            kernel_id: 2,
+            scope: "user".into(),
+            content: "original".into(),
+            node_type: "fact".into(),
+            tags: vec!["a".into()],
+            created_at_ms: 1,
+            valid_from_ms: 1,
+            valid_until_ms: i64::MAX,
+            superseded_by: None,
+        };
+        let mut folded = live.clone();
+        folded.content = "tampered".into();
+        assert_eq!(
+            node_field_mismatches(&live.id, &live, &folded),
+            vec!["node:mem-0000000000000001:content".to_string()]
+        );
+        assert!(node_field_mismatches(&live.id, &live, &live).is_empty());
     }
 }

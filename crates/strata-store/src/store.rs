@@ -9,9 +9,15 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use strata::StrataLog;
+use strata::{
+    frame_hash, header_hash, merkle_root, parse_frame, payload_blake3, FrameRecord, SegmentHeader,
+    SegmentTrailer, StrataLog, FRAME_FIXED_WIRE_SIZE, GENESIS_PREV_SEGMENT_HASH, HEADER_WIRE_SIZE,
+    SEGMENT_MAGIC, SEGMENT_VERSION, TRAILER_WIRE_SIZE,
+};
 use strata_gate::policy::{ANY_KIND, WILDCARD_PREFIX};
-use strata_gate::record::{action_kind, EffectRecord, GateRecord, Propose, RecordKind, Verdict};
+use strata_gate::record::{
+    action_kind, EffectRecord, GapDetail, GateRecord, Propose, RecordKind, Verdict,
+};
 use strata_gate::{GateRuntime, Policy, Rule, SeqAck};
 use strata_kernel::checkpoint::{checkpoint_hash, Checkpoint};
 use strata_kernel::event::ReviewEvent;
@@ -102,6 +108,192 @@ struct StateDigest<'a> {
     orphan_writes: u64,
 }
 
+fn state_digest_from(
+    nodes: &BTreeMap<String, NodeRecord>,
+    origins: &BTreeMap<String, u64>,
+    edges: &[ConnectionRecord],
+    fsrs: &State,
+    checkpoints: &[Checkpoint],
+    orphan_writes: u64,
+) -> [u8; 32] {
+    let digest = StateDigest {
+        nodes: nodes.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+        origins: origins.iter().map(|(k, v)| (k.as_str(), *v)).collect(),
+        edges,
+        fsrs_root: strata_kernel::checkpoint::state_root(fsrs),
+        checkpoints: checkpoints.iter().map(checkpoint_hash).collect(),
+        orphan_writes,
+    };
+    hash32(&borsh_vec(&digest).expect("state digest serialization is infallible"))
+}
+
+/// Derived maps. Open-time replay, live admits, and receipt refold all apply
+/// ops through this one fold so the three paths cannot drift.
+#[derive(Default)]
+struct Index {
+    nodes: BTreeMap<String, NodeRecord>,
+    origins: BTreeMap<String, u64>,
+    edges: Vec<ConnectionRecord>,
+    forward: BTreeMap<String, Vec<usize>>,
+    reverse: BTreeMap<String, Vec<usize>>,
+    fsrs: State,
+    review_events: Vec<(u64, [u8; 32], ReviewEvent)>,
+    checkpoints: Vec<Checkpoint>,
+    orphan_writes: u64,
+}
+
+impl Index {
+    fn state_digest(&self) -> [u8; 32] {
+        state_digest_from(
+            &self.nodes,
+            &self.origins,
+            &self.edges,
+            &self.fsrs,
+            &self.checkpoints,
+            self.orphan_writes,
+        )
+    }
+
+    fn fold_frames(&mut self, frames: Vec<FrameRecord>) -> Result<(), StoreError> {
+        let mut propose_at: HashMap<u64, Propose> = HashMap::new();
+        let mut gates_for: HashMap<u64, Vec<(u64, GateRecord)>> = HashMap::new();
+        let mut pending: HashMap<[u8; 32], VecDeque<u64>> = HashMap::new();
+        let mut gate_seq_counter: u64 = 0;
+
+        for frame in frames {
+            let seq = frame.seq;
+            if let Some(kind) = RecordKind::from_u8(frame.kind) {
+                let gseq = gate_seq_counter;
+                gate_seq_counter += 1;
+                match kind {
+                    RecordKind::Propose => {
+                        if let Ok(p) = Propose::try_from_slice(&frame.payload) {
+                            propose_at.insert(gseq, p);
+                        }
+                    }
+                    RecordKind::Gate => {
+                        if let Ok(g) = GateRecord::try_from_slice(&frame.payload) {
+                            gates_for.entry(g.propose_seq).or_default().push((gseq, g));
+                        }
+                    }
+                    RecordKind::Effect => {
+                        if let Ok(effect) = EffectRecord::try_from_slice(&frame.payload) {
+                            let covering_propose = propose_at
+                                .get(&effect.propose_seq)
+                                .is_some_and(|p| p.action_hash == effect.action_hash);
+                            let admitting_gate =
+                                gates_for.get(&effect.propose_seq).is_some_and(|gs| {
+                                    gs.iter().any(|(gsq, g)| {
+                                        *gsq == effect.gate_seq
+                                            && g.verdict == Verdict::Allow
+                                            && *gsq < gseq
+                                    })
+                                });
+                            if covering_propose && admitting_gate {
+                                pending
+                                    .entry(effect.payload_digest)
+                                    .or_default()
+                                    .push_back(gseq);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else if frame.kind == KIND_STORE_WRITE {
+                let digest = hash32(&frame.payload);
+                let admitted = pending.get_mut(&digest).and_then(|queue| queue.pop_front());
+                match (admitted, StoreOp::try_from_slice(&frame.payload).ok()) {
+                    (Some(gseq), Some(op)) => self.apply_op(&op, gseq, seq)?,
+                    _ => self.orphan_writes += 1,
+                }
+            } else if frame.kind == KIND_STORE_CHECKPOINT {
+                if let Ok(cp) = Checkpoint::try_from_slice(&frame.payload) {
+                    self.checkpoints.push(cp);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_op(
+        &mut self,
+        op: &StoreOp,
+        gate_effect_seq: u64,
+        frame_seq: u64,
+    ) -> Result<(), StoreError> {
+        match op {
+            StoreOp::UpsertNode { record } => {
+                let handle = handle_of(&record.id);
+                let is_new = !self.fsrs.cards.contains_key(&handle);
+                self.origins.insert(record.id.clone(), gate_effect_seq);
+                self.nodes.insert(record.id.clone(), record.clone());
+                if is_new {
+                    self.fold_review(handle, INGEST_RATING, record.kernel_id, frame_seq)?;
+                }
+            }
+            StoreOp::SaveEdge { edge } => {
+                let idx = self.edges.len();
+                self.edges.push(edge.clone());
+                self.forward
+                    .entry(edge.source_id.clone())
+                    .or_default()
+                    .push(idx);
+                self.reverse
+                    .entry(edge.target_id.clone())
+                    .or_default()
+                    .push(idx);
+            }
+            StoreOp::SupersedeNode { id, superseded_by } => {
+                if let Some(record) = self.nodes.get_mut(id) {
+                    record.superseded_by = Some(superseded_by.clone());
+                }
+            }
+            StoreOp::ReviewNode { card_id, rating } => {
+                self.fold_review(*card_id, *rating, ALGO_V2, frame_seq)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn fold_review(
+        &mut self,
+        card_id: u64,
+        rating: u8,
+        kernel_id: u32,
+        event_seq: u64,
+    ) -> Result<(), StoreError> {
+        let event = ReviewEvent {
+            card_id,
+            rating,
+            event_seq,
+        };
+        let event_hash = hash32(&borsh_vec(&event)?);
+        let kernel = Kernel::<ReviewEvent>::for_version(kernel_id)
+            .map_err(|e| StoreError::Verify(e.to_string()))?;
+        kernel.apply(&mut self.fsrs, &event);
+        self.review_events.push((event_seq, event_hash, event));
+        Ok(())
+    }
+}
+
+/// Read-only refold of the log. Compared with the live index by receipt replay.
+pub struct Refold {
+    /// Frames that survived the integrity scan.
+    pub frames: u64,
+    /// Digest of the freshly folded index.
+    pub state_digest: [u8; 32],
+    /// Nodes the fold produced.
+    pub nodes: BTreeMap<String, NodeRecord>,
+    /// Node id to the gate-space effect seq that admitted it.
+    pub origins: BTreeMap<String, u64>,
+    /// Retrievability at the log head, keyed by node id.
+    pub retrievability: BTreeMap<String, f64>,
+    /// Stored GATE verdicts that disagree with a re-derivation under the pinned policy.
+    pub gate_mismatches: Vec<String>,
+    /// Structural sweep gaps. Empty on a clean log.
+    pub gaps: Vec<String>,
+}
+
 /// The STRATA-native memory store.
 ///
 /// See the crate docs for the write path and determinism contract. v1 is
@@ -175,72 +367,14 @@ impl StrataStore {
 
     fn replay(&mut self) -> Result<(), StoreError> {
         let frames = self.log.read_frames(1)?;
-
-        // Gate-space structures (gate frames only, dense 0-based seqs).
-        let mut propose_at: HashMap<u64, Propose> = HashMap::new();
-        let mut gates_for: HashMap<u64, Vec<(u64, GateRecord)>> = HashMap::new();
-        // payload_digest -> admitted-but-unconsumed effect gate seqs.
-        let mut pending: HashMap<[u8; 32], VecDeque<u64>> = HashMap::new();
-        let mut gate_seq_counter: u64 = 0;
-
-        for frame in frames {
-            let seq = frame.seq;
-            if let Some(kind) = RecordKind::from_u8(frame.kind) {
-                let gseq = gate_seq_counter;
-                gate_seq_counter += 1;
-                match kind {
-                    RecordKind::Propose => {
-                        if let Ok(p) = Propose::try_from_slice(&frame.payload) {
-                            propose_at.insert(gseq, p);
-                        }
-                    }
-                    RecordKind::Gate => {
-                        if let Ok(g) = GateRecord::try_from_slice(&frame.payload) {
-                            gates_for.entry(g.propose_seq).or_default().push((gseq, g));
-                        }
-                    }
-                    RecordKind::Effect => {
-                        if let Ok(effect) = EffectRecord::try_from_slice(&frame.payload) {
-                            let covering_propose = propose_at
-                                .get(&effect.propose_seq)
-                                .is_some_and(|p| p.action_hash == effect.action_hash);
-                            let admitting_gate =
-                                gates_for.get(&effect.propose_seq).is_some_and(|gs| {
-                                    gs.iter().any(|(gsq, g)| {
-                                        *gsq == effect.gate_seq
-                                            && g.verdict == Verdict::Allow
-                                            && *gsq < gseq
-                                    })
-                                });
-                            if covering_propose && admitting_gate {
-                                pending
-                                    .entry(effect.payload_digest)
-                                    .or_default()
-                                    .push_back(gseq);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            } else if frame.kind == KIND_STORE_WRITE {
-                let digest = hash32(&frame.payload);
-                let admitted = pending.get_mut(&digest).and_then(|queue| queue.pop_front());
-                match (admitted, StoreOp::try_from_slice(&frame.payload).ok()) {
-                    (Some(gseq), Some(op)) => self.apply_op(&op, gseq, seq)?,
-                    _ => self.orphan_writes += 1,
-                }
-            } else if frame.kind == KIND_STORE_CHECKPOINT {
-                if let Ok(cp) = Checkpoint::try_from_slice(&frame.payload) {
-                    self.checkpoints.push(cp);
-                }
-            }
-            // Unknown kinds are ignored: forward compatibility.
-        }
+        let mut index = Index::default();
+        index.fold_frames(frames)?;
+        self.install(index);
         Ok(())
     }
 
     /// Apply one admitted op to the derived maps. Live writes and replay call
-    /// this with the same inputs, which is what makes reopen bit-identical.
+    /// the same [`Index::apply_op`], which is what makes reopen bit-identical.
     ///
     /// `gate_effect_seq` is the admitting effect's gate-space seq (used for
     /// origins/gate contexts); `frame_seq` is the data frame's log seq (used
@@ -251,60 +385,36 @@ impl StrataStore {
         gate_effect_seq: u64,
         frame_seq: u64,
     ) -> Result<(), StoreError> {
-        match op {
-            StoreOp::UpsertNode { record } => {
-                let handle = handle_of(&record.id);
-                let is_new = !self.fsrs.cards.contains_key(&handle);
-                self.origins.insert(record.id.clone(), gate_effect_seq);
-                self.nodes.insert(record.id.clone(), record.clone());
-                if is_new {
-                    // Every ingest folds one ReviewEvent ("Good") into the
-                    // kernel state under the record's kernel version.
-                    self.fold_review(handle, INGEST_RATING, record.kernel_id, frame_seq)?;
-                }
-            }
-            StoreOp::SaveEdge { edge } => {
-                let idx = self.edges.len();
-                self.edges.push(edge.clone());
-                self.forward
-                    .entry(edge.source_id.clone())
-                    .or_default()
-                    .push(idx);
-                self.reverse
-                    .entry(edge.target_id.clone())
-                    .or_default()
-                    .push(idx);
-            }
-            StoreOp::SupersedeNode { id, superseded_by } => {
-                if let Some(record) = self.nodes.get_mut(id) {
-                    record.superseded_by = Some(superseded_by.clone());
-                }
-            }
-            StoreOp::ReviewNode { card_id, rating } => {
-                self.fold_review(*card_id, *rating, ALGO_V2, frame_seq)?;
-            }
-        }
-        Ok(())
+        let mut index = self.take_index();
+        let result = index.apply_op(op, gate_effect_seq, frame_seq);
+        self.install(index);
+        result
     }
 
-    fn fold_review(
-        &mut self,
-        card_id: u64,
-        rating: u8,
-        kernel_id: u32,
-        event_seq: u64,
-    ) -> Result<(), StoreError> {
-        let event = ReviewEvent {
-            card_id,
-            rating,
-            event_seq,
-        };
-        let event_hash = hash32(&borsh_vec(&event)?);
-        let kernel = Kernel::<ReviewEvent>::for_version(kernel_id)
-            .map_err(|e| StoreError::Verify(e.to_string()))?;
-        kernel.apply(&mut self.fsrs, &event);
-        self.review_events.push((event_seq, event_hash, event));
-        Ok(())
+    fn take_index(&mut self) -> Index {
+        Index {
+            nodes: std::mem::take(&mut self.nodes),
+            origins: std::mem::take(&mut self.origins),
+            edges: std::mem::take(&mut self.edges),
+            forward: std::mem::take(&mut self.forward),
+            reverse: std::mem::take(&mut self.reverse),
+            fsrs: std::mem::take(&mut self.fsrs),
+            review_events: std::mem::take(&mut self.review_events),
+            checkpoints: std::mem::take(&mut self.checkpoints),
+            orphan_writes: std::mem::take(&mut self.orphan_writes),
+        }
+    }
+
+    fn install(&mut self, index: Index) {
+        self.nodes = index.nodes;
+        self.origins = index.origins;
+        self.edges = index.edges;
+        self.forward = index.forward;
+        self.reverse = index.reverse;
+        self.fsrs = index.fsrs;
+        self.review_events = index.review_events;
+        self.checkpoints = index.checkpoints;
+        self.orphan_writes = index.orphan_writes;
     }
 
     // ------------------------------------------------------------------
@@ -770,15 +880,88 @@ impl StrataStore {
     /// (nodes, origins, edges, FSRS state root, checkpoint hashes, orphan
     /// count). Two stores replaying the same log produce the same digest.
     pub fn state_digest(&self) -> [u8; 32] {
-        let digest = StateDigest {
-            nodes: self.nodes.iter().map(|(k, v)| (k.as_str(), v)).collect(),
-            origins: self.origins.iter().map(|(k, v)| (k.as_str(), *v)).collect(),
-            edges: &self.edges,
-            fsrs_root: strata_kernel::checkpoint::state_root(&self.fsrs),
-            checkpoints: self.checkpoints.iter().map(checkpoint_hash).collect(),
-            orphan_writes: self.orphan_writes,
-        };
-        hash32(&borsh_vec(&digest).expect("state digest serialization is infallible"))
+        state_digest_from(
+            &self.nodes,
+            &self.origins,
+            &self.edges,
+            &self.fsrs,
+            &self.checkpoints,
+            self.orphan_writes,
+        )
+    }
+
+    /// Re-read the log, refuse a broken frame, and fold a fresh index.
+    /// Does not append, truncate, or seal.
+    pub fn refold(&self) -> Result<Refold, StoreError> {
+        self.verify_segments()?;
+        self.log.verify_tail()?;
+        let frames = self.log.read_frames(1)?;
+        let frame_count = frames.len() as u64;
+        let gate_mismatches = gate_verdict_mismatches(self, &frames)?;
+        let mut index = Index::default();
+        index.fold_frames(frames)?;
+        let now = self.log.head().last_acked_seq;
+        let mut retrievability = BTreeMap::new();
+        for id in index.nodes.keys() {
+            let Some(card) = index.fsrs.cards.get(&handle_of(id)) else {
+                continue;
+            };
+            if let Ok(score) = FsrsFold::retrievability(card, now, ALGO_V2) {
+                retrievability.insert(id.clone(), score);
+            }
+        }
+        let gaps = self.sweep().iter().map(gap_label).collect::<Vec<_>>();
+        Ok(Refold {
+            frames: frame_count,
+            state_digest: index.state_digest(),
+            nodes: index.nodes,
+            origins: index.origins,
+            retrievability,
+            gate_mismatches,
+            gaps,
+        })
+    }
+
+    /// Strict read of every segment. A torn frame, blake3 miss, or broken
+    /// chain is an error — unlike [`StrataLog::read_frames`], which stops at
+    /// the first bad frame and returns the prefix.
+    fn verify_segments(&self) -> Result<(), StoreError> {
+        let dir = self.dir.join(LOG_DIR);
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("seg") {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        if paths.is_empty() {
+            return Err(StoreError::Verify("log has no segments".into()));
+        }
+        let mut expected_prev = GENESIS_PREV_SEGMENT_HASH;
+        for (i, path) in paths.iter().enumerate() {
+            let is_last = i + 1 == paths.len();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("segment");
+            let bytes = std::fs::read(path)?;
+            let scanned = scan_segment(&bytes, name)?;
+            if scanned.header.prev_segment_hash != expected_prev {
+                return Err(StoreError::Verify(format!(
+                    "{name}: segment chain link mismatch"
+                )));
+            }
+            if !is_last && scanned.trailer.is_none() {
+                return Err(StoreError::Verify(format!(
+                    "{name}: sealed segment is missing its trailer"
+                )));
+            }
+            if !is_last {
+                expected_prev = hash32(&bytes);
+            }
+        }
+        Ok(())
     }
 
     /// The pinned policy.
@@ -824,5 +1007,129 @@ impl StrataStore {
     /// Review events retained for verification, in fold order.
     pub fn review_event_count(&self) -> usize {
         self.review_events.len()
+    }
+}
+
+struct ScannedSegment {
+    header: SegmentHeader,
+    trailer: Option<SegmentTrailer>,
+}
+
+fn scan_segment(bytes: &[u8], name: &str) -> Result<ScannedSegment, StoreError> {
+    if bytes.len() < HEADER_WIRE_SIZE {
+        return Err(StoreError::Verify(format!(
+            "{name}: segment header unreadable"
+        )));
+    }
+    let header: SegmentHeader = borsh::from_slice(&bytes[..HEADER_WIRE_SIZE])
+        .map_err(|_| StoreError::Verify(format!("{name}: segment header unreadable")))?;
+    if header.magic != SEGMENT_MAGIC || header.version != SEGMENT_VERSION {
+        return Err(StoreError::Verify(format!(
+            "{name}: segment header unreadable"
+        )));
+    }
+    let mut prev = header_hash(&header);
+    let mut off = HEADER_WIRE_SIZE;
+    let mut leaves = Vec::new();
+    let mut frames = 0u64;
+    loop {
+        let rem = bytes.len() - off;
+        if rem == 0 {
+            return Ok(ScannedSegment {
+                header,
+                trailer: None,
+            });
+        }
+        if rem == TRAILER_WIRE_SIZE {
+            let trailer: SegmentTrailer = borsh::from_slice(&bytes[off..]).map_err(|_| {
+                StoreError::Verify(format!("{name}: trailer-sized tail failed to parse"))
+            })?;
+            if trailer.frame_count != frames {
+                return Err(StoreError::Verify(format!(
+                    "{name}: trailer frame_count {} != scanned {frames}",
+                    trailer.frame_count
+                )));
+            }
+            if trailer.merkle_root != merkle_root(&leaves) {
+                return Err(StoreError::Verify(format!(
+                    "{name}: trailer merkle root mismatch"
+                )));
+            }
+            return Ok(ScannedSegment {
+                header,
+                trailer: Some(trailer),
+            });
+        }
+        if rem < FRAME_FIXED_WIRE_SIZE {
+            return Err(StoreError::Verify(format!(
+                "{name}: short frame header at offset {off}"
+            )));
+        }
+        let (frame, used) = parse_frame(&bytes[off..]).map_err(|e| {
+            StoreError::Verify(format!("{name}: frame parse failed at offset {off}: {e}"))
+        })?;
+        if frame.payload_blake3 != payload_blake3(frame.kind, &frame.payload) {
+            return Err(StoreError::Verify(format!(
+                "{name}: payload blake3 mismatch at offset {off}"
+            )));
+        }
+        if frame.prev_frame_hash != prev {
+            return Err(StoreError::Verify(format!(
+                "{name}: frame chain link mismatch at offset {off}"
+            )));
+        }
+        prev = frame_hash(&frame);
+        leaves.push(frame.payload_blake3);
+        frames += 1;
+        off += used;
+    }
+}
+
+fn gate_verdict_mismatches(
+    store: &StrataStore,
+    frames: &[FrameRecord],
+) -> Result<Vec<String>, StoreError> {
+    let recomputed = store
+        .rederive_verdicts()
+        .map_err(|error| StoreError::Verify(error.to_string()))?;
+    let mut stored = Vec::new();
+    let mut gate_seq = 0u64;
+    for frame in frames {
+        let Some(kind) = RecordKind::from_u8(frame.kind) else {
+            continue;
+        };
+        let gseq = gate_seq;
+        gate_seq += 1;
+        if kind != RecordKind::Gate {
+            continue;
+        }
+        let gate = GateRecord::try_from_slice(&frame.payload).map_err(|error| {
+            StoreError::Verify(format!("malformed gate record at seq {gseq}: {error}"))
+        })?;
+        stored.push((gseq, gate.verdict));
+    }
+    let mut out = Vec::new();
+    if stored.len() != recomputed.len() {
+        out.push("gate:count".into());
+    }
+    for (left, right) in stored.iter().zip(recomputed.iter()) {
+        if left != right {
+            out.push(format!("gate:{}", left.0));
+        }
+    }
+    Ok(out)
+}
+
+fn gap_label(gap: &strata_gate::record::GapRecord) -> String {
+    match &gap.detail {
+        GapDetail::OrphanEffect { effect_seq, .. } => format!("gap:orphan_effect:{effect_seq}"),
+        GapDetail::ReadNoReceipt { reader_seq, .. } => {
+            format!("gap:read_no_receipt:{reader_seq}")
+        }
+        GapDetail::DutySeqGap {
+            source,
+            expected,
+            found,
+        } => format!("gap:duty_seq_gap:{source}:{expected}:{found}"),
     }
 }
