@@ -133,7 +133,7 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
         lookback_days: lookback,
         scan_limit,
     };
-    let result = walk_storage(storage, &request)?;
+    let result = walk_storage(&**storage, &request)?;
 
     // content previews for causes + rejections (bounded pool, same scope)
     let contents: std::collections::HashMap<String, String> = storage
@@ -159,7 +159,7 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
 
     // Persist trail edges ONLY on explicit promote.
     let (edges_persisted, edge_list) = if promote && !result.causes.is_empty() {
-        let written = persist_evidence_edges(storage, &result)?;
+        let written = persist_evidence_edges(&**storage, &result)?;
         (written.len(), written)
     } else {
         (0, vec![])
@@ -215,8 +215,8 @@ mod tests {
 
     async fn test_storage() -> (Arc<Storage>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        (storage, dir)
     }
 
     fn sha(c: char) -> String {

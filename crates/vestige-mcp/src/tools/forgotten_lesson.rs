@@ -275,8 +275,8 @@ mod tests {
     fn test_storage() -> (Arc<Storage>, TempDir, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
         let db = dir.path().join("test.db");
-        let storage = Storage::new(Some(db.clone())).unwrap();
-        (Arc::new(storage), dir, db)
+        let storage = vestige_core::open_storage(Some(db.clone())).unwrap();
+        (storage, dir, db)
     }
 
     /// Fabricate FSRS decay directly in the seeded store: the storage API has
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(changed, 1, "fabrication must hit the seeded row");
     }
 
-    fn ingest(storage: &Storage, content: &str, tags: &[&str]) -> vestige_core::KnowledgeNode {
+    fn ingest(storage: &Arc<Storage>, content: &str, tags: &[&str]) -> vestige_core::KnowledgeNode {
         storage
             .ingest(IngestInput {
                 content: content.to_string(),

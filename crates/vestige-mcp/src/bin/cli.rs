@@ -14,23 +14,16 @@ mod glibc_compat;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-#[cfg(feature = "legacy-sqlite")]
-use std::io::BufWriter;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-#[cfg(feature = "legacy-sqlite")]
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
-#[cfg(feature = "legacy-sqlite")]
-use chrono::NaiveDate;
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand};
 use colored::Colorize;
-// Legacy SQLite store surface: behind `legacy-sqlite` (build/t5-legacy-isolation).
-#[cfg(feature = "legacy-sqlite")]
 use vestige_core::{
     IngestInput, PortableImportMode, SecretConfidence, SecretPolicy, SourceEnvelope,
     SourceUpsertOutcome, Storage, scan_secrets,
@@ -57,7 +50,6 @@ struct Cli {
     command: Commands,
 }
 
-#[cfg(feature = "legacy-sqlite")]
 static CLI_DB_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Args)]
@@ -212,14 +204,6 @@ enum Commands {
         /// Merge into the current database instead of requiring an empty target
         #[arg(long)]
         merge: bool,
-    },
-
-    /// One-shot migration: empty the SQLite store (or a portable archive) into a STRATA log
-    MigrateToStrata {
-        /// Source: vestige.portable.v1 archive JSON, SQLite db file, or data dir containing vestige.db
-        source: PathBuf,
-        /// Destination directory for the STRATA log
-        dest: PathBuf,
     },
 
     /// Two-way sync with a file-backed portable archive, or Vestige Cloud
@@ -478,14 +462,6 @@ enum Commands {
     /// Run the planted-cause selftest against a throwaway copy of the store
     Selftest,
 
-    /// Verify a strata store directory (kernel replay + checkpoint chain +
-    /// gate rederivation/sweep). Gates the SQLite->STRATA default flip.
-    StrataVerify {
-        /// Store directory holding kernel.log / kernel.checkpoints /
-        /// kernel.head / gate.log / gate.policy / gate.head
-        dir: PathBuf,
-    },
-
     /// Find decayed fix/lesson memories sharing an anchor with a failure
     ForgottenLesson {
         /// Failure memory id to inspect
@@ -502,15 +478,13 @@ enum Commands {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    #[cfg(feature = "legacy-sqlite")]
     if let Some(data_dir) = cli.data_dir {
-        let db_path = Storage::db_path_for_data_dir(data_dir)?;
+        let db_path = vestige_core::db_path_for_data_dir(data_dir)?;
         CLI_DB_PATH
             .set(db_path)
             .map_err(|_| anyhow::anyhow!("data directory was initialized more than once"))?;
     }
 
-    #[cfg(feature = "legacy-sqlite")]
     match cli.command {
         Commands::Stats { tagging, states } => run_stats(tagging, states),
         Commands::Health => run_health(),
@@ -546,7 +520,6 @@ fn main() -> anyhow::Result<()> {
         } => run_export(output, format, tags, since),
         Commands::PortableExport { output } => run_portable_export(output),
         Commands::PortableImport { input, merge } => run_portable_import(input, merge),
-        Commands::MigrateToStrata { source, dest } => run_migrate_to_strata(source, dest),
         Commands::Sync {
             archive,
             cloud,
@@ -645,44 +618,11 @@ fn main() -> anyhow::Result<()> {
             dashboard_port,
         } => run_serve(port, dashboard, dashboard_port),
         Commands::Selftest => run_selftest(),
-        Commands::StrataVerify { dir } => run_strata_verify(dir),
         Commands::ForgottenLesson {
             failure_id,
             scope,
             json,
         } => run_forgotten_lesson(failure_id, scope, json),
-    }
-
-    // Legacy-sqlite-free build (build/t5-legacy-isolation): only the
-    // self-update family works without the store. Every store-backed
-    // subcommand fails with the clear open_storage() error; the STRATA
-    // backend becomes the default in the next merge.
-    #[cfg(not(feature = "legacy-sqlite"))]
-    match cli.command {
-        Commands::Update {
-            version,
-            install_dir,
-            dry_run,
-            no_sandwich,
-            sandwich_companion,
-            sandwich,
-        } => run_update(
-            version,
-            install_dir,
-            dry_run,
-            no_sandwich,
-            sandwich_companion,
-            sandwich,
-        ),
-        Commands::Sandwich { command } => match command {
-            SandwichCommands::Install { version, options } => {
-                run_sandwich_install(version.as_deref(), &options)
-            }
-        },
-        _ => Err(anyhow::anyhow!(
-            "{}",
-            vestige_core::storage::LegacySqliteDisabled
-        )),
     }
 }
 
@@ -1386,7 +1326,6 @@ fn run_command(command: &mut Command, action: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 fn create_private_file(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(unix)]
     {
@@ -1716,7 +1655,6 @@ fn run_update(
 }
 
 /// Run stats command
-#[cfg(feature = "legacy-sqlite")]
 fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
     let storage = open_storage()?;
     let stats = storage.get_stats()?;
@@ -1859,7 +1797,6 @@ fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
 }
 
 /// Compute cognitive state distribution for memories
-#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 fn compute_state_distribution(
     memories: &[vestige_core::KnowledgeNode],
 ) -> (usize, usize, usize, usize) {
@@ -1889,7 +1826,6 @@ fn compute_state_distribution(
 }
 
 /// Print a distribution bar
-#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 fn print_distribution_bar(label: &str, count: usize, total: usize, color: &str) {
     let percentage = if total > 0 {
         (count as f64 / total as f64) * 100.0
@@ -1917,7 +1853,6 @@ fn print_distribution_bar(label: &str, count: usize, total: usize, color: &str) 
 }
 
 /// Run health check
-#[cfg(feature = "legacy-sqlite")]
 fn run_health() -> anyhow::Result<()> {
     let storage = open_storage()?;
     let stats = storage.get_stats()?;
@@ -2068,12 +2003,11 @@ fn run_health() -> anyhow::Result<()> {
 /// Run consolidation cycle
 /// The database this CLI invocation targets (`--data-dir` wins, then the
 /// platform default).
-#[cfg(feature = "legacy-sqlite")]
 fn cli_db_path() -> anyhow::Result<PathBuf> {
     if let Some(path) = CLI_DB_PATH.get() {
         return Ok(path.clone());
     }
-    Ok(Storage::default_db_path()?)
+    Ok(vestige_core::default_db_path()?)
 }
 
 /// Apply pending migrations, or rehearse them on a throwaway copy of the store.
@@ -2084,7 +2018,6 @@ fn cli_db_path() -> anyhow::Result<PathBuf> {
 /// that rehearsal as a command: copy the store and its WAL/SHM sidecars into
 /// a temp directory, report what the strict checks see on disk today, open the
 /// copy so every migration actually runs, and never touch the original.
-#[cfg(feature = "legacy-sqlite")]
 fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
     let source = cli_db_path()?;
     if !source.exists() {
@@ -2093,7 +2026,7 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
 
     if !dry_run {
         println!("{}", "=== Vestige Upgrade ===".cyan().bold());
-        let storage = Storage::new(Some(source.clone()))?;
+        let storage = vestige_core::open_storage(Some(source.clone()))?;
         let stats = storage.get_stats()?;
         println!("{} {}", "Migrated:".green().bold(), source.display());
         println!("Total memories: {}", stats.total_nodes);
@@ -2149,7 +2082,7 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
     }
     println!();
 
-    match Storage::new(Some(copy.clone())) {
+    match vestige_core::open_storage(Some(copy.clone())) {
         Ok(storage) => {
             let stats = storage.get_stats()?;
             println!("{}", "Migration on the copy: OK".green().bold());
@@ -2177,7 +2110,6 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "legacy-sqlite")]
 fn run_consolidate() -> anyhow::Result<()> {
     println!("{}", "=== Vestige Consolidation ===".cyan().bold());
     println!();
@@ -2236,7 +2168,6 @@ fn run_consolidate() -> anyhow::Result<()> {
 }
 
 /// Run restore from backup
-#[cfg(feature = "legacy-sqlite")]
 fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
     println!("{}", "=== Vestige Restore ===".cyan().bold());
     println!();
@@ -2388,28 +2319,25 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
 }
 
 /// Get the default database path
-#[cfg(feature = "legacy-sqlite")]
 fn get_default_db_path() -> anyhow::Result<PathBuf> {
     if let Some(path) = CLI_DB_PATH.get() {
         Ok(path.clone())
     } else {
-        Ok(Storage::default_db_path()?)
+        Ok(vestige_core::default_db_path()?)
     }
 }
 
 /// Open storage using the CLI-selected data directory, if one was provided.
-#[cfg(feature = "legacy-sqlite")]
-fn open_storage() -> anyhow::Result<Storage> {
+fn open_storage() -> anyhow::Result<std::sync::Arc<Storage>> {
     if let Some(path) = CLI_DB_PATH.get() {
-        Ok(Storage::new(Some(path.clone()))?)
+        Ok(vestige_core::open_storage(Some(path.clone()))?)
     } else {
-        Ok(Storage::new(None)?)
+        Ok(vestige_core::open_storage(None)?)
     }
 }
 
 /// Fetch all nodes from storage using pagination
-#[cfg(feature = "legacy-sqlite")]
-fn fetch_all_nodes(storage: &Storage) -> anyhow::Result<Vec<vestige_core::KnowledgeNode>> {
+fn fetch_all_nodes(storage: &Arc<Storage>) -> anyhow::Result<Vec<vestige_core::KnowledgeNode>> {
     let mut all_nodes = Vec::new();
     let page_size = 500;
     let mut offset = 0;
@@ -2428,7 +2356,6 @@ fn fetch_all_nodes(storage: &Storage) -> anyhow::Result<Vec<vestige_core::Knowle
 }
 
 /// Run backup command using SQLite's consistent-snapshot export.
-#[cfg(feature = "legacy-sqlite")]
 fn run_backup(output: PathBuf) -> anyhow::Result<()> {
     println!("{}", "=== Vestige Backup ===".cyan().bold());
     println!();
@@ -2480,12 +2407,11 @@ fn run_backup(output: PathBuf) -> anyhow::Result<()> {
 /// Snapshots the store to a tempdir copy, plants causes/failures there, runs
 /// the real backfill against the copy, and prints the same payload the MCP
 /// tool returns. The live store is only read.
-#[cfg(feature = "legacy-sqlite")]
 fn run_selftest() -> anyhow::Result<()> {
     println!("{}", "=== Planted-Cause Selftest ===".cyan().bold());
     println!();
 
-    let storage = std::sync::Arc::new(open_storage()?);
+    let storage = open_storage()?;
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt
         .block_on(vestige_mcp::tools::selftest::execute(&storage, None))
@@ -2521,47 +2447,14 @@ fn run_selftest() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Verify a strata store directory: recompute the kernel log tail, the
-/// checkpoint chain, every state root, and every gate verdict under the
-/// stored policy, plus the structural sweep. Nothing on disk is trusted.
-fn run_strata_verify(dir: PathBuf) -> anyhow::Result<()> {
-    println!("{}", "=== Strata Store Verification ===".cyan().bold());
-    println!();
-    let report = strata_verify::verify_store(&dir);
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    println!();
-    if report.ok() {
-        println!(
-            "{}",
-            format!(
-                "OK · log_tail ✓ · checkpoint_chain ✓ · state_root ✓ · gate_verdicts ✓ · no gaps · {}ms",
-                report.duration_ms
-            )
-            .green()
-            .bold()
-        );
-        Ok(())
-    } else {
-        for failure in &report.failures {
-            println!("{}", format!("  {failure}").red());
-        }
-        Err(anyhow::anyhow!(
-            "strata store verification failed: {} failure(s), gaps: {:?}",
-            report.failures.len(),
-            report.gaps
-        ))
-    }
-}
-
 /// Run the forgotten-lesson scan (the MCP `forgotten_lesson` tool) from the
 /// CLI: decayed fix/lesson memories sharing an exact anchor with a failure.
-#[cfg(feature = "legacy-sqlite")]
 fn run_forgotten_lesson(
     failure_id: String,
     scope: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let storage = std::sync::Arc::new(open_storage()?);
+    let storage = open_storage()?;
     let args = serde_json::json!({"failure_id": failure_id, "scope": scope});
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt
@@ -2603,7 +2496,6 @@ fn run_forgotten_lesson(
 }
 
 /// Run export command - exports memories in JSON or JSONL format
-#[cfg(feature = "legacy-sqlite")]
 fn run_export(
     output: PathBuf,
     format: String,
@@ -2737,7 +2629,6 @@ fn run_export(
 }
 
 /// Run exact portable archive export.
-#[cfg(feature = "legacy-sqlite")]
 fn run_portable_export(output: PathBuf) -> anyhow::Result<()> {
     println!("{}", "=== Vestige Portable Export ===".cyan().bold());
     println!();
@@ -2781,7 +2672,6 @@ fn run_portable_export(output: PathBuf) -> anyhow::Result<()> {
 }
 
 /// Run exact portable archive import.
-#[cfg(feature = "legacy-sqlite")]
 fn run_portable_import(input: PathBuf, merge: bool) -> anyhow::Result<()> {
     println!("{}", "=== Vestige Portable Import ===".cyan().bold());
     println!();
@@ -2837,67 +2727,7 @@ fn run_portable_import(input: PathBuf, merge: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---- strata-migrate (one self-contained block; everything else lives in
-// ---- crates/strata-migrate) ----------------------------------------------
-/// Run the one-shot SQLite -> STRATA migration (`vestige migrate-to-strata`).
-fn run_migrate_to_strata(source: PathBuf, dest: PathBuf) -> anyhow::Result<()> {
-    println!("{}", "=== Vestige -> STRATA Migration ===".cyan().bold());
-    println!();
-
-    if !source.exists() {
-        anyhow::bail!("Source not found: {}", source.display());
-    }
-    std::fs::create_dir_all(&dest)?;
-
-    println!("{}: {}", "Source".white().bold(), source.display());
-    println!("{}: {}", "Strata dir".white().bold(), dest.display());
-    println!();
-
-    let report = strata_migrate::migrate(&source, &dest)
-        .map_err(|e| anyhow::anyhow!("migration failed: {e}"))?;
-
-    println!("{}: {}", "Nodes".white().bold(), report.nodes);
-    println!("{}: {}", "Edges".white().bold(), report.edges);
-    println!("{}: {}", "FSRS events".white().bold(), report.fsrs_events);
-    println!("{}: {}", "Skipped tables".white().bold(), report.skipped_tables.len());
-    for table in &report.skipped_tables {
-        println!("  {} {}", "-".dimmed(), table.yellow());
-    }
-    if report.verify_passed {
-        println!("{}: {}", "Verify".white().bold(), "kernel replay + log tail PASSED".green());
-    } else {
-        println!("{}: {}", "Verify".white().bold(), "FAILED (see stderr)".red().bold());
-    }
-    println!(
-        "{}: {:.3}s",
-        "Duration".white().bold(),
-        report.duration.as_secs_f64()
-    );
-    println!();
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    println!();
-    if report.verify_passed {
-        println!(
-            "{}",
-            format!(
-                "Migration complete: {} nodes, {} edges, {} fsrs events -> {}",
-                report.nodes,
-                report.edges,
-                report.fsrs_events,
-                dest.display()
-            )
-            .green()
-            .bold()
-        );
-    } else {
-        anyhow::bail!("migration finished but verification FAILED; do not adopt this log");
-    }
-
-    Ok(())
-}
-
 /// Run file-backed two-way sync.
-#[cfg(feature = "legacy-sqlite")]
 fn run_sync(archive: Option<PathBuf>, cloud: bool, endpoint: Option<String>) -> anyhow::Result<()> {
     if cloud {
         run_sync_cloud(endpoint)
@@ -2911,7 +2741,6 @@ fn run_sync(archive: Option<PathBuf>, cloud: bool, endpoint: Option<String>) -> 
     }
 }
 
-#[cfg(feature = "legacy-sqlite")]
 fn run_sync_file(archive: PathBuf) -> anyhow::Result<()> {
     println!("{}", "=== Vestige File Sync ===".cyan().bold());
     println!();
@@ -2924,7 +2753,6 @@ fn run_sync_file(archive: PathBuf) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "cloud-sync")]
-#[cfg(feature = "legacy-sqlite")]
 fn run_sync_cloud(endpoint: Option<String>) -> anyhow::Result<()> {
     let endpoint = endpoint
         .or_else(|| std::env::var("VESTIGE_CLOUD_ENDPOINT").ok())
@@ -2977,7 +2805,6 @@ fn run_sync_cloud(endpoint: Option<String>) -> anyhow::Result<()> {
 }
 
 #[cfg(not(feature = "cloud-sync"))]
-#[cfg(feature = "legacy-sqlite")]
 fn run_sync_cloud(_endpoint: Option<String>) -> anyhow::Result<()> {
     anyhow::bail!(
         "this build was compiled without the `cloud-sync` feature. Official binaries from \
@@ -2986,7 +2813,6 @@ fn run_sync_cloud(_endpoint: Option<String>) -> anyhow::Result<()> {
     )
 }
 
-#[cfg(feature = "legacy-sqlite")]
 fn print_sync_report(report: &vestige_core::PortableSyncReport) {
     if let Some(pull) = &report.pull {
         println!("{}", "Pull: merged remote archive".yellow());
@@ -3018,7 +2844,6 @@ fn print_sync_report(report: &vestige_core::PortableSyncReport) {
 }
 
 /// Run garbage collection command
-#[cfg(feature = "legacy-sqlite")]
 fn run_gc(
     min_retention: f64,
     max_age_days: Option<u64>,
@@ -3173,7 +2998,6 @@ fn run_gc(
 }
 
 /// Ingest a memory via CLI (routes through smart_ingest / PE Gating)
-#[cfg(feature = "legacy-sqlite")]
 fn run_ingest(
     content: String,
     tags: Option<String>,
@@ -3269,7 +3093,6 @@ fn run_ingest(
 ///
 /// Deliberately emits IDs, detector classes, and short fingerprints only. It
 /// never prints the matching content, source, or surrounding context.
-#[cfg(feature = "legacy-sqlite")]
 fn run_scan_secrets(
     include_suspected: bool,
     json_output: bool,
@@ -3382,7 +3205,6 @@ fn run_scan_secrets(
 
 /// Run Retroactive Salience Backfill from the CLI (the demo's payoff command).
 #[allow(clippy::too_many_arguments)]
-#[cfg(feature = "legacy-sqlite")]
 fn run_backfill(
     failure_id: Option<String>,
     manual: bool,
@@ -3395,7 +3217,7 @@ fn run_backfill(
     broke_in: Option<String>,
     why_not: Option<String>,
 ) -> anyhow::Result<()> {
-    let storage = std::sync::Arc::new(open_storage()?);
+    let storage = open_storage()?;
 
     // Resolve the failure text up front (used by the contrast baseline).
     // Use the SAME failure detector the backfill tool uses (content + tags, full
@@ -3605,7 +3427,6 @@ fn run_backfill(
 /// edges -> ranked suspect change records. Mirrors the MCP `causal_walk`
 /// tool (same core engine); `--json` prints the raw result for tooling.
 #[allow(clippy::too_many_arguments)]
-#[cfg(feature = "legacy-sqlite")]
 fn run_causal_walk(
     failing_test: Option<String>,
     stack_frame: Option<String>,
@@ -3656,13 +3477,13 @@ fn run_causal_walk(
         lookback_days,
         scan_limit: 500,
     };
-    let result = cw::walk_storage(&storage, &request).map_err(anyhow::Error::msg)?;
+    let result = cw::walk_storage(&*storage, &request).map_err(anyhow::Error::msg)?;
 
     if json {
         let mut payload = serde_json::to_value(&result)?;
         if promote && !result.causes.is_empty() {
             payload["promoted_edges"] = serde_json::to_value(
-                cw::persist_evidence_edges(&storage, &result).unwrap_or_default(),
+                cw::persist_evidence_edges(&*storage, &result).unwrap_or_default(),
             )?;
         }
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -3716,7 +3537,7 @@ fn run_causal_walk(
 
     if promote && !result.causes.is_empty() {
         let written =
-        cw::persist_evidence_edges(&storage, &result).map_err(anyhow::Error::msg)?;
+        cw::persist_evidence_edges(&*storage, &result).map_err(anyhow::Error::msg)?;
         println!(
             "{} {} evidence_of trail edge{} persisted",
             "→".magenta(),
@@ -3736,7 +3557,6 @@ fn run_causal_walk(
 /// Normalized remote identity for a repo: `git config remote.origin.url`
 /// stripped of protocol and `.git` (`https://github.com/a/b.git`,
 /// `git@github.com:a/b` -> `github.com/a/b`). None when no remote is set.
-#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 fn git_repo_identity(path: &Path) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -3766,7 +3586,6 @@ fn git_repo_identity(path: &Path) -> Option<String> {
 /// query-time entity extractor turns those into the causal join keys. Records
 /// upsert on `(git, "<repo>#<sha>")`, so re-running is free, and created_at is
 /// the commit time so the backward reach is exact.
-#[cfg(feature = "legacy-sqlite")]
 fn run_ingest_git(
     path: PathBuf,
     since: Option<String>,
@@ -3882,12 +3701,10 @@ fn run_ingest_git(
 }
 
 /// Recall + reason across memories using the real deep_reference engine.
-#[cfg(feature = "legacy-sqlite")]
 fn run_recall(query: String, depth: i64, json: bool) -> anyhow::Result<()> {
     use vestige_mcp::cognitive::CognitiveEngine;
 
     let storage = open_storage()?;
-    let storage = Arc::new(storage);
 
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(async move {
@@ -3960,7 +3777,6 @@ fn run_recall(query: String, depth: i64, json: bool) -> anyhow::Result<()> {
 }
 
 /// Compose: surface never-composed memory pairs + the testable question they imply.
-#[cfg(feature = "legacy-sqlite")]
 fn run_project(
     out: PathBuf,
     format: String,
@@ -4049,7 +3865,6 @@ fn run_project(
     Ok(())
 }
 
-#[cfg(feature = "legacy-sqlite")]
 fn run_compose(limit: i32, tags: Option<String>, json: bool) -> anyhow::Result<()> {
     let storage = open_storage()?;
 
@@ -4137,7 +3952,6 @@ fn run_compose(limit: i32, tags: Option<String>, json: bool) -> anyhow::Result<(
 }
 
 /// Run the dashboard web server
-#[cfg(feature = "legacy-sqlite")]
 fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
     use vestige_mcp::cognitive::CognitiveEngine;
 
@@ -4149,8 +3963,6 @@ fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
     );
 
     let storage = open_storage()?;
-
-    let storage = std::sync::Arc::new(storage);
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -4168,7 +3980,6 @@ fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
 }
 
 /// Start standalone HTTP MCP server (no stdio transport)
-#[cfg(feature = "legacy-sqlite")]
 fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Result<()> {
     use vestige_mcp::cognitive::CognitiveEngine;
 
@@ -4176,8 +3987,6 @@ fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Re
     println!();
 
     let storage = open_storage()?;
-
-    let storage = Arc::new(storage);
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -4254,7 +4063,6 @@ fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Re
 }
 
 /// Truncate a string for display (UTF-8 safe)
-#[cfg_attr(not(feature = "legacy-sqlite"), allow(dead_code))]
 fn truncate(s: &str, max_chars: usize) -> String {
     let s = s.replace('\n', " ");
     if s.chars().count() <= max_chars {

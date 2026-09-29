@@ -954,7 +954,7 @@ fn git_lines(repo: &str, git_args: &[&str]) -> Option<Vec<String>> {
 /// `needs_report`, not errors.
 #[cfg(feature = "legacy-sqlite")]
 pub fn walk_storage(
-    storage: &crate::Storage,
+    storage: &crate::storage::Storage,
     req: &CausalWalkRequest,
 ) -> Result<CausalWalkResult, String> {
     let scope = req.scope.trim();
@@ -1063,7 +1063,7 @@ pub fn walk_storage(
 /// Called ONLY on promote; preview writes nothing. Returns the edges written.
 #[cfg(feature = "legacy-sqlite")]
 pub fn persist_evidence_edges(
-    storage: &crate::Storage,
+    storage: &crate::storage::Storage,
     result: &CausalWalkResult,
 ) -> Result<Vec<(String, String)>, String> {
     let mut written = Vec::new();
@@ -1108,7 +1108,7 @@ pub fn persist_evidence_edges(
 #[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
-    use crate::storage::Storage;
+    use crate::storage::SqliteMemoryStore as Storage;
     use crate::{IngestInput, KnowledgeNode};
     use tempfile::TempDir;
 

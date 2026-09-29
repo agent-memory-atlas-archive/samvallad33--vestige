@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::DateTime;
 use vestige_core::storage::{PortableTable, PortableValue};
-use vestige_core::{PortableArchive, Storage, PORTABLE_ARCHIVE_FORMAT};
+use vestige_core::{PortableArchive, PORTABLE_ARCHIVE_FORMAT, SqliteMemoryStore};
 
 use crate::MigrationError;
 
@@ -32,7 +32,7 @@ pub fn load_archive(source: &Path) -> Result<PortableArchive, MigrationError> {
 
     if is_sqlite_file(&resolved)? {
         // Path B: direct SQLite walk via vestige-core's own export code.
-        let storage = Storage::new(Some(resolved.clone()))
+        let storage = SqliteMemoryStore::new(Some(resolved.clone()))
             .map_err(|e| MigrationError::Source(format!("open SQLite store: {e}")))?;
         let archive = storage
             .export_portable_archive()

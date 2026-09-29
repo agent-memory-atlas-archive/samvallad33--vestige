@@ -152,7 +152,7 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
     }
 }
 
-fn recent(storage: &Storage, limit: i32) -> Result<Value, String> {
+fn recent(storage: &Arc<Storage>, limit: i32) -> Result<Value, String> {
     let events = storage
         .get_recent_composition_events(limit)
         .map_err(|e| e.to_string())?;
@@ -162,7 +162,7 @@ fn recent(storage: &Storage, limit: i32) -> Result<Value, String> {
     }))
 }
 
-fn get(storage: &Storage, event_id: &str) -> Result<Value, String> {
+fn get(storage: &Arc<Storage>, event_id: &str) -> Result<Value, String> {
     let event = storage
         .get_composition_event(event_id)
         .map_err(|e| e.to_string())?
@@ -181,7 +181,7 @@ fn get(storage: &Storage, event_id: &str) -> Result<Value, String> {
     }))
 }
 
-fn memory(storage: &Storage, memory_id: &str, limit: i32) -> Result<Value, String> {
+fn memory(storage: &Arc<Storage>, memory_id: &str, limit: i32) -> Result<Value, String> {
     let events = storage
         .get_compositions_for_memory(memory_id, limit)
         .map_err(|e| e.to_string())?;
@@ -192,7 +192,7 @@ fn memory(storage: &Storage, memory_id: &str, limit: i32) -> Result<Value, Strin
     }))
 }
 
-fn neighbors(storage: &Storage, memory_id: &str, limit: i32) -> Result<Value, String> {
+fn neighbors(storage: &Arc<Storage>, memory_id: &str, limit: i32) -> Result<Value, String> {
     let neighbors = storage
         .get_composition_neighbors(memory_id, limit)
         .map_err(|e| e.to_string())?;
@@ -204,7 +204,7 @@ fn neighbors(storage: &Storage, memory_id: &str, limit: i32) -> Result<Value, St
 }
 
 fn never_composed(
-    storage: &Storage,
+    storage: &Arc<Storage>,
     limit: i32,
     tags: Option<&[String]>,
     scope: Option<&str>,
@@ -223,7 +223,7 @@ fn never_composed(
     }))
 }
 
-fn bounty_mode(storage: &Storage, limit: i32, tags: Option<&[String]>) -> Result<Value, String> {
+fn bounty_mode(storage: &Arc<Storage>, limit: i32, tags: Option<&[String]>) -> Result<Value, String> {
     const PAGE_SIZE: i32 = 100;
     const MAX_SCAN_EVENTS: i32 = 1_000;
 
@@ -361,7 +361,7 @@ fn bounty_mode_lanes_full(
 }
 
 fn composition_matches_tags(
-    storage: &Storage,
+    storage: &Arc<Storage>,
     event: &vestige_core::CompositionEventRecord,
     members: &[vestige_core::CompositionMemberRecord],
     tags: Option<&[String]>,
@@ -412,7 +412,7 @@ fn tag_matches_filter(tag: &str, filters: &[String]) -> bool {
         .any(|wanted| tag == wanted || tag.starts_with(&format!("{wanted}:")))
 }
 
-fn label(storage: &Storage, args: &ComposedGraphArgs) -> Result<Value, String> {
+fn label(storage: &Arc<Storage>, args: &ComposedGraphArgs) -> Result<Value, String> {
     let event_id = args
         .event_id
         .as_deref()
@@ -466,11 +466,11 @@ mod tests {
 
     fn test_storage() -> (Arc<Storage>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        (storage, dir)
     }
 
-    fn ingest(storage: &Storage, content: &str, tags: &[&str]) -> String {
+    fn ingest(storage: &Arc<Storage>, content: &str, tags: &[&str]) -> String {
         storage
             .ingest(IngestInput {
                 content: content.to_string(),

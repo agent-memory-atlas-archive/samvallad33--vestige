@@ -25,7 +25,7 @@ const VIEW_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 async fn sized_store() -> (Arc<Storage>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let storage = Arc::new(Storage::new(Some(dir.path().join("sized.db"))).expect("storage"));
+    let storage = vestige_core::open_storage(Some(dir.path().join("sized.db"))).expect("storage");
     for index in 0..MEMORY_COUNT {
         storage
             .ingest_in_scope(
@@ -135,7 +135,7 @@ async fn every_view_completes_quickly_on_a_sized_store() {
 async fn stats_view_scales_linearly_not_quadratically() {
     async fn timed_stats(count: usize) -> std::time::Duration {
         let dir = tempfile::tempdir().expect("temp dir");
-        let storage = Arc::new(Storage::new(Some(dir.path().join("scale.db"))).expect("storage"));
+        let storage = vestige_core::open_storage(Some(dir.path().join("scale.db"))).expect("storage");
         for index in 0..count {
             storage
                 .ingest_in_scope(

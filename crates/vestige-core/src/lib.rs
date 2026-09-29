@@ -44,7 +44,7 @@
 //! use vestige_core::{Storage, IngestInput, Rating};
 //!
 //! // Create storage (uses default platform-specific location)
-//! let mut storage = Storage::new(None)?;
+//! let storage = open_storage(None)?;
 //!
 //! // Ingest a memory
 //! let input = IngestInput {
@@ -291,6 +291,8 @@ pub use storage::{
     StateTransitionRecord,
     Storage,
     StorageError,
+    db_path_for_data_dir,
+    default_db_path,
     StoredCounterfactualReplay,
     SynapticCapturePolicy,
     SynapticCaptureRequest,

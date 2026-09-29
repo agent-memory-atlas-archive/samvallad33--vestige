@@ -624,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn test_unified_scan_empty_storage() {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         let storage = Arc::new(storage);
         // Default action (scan) on empty storage must not error.
         let result = execute_unified(&storage, None, None).await;
@@ -634,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn tag_rename_requires_preview_token_and_supports_agent_visible_undo() {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         let node = storage
             .ingest(IngestInput {
                 content: "MCP tag rename fixture".to_string(),
@@ -721,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn tag_actions_reject_scope_combined_with_all_scopes() {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         storage
             .ingest(IngestInput {
                 content: "scope conflict fixture".to_string(),
@@ -779,7 +779,7 @@ mod tests {
     #[tokio::test]
     async fn overlong_source_tag_is_renameable_end_to_end() {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         let overlong = "z".repeat(250);
         let node = storage
             .ingest(IngestInput {
@@ -829,7 +829,7 @@ mod tests {
     #[tokio::test]
     async fn tag_merge_requires_multiple_sources() {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         let error = execute_unified(
             &storage,
             None,
@@ -847,7 +847,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_storage() {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         let storage = Arc::new(storage);
         let result = execute(&storage, None).await;
         assert!(result.is_ok());
@@ -859,7 +859,7 @@ mod tests {
     #[tokio::test]
     async fn identical_content_clusters_by_exact_equality() {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         storage
             .ingest(vestige_core::IngestInput {
                 content: "Deploy the gateway before Friday".to_string(),
@@ -897,7 +897,7 @@ mod tests {
     #[tokio::test]
     async fn identical_content_hash_clusters_across_different_text() {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         // SourceEnvelope is #[non_exhaustive]: build via Default + field
         // mutation instead of a struct expression. Two renderings of the same
         // upstream record share its declared content hash. (Same-source-key
@@ -934,7 +934,7 @@ mod tests {
     #[tokio::test]
     async fn near_identical_content_is_not_clustered() {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         storage
             .ingest(vestige_core::IngestInput {
                 content: "Use tokio runtime for async Rust services".to_string(),
@@ -958,7 +958,7 @@ mod tests {
     #[tokio::test]
     async fn tag_filter_restricts_clusters() {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         storage
             .ingest(vestige_core::IngestInput {
                 content: "Duplicated release note".to_string(),

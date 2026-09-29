@@ -714,8 +714,8 @@ mod tests {
 
     fn test_storage() -> (Arc<Storage>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(Some(dir.path().join("receipt-tool.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("receipt-tool.db"))).unwrap();
+        (storage, dir)
     }
 
     #[tokio::test]

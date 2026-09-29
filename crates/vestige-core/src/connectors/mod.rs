@@ -221,7 +221,7 @@ pub struct SyncReport {
 /// resumed across calls rather than blocking on one enormous fetch).
 #[cfg(feature = "legacy-sqlite")]
 pub async fn run_sync<C: Connector>(
-    store: &crate::storage::SqliteMemoryStore,
+    store: &crate::storage::Storage,
     connector: &C,
     reconcile: bool,
     max_pages: usize,

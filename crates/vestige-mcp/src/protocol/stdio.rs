@@ -29,7 +29,7 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 /// The concurrent consumers of those threads are: these MAX_INFLIGHT stdio
 /// handlers, the dashboard's axum server (the HTTP MCP transport in
 /// `protocol/http.rs` is itself capped at `CONCURRENCY_LIMIT`), at most one
-/// consolidation worker (`SqliteMemoryStore::run_consolidation` is
+/// consolidation worker (the storage backend's `run_consolidation` is
 /// synchronous and occupies one worker for its whole run;
 /// `McpServer::claim_consolidation` is what holds it to one, and before that
 /// claim existed several handlers could each spawn their own), plus the
@@ -231,7 +231,7 @@ enum HandlerProbe {
     /// Panics inside the spawned task.
     Panic,
     /// Parks on a blocking `std::sync::Mutex`, which is the lock kind
-    /// `vestige-core`'s `SqliteMemoryStore` reader and writer connections use.
+    /// the vestige-core storage backend's reader and writer connections use.
     /// A task parked there has no await point and cannot be aborted.
     BlockingPark,
 }
@@ -756,7 +756,7 @@ mod tests {
 
     fn test_parts() -> (Arc<Storage>, Arc<Mutex<CognitiveEngine>>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
         (storage, cognitive, dir)
     }

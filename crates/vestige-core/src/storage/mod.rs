@@ -104,7 +104,8 @@ pub use sqlite::{
     EmbeddingProfileMigrationNodeCheckpoint, EmbeddingProfileMigrationRecord,
     EmbeddingProfileVector, EndorsementEventRecord, FilePortableSyncBackend, HygieneNodeSummary,
     HygieneSnapshot, InsightRecord, IntentionRecord, NeverComposedCandidate,
-    PortableSyncBackend, PortableSyncReport, ReconcileReport, Result, SmartIngestResult,
+    PortableSyncBackend, PortableSyncReport, PurgeReport, ReconcileReport, Result,
+    SmartIngestResult,
     SourceUpsertOutcome, SourceUpsertResult, SqliteMemoryStore, StateTransitionRecord,
     StorageError, TagVocabulary,
 };
@@ -150,7 +151,6 @@ pub use unlearning_store::{
 /// existing `Arc<Storage>` call site keeps compiling. Scheduled for removal
 /// once no downstream source file references it.
 #[cfg(feature = "legacy-sqlite")]
-pub type Storage = SqliteMemoryStore;
 
 /// Error returned by [`open_storage`] when the binary was built without the
 /// `legacy-sqlite` feature. Exists in every build so callers can name it
@@ -167,17 +167,39 @@ pub struct LegacySqliteDisabled;
 /// [`LegacySqliteDisabled`] ("built without legacy-sqlite; STRATA default
 /// lands in the next merge") — the STRATA backend, not SQLite, becomes the
 /// default in the next merge.
-#[cfg(feature = "legacy-sqlite")]
-pub fn open_storage(path: Option<std::path::PathBuf>) -> sqlite::Result<SqliteMemoryStore> {
-    SqliteMemoryStore::new(path)
+/// Phase 4 storage wall: the product-wide seam.
+///
+/// Every tool, server, CLI entry point, and cognitive module holds the store
+/// through this trait object (`Arc<Storage>`, `&Storage`). `SqliteMemoryStore`
+/// is one implementation of it, constructed only via [`open_storage`] (and
+/// direct backend construction inside `vestige-core`'s own tests). A second
+/// engine implements `MemoryStoreSend` and drops in behind the same alias.
+pub type Storage = dyn MemoryStore;
+
+/// Default database artifact path for the SQLite backend.
+pub fn default_db_path() -> Result<std::path::PathBuf> {
+    SqliteMemoryStore::default_db_path()
 }
 
-/// Feature-off twin of [`open_storage`]: always fails with
-/// [`LegacySqliteDisabled`]. The `Ok` side is `Infallible` because no store
-/// type exists in this build.
+/// Database artifact path for a given data directory (SQLite backend).
+pub fn db_path_for_data_dir(data_dir: std::path::PathBuf) -> Result<std::path::PathBuf> {
+    SqliteMemoryStore::db_path_for_data_dir(data_dir)
+}
+
+/// Construct the default local backend (SQLite reference implementation)
+/// behind the Phase 4 storage trait. This is the only constructor the MCP
+/// layer is allowed to call. With `legacy-sqlite` compiled out (the STRATA
+/// default), it fails with [`LegacySqliteDisabled`].
+#[cfg(feature = "legacy-sqlite")]
+pub fn open_storage(path: Option<std::path::PathBuf>) -> Result<std::sync::Arc<dyn MemoryStore>> {
+    Ok(std::sync::Arc::new(SqliteMemoryStore::new(path)?))
+}
+
+/// Feature-off twin of [`open_storage`]: always fails because no legacy
+/// backend exists in this build; the STRATA backend constructs directly.
 #[cfg(not(feature = "legacy-sqlite"))]
 pub fn open_storage(
     _path: Option<std::path::PathBuf>,
-) -> std::result::Result<std::convert::Infallible, LegacySqliteDisabled> {
+) -> std::result::Result<std::sync::Arc<dyn MemoryStore>, LegacySqliteDisabled> {
     Err(LegacySqliteDisabled)
 }

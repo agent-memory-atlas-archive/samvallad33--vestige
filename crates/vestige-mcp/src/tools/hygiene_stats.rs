@@ -608,7 +608,7 @@ mod tests {
     async fn empty_store_has_all_zero_buckets_and_default_scope() {
         let directory = tempfile::tempdir().expect("temporary database");
         let storage =
-            Arc::new(Storage::new(Some(directory.path().join("stats.db"))).expect("test storage"));
+            vestige_core::open_storage(Some(directory.path().join("stats.db"))).expect("test storage");
 
         let response = execute(&storage, Some(json!({ "view": "stats" })))
             .await
@@ -632,7 +632,7 @@ mod tests {
     async fn tag_audit_is_agent_visible_and_scope_filtered() {
         let directory = tempfile::tempdir().expect("temporary database");
         let storage =
-            Arc::new(Storage::new(Some(directory.path().join("audit.db"))).expect("test storage"));
+            vestige_core::open_storage(Some(directory.path().join("audit.db"))).expect("test storage");
         storage
             .ingest_in_scope(
                 IngestInput {
@@ -898,7 +898,7 @@ mod tests {
     async fn stats_population_stays_inside_the_requested_scope() {
         let directory = tempfile::tempdir().expect("temporary database");
         let storage =
-            Arc::new(Storage::new(Some(directory.path().join("scope.db"))).expect("test storage"));
+            vestige_core::open_storage(Some(directory.path().join("scope.db"))).expect("test storage");
         storage
             .ingest_in_scope(
                 IngestInput {

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::Storage;
 #[cfg(feature = "legacy-sqlite")]
 use crate::storage::Result;
+use std::sync::Arc;
 
 /// Which client file shape to render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,7 +106,7 @@ const MAX_LINE_CHARS: usize = 400;
 
 #[cfg(feature = "legacy-sqlite")]
 /// Pick the durable subset of `opts.scope`.
-pub fn select_durable(storage: &Storage, opts: &ProjectionOptions) -> Result<Vec<ProjectedItem>> {
+pub fn select_durable(storage: &Arc<Storage>, opts: &ProjectionOptions) -> Result<Vec<ProjectedItem>> {
     let now = Utc::now();
     let candidates =
         storage.projection_candidates(&opts.scope, opts.min_retention, CANDIDATE_LIMIT)?;
@@ -235,7 +236,7 @@ pub fn render(format: ProjectionFormat, scope: &str, items: &[ProjectedItem]) ->
 
 #[cfg(feature = "legacy-sqlite")]
 /// Build the full projection for a scope.
-pub fn project(storage: &Storage, opts: &ProjectionOptions) -> Result<Projection> {
+pub fn project(storage: &Arc<Storage>, opts: &ProjectionOptions) -> Result<Projection> {
     let mut items = select_durable(storage, opts)?;
     let mut region = render(opts.format, &opts.scope, &items);
     while region.len() > 10_000 && !items.is_empty() {
@@ -486,7 +487,7 @@ mod tests {
     #[test]
     fn selection_excludes_future_and_suppressed_memory() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
+        let storage = crate::storage::open_storage(Some(dir.path().join("test.db"))).unwrap();
         let future = storage
             .ingest(IngestInput {
                 content: "future decision".into(),
@@ -613,7 +614,7 @@ mod tests {
     #[test]
     fn select_durable_keeps_decisions_patterns_and_rule_tagged_facts_only() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
+        let storage = crate::storage::open_storage(Some(dir.path().join("test.db"))).unwrap();
         let ingest = |content: &str, node_type: &str, tags: &[&str], valid_until| {
             storage
                 .ingest(IngestInput {

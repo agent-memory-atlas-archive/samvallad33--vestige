@@ -1691,7 +1691,8 @@ mod exact_nomination_tests {
     //! 2026-09-28): identical content hash / same declared source key /
     //! exactly equal entity sets. Near-identical content must NOT nominate.
 
-    use crate::{IngestInput, Storage};
+    use crate::IngestInput;
+    use crate::storage::SqliteMemoryStore as Storage;
 
     fn store() -> (tempfile::TempDir, Storage) {
         let dir = tempfile::tempdir().unwrap();

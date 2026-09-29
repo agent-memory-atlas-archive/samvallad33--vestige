@@ -226,11 +226,11 @@ mod tests {
 
     fn storage() -> (Arc<Storage>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        (storage, dir)
     }
 
-    fn ingest(storage: &Storage, content: &str, node_type: &str) -> String {
+    fn ingest(storage: &Arc<Storage>, content: &str, node_type: &str) -> String {
         storage
             .ingest(IngestInput {
                 content: content.to_string(),

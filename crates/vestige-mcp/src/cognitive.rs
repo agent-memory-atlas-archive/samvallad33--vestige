@@ -4,6 +4,7 @@
 //! Each module is initialized once at startup and shared via Arc<Mutex<>>
 //! across all tool invocations.
 
+use std::sync::Arc;
 use vestige_core::neuroscience::predictive_retrieval::PredictiveMemory;
 use vestige_core::neuroscience::prospective_memory::{IntentionParser, ProspectiveMemory};
 #[cfg(feature = "vector-search")]
@@ -102,7 +103,7 @@ impl CognitiveEngine {
     /// Hydrates `ActivationNetwork` plus the active synaptic-tag projection.
     /// Other modules (MemoryChainBuilder, HippocampalIndex) require full
     /// MemoryNode content and are deferred to a follow-up.
-    pub fn hydrate(&mut self, storage: &Storage) {
+    pub fn hydrate(&mut self, storage: &Arc<Storage>) {
         match storage.get_all_connections() {
             Ok(connections) => {
                 for conn in &connections {
@@ -203,13 +204,13 @@ mod tests {
         assert_eq!(COGNITIVE_MODULE_COUNT, expected);
     }
 
-    fn create_test_storage() -> (Storage, TempDir) {
+    fn create_test_storage() -> (Arc<Storage>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
         (storage, dir)
     }
 
-    fn ingest_memory(storage: &Storage, content: &str) -> String {
+    fn ingest_memory(storage: &Arc<Storage>, content: &str) -> String {
         let result = storage
             .ingest(IngestInput {
                 content: content.to_string(),

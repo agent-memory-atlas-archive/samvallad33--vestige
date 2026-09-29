@@ -3288,11 +3288,11 @@ mod tests {
     fn seed_storage() -> (tempfile::TempDir, Arc<Storage>) {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let storage = Arc::new(Storage::new(Some(db_path)).unwrap());
+        let storage = vestige_core::open_storage(Some(db_path)).unwrap();
         (dir, storage)
     }
 
-    fn ingest(storage: &Storage, content: &str) -> String {
+    fn ingest(storage: &Arc<Storage>, content: &str) -> String {
         let node = storage
             .ingest(IngestInput {
                 content: content.to_string(),
@@ -3482,7 +3482,7 @@ mod tests {
         );
     }
 
-    fn link(storage: &Storage, source: &str, target: &str) {
+    fn link(storage: &Arc<Storage>, source: &str, target: &str) {
         let now = Utc::now();
         storage
             .save_connection(&ConnectionRecord {
@@ -3729,7 +3729,7 @@ mod tests {
         assert!(!pair["topic"].as_str().unwrap().is_empty());
     }
 
-    fn ingest_project_memory(storage: &Storage, content: &str, project: &str) {
+    fn ingest_project_memory(storage: &Arc<Storage>, content: &str, project: &str) {
         storage
             .ingest(IngestInput {
                 content: content.to_string(),

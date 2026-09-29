@@ -176,7 +176,7 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
 
     // Validate and ingest outside the target, then reuse the transactional importer.
     let staging_dir = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let staging = Storage::new(Some(staging_dir.path().join("restore.db")))
+    let staging = vestige_core::open_storage(Some(staging_dir.path().join("restore.db")))
         .map_err(|error| format!("Restore staging failed: {error}"))?;
 
     for memory in &memories {
@@ -240,7 +240,7 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
     }))
 }
 
-fn ensure_restore_path_allowed(storage: &Storage, path: &Path) -> Result<(), String> {
+fn ensure_restore_path_allowed(storage: &Arc<Storage>, path: &Path) -> Result<(), String> {
     let canonical_path = path
         .canonicalize()
         .map_err(|e| format!("Failed to resolve restore path: {}", e))?;
@@ -275,8 +275,8 @@ mod tests {
 
     async fn test_storage() -> (Arc<Storage>, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
-        (Arc::new(storage), dir)
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        (storage, dir)
     }
 
     fn write_temp_file(dir: &TempDir, name: &str, content: &str) -> String {

@@ -108,7 +108,7 @@ fn is_write_decision(label: &str) -> bool {
 ///
 /// This is the single source of truth: the dashboard handler delegates here so
 /// the MCP write path and the dashboard can never disagree about the mode.
-pub fn read_review_mode(storage: &Storage) -> vestige_core::ReviewMode {
+pub fn read_review_mode(storage: &Arc<Storage>) -> vestige_core::ReviewMode {
     let path = storage.data_dir().join("review_mode.json");
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -863,7 +863,7 @@ struct ReceiptSigner {
 /// key, seed/public-key mismatch, or non-active key is an error: retrieval
 /// receipt persistence then fails closed instead of quietly emitting unsigned
 /// evidence under a signing-enabled deployment.
-fn configured_receipt_signer(storage: &Storage) -> Result<Option<ReceiptSigner>, String> {
+fn configured_receipt_signer(storage: &Arc<Storage>) -> Result<Option<ReceiptSigner>, String> {
     let key_id = env::var(RECEIPT_SIGNING_KEY_ID_ENV).ok();
     let seed_path = env::var_os(RECEIPT_SIGNING_SEED_PATH_ENV);
     match (key_id, seed_path) {
@@ -926,7 +926,7 @@ fn receipt_memory_ids(receipt: &Receipt) -> Vec<String> {
 }
 
 fn sign_retrieval_receipt(
-    storage: &Storage,
+    storage: &Arc<Storage>,
     signer: &ReceiptSigner,
     receipt: &mut Receipt,
 ) -> Result<
@@ -1972,7 +1972,7 @@ mod tests {
         let _lock = receipt_signing_env_lock().lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("retrieval-capsule.db");
-        let storage = Arc::new(vestige_core::Storage::new(Some(db_path.clone())).unwrap());
+        let storage = Arc::new(vestige_core::open_storage(Some(db_path.clone())).unwrap());
         // Replay-item rows deliberately carry an FK to the canonical memory so
         // this regression exercises the same path as a live retrieval rather
         // than relying on impossible fixture identifiers.
@@ -2262,9 +2262,7 @@ mod tests {
 
     fn store() -> std::sync::Arc<vestige_core::Storage> {
         let dir = tempfile::tempdir().unwrap();
-        std::sync::Arc::new(
-            vestige_core::Storage::new(Some(dir.path().join("gate_test.db"))).unwrap(),
-        )
+        vestige_core::open_storage(Some(dir.path().join("gate_test.db"))).unwrap()
     }
 
     #[test]
@@ -2272,7 +2270,7 @@ mod tests {
         let _lock = receipt_signing_env_lock().lock().unwrap();
         let _reset = ReceiptSigningEnvReset::capture();
         let dir = tempfile::tempdir().unwrap();
-        let storage = Arc::new(Storage::new(Some(dir.path().join("signed-receipt.db"))).unwrap());
+        let storage = vestige_core::open_storage(Some(dir.path().join("signed-receipt.db"))).unwrap();
         let provisioned = vestige_core::storage::provision_receipt_signing_key_sidecar(
             &dir.path().join("receipt-keys"),
             "test-receipt-key",
