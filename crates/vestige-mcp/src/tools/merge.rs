@@ -210,7 +210,10 @@ fn merge_candidates(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value
                     "classification": c.classification.as_str(),
                     "hasProtectedMember": c.has_protected_member,
                     "signals": {
-                        "embeddingSimilarity": format!("{:.3}", c.signals.embedding_similarity),
+                        // NOTE: the embeddingSimilarity signal was removed with
+                        // the embedding component of score_pair; clusters are
+                        // nominated by exact equality only and these lexical
+                        // scores are tie-breakers/review labels.
                         "tagOverlap": format!("{:.3}", c.signals.tag_overlap),
                         "tokenOverlap": format!("{:.3}", c.signals.token_overlap),
                         "combinedScore": format!("{:.3}", c.signals.combined_score)
@@ -324,7 +327,6 @@ fn plan_to_json(plan: &vestige_core::MergePlan, policy: &vestige_core::MergePoli
         "confidence": format!("{:.3}", plan.confidence),
         "classification": plan.classification.as_str(),
         "signals": {
-            "embeddingSimilarity": format!("{:.3}", plan.signals.embedding_similarity),
             "tagOverlap": format!("{:.3}", plan.signals.tag_overlap),
             "tokenOverlap": format!("{:.3}", plan.signals.token_overlap),
             "combinedScore": format!("{:.3}", plan.signals.combined_score)

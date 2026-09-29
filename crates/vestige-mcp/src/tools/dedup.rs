@@ -1,13 +1,14 @@
 //! Find Duplicates Tool
 //!
-//! Detects duplicate and near-duplicate memory clusters using
-//! cosine similarity on stored embeddings. Uses union-find for
-//! efficient clustering.
+//! Detects duplicate memory clusters by EXACT EQUALITY ONLY (owner decision
+//! 2026-09-28: no similarity anywhere in dedup nomination). Clusters form
+//! when memories share an identical content identity (the stored envelope
+//! `content_hash`, or byte-identical content when no hash was recorded) or
+//! the same declared source key (`source_system` + `source_id`). The former
+//! cosine-similarity clustering over stored embeddings was removed.
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use serde::Deserialize;
 use serde_json::Value;
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -15,21 +16,12 @@ use crate::cognitive::CognitiveEngine;
 use tokio::sync::Mutex;
 
 use vestige_core::Storage;
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
-use vestige_core::cosine_similarity;
 
 /// Input schema for find_duplicates tool
 pub fn schema() -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "similarity_threshold": {
-                "type": "number",
-                "description": "Minimum cosine similarity to consider as duplicate (0.0-1.0, default: 0.80)",
-                "default": 0.80,
-                "minimum": 0.5,
-                "maximum": 1.0
-            },
             "limit": {
                 "type": "integer",
                 "description": "Maximum number of duplicate clusters to return (default: 20)",
@@ -48,235 +40,190 @@ pub fn schema() -> Value {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 struct DedupArgs {
-    #[serde(alias = "similarity_threshold")]
-    similarity_threshold: Option<f64>,
     limit: Option<usize>,
     tags: Option<Vec<String>>,
 }
 
-/// Simple union-find for clustering
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
-struct UnionFind {
-    parent: Vec<usize>,
-    rank: Vec<usize>,
-}
-
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
-impl UnionFind {
-    fn new(n: usize) -> Self {
-        Self {
-            parent: (0..n).collect(),
-            rank: vec![0; n],
-        }
-    }
-
-    fn find(&mut self, x: usize) -> usize {
-        if self.parent[x] != x {
-            self.parent[x] = self.find(self.parent[x]);
-        }
-        self.parent[x]
-    }
-
-    fn union(&mut self, x: usize, y: usize) {
-        let rx = self.find(x);
-        let ry = self.find(y);
-        if rx == ry {
-            return;
-        }
-        if self.rank[rx] < self.rank[ry] {
-            self.parent[rx] = ry;
-        } else if self.rank[rx] > self.rank[ry] {
-            self.parent[ry] = rx;
-        } else {
-            self.parent[ry] = rx;
-            self.rank[rx] += 1;
-        }
-    }
-}
-
 pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-    {
-        let args: DedupArgs = match args {
-            Some(v) => {
-                serde_json::from_value(v).map_err(|e| format!("Invalid arguments: {}", e))?
-            }
-            None => DedupArgs {
-                similarity_threshold: None,
-                limit: None,
-                tags: None,
-            },
-        };
-        let threshold = args.similarity_threshold.unwrap_or(0.80) as f32;
-        let limit = args.limit.unwrap_or(20);
-        let tag_filter = args.tags.unwrap_or_default();
+    let args: DedupArgs = match args {
+        Some(v) => serde_json::from_value(v).map_err(|e| format!("Invalid arguments: {}", e))?,
+        None => DedupArgs {
+            limit: None,
+            tags: None,
+        },
+    };
+    let limit = args.limit.unwrap_or(20);
+    let tag_filter = args.tags.unwrap_or_default();
 
-        // Load all embeddings
-        let all_embeddings = storage
-            .get_all_embeddings()
-            .map_err(|e| format!("Failed to load embeddings: {}", e))?;
-
-        if all_embeddings.is_empty() {
-            return Ok(serde_json::json!({
-                "clusters": [],
-                "totalMemories": 0,
-                "totalWithEmbeddings": 0,
-                "message": "No embeddings found. Run consolidation first."
-            }));
+    // Load nodes for metadata (content, retention, tags, source envelope).
+    let mut all_nodes = Vec::new();
+    let mut offset = 0;
+    loop {
+        let batch = storage
+            .get_all_nodes(500, offset)
+            .map_err(|e| format!("Failed to load nodes: {}", e))?;
+        let batch_len = batch.len();
+        all_nodes.extend(batch);
+        if batch_len < 500 {
+            break;
         }
+        offset += 500;
+    }
 
-        // Load nodes for metadata (content preview, retention, tags)
-        let mut all_nodes = Vec::new();
-        let mut offset = 0;
-        loop {
-            let batch = storage
-                .get_all_nodes(500, offset)
-                .map_err(|e| format!("Failed to load nodes: {}", e))?;
-            let batch_len = batch.len();
-            all_nodes.extend(batch);
-            if batch_len < 500 {
-                break;
-            }
-            offset += 500;
+    // Filter by tags if specified
+    let filtered: Vec<&vestige_core::KnowledgeNode> = all_nodes
+        .iter()
+        .filter(|n| tag_filter.is_empty() || tag_filter.iter().any(|t| n.tags.contains(t)))
+        .collect();
+
+    let n = filtered.len();
+
+    // Union-find over the two exact-equality keys.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut root = x;
+        while parent[root] != root {
+            root = parent[root];
         }
-
-        // Build node lookup
-        let node_map: HashMap<String, &vestige_core::KnowledgeNode> =
-            all_nodes.iter().map(|n| (n.id.clone(), n)).collect();
-
-        // Filter by tags if specified
-        let filtered_embeddings: Vec<(usize, &String, &Vec<f32>)> = all_embeddings
-            .iter()
-            .enumerate()
-            .filter(|(_, (id, _))| {
-                if tag_filter.is_empty() {
-                    return true;
-                }
-                if let Some(node) = node_map.get(id) {
-                    tag_filter.iter().any(|t| node.tags.contains(t))
-                } else {
-                    false
-                }
-            })
-            .map(|(i, (id, vec))| (i, id, vec))
-            .collect();
-
-        let n = filtered_embeddings.len();
-
-        if n > 2000 {
-            return Ok(serde_json::json!({
-                "warning": format!("Too many memories to scan ({} with embeddings). Filter by tags to reduce scope.", n),
-                "totalMemories": all_nodes.len(),
-                "totalWithEmbeddings": n
-            }));
+        let mut cur = x;
+        while parent[cur] != root {
+            let next = parent[cur];
+            parent[cur] = root;
+            cur = next;
         }
-
-        // O(n^2) pairwise similarity + union-find clustering
-        let mut uf = UnionFind::new(n);
-        let mut similarities: Vec<(usize, usize, f32)> = Vec::new();
-
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let sim = cosine_similarity(filtered_embeddings[i].2, filtered_embeddings[j].2);
-                if sim >= threshold {
-                    uf.union(i, j);
-                    similarities.push((i, j, sim));
-                }
-            }
+        root
+    }
+    let union = |parent: &mut Vec<usize>, a: usize, b: usize| {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent[ra] = rb;
         }
+    };
 
-        // Group into clusters
-        let mut cluster_map: HashMap<usize, Vec<usize>> = HashMap::new();
-        for i in 0..n {
-            let root = uf.find(i);
-            cluster_map.entry(root).or_default().push(i);
+    // Key 1: identical content identity — the stored envelope content hash
+    // when present, else the exact content itself.
+    let mut by_content: HashMap<String, Vec<usize>> = HashMap::new();
+    // Key 2: the same declared source key (source_system + source_id).
+    let mut by_source: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, node) in filtered.iter().enumerate() {
+        let env = node.source_envelope.as_ref();
+        let content_key = env
+            .and_then(|e| e.content_hash.clone())
+            .unwrap_or_else(|| node.content.clone());
+        by_content.entry(content_key).or_default().push(i);
+        if let Some(env) = env
+            && let (Some(system), Some(id)) = (&env.source_system, &env.source_id)
+        {
+            // Same granularity as the store's UNIQUE source-key index:
+            // (system, project, id). Two projects' "issue 42" stay separate.
+            let project = env.source_project.as_deref().unwrap_or("");
+            by_source.entry(format!("{system}:{project}:{id}")).or_default().push(i);
         }
-
-        // Only keep clusters with >1 member, sorted by size descending
-        let mut clusters: Vec<Vec<usize>> =
-            cluster_map.into_values().filter(|c| c.len() > 1).collect();
-        clusters.sort_by_key(|b| std::cmp::Reverse(b.len()));
-        clusters.truncate(limit);
-
-        // Build similarity lookup for formatting
-        let mut sim_lookup: HashMap<(usize, usize), f32> = HashMap::new();
-        for &(i, j, sim) in &similarities {
-            sim_lookup.insert((i, j), sim);
-            sim_lookup.insert((j, i), sim);
+    }
+    for group in by_content.values().chain(by_source.values()) {
+        for pair in group.windows(2) {
+            union(&mut parent, pair[0], pair[1]);
         }
+    }
 
-        // Format output
-        let cluster_results: Vec<Value> = clusters
-            .iter()
-            .enumerate()
-            .map(|(ci, members)| {
-                let anchor = members[0];
-                let member_results: Vec<Value> = members
-                    .iter()
-                    .map(|&idx| {
-                        let id = &filtered_embeddings[idx].1;
-                        let node = node_map.get(id.as_str());
-                        let content_preview = node
-                            .map(|n| {
-                                let c = n.content.replace('\n', " ");
-                                if c.len() > 120 {
-                                    format!("{}...", &c[..c.floor_char_boundary(120)])
-                                } else {
-                                    c
-                                }
-                            })
-                            .unwrap_or_default();
+    // Group into clusters
+    let mut cluster_map: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        cluster_map.entry(root).or_default().push(i);
+    }
 
-                        let sim_to_anchor = if idx == anchor {
-                            1.0
+    // Only keep clusters with >1 member, sorted by size descending
+    let mut clusters: Vec<Vec<usize>> =
+        cluster_map.into_values().filter(|c| c.len() > 1).collect();
+    clusters.sort_by_key(|b| std::cmp::Reverse(b.len()));
+    clusters.truncate(limit);
+
+    // Format output
+    let cluster_results: Vec<Value> = clusters
+        .iter()
+        .enumerate()
+        .map(|(ci, members)| {
+            let anchor = members[0];
+            let anchor_env = filtered[anchor].source_envelope.as_ref();
+            let anchor_content_key = anchor_env
+                .and_then(|e| e.content_hash.clone())
+                .unwrap_or_else(|| filtered[anchor].content.clone());
+            let anchor_source_key = anchor_env.and_then(|e| {
+                Some(format!(
+                    "{}:{}:{}",
+                    e.source_system.as_deref()?,
+                    e.source_project.as_deref().unwrap_or(""),
+                    e.source_id.as_deref()?
+                ))
+            });
+            let member_results: Vec<Value> = members
+                .iter()
+                .map(|&idx| {
+                    let node = filtered[idx];
+                    let content_preview = {
+                        let c = node.content.replace('\n', " ");
+                        if c.len() > 120 {
+                            format!("{}...", &c[..c.floor_char_boundary(120)])
                         } else {
-                            sim_lookup
-                                .get(&(anchor, idx))
-                                .copied()
-                                .unwrap_or(0.0)
-                        };
+                            c
+                        }
+                    };
+                    let env = node.source_envelope.as_ref();
+                    let member_content_key = env
+                        .and_then(|e| e.content_hash.clone())
+                        .unwrap_or_else(|| node.content.clone());
+                    let member_source_key = env.and_then(|e| {
+                        Some(format!(
+                            "{}:{}:{}",
+                            e.source_system.as_deref()?,
+                            e.source_project.as_deref().unwrap_or(""),
+                            e.source_id.as_deref()?
+                        ))
+                    });
 
-                        serde_json::json!({
-                            "id": id,
-                            "contentPreview": content_preview,
-                            "retention": node.map(|n| n.retention_strength).unwrap_or(0.0),
-                            "createdAt": node.map(|n| n.created_at.to_rfc3339()).unwrap_or_default(),
-                            "tags": node.map(|n| &n.tags).unwrap_or(&vec![]),
-                            "similarityToAnchor": format!("{:.3}", sim_to_anchor)
-                        })
+                    // Relation to the cluster anchor: exact content identity,
+                    // exact source key, or reached transitively through a
+                    // chain of exact equalities.
+                    let relation = if idx == anchor {
+                        "anchor"
+                    } else if member_content_key == anchor_content_key {
+                        "content"
+                    } else if member_source_key.as_deref() == anchor_source_key.as_deref() {
+                        "source_key"
+                    } else {
+                        "transitive"
+                    };
+
+                    serde_json::json!({
+                        "id": node.id,
+                        "contentPreview": content_preview,
+                        "retention": node.retention_strength,
+                        "createdAt": node.created_at.to_rfc3339(),
+                        "tags": &node.tags,
+                        "matchRelation": relation
                     })
-                    .collect();
-
-                serde_json::json!({
-                    "clusterId": ci,
-                    "size": members.len(),
-                    "members": member_results,
-                    "suggestedAction": if members.len() > 3 { "review" } else { "merge" }
                 })
+                .collect();
+
+            serde_json::json!({
+                "clusterId": ci,
+                "size": members.len(),
+                "members": member_results,
+                "suggestedAction": if members.len() > 3 { "review" } else { "merge" }
             })
-            .collect();
+        })
+        .collect();
 
-        Ok(serde_json::json!({
-            "clusters": cluster_results,
-            "totalClusters": cluster_results.len(),
-            "totalMemories": all_nodes.len(),
-            "totalWithEmbeddings": n,
-            "threshold": threshold,
-            "pairsChecked": n * (n - 1) / 2
-        }))
-    }
-
-    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
-    {
-        let _ = storage;
-        let _ = args;
-        Ok(serde_json::json!({
-            "error": "Embeddings feature not enabled. Cannot compute similarities.",
-            "clusters": []
-        }))
-    }
+    Ok(serde_json::json!({
+        "clusters": cluster_results,
+        "totalClusters": cluster_results.len(),
+        "totalMemories": all_nodes.len(),
+        "totalScanned": n,
+        "note": "Exact-equality grouping only: identical content hash (or byte-identical content) and identical declared source keys. Similarity-based clustering was removed."
+    }))
 }
 
 // ============================================================================
@@ -286,11 +233,13 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
 //   action = scan (default) | plan_merge | plan_supersede | apply | undo
 //          | tag_rename | tag_merge | protect | policy
 //
-// `scan` combines cosine-similarity duplicate clusters (this module's
-// `execute`) with Fellegi-Sunter merge candidates (`merge::merge_candidates`),
-// returning both in separate fields. The mutate/preview/reverse actions delegate
-// to `super::merge::execute` verbatim, preserving plan_id → apply → undo,
-// confirm-gating, and bitemporal-never-delete byte-for-byte.
+// `scan` combines exact-equality duplicate clusters (this module's `execute`:
+// identical content hash or declared source key) with Fellegi-Sunter labelled
+// merge candidates (`merge::merge_candidates`, itself nominated by exact
+// equality only), returning both in separate fields. The mutate/preview/reverse
+// actions delegate to `super::merge::execute` verbatim, preserving
+// plan_id → apply → undo, confirm-gating, and bitemporal-never-delete
+// byte-for-byte.
 // ============================================================================
 
 /// Discriminated-union schema for the unified `dedup` tool.
@@ -303,11 +252,6 @@ pub fn unified_schema() -> Value {
                 "enum": ["scan", "plan_merge", "plan_supersede", "apply", "undo", "verdict", "tag_rename", "tag_merge", "protect", "policy"],
                 "default": "scan",
                 "description": "'scan' (default, read-only): duplicate clusters, merge candidates, pending reconsolidation plans. 'plan_merge' / 'plan_supersede': preview a reversible plan. 'apply': run a plan_id. 'undo': reverse an operation_id, or list the reflog. 'verdict': approve|reject|quarantine a reconsolidation plan. 'tag_rename' / 'tag_merge': preview-token gated. 'protect': pin a memory. 'policy': thresholds."
-            },
-            "similarity_threshold": {
-                "type": "number",
-                "description": "[scan] Minimum cosine similarity for clusters (0.5 to 1, default 0.80).",
-                "minimum": 0.5, "maximum": 1.0
             },
             "limit": {
                 "type": "integer",
@@ -369,9 +313,10 @@ pub async fn execute_unified(
 
     match action.as_str() {
         "scan" => {
-            // Cosine-similarity duplicate clusters (this module).
+            // Exact-equality duplicate clusters (this module).
             let clusters = execute(storage, args.clone()).await?;
-            // Fellegi-Sunter merge candidates (merge module, name-dispatched).
+            // Fellegi-Sunter labelled merge candidates, nominated by exact
+            // equality in storage (merge module, name-dispatched).
             let candidates =
                 super::merge::execute(storage, "merge_candidates", args.clone()).await?;
             // Pending reconsolidation verdicts — expired plans are swept by
@@ -656,7 +601,11 @@ mod tests {
     fn test_schema() {
         let schema = schema();
         assert_eq!(schema["type"], "object");
-        assert!(schema["properties"]["similarity_threshold"].is_object());
+        // The cosine similarity_threshold parameter is gone: nomination is
+        // exact equality only.
+        assert!(schema["properties"].get("similarity_threshold").is_none());
+        assert!(schema["properties"]["limit"].is_object());
+        assert!(schema["properties"]["tags"].is_object());
     }
 
     #[test]
@@ -895,17 +844,6 @@ mod tests {
         assert!(error.contains("at least two"));
     }
 
-    #[test]
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-    fn test_union_find() {
-        let mut uf = UnionFind::new(5);
-        uf.union(0, 1);
-        uf.union(2, 3);
-        uf.union(1, 3);
-        assert_eq!(uf.find(0), uf.find(3));
-        assert_ne!(uf.find(0), uf.find(4));
-    }
-
     #[tokio::test]
     async fn test_empty_storage() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -913,5 +851,141 @@ mod tests {
         let storage = Arc::new(storage);
         let result = execute(&storage, None).await;
         assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result["clusters"], serde_json::json!([]));
+        assert_eq!(result["totalClusters"], 0);
+    }
+
+    #[tokio::test]
+    async fn identical_content_clusters_by_exact_equality() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        storage
+            .ingest(vestige_core::IngestInput {
+                content: "Deploy the gateway before Friday".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .ingest(vestige_core::IngestInput {
+                content: "Deploy the gateway before Friday".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .ingest(vestige_core::IngestInput {
+                content: "An unrelated cooking note".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let result = execute(&storage, None).await.unwrap();
+        assert_eq!(result["totalClusters"], 1, "{result}");
+        let cluster = &result["clusters"][0];
+        assert_eq!(cluster["size"], 2);
+        let relations: Vec<&str> = cluster["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["matchRelation"].as_str().unwrap())
+            .collect();
+        assert!(relations.contains(&"anchor"));
+        assert!(relations.contains(&"content"));
+        assert_eq!(result["totalMemories"], 3);
+    }
+
+    #[tokio::test]
+    async fn identical_content_hash_clusters_across_different_text() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        // SourceEnvelope is #[non_exhaustive]: build via Default + field
+        // mutation instead of a struct expression. Two renderings of the same
+        // upstream record share its declared content hash. (Same-source-key
+        // duplicates are blocked by the store's UNIQUE index, so that legacy
+        // shape is covered by the vestige-core nomination tests instead.)
+        let mut envelope = vestige_core::SourceEnvelope::default();
+        envelope.content_hash = Some("sha256:abc".to_string());
+        storage
+            .ingest(vestige_core::IngestInput {
+                content: "Redmine 42 original description".to_string(),
+                source_envelope: Some(envelope.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .ingest(vestige_core::IngestInput {
+                content: "Redmine 42 edited description after upstream change".to_string(),
+                source_envelope: Some(envelope),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let result = execute(&storage, None).await.unwrap();
+        assert_eq!(result["totalClusters"], 1, "{result}");
+        let relations: Vec<&str> = result["clusters"][0]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["matchRelation"].as_str().unwrap())
+            .collect();
+        assert!(relations.contains(&"content"));
+    }
+
+    #[tokio::test]
+    async fn near_identical_content_is_not_clustered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        storage
+            .ingest(vestige_core::IngestInput {
+                content: "Use tokio runtime for async Rust services".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .ingest(vestige_core::IngestInput {
+                content: "Use the tokio runtime for async Rust services".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let result = execute(&storage, None).await.unwrap();
+        assert_eq!(
+            result["totalClusters"], 0,
+            "near-identical content must not cluster without an exact key: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_filter_restricts_clusters() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Arc::new(Storage::new(Some(dir.path().join("test.db"))).unwrap());
+        storage
+            .ingest(vestige_core::IngestInput {
+                content: "Duplicated release note".to_string(),
+                tags: vec!["rust".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .ingest(vestige_core::IngestInput {
+                content: "Duplicated release note".to_string(),
+                tags: vec!["python".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let unfiltered = execute(&storage, None).await.unwrap();
+        assert_eq!(unfiltered["totalClusters"], 1);
+
+        let filtered = execute(
+            &storage,
+            Some(serde_json::json!({ "tags": ["rust"] })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            filtered["totalClusters"], 0,
+            "filtering out one member dissolves the cluster: {filtered}"
+        );
     }
 }

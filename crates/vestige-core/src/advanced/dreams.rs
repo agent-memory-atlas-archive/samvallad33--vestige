@@ -30,7 +30,8 @@
 //! ## Novelty Detection
 //!
 //! The system measures how "new" an insight is based on:
-//! - Distance from existing memories in embedding space
+//! - Distance from existing memories in token-overlap space (tag + content
+//!   word similarity; the embedding branch was removed)
 //! - Uniqueness of the combination that produced it
 //! - Information gain over source memories
 //!
@@ -879,14 +880,13 @@ impl Default for ConsolidationReport {
 // HELPER FUNCTIONS
 // ============================================================================
 
-/// Calculate similarity between two memories
+/// Calculate similarity between two memories.
+///
+/// Token/content based only: tag Jaccard blended with content word overlap.
+/// The former embedding-cosine branch was removed (no similarity anywhere
+/// outside exact equality); the previous fallback formula is now the whole
+/// computation.
 fn calculate_memory_similarity(a: &DreamMemory, b: &DreamMemory) -> f64 {
-    // Use embeddings if available
-    if let (Some(emb_a), Some(emb_b)) = (&a.embedding, &b.embedding) {
-        return cosine_similarity(emb_a, emb_b);
-    }
-
-    // Fallback to tag + content similarity
     let tag_sim = tag_similarity(&a.tags, &b.tags);
     let content_sim = content_word_similarity(&a.content, &b.content);
 
@@ -1063,7 +1063,9 @@ pub struct DreamMemory {
     pub id: String,
     /// Memory content
     pub content: String,
-    /// Embedding vector
+    /// Unused. Similarity in dreams is tag/content-token based; the
+    /// embedding-cosine read of this field was removed. The field survives
+    /// only so out-of-module constructors keep compiling — set it to `None`.
     pub embedding: Option<Vec<f32>>,
     /// Tags
     pub tags: Vec<String>,
@@ -1371,12 +1373,8 @@ impl MemoryDreamer {
     }
 
     fn calculate_similarity(&self, a: &DreamMemory, b: &DreamMemory) -> f64 {
-        // Primary: embedding similarity
-        if let (Some(emb_a), Some(emb_b)) = (&a.embedding, &b.embedding) {
-            return cosine_similarity(emb_a, emb_b);
-        }
-
-        // Fallback: tag overlap + content similarity
+        // Tag overlap + content similarity. The embedding-cosine branch was
+        // removed; this former fallback is now the primary and only path.
         let tag_sim = self.tag_similarity(&a.tags, &b.tags);
         let content_sim = self.content_similarity(&a.content, &b.content);
 
@@ -1845,23 +1843,6 @@ impl Default for MemoryDreamer {
     }
 }
 
-/// Calculate cosine similarity between two vectors
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    if a.len() != b.len() {
-        return 0.0;
-    }
-
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let mag_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    if mag_a == 0.0 || mag_b == 0.0 {
-        return 0.0;
-    }
-
-    (dot / (mag_a * mag_b)) as f64
-}
-
 /// Truncate string to max length (UTF-8 safe)
 fn truncate(s: &str, max_len: usize) -> &str {
     if s.len() <= max_len {
@@ -1983,12 +1964,23 @@ mod tests {
 
     #[test]
     fn test_cosine_similarity() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![1.0, 0.0, 0.0];
-        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 0.001);
+        // Deleted along with the embedding-cosine branch: similarity in dreams
+        // is now exclusively tag + content-word overlap. The embedding field on
+        // DreamMemory is inert — verify a populated vector cannot change the
+        // score (it would have, as the primary branch, before the removal).
+        let mut a = make_memory("1", "rust async tokio runtime", vec!["rust"]);
+        let mut b = make_memory("2", "rust async tokio runtime", vec!["rust"]);
+        a.embedding = Some(vec![1.0, 0.0]);
+        b.embedding = Some(vec![0.0, 1.0]);
 
-        let c = vec![0.0, 1.0, 0.0];
-        assert!(cosine_similarity(&a, &c).abs() < 0.001);
+        let with_vectors = calculate_memory_similarity(&a, &b);
+
+        a.embedding = None;
+        b.embedding = None;
+        let without_vectors = calculate_memory_similarity(&a, &b);
+
+        assert!((with_vectors - without_vectors).abs() < 1e-9);
+        assert!((with_vectors - 1.0).abs() < 1e-9);
     }
 
     // ========== Activity Tracker Tests ==========

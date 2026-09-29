@@ -30,7 +30,6 @@
 //! let decision = gate.evaluate(
 //!     "Use async/await for better performance",
 //!     &existing_memories,
-//!     &embeddings,
 //! );
 //!
 //! match decision {
@@ -57,8 +56,16 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.75;
 
 /// Threshold for considering content as "nearly identical"
-/// Above this = definitely update, not create
-const NEAR_IDENTICAL_THRESHOLD: f32 = 0.92;
+/// Above this = definitely update, not create.
+///
+/// Calibrated for the token Dice coefficient (was 0.92 under embedding
+/// cosine): a benign paraphrase of a 6-token memory — same vocabulary plus a
+/// two-word suffix, or one filler swapped — measures 6/7 ≈ 0.857, and a
+/// one-marker correction measures 0.71-0.75. 0.85 keeps the paraphrase in
+/// the reinforce band and the correction out of it; the contradiction
+/// marker check runs before this threshold either way, so a contradicting
+/// near-paraphrase can never reinforce.
+const NEAR_IDENTICAL_THRESHOLD: f32 = 0.85;
 
 /// Threshold for "correction" detection
 /// When new content contradicts existing with high similarity
@@ -230,8 +237,6 @@ pub struct CandidateMemory {
     pub id: String,
     /// Memory content
     pub content: String,
-    /// Embedding vector
-    pub embedding: Vec<f32>,
     /// Current retrieval strength
     pub retrieval_strength: f64,
     /// Current retention strength
@@ -251,7 +256,7 @@ pub struct CandidateMemory {
 pub struct SimilarityResult {
     /// Memory ID
     pub memory_id: String,
-    /// Cosine similarity score (0.0 - 1.0)
+    /// Content token similarity score (0.0 - 1.0)
     pub similarity: f32,
     /// Prediction error (1.0 - similarity)
     pub prediction_error: f32,
@@ -358,10 +363,11 @@ impl PredictionErrorGate {
     /// Evaluate new content against candidates
     ///
     /// Returns a decision on whether to create, update, or supersede.
+    /// Similarity is computed from content tokens only (Dice coefficient over
+    /// the two token sets); the embedding-similarity component was removed.
     pub fn evaluate(
         &mut self,
         new_content: &str,
-        new_embedding: &[f32],
         candidates: &[CandidateMemory],
     ) -> GateDecision {
         self.stats.total_evaluations += 1;
@@ -380,7 +386,7 @@ impl PredictionErrorGate {
         let mut similarities: Vec<SimilarityResult> = candidates
             .iter()
             .map(|c| {
-                let similarity = cosine_similarity(new_embedding, &c.embedding);
+                let similarity = content_similarity(new_content, &c.content);
                 let appears_contradictory = self.detect_contradiction(new_content, &c.content);
 
                 SimilarityResult {
@@ -410,12 +416,14 @@ impl PredictionErrorGate {
         if let Some(best) = top_candidates.first() {
             // A CORRECTION is lexically near-identical to what it corrects:
             // "Never use fp16lib on Windows" vs "Always use fp16lib on Windows"
-            // measures 0.928 cosine, just over the 0.92 near_identical_threshold.
-            // Reinforcing on similarity alone therefore discards the correction
-            // AND strengthens the very memory the user just said is wrong --
-            // the single worst outcome this gate can produce. `appears_contradictory`
-            // is already computed for this candidate above, so honour it here and
-            // let the contradiction branch below decide.
+            // measures 0.75 on the token Dice coefficient — below the 0.85
+            // near-identical threshold and inside the correction band.
+            // Reinforcing on similarity alone therefore discards the
+            // correction AND strengthens the very memory the user just said
+            // is wrong -- the single worst outcome this gate can produce.
+            // `appears_contradictory` is already computed for this candidate
+            // above, so honour it here and let the contradiction branch below
+            // decide.
             if best.similarity >= self.config.near_identical_threshold
                 && !best.appears_contradictory
             {
@@ -558,7 +566,6 @@ impl PredictionErrorGate {
     pub fn evaluate_with_intent(
         &mut self,
         new_content: &str,
-        new_embedding: &[f32],
         candidates: &[CandidateMemory],
         intent: EvaluationIntent,
     ) -> GateDecision {
@@ -578,7 +585,7 @@ impl PredictionErrorGate {
             EvaluationIntent::ForceUpdate { target_id } => {
                 // Find the target candidate
                 if let Some(c) = candidates.iter().find(|c| c.id == target_id) {
-                    let similarity = cosine_similarity(new_embedding, &c.embedding);
+                    let similarity = content_similarity(new_content, &c.content);
                     self.stats.total_evaluations += 1;
                     self.stats.updates += 1;
                     GateDecision::Update {
@@ -589,7 +596,7 @@ impl PredictionErrorGate {
                     }
                 } else {
                     // Target not found, evaluate normally
-                    self.evaluate(new_content, new_embedding, candidates)
+                    self.evaluate(new_content, candidates)
                 }
             }
             EvaluationIntent::Supersede {
@@ -597,7 +604,7 @@ impl PredictionErrorGate {
                 reason,
             } => {
                 if let Some(c) = candidates.iter().find(|c| c.id == old_memory_id) {
-                    let similarity = cosine_similarity(new_embedding, &c.embedding);
+                    let similarity = content_similarity(new_content, &c.content);
                     self.stats.total_evaluations += 1;
                     self.stats.supersedes += 1;
                     GateDecision::Supersede {
@@ -607,10 +614,10 @@ impl PredictionErrorGate {
                         prediction_error: 1.0 - similarity,
                     }
                 } else {
-                    self.evaluate(new_content, new_embedding, candidates)
+                    self.evaluate(new_content, candidates)
                 }
             }
-            EvaluationIntent::Auto => self.evaluate(new_content, new_embedding, candidates),
+            EvaluationIntent::Auto => self.evaluate(new_content, candidates),
         }
     }
 
@@ -624,8 +631,8 @@ impl PredictionErrorGate {
     /// read as agreement and *reinforced the claim being corrected* — measured
     /// at 0.965 similarity against a 0.92 near-identical threshold, with the
     /// same pair in the reverse order correctly kept. Subject identity is
-    /// already established here by the caller's embedding-similarity gate, so
-    /// no lexical-overlap floor is applied on top of it.
+    /// already established here by the candidate's token similarity, so no
+    /// lexical-overlap floor is applied on top of it.
     fn detect_contradiction(&self, new_content: &str, old_content: &str) -> bool {
         crate::advanced::contradiction::appears_contradictory(
             new_content,
@@ -717,21 +724,52 @@ impl GateStats {
 // HELPER FUNCTIONS
 // ============================================================================
 
-/// Calculate cosine similarity between two vectors
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
+/// Content token similarity (0.0–1.0), the replacement for the removed
+/// embedding cosine component of prediction error.
+///
+/// Dice coefficient over the two token sets: `2·|A∩B| / (|A|+|B|)`, where a
+/// token is a lowercased alphanumeric run longer than two characters. Dice is
+/// the F1 score of the set match, and each gate band keeps its intended
+/// meaning under it:
+///
+/// - identical contents score exactly 1.0, and a benign near-paraphrase
+///   (one filler swapped, or a short suffix added) scores ~0.857, so both
+///   reinforce (`near_identical_threshold` is calibrated at 0.85 for this
+///   metric); a contradicting near-paraphrase is caught by the marker check
+///   before the threshold, never reinforced;
+/// - a one-marker correction of its original ("Actually, the correct approach
+///   is to retire the storage policy node." vs "The approach is to retain the
+///   storage policy node.") scores 10/14 ≈ 0.71 — inside the correction band
+///   (`correction_threshold` = 0.70) but far below near-identical, so it is
+///   kept as a separate claim instead of reinforcing the sentence it fixes;
+/// - a short additive note whose tokens are a strict subset of a longer
+///   memory scores low (3-of-7 shared tokens -> 0.6), because Dice, unlike
+///   the overlap coefficient, charges for the unmatched remainder — so an
+///   additive footnote neither merges into nor reinforces its parent.
+///
+/// Two empty token sets (content made only of stopword-length tokens) score
+/// 0.0: no shared signal means no update path.
+pub fn content_similarity(new_content: &str, existing_content: &str) -> f32 {
+    let a = token_set(new_content);
+    let b = token_set(existing_content);
+    if a.is_empty() || b.is_empty() {
         return 0.0;
     }
-
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    if norm_a == 0.0 || norm_b == 0.0 {
+    let intersection = a.intersection(&b).count() as f32;
+    let total = (a.len() + b.len()) as f32;
+    if total == 0.0 {
         return 0.0;
     }
+    (2.0 * intersection / total).clamp(0.0, 1.0)
+}
 
-    (dot / (norm_a * norm_b)).clamp(0.0, 1.0)
+/// Lowercased alphanumeric tokens longer than two characters.
+fn token_set(content: &str) -> std::collections::HashSet<String> {
+    content
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() > 2)
+        .map(|t| t.to_lowercase())
+        .collect()
 }
 
 // ============================================================================
@@ -742,33 +780,19 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
 
-    fn make_embedding(seed: f32) -> Vec<f32> {
-        // Create embeddings with controlled similarity based on seed
-        // Seeds close to each other = similar vectors
-        // Seeds far apart = different vectors
-        (0..384)
-            .map(|i| {
-                let base = (i as f32 / 384.0) * std::f32::consts::PI * 2.0;
-                (base * seed).sin()
-            })
-            .collect()
-    }
+    /// A fixed 7-token base content, a benign one-token-swap note, and a
+    /// genuinely divergent note. Dice over the token sets:
+    /// - ONE_TOKEN_OFF: 2*6/(7+7) = 6/7 ~= 0.857 — the reinforce band
+    ///   (>= 0.85; no contradiction marker, so reinforcement is safe).
+    /// - UPDATE_BAND: 2*6/(7+8) = 0.8 — the ordinary update band [0.75, 0.85).
+    const BASE_CONTENT: &str = "alpha beta gamma delta epsilon zeta eta";
+    const ONE_TOKEN_OFF: &str = "alpha beta gamma delta epsilon zeta kappa";
+    const UPDATE_BAND: &str = "alpha beta gamma delta epsilon zeta kappa theta";
 
-    fn make_orthogonal_embedding() -> Vec<f32> {
-        // Create an embedding that's orthogonal to seed=1.0
-        (0..384)
-            .map(|i| {
-                let base = (i as f32 / 384.0) * std::f32::consts::PI * 2.0;
-                (base + std::f32::consts::PI / 2.0).sin() // 90 degree phase shift
-            })
-            .collect()
-    }
-
-    fn make_candidate(id: &str, seed: f32) -> CandidateMemory {
+    fn make_candidate(id: &str, content: &str) -> CandidateMemory {
         CandidateMemory {
             id: id.to_string(),
-            content: format!("Content for {}", id),
-            embedding: make_embedding(seed),
+            content: content.to_string(),
             retrieval_strength: 0.8,
             retention_strength: 0.7,
             tags: vec![],
@@ -779,24 +803,36 @@ mod tests {
     }
 
     #[test]
-    fn test_cosine_similarity() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![1.0, 0.0, 0.0];
-        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 0.001);
+    fn test_content_similarity_bands() {
+        // Identical contents are an exact token-set match.
+        assert!((content_similarity(BASE_CONTENT, BASE_CONTENT) - 1.0).abs() < 1e-6);
 
-        let c = vec![0.0, 1.0, 0.0];
-        assert!((cosine_similarity(&a, &c) - 0.0).abs() < 0.001);
+        // A one-marker correction of its original stays in the correction
+        // band: >= 0.70, well below near-identical.
+        let original = "The approach is to retain the storage policy node.";
+        let correction = "Actually, the correct approach is to retire the storage policy node.";
+        let sim = content_similarity(correction, original);
+        assert!(sim >= 0.70, "correction must reach the correction band, got {sim}");
+        assert!(sim < 0.85, "correction must not look near-identical, got {sim}");
 
-        let d = vec![-1.0, 0.0, 0.0];
-        assert!(cosine_similarity(&a, &d) <= 0.0);
+        // A strict token-subset note scores low: Dice charges for the
+        // unmatched remainder. 3-of-7 shared tokens -> 0.6, below both the
+        // correction band (0.70) and the update band (0.75).
+        let subset = content_similarity("alpha beta gamma", BASE_CONTENT);
+        assert!(subset < 0.70, "subset note must stay below the correction band, got {subset}");
+
+        // Disjoint contents share nothing.
+        assert_eq!(content_similarity("completely different topic", BASE_CONTENT), 0.0);
+
+        // Stopword-only content has no signal.
+        assert_eq!(content_similarity("to be or not to be", "so it goes"), 0.0);
     }
 
     #[test]
     fn test_empty_candidates() {
         let mut gate = PredictionErrorGate::new();
-        let embedding = make_embedding(1.0);
 
-        let decision = gate.evaluate("New content", &embedding, &[]);
+        let decision = gate.evaluate("New content", &[]);
 
         assert!(matches!(
             decision,
@@ -810,13 +846,11 @@ mod tests {
     #[test]
     fn test_high_similarity_update() {
         let mut gate = PredictionErrorGate::new();
-        let embedding = make_embedding(1.0);
 
-        // Create candidate with identical embedding
-        let mut candidate = make_candidate("mem-1", 1.0);
-        candidate.embedding = embedding.clone();
+        // Identical content is the only thing that still reinforces.
+        let candidate = make_candidate("mem-1", "Same content");
 
-        let decision = gate.evaluate("Same content", &embedding, &[candidate]);
+        let decision = gate.evaluate("Same content", &[candidate]);
 
         assert!(decision.is_update());
         if let GateDecision::Update { update_type, .. } = decision {
@@ -827,14 +861,19 @@ mod tests {
     #[test]
     fn test_demoted_memory_creates_by_default() {
         let mut gate = PredictionErrorGate::new();
-        let embedding = vec![1.0, 0.0];
 
-        // Similar enough to be a candidate, but not an exact duplicate.
-        let mut candidate = make_candidate("mem-1", 1.0);
-        candidate.embedding = vec![0.82, (1.0_f32 - 0.82_f32.powi(2)).sqrt()];
+        // Token similarity ~0.78 (in the update band), but not identical, and
+        // the stored memory was demoted.
+        let mut candidate = make_candidate(
+            "mem-1",
+            "Use the redis-backed queue for fast result delivery",
+        );
         candidate.was_demoted = true;
 
-        let decision = gate.evaluate("Better solution", &embedding, &[candidate]);
+        let decision = gate.evaluate(
+            "Use the redis-backed queue for better solution delivery",
+            &[candidate],
+        );
 
         assert!(matches!(
             decision,
@@ -849,18 +888,17 @@ mod tests {
     #[test]
     fn test_contradiction_creates_by_default() {
         let mut gate = PredictionErrorGate::new();
-        let new_embedding = vec![1.0, 0.0];
-        let mut candidate = make_candidate("policy-node", 1.0);
-        candidate.embedding = vec![0.82, (1.0_f32 - 0.82_f32.powi(2)).sqrt()];
-        candidate.content = "The approach is to retain the storage policy node.".to_string();
+        let candidate = make_candidate(
+            "policy-node",
+            "The approach is to retain the storage policy node.",
+        );
 
-        // A same-subject revision: enough token overlap for the correction
-        // marker to count, and a marker on exactly one side. (A marker with no
-        // shared subject no longer fires — that shape was measured to be a
-        // false positive on real content.)
+        // A same-subject revision: enough token overlap (Dice ~= 0.71) for the
+        // correction marker to count, and a marker on exactly one side. (A
+        // marker with no shared subject no longer fires — that shape was
+        // measured to be a false positive on real content.)
         let decision = gate.evaluate(
             "Actually, the correct approach is to retire the storage policy node.",
-            &new_embedding,
             &[candidate],
         );
 
@@ -878,12 +916,10 @@ mod tests {
     #[test]
     fn test_explicit_supersede_intent_is_preserved() {
         let mut gate = PredictionErrorGate::new();
-        let embedding = make_embedding(1.0);
-        let candidate = make_candidate("mem-1", 1.05);
+        let candidate = make_candidate("mem-1", BASE_CONTENT);
 
         let decision = gate.evaluate_with_intent(
             "Reviewed correction",
-            &embedding,
             &[candidate],
             EvaluationIntent::Supersede {
                 old_memory_id: "mem-1".to_string(),
@@ -904,13 +940,10 @@ mod tests {
     #[test]
     fn test_different_content_create() {
         let mut gate = PredictionErrorGate::new();
-        let new_embedding = make_embedding(1.0);
 
-        // Use orthogonal embedding for truly different content
-        let mut candidate = make_candidate("mem-1", 1.0);
-        candidate.embedding = make_orthogonal_embedding();
+        let candidate = make_candidate("mem-1", BASE_CONTENT);
 
-        let decision = gate.evaluate("Completely different topic", &new_embedding, &[candidate]);
+        let decision = gate.evaluate("Completely different topic", &[candidate]);
 
         assert!(matches!(decision, GateDecision::Create { .. }));
     }
@@ -956,12 +989,10 @@ mod tests {
     #[test]
     fn test_force_create_intent() {
         let mut gate = PredictionErrorGate::new();
-        let embedding = make_embedding(1.0);
-        let candidate = make_candidate("mem-1", 1.0);
+        let candidate = make_candidate("mem-1", BASE_CONTENT);
 
         let decision = gate.evaluate_with_intent(
             "New content",
-            &embedding,
             &[candidate],
             EvaluationIntent::ForceCreate,
         );
@@ -978,12 +1009,10 @@ mod tests {
     #[test]
     fn test_force_update_intent() {
         let mut gate = PredictionErrorGate::new();
-        let embedding = make_embedding(1.0);
-        let candidate = make_candidate("mem-1", 5.0);
+        let candidate = make_candidate("mem-1", BASE_CONTENT);
 
         let decision = gate.evaluate_with_intent(
             "Updated content",
-            &embedding,
             &[candidate],
             EvaluationIntent::ForceUpdate {
                 target_id: "mem-1".to_string(),
@@ -996,41 +1025,18 @@ mod tests {
     #[test]
     fn test_stats() {
         let mut gate = PredictionErrorGate::new();
-        let embedding = make_embedding(1.0);
 
         // Create (empty candidates)
-        gate.evaluate("Content", &embedding, &[]);
+        gate.evaluate("Content", &[]);
 
         // Update (identical)
-        let mut candidate = make_candidate("mem-1", 1.0);
-        candidate.embedding = embedding.clone();
-        gate.evaluate("Content", &embedding, &[candidate.clone()]);
+        let candidate = make_candidate("mem-1", "Content");
+        gate.evaluate("Content", &[candidate]);
 
         let stats = gate.stats();
         assert_eq!(stats.total_evaluations, 2);
         assert_eq!(stats.creates, 1);
         assert_eq!(stats.updates, 1);
-    }
-
-    /// Unit vector `base` rotated toward an orthogonal direction so that
-    /// cos(result, base) == `target_cos` exactly (up to float error).
-    fn vector_with_cosine(base: &[f32], target_cos: f32) -> Vec<f32> {
-        // Build an orthogonal unit vector by swapping two coordinates with a sign flip
-        // on a copy that has been made orthogonal via Gram-Schmidt against `base`.
-        let n = base.len();
-        let norm_b: f32 = base.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let b: Vec<f32> = base.iter().map(|x| x / norm_b).collect();
-        let mut o: Vec<f32> = (0..n).map(|i| if i % 2 == 0 { 1.0 } else { -0.5 }).collect();
-        let dot: f32 = o.iter().zip(&b).map(|(x, y)| x * y).sum();
-        for (oi, bi) in o.iter_mut().zip(&b) {
-            *oi -= dot * bi;
-        }
-        let norm_o: f32 = o.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let sin = (1.0 - target_cos * target_cos).sqrt();
-        b.iter()
-            .zip(&o)
-            .map(|(bi, oi)| target_cos * bi + sin * (oi / norm_o))
-            .collect()
     }
 
     /// Yang, Duncan and Barense 2026: PE updates weak memories, never strong
@@ -1039,14 +1045,16 @@ mod tests {
     #[test]
     fn strong_memory_is_not_merged_into_by_similar_content() {
         let mut gate = PredictionErrorGate::new();
-        let mut strong = make_candidate("strong", 1.0);
+        let mut strong = make_candidate("strong", BASE_CONTENT);
         strong.was_promoted = true;
         strong.retrieval_strength = 0.95;
-        let new_embedding = vector_with_cosine(&strong.embedding, 0.85);
-        let sim = cosine_similarity(&new_embedding, &strong.embedding);
-        assert!((0.75..0.92).contains(&sim), "test vector must sit in the update band, got {sim}");
+        let sim = content_similarity(UPDATE_BAND, BASE_CONTENT);
+        assert!(
+            (0.75..0.85).contains(&sim),
+            "test content must sit in the update band, got {sim}"
+        );
 
-        let decision = gate.evaluate("a similar but distinct note", &new_embedding, &[strong.clone()]);
+        let decision = gate.evaluate(UPDATE_BAND, &[strong.clone()]);
         match decision {
             GateDecision::Create {
                 reason: CreateReason::ProtectedStrongMemory,
@@ -1062,11 +1070,10 @@ mod tests {
     #[test]
     fn weak_memory_still_merges_with_similar_content() {
         let mut gate = PredictionErrorGate::new();
-        let weak = make_candidate("weak", 1.0);
+        let weak = make_candidate("weak", BASE_CONTENT);
         assert!(!weak.was_promoted);
-        let new_embedding = vector_with_cosine(&weak.embedding, 0.85);
 
-        let decision = gate.evaluate("a similar but distinct note", &new_embedding, &[weak]);
+        let decision = gate.evaluate(UPDATE_BAND, &[weak]);
         match decision {
             GateDecision::Update {
                 update_type: UpdateType::Merge,
@@ -1079,14 +1086,14 @@ mod tests {
 
     /// Near-identical content still REINFORCES a strong memory: reinforce
     /// strengthens without touching content, so it is not an intrusion.
+    /// Under token similarity "near-identical" means an exact token-set match.
     #[test]
     fn strong_memory_is_still_reinforced_by_near_identical_content() {
         let mut gate = PredictionErrorGate::new();
-        let mut strong = make_candidate("strong", 1.0);
+        let mut strong = make_candidate("strong", BASE_CONTENT);
         strong.was_promoted = true;
-        let new_embedding = vector_with_cosine(&strong.embedding, 0.96);
 
-        let decision = gate.evaluate("Content for strong", &new_embedding, &[strong]);
+        let decision = gate.evaluate(BASE_CONTENT, &[strong]);
         assert!(
             matches!(decision, GateDecision::Update { update_type: UpdateType::Reinforce, .. }),
             "got {decision:?}"
@@ -1102,13 +1109,27 @@ mod tests {
             ..Default::default()
         };
         let mut gate = PredictionErrorGate::with_config(config);
-        let mut strong = make_candidate("strong", 1.0);
+        let mut strong = make_candidate("strong", BASE_CONTENT);
         strong.was_promoted = true;
-        let new_embedding = vector_with_cosine(&strong.embedding, 0.85);
 
-        let decision = gate.evaluate("a similar but distinct note", &new_embedding, &[strong]);
+        let decision = gate.evaluate(UPDATE_BAND, &[strong]);
         assert!(
             matches!(decision, GateDecision::Update { update_type: UpdateType::Merge, .. }),
+            "got {decision:?}"
+        );
+    }
+
+    /// A benign paraphrase (one token swapped, no contradiction marker)
+    /// REINFORCES: reinforcement never touches content, and the marker check
+    /// in front of the threshold already routed real corrections away.
+    #[test]
+    fn benign_one_token_off_note_reinforces() {
+        let mut gate = PredictionErrorGate::new();
+        let candidate = make_candidate("mem-1", BASE_CONTENT);
+
+        let decision = gate.evaluate(ONE_TOKEN_OFF, &[candidate]);
+        assert!(
+            matches!(decision, GateDecision::Update { update_type: UpdateType::Reinforce, .. }),
             "got {decision:?}"
         );
     }

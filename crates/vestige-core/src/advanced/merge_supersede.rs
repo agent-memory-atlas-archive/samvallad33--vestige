@@ -32,8 +32,19 @@
 //! over-merges and destroys the audit trail. Fellegi-Sunter record linkage uses
 //! **two** thresholds to carve the score space into three zones, so the
 //! borderline "possible match" cases are surfaced for review instead of being
-//! force-decided. We reuse the embedding cosine similarity already in the store
-//! plus cheap lexical signals (tag overlap, token Jaccard) as the match weight.
+//! force-decided.
+//!
+//! ## Nomination is exact equality; scores are tie-breakers only
+//!
+//! The embedding cosine component was removed (owner decision, 2026-09-28: no
+//! similarity anywhere in dedup/merge nomination). A pair is NOMINATED as a
+//! merge candidate only by exact equality — identical content hash, the same
+//! declared source key, or an exactly equal extracted-entity set (see
+//! `SqliteMemoryStore::merge_candidates`). The tag/token weighted score below
+//! never nominates anything: it only orders nominated clusters and labels them
+//! for review (`Match` / `Possible` / `NonMatch`), so a human decides in every
+//! case where the equality evidence is weak (e.g. a shared source key over
+//! diverged contents).
 
 use serde::{Deserialize, Serialize};
 
@@ -48,12 +59,13 @@ pub const DEFAULT_MATCH_THRESHOLD: f32 = 0.86;
 /// Below this → "non-match" (never offered).
 pub const DEFAULT_POSSIBLE_THRESHOLD: f32 = 0.72;
 
-/// Weight of embedding cosine similarity in the combined score.
-const W_EMBEDDING: f32 = 0.70;
+// Post-embedding weights: the two remaining lexical signals renormalized over
+// the full weight mass. These scores are TIE-BREAKERS and review labels for
+// clusters already nominated by exact equality — they never nominate a pair.
 /// Weight of tag overlap (Jaccard) in the combined score.
-const W_TAGS: f32 = 0.15;
+const W_TAGS: f32 = 0.40;
 /// Weight of content token overlap (Jaccard) in the combined score.
-const W_TOKENS: f32 = 0.15;
+const W_TOKENS: f32 = 0.60;
 
 // ============================================================================
 // CLASSIFICATION
@@ -139,8 +151,6 @@ impl MergePolicy {
 /// user can see *why* two memories were judged duplicates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchSignals {
-    /// Cosine similarity of the two embeddings (0–1).
-    pub embedding_similarity: f32,
     /// Jaccard overlap of the two tag sets (0–1).
     pub tag_overlap: f32,
     /// Jaccard overlap of content tokens (0–1).
@@ -150,8 +160,11 @@ pub struct MatchSignals {
 }
 
 /// Compute the combined match score and its signal breakdown for a pair.
+///
+/// The score is built from tag and token overlap ONLY (the embedding component
+/// is gone). It is a tie-breaker/review label for pairs nominated by exact
+/// equality upstream — it must not be used to nominate candidates.
 pub fn score_pair(
-    embedding_similarity: f32,
     a_tags: &[String],
     b_tags: &[String],
     a_content: &str,
@@ -159,12 +172,8 @@ pub fn score_pair(
 ) -> MatchSignals {
     let tag_overlap = jaccard(&tag_set(a_tags), &tag_set(b_tags));
     let token_overlap = jaccard(&token_set(a_content), &token_set(b_content));
-    let combined_score = (W_EMBEDDING * embedding_similarity.clamp(0.0, 1.0)
-        + W_TAGS * tag_overlap
-        + W_TOKENS * token_overlap)
-        .clamp(0.0, 1.0);
+    let combined_score = (W_TAGS * tag_overlap + W_TOKENS * token_overlap).clamp(0.0, 1.0);
     MatchSignals {
-        embedding_similarity: embedding_similarity.clamp(0.0, 1.0),
         tag_overlap,
         token_overlap,
         combined_score,
@@ -424,13 +433,11 @@ mod tests {
     #[test]
     fn score_pair_combines_signals() {
         let s = score_pair(
-            1.0,
             &["rust".into(), "async".into()],
             &["rust".into(), "async".into()],
             "use tokio for async rust",
             "use tokio for async rust",
         );
-        assert!((s.embedding_similarity - 1.0).abs() < 1e-6);
         assert!((s.tag_overlap - 1.0).abs() < 1e-6);
         assert!(s.token_overlap > 0.9);
         assert!(s.combined_score > 0.95);
@@ -439,7 +446,6 @@ mod tests {
     #[test]
     fn score_pair_disjoint_is_low() {
         let s = score_pair(
-            0.1,
             &["a".into()],
             &["b".into()],
             "completely different topic alpha",
@@ -450,6 +456,23 @@ mod tests {
             MergePolicy::default().classify(s.combined_score),
             MatchClass::NonMatch
         );
+    }
+
+    /// Exact content equality with no tags still scores high: identical
+    /// contents trivially share their full token set.
+    #[test]
+    fn score_pair_identical_content_untagged() {
+        let s = score_pair(&[], &[], "deploy the gateway before Friday", "deploy the gateway before Friday");
+        assert!((s.token_overlap - 1.0).abs() < 1e-6);
+        assert!((s.combined_score - W_TOKENS).abs() < 1e-6);
+        // Tag overlap contributes nothing when neither side is tagged.
+        assert_eq!(s.tag_overlap, 0.0);
+    }
+
+    /// The two remaining weights are a complete partition of the score mass.
+    #[test]
+    fn weights_renormalize_to_one() {
+        assert!((W_TAGS + W_TOKENS - 1.0).abs() < 1e-6);
     }
 
     #[test]
