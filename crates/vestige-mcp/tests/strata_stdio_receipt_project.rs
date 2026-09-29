@@ -373,6 +373,13 @@ fn receipt_replay_and_project_complete_over_real_stdio() {
     drop(server);
 
     assert_no_sqlite(data.path());
+    // The running server leaves the log unsealed. The checkpoint frame is the
+    // existing KIND_STORE_CHECKPOINT seal, the same one the handler test uses
+    // before strata-verify. It is not a new op kind.
+    {
+        let mut store = strata_store::StrataStore::open(data.path()).unwrap();
+        store.seal_checkpoint().unwrap();
+    }
     let report = strata_verify::verify_path(data.path());
     assert!(report.ok, "strata-verify failed: {}", report.json);
 

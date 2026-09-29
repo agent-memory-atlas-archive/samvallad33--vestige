@@ -10,19 +10,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use strata_store::VALID_FOREVER_MS;
 use vestige_core::storage::{
     CompositionEventRecord, ConnectionRecord as VestigeEdge, ConsolidationHistoryRecord,
-    CoverageSnapshot, HandleKind, HandleResolution, HealthStatus, HygieneNodeSummary,
-    HygieneSnapshot, MemoryEdge, MemoryRecord, MemoryStoreError, MemoryStoreResult,
-    MemoryStoreSend, ModelSignature, NeverComposedCandidate, ReceiptAttestationStatus,
-    SchedulingState, SearchQuery, StateTransitionRecord, Storage, StorageError, StoreStats,
-    WalCheckpointMode, WalCheckpointStatus, HANDLE_REQUIRED_DETAIL, MAX_CANDIDATES,
+    CoverageSnapshot, HANDLE_REQUIRED_DETAIL, HandleKind, HandleResolution, HealthStatus,
+    HygieneNodeSummary, HygieneSnapshot, MAX_CANDIDATES, MemoryEdge, MemoryRecord,
+    MemoryStoreError, MemoryStoreResult, MemoryStoreSend, ModelSignature, NeverComposedCandidate,
+    ReceiptAttestationStatus, SchedulingState, SearchQuery, StateTransitionRecord, Storage,
+    StorageError, StoreStats, WalCheckpointMode, WalCheckpointStatus,
 };
 use vestige_core::{
-    scan_secrets, ConsolidationResult, DecayRisk, IngestInput, KnowledgeNode, MemoryStats, Receipt,
-    SecretPolicy,
+    ConsolidationResult, DecayRisk, IngestInput, KnowledgeNode, MemoryStats, Receipt, SecretPolicy,
+    scan_secrets,
 };
 
 const Q32_SCALE: f64 = 4294967296.0;
@@ -72,7 +72,7 @@ fn node_field_mismatches(
 
 /// The durable directory this process opened is a Strata log, not a SQLite file.
 pub fn is_strata_backend(storage: &Storage) -> bool {
-    storage.db_path().file_name().and_then(|name| name.to_str()) == Some("log")
+    storage.is_strata_log()
 }
 
 /// Open (or create) a Strata log under `dir`. Creates no SQLite file.
@@ -487,6 +487,10 @@ impl MemoryStoreSend for StrataMemory {
         &self.log_dir
     }
 
+    fn is_strata_log(&self) -> bool {
+        true
+    }
+
     fn last_backup_timestamp(&self) -> Option<DateTime<Utc>> {
         None
     }
@@ -710,7 +714,10 @@ impl MemoryStoreSend for StrataMemory {
 
     fn save_connection(&self, connection: &VestigeEdge) -> Result<(), StorageError> {
         let edge = to_strata_edge(connection);
-        self.lock().save_connection(&edge).map_err(map_store).map(|_| ())
+        self.lock()
+            .save_connection(&edge)
+            .map_err(map_store)
+            .map(|_| ())
     }
 
     fn admit_projection(

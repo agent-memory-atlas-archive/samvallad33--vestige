@@ -15,6 +15,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 // Phase 4 wall: types referenced by the product-wide sync seam below.
+use crate::SchemaIntrospection;
 use crate::actor::{ActorPolicySnapshot, RoleResolution};
 use crate::advanced::reconsolidation::LabileCandidate;
 use crate::advanced::{MergeCandidate, MergeOperation, MergePlan, MergePolicy};
@@ -25,7 +26,6 @@ use crate::memory::{ConsolidationResult, IngestInput, KnowledgeNode, MemoryStats
 use crate::neuroscience::SynapticTag;
 use crate::security::SecretPolicy;
 use crate::trace::{MemoryPr, MemoryPrAction, MemoryPrStatus, MemoryTraceEvent, Receipt};
-use crate::SchemaIntrospection;
 // Dual-mode rule (strata/fix-00a): every storage type this trait names is
 // defined in the UNGATED `super::types` module, so the trait compiles with
 // AND without `legacy-sqlite`. The pure receipt-attestation trio is
@@ -1468,6 +1468,12 @@ pub trait LocalMemoryStore: Sync + 'static {
         ))
     }
 
+    /// True only for the Strata log backend. The default is false so a probe
+    /// never calls [`Self::db_path`], whose default panics.
+    fn is_strata_log(&self) -> bool {
+        false
+    }
+
     /// Evidence snapshot of one memory inside intention evaluation.
     fn intention_memory_snapshot(
         &self,
@@ -2857,7 +2863,7 @@ pub trait MemoryStore: Send + Sync + 'static {
     ) -> StoreResult<Vec<CompositionEventRecord>>;
     fn get_connections_for_memory(&self, memory_id: &str) -> StoreResult<Vec<ConnectionRecord>>;
     fn get_consolidation_history(&self, limit: i32)
-        -> StoreResult<Vec<ConsolidationHistoryRecord>>;
+    -> StoreResult<Vec<ConsolidationHistoryRecord>>;
     fn get_context_ablation_replay(
         &self,
         replay_id: &str,
@@ -2897,7 +2903,7 @@ pub trait MemoryStore: Send + Sync + 'static {
         receipt_id: &str,
     ) -> StoreResult<Option<DsseEnvelope>>;
     fn get_recent_composition_events(&self, limit: i32)
-        -> StoreResult<Vec<CompositionEventRecord>>;
+    -> StoreResult<Vec<CompositionEventRecord>>;
     fn get_recent_composition_events_page(
         &self,
         limit: i32,
@@ -2922,7 +2928,7 @@ pub trait MemoryStore: Send + Sync + 'static {
     fn get_walk_receipt(&self, receipt_id: &str) -> StoreResult<Option<StoredWalkReceipt>>;
     fn git_commit_nodes(&self, limit: usize) -> StoreResult<Vec<GitCommitNode>>;
     fn grant_actor_role(&self, actor_did: &str, role: &str, note: Option<&str>)
-        -> StoreResult<u64>;
+    -> StoreResult<u64>;
     fn hybrid_search(
         &self,
         query: &str,
@@ -2963,6 +2969,7 @@ pub trait MemoryStore: Send + Sync + 'static {
         input: IngestInput,
         policy: SecretPolicy,
     ) -> StoreResult<KnowledgeNode>;
+    fn is_strata_log(&self) -> bool;
     fn intention_memory_snapshot(
         &self,
         scope: &str,
@@ -3807,6 +3814,9 @@ where
         policy: SecretPolicy,
     ) -> StoreResult<KnowledgeNode> {
         <T as MemoryStoreSend>::ingest_with_secret_policy(self, input, policy)
+    }
+    fn is_strata_log(&self) -> bool {
+        <T as MemoryStoreSend>::is_strata_log(self)
     }
     fn intention_memory_snapshot(
         &self,
