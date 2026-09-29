@@ -5,8 +5,8 @@
 //! 1. reads every segment in place — a flipped sealed byte, a truncation,
 //!    or a wrong `strata.key` fails the chain check, and nothing is written;
 //! 2. decodes the MIGRATION_RECEIPT (frame kind 46) and verifies its
-//!    blake3 checksum and its ed25519 signature under the in-log
-//!    verifying key;
+//!    blake3 checksum and its ed25519 signature. The embedded verifying
+//!    key is trusted only when it matches `receipt-signing.key`;
 //! 3. REPLAYS the frames against the receipt's per-table counts — a
 //!    dropped frame (possible only with the signing key, i.e. a lying
 //!    receipt) still fails here because the frame counts no longer match.
@@ -19,6 +19,7 @@ use strata_migrate::records::{
     KIND_EDGE, KIND_MIGRATION_RECEIPT, KIND_NODE, KIND_TOMBSTONE, decode_receipt,
 };
 
+use crate::pin;
 use crate::readonly;
 
 /// Outcome of a full migrated-log verification.
@@ -86,10 +87,17 @@ pub fn verify_migrated_log(dir: &Path) -> Result<MigrationVerifyReport, String> 
     if !checksum_ok {
         failures.push("receipt checksum does not bind its body".into());
     }
-    let signature_ok = receipt.verify_signature();
-    if !signature_ok {
+    // Trust the on-disk pin, not the key carried in the receipt.
+    let pinned = pin::require_receipt_pin(dir, &receipt.verifying_key);
+    let signature_ok = match &pinned {
+        Ok(_) => receipt.verify_signature(),
+        Err(_) => false,
+    };
+    if let Err(err) = &pinned {
+        failures.push(err.clone());
+    } else if !signature_ok {
         failures.push(
-            "receipt ed25519 signature does not verify under the in-log verifying key".into(),
+            "receipt ed25519 signature does not verify under the pinned receipt-signing.key".into(),
         );
     }
 

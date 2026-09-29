@@ -13,9 +13,9 @@ publish = false
 autobins = false
 
 [features]
-# The shipped binaries boot a Strata log and do not link rusqlite.
-# `legacy-sqlite` is the SQLite harness. `migrate-to-strata` is the only
-# path that links strata-migrate (and its bundled rusqlite).
+# The shipped binaries boot a Strata log. `legacy-sqlite` stays available for
+# the SQLite unit tests and the v3-engine harness. `migrate-to-strata` is the
+# only path that links rusqlite (the importer's read-only reader).
 default = ["connectors", "cloud-sync", "codebase-git"]
 # LEGACY SQLITE QUARANTINE (build/t5-legacy-isolation), mirroring
 # vestige-core. Gates every Storage/sqlite-touching module (server, tools,
@@ -23,17 +23,10 @@ default = ["connectors", "cloud-sync", "codebase-git"]
 # actor_surface), this crate's own rusqlite use (backup WAL checkpoint),
 # and forwards to vestige-core's `legacy-sqlite` + `bundled-sqlite`.
 # Off by default. Unit tests and the v3-engine harness opt in.
-# sqlite-source stays off the default binaries; the harness and the
-# migrate feature are what link the reader.
-legacy-sqlite = [
-    "vestige-core/legacy-sqlite",
-    "vestige-core/bundled-sqlite",
-    "dep:rusqlite",
-    "strata-migrate/sqlite-source",
-]
-# Upgrade path only (`vestige migrate-to-strata`). Not in the default
-# feature set: it is the dependency that links bundled rusqlite.
-migrate-to-strata = ["dep:strata-migrate", "dep:strata-verify", "strata-migrate/sqlite-source"]
+legacy-sqlite = ["vestige-core/legacy-sqlite", "vestige-core/bundled-sqlite", "dep:rusqlite"]
+# Upgrade path only (`vestige migrate-to-strata`). Enables the importer's
+# read-only v3 reader. Not in the default feature set.
+migrate-to-strata = ["dep:strata-migrate", "strata-migrate/sqlite-reader"]
 # Raw engine test harness for THIS crate's own test builds (feature-gated
 # restart/creation tests). Never in default; the shipped binary keeps the
 # guard + creation block armed.
@@ -93,14 +86,13 @@ path = "src/bin/cli.rs"
 # always-off stubs (w1b).
 vestige-core = { version = "3.0.0", path = "../vestige-core", default-features = false }
 
-# One-shot SQLite -> STRATA migration. Optional: the default binaries must
-# not link this crate (it depends on bundled rusqlite). Enable with
-# `--features migrate-to-strata`. The standalone `strata-verify` crate is
-# tested from its own manifest; depending on it here pulled rusqlite in.
-strata-migrate = { path = "../strata-migrate", optional = true }
-# Read-only verifier. Same feature as migration: it depends on strata-migrate
-# and therefore bundled rusqlite. Not in the default binaries.
-strata-verify = { path = "../strata-verify", optional = true }
+# One-shot SQLite -> STRATA migration. Optional, and without its default
+# features, so the v3 reader (`sqlite-reader` / rusqlite) stays off until
+# `migrate-to-strata`. Log and receipt types are always available through
+# strata-verify below.
+strata-migrate = { path = "../strata-migrate", optional = true, default-features = false }
+# Log and receipt verification. Does not enable `sqlite-reader`.
+strata-verify = { path = "../strata-verify" }
 
 # Strata log the shipped MCP server boots. Workspace-excluded; path dep only.
 strata-store = { path = "../strata-store" }

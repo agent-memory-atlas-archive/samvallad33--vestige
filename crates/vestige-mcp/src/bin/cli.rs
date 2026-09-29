@@ -200,9 +200,17 @@ enum Commands {
     ///
     /// Accepts a migrated log (no `kernel.log`), a live store (`log/` plus
     /// `store.meta`), or the kernel/gate layout.
+    ///
+    /// The key fingerprint is the lowercase blake3 hex of the 32-byte
+    /// ed25519 verifying key. A migration receipt is trusted only when that
+    /// key matches `receipt-signing.key` beside the log. With no receipt,
+    /// the fingerprint is `strata.key` and the report says so.
     StrataVerify {
         /// Directory to verify
         dir: PathBuf,
+        /// Require this key fingerprint (blake3 hex of the ed25519 verifying key)
+        #[arg(long)]
+        expect_key: Option<String>,
     },
 
     /// Export memories in JSON or JSONL format
@@ -546,7 +554,7 @@ fn main() -> anyhow::Result<()> {
             dry_run,
             accept_wal_snapshot,
         } => run_migrate_to_strata(from, to, dry_run, accept_wal_snapshot),
-        Commands::StrataVerify { dir } => run_strata_verify(dir),
+        Commands::StrataVerify { dir, expect_key } => run_strata_verify(dir, expect_key),
         Commands::Export {
             output,
             format,
@@ -2421,29 +2429,34 @@ fn get_default_db_path() -> anyhow::Result<PathBuf> {
 }
 
 /// Verify a STRATA directory. Same report as the `strata-verify` binary.
-/// Creates nothing in `dir`.
-fn run_strata_verify(dir: PathBuf) -> anyhow::Result<()> {
-    #[cfg(not(feature = "migrate-to-strata"))]
-    {
-        let _ = dir;
-        anyhow::bail!(
-            "strata-verify is not linked into this binary; rebuild with --features migrate-to-strata"
-        );
+/// Creates nothing in `dir`. Log and receipt checks only. The v3 SQLite
+/// comparison is `sqlite-reader`, which this path does not enable.
+fn run_strata_verify(dir: PathBuf, expect_key: Option<String>) -> anyhow::Result<()> {
+    let report = strata_verify::verify_path(&dir);
+    println!("{}", report.json);
+    if !report.key_fingerprint.is_empty() {
+        println!("key fingerprint: {}", report.key_fingerprint);
     }
-    #[cfg(feature = "migrate-to-strata")]
-    {
-        let report = strata_verify::verify_path(&dir);
-        println!("{}", report.json);
-        if report.ok {
-            println!("OK");
-            return Ok(());
+    let mut failed = !report.ok;
+    if let Some(expected) = expect_key.as_deref() {
+        let actual = report.key_fingerprint.to_ascii_lowercase();
+        let expected = expected.trim().to_ascii_lowercase();
+        if actual != expected {
+            eprintln!(
+                "signing key fingerprint {actual} does not match --expect-key {expected}"
+            );
+            failed = true;
         }
-        println!("FAILED");
-        for failure in &report.failures {
-            eprintln!("  {failure}");
-        }
-        std::process::exit(1);
     }
+    if !failed {
+        println!("OK");
+        return Ok(());
+    }
+    println!("FAILED");
+    for failure in &report.failures {
+        eprintln!("  {failure}");
+    }
+    std::process::exit(1);
 }
 
 /// Open storage using the CLI-selected data directory, if one was provided.

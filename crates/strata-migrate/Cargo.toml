@@ -13,11 +13,13 @@ publish = false
 [workspace]
 
 [features]
-# SQLite source reader. Default for this crate's own test/bin builds.
-# vestige-mcp and strata-verify depend with default-features = false so the
-# 4.0 binaries do not link rusqlite unless they opt into legacy-sqlite.
-default = ["sqlite-source"]
-sqlite-source = ["dep:rusqlite"]
+# On for this crate's own tests and `vestige migrate-to-strata`. The default
+# `vestige` binary depends on strata-migrate without it.
+default = ["sqlite-reader"]
+# Importer's read-only v3 reader (`source::open_readonly`). This is the only
+# gate for checking a log against a source SQLite store. Not a store-open
+# or write path.
+sqlite-reader = ["dep:rusqlite"]
 
 [dependencies]
 borsh = { version = "1", features = ["derive"] }
@@ -34,8 +36,9 @@ tempfile = "3"
 base64 = "0.22"
 # Fixture generator bin error type.
 anyhow = "1"
-# Read-only source reader (mode=ro&immutable=1 URI). Same version/features
-# as vestige-core uses, so cargo unifies to a single bundled SQLite build.
+# Read-only source reader (mode=ro&immutable=1 URI). Optional: log and
+# receipt checks compile without it. Same version/features as vestige-core
+# so a migrate build unifies to one bundled SQLite.
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 
 strata = { path = "../strata" }
@@ -54,3 +57,8 @@ vestige-core = { path = "../vestige-core", default-features = false }
 # Fixture tooling builds synthetic v3 stores through the real migration
 # path; test builds only — never unified into the shipped binary.
 vestige-core = { path = "../vestige-core", features = ["bundled-sqlite", "v3-engine"] }
+
+[[bin]]
+name = "make-v3-fixture"
+path = "src/bin/make-v3-fixture.rs"
+required-features = ["sqlite-reader"]

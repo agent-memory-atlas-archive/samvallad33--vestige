@@ -34,6 +34,7 @@
 pub mod layout;
 mod live;
 pub mod migration;
+mod pin;
 mod readonly;
 
 use std::fmt;
@@ -675,6 +676,9 @@ pub struct PathReport {
     pub json: String,
     /// Human-readable failures. Empty when `ok` is true.
     pub failures: Vec<String>,
+    /// blake3 hex of the ed25519 verifying key this check trusted.
+    /// Empty when no key was trusted.
+    pub key_fingerprint: String,
 }
 
 /// Verify `dir` without writing.
@@ -697,11 +701,23 @@ pub fn verify_path(dir: &Path) -> PathReport {
     if live::is_live_store(dir) {
         let report = live::verify_live_store(dir);
         let failures = report.failures.clone();
-        return path_from(report.ok, &report, failures);
+        let key = segment_key(&dir.join("log"));
+        return path_from(report.ok, &report, failures, key);
+    }
+    // Fresh strata-store: `log/*.seg` exists before the first checkpoint
+    // writes `store.meta`. Check that log; do not fall through to kernel.log.
+    let nested_log = dir.join("log");
+    if readonly::dir_has_segments(&nested_log) {
+        return verify_segment_dir(&nested_log);
     }
     let report = verify_store(dir);
     let failures = report.failures.iter().map(|f| f.to_string()).collect();
-    path_from(report.ok(), &report, failures)
+    let key = pin::KeyUse {
+        fingerprint: String::new(),
+        pin: "none",
+        note: "kernel/gate layout has no strata receipt key".into(),
+    };
+    path_from(report.ok(), &report, failures, key)
 }
 
 fn verify_segment_dir(dir: &Path) -> PathReport {
@@ -718,7 +734,8 @@ fn verify_segment_dir(dir: &Path) -> PathReport {
             Ok(report) => {
                 let failures = report.failures.clone();
                 let ok = report.ok;
-                path_from(ok, &report, failures)
+                let key = receipt_key(dir, &scan);
+                path_from(ok, &report, failures, key)
             }
             Err(err) => path_failure(err),
         };
@@ -729,22 +746,93 @@ fn verify_segment_dir(dir: &Path) -> PathReport {
         segments: scan.segments,
         failures: Vec::new(),
     };
-    path_from(true, &report, Vec::new())
+    path_from(true, &report, Vec::new(), pin::segment_only(&scan.segment_key))
+}
+
+fn segment_key(log_dir: &Path) -> pin::KeyUse {
+    match readonly::scan_log(log_dir) {
+        Ok(scan) => pin::segment_only(&scan.segment_key),
+        Err(err) => pin::KeyUse {
+            fingerprint: String::new(),
+            pin: "none",
+            note: err,
+        },
+    }
+}
+
+/// Pin decision for a log that carries a receipt. A mismatch still reports
+/// the pin file's fingerprint. A missing pin file reports `strata.key`.
+fn receipt_key(dir: &Path, scan: &readonly::Scan) -> pin::KeyUse {
+    let embedded = embedded_receipt_key(&scan.frames);
+    let Some(embedded) = embedded else {
+        return pin::segment_only(&scan.segment_key);
+    };
+    match pin::require_receipt_pin(dir, &embedded) {
+        Ok(key) => key,
+        Err(err) => {
+            let pinned = pin::pinned_fingerprint(dir);
+            pin::KeyUse {
+                fingerprint: pinned
+                    .clone()
+                    .unwrap_or_else(|| pin::fingerprint(&scan.segment_key)),
+                pin: if pinned.is_some() {
+                    "receipt-signing.key"
+                } else {
+                    "none"
+                },
+                note: err,
+            }
+        }
+    }
+}
+
+fn embedded_receipt_key(frames: &[readonly::ScannedFrame]) -> Option<[u8; 32]> {
+    use strata_migrate::records::{KIND_MIGRATION_RECEIPT, decode_receipt};
+    let frame = frames.iter().find(|frame| frame.kind == KIND_MIGRATION_RECEIPT)?;
+    decode_receipt(&frame.payload).ok().map(|receipt| receipt.verifying_key)
 }
 
 fn path_failure(err: String) -> PathReport {
-    let body = serde_json::json!({ "ok": false, "failures": [err.clone()] });
+    let body = serde_json::json!({
+        "ok": false,
+        "failures": [err.clone()],
+        "key_fingerprint": "",
+        "key_pin": "none",
+        "key_pin_note": err,
+    });
     PathReport {
         ok: false,
         json: serde_json::to_string_pretty(&body).expect("failure report serializes"),
         failures: vec![err],
+        key_fingerprint: String::new(),
     }
 }
 
-fn path_from(ok: bool, body: &impl serde::Serialize, failures: Vec<String>) -> PathReport {
+fn path_from(
+    ok: bool,
+    body: &impl serde::Serialize,
+    failures: Vec<String>,
+    key: pin::KeyUse,
+) -> PathReport {
+    let mut value = serde_json::to_value(body).expect("verify report serializes");
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "key_fingerprint".to_string(),
+            serde_json::Value::String(key.fingerprint.clone()),
+        );
+        obj.insert(
+            "key_pin".to_string(),
+            serde_json::Value::String(key.pin.to_string()),
+        );
+        obj.insert(
+            "key_pin_note".to_string(),
+            serde_json::Value::String(key.note),
+        );
+    }
     PathReport {
         ok,
-        json: serde_json::to_string_pretty(body).expect("verify report serializes"),
+        json: serde_json::to_string_pretty(&value).expect("verify report serializes"),
         failures,
+        key_fingerprint: key.fingerprint,
     }
 }
