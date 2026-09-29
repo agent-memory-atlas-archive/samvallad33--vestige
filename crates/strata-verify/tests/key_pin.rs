@@ -147,7 +147,12 @@ fn vestige_if_set(log_dir: &Path, expect: Option<&str>, want_ok: bool) {
     );
 }
 
-fn run_verify(bin: &str, log_dir: &Path, expect: Option<&str>, subcommand: bool) -> std::process::Output {
+fn run_verify(
+    bin: &str,
+    log_dir: &Path,
+    expect: Option<&str>,
+    subcommand: bool,
+) -> std::process::Output {
     let mut cmd = Command::new(bin);
     if subcommand {
         cmd.arg("strata-verify");
@@ -184,11 +189,7 @@ fn resigned_embedded_key_fails_the_folder_pin() {
     let log_dir = tmp.path().join("strata");
     let original = [9u8; 32];
     build_log(&log_dir, original);
-    let original_fp = fingerprint(
-        &SigningKey::from_bytes(&original)
-            .verifying_key()
-            .to_bytes(),
-    );
+    let original_fp = fingerprint(&SigningKey::from_bytes(&original).verifying_key().to_bytes());
     let fresh = SigningKey::from_bytes(&[4u8; 32]);
     resign_receipt(&log_dir, &fresh);
 
@@ -309,7 +310,11 @@ fn live_stdio_store_pins_strata_key() {
         true,
     );
     let err = String::from_utf8_lossy(&expect_old.stderr);
-    assert!(!expect_old.status.success(), "{}", String::from_utf8_lossy(&expect_old.stdout));
+    assert!(
+        !expect_old.status.success(),
+        "{}",
+        String::from_utf8_lossy(&expect_old.stdout)
+    );
     assert!(
         err.contains("does not match --expect-key"),
         "{err}\n{}",
@@ -391,7 +396,12 @@ impl StdioServer {
             .unwrap()
             .write_all(line.as_bytes())
             .and_then(|()| self.stdin.as_mut().unwrap().flush())
-            .unwrap_or_else(|err| panic!("stdio write: {err}; stderr {:?}", self.stderr.lock().unwrap()));
+            .unwrap_or_else(|err| {
+                panic!(
+                    "stdio write: {err}; stderr {:?}",
+                    self.stderr.lock().unwrap()
+                )
+            });
     }
 
     fn call(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -417,7 +427,11 @@ impl StdioServer {
     fn stop(mut self) {
         self.stdin.take();
         let status = self.child.wait().expect("wait vestige-mcp");
-        assert!(status.success(), "stdio exit {status:?}; stderr {:?}", self.stderr.lock().unwrap());
+        assert!(
+            status.success(),
+            "stdio exit {status:?}; stderr {:?}",
+            self.stderr.lock().unwrap()
+        );
     }
 }
 
@@ -502,7 +516,11 @@ fn sign_unsealed_segment(log_dir: &Path, key: &SigningKey) {
     let mut rest = &bytes[HEADER_WIRE_SIZE..];
     let mut leaves = Vec::new();
     while !rest.is_empty() {
-        assert_ne!(rest.len(), TRAILER_WIRE_SIZE, "live segment is already sealed");
+        assert_ne!(
+            rest.len(),
+            TRAILER_WIRE_SIZE,
+            "live segment is already sealed"
+        );
         let (frame, used) = parse_frame(rest).unwrap();
         rest = &rest[used..];
         leaves.push(frame.payload_blake3);

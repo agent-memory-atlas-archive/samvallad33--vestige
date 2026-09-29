@@ -76,7 +76,7 @@ use std::time::Instant;
 #[cfg(feature = "sqlite-reader")]
 use strata::StrataLog;
 #[cfg(feature = "sqlite-reader")]
-use strata_kernel::checkpoint::{Checkpoint, checkpoint_hash};
+use strata_kernel::checkpoint::{checkpoint_hash, Checkpoint};
 #[cfg(any(feature = "sqlite-reader", test))]
 use strata_kernel::event::ReviewEvent;
 #[cfg(any(feature = "sqlite-reader", test))]

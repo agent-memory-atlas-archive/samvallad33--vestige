@@ -352,9 +352,9 @@ fn missing_required_arguments_error_per_tool() {
     // `project` call names that pending admission. The refusals above are
     // missing required subjects.
     let defaults = server.call_tool("project", json!({}));
-    let text = defaults["error"].as_str().unwrap_or_else(|| {
-        panic!("project preview must name the pending admission: {defaults}")
-    });
+    let text = defaults["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("project preview must name the pending admission: {defaults}"));
     assert!(
         text.contains("pending_strata") && text.contains("projection_candidates"),
         "project preview must name the pending admission: {text}"

@@ -2446,9 +2446,7 @@ fn run_strata_verify(dir: PathBuf, expect_key: Option<String>) -> anyhow::Result
         let actual = report.key_fingerprint.to_ascii_lowercase();
         let expected = expected.trim().to_ascii_lowercase();
         if actual != expected {
-            eprintln!(
-                "signing key fingerprint {actual} does not match --expect-key {expected}"
-            );
+            eprintln!("signing key fingerprint {actual} does not match --expect-key {expected}");
             failed = true;
         }
     }

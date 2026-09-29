@@ -4636,7 +4636,12 @@ fn purge_fails_closed_when_a_referencing_row_cannot_be_read() {
 /// Ingest a node and seed it with a controllable embedding under the active
 /// model so similarity is deterministic in tests.
 #[cfg(vestige_embeddings_removed)]
-fn seed_node(storage: &SqliteMemoryStore, content: &str, tags: &[&str], vector: Vec<f32>) -> String {
+fn seed_node(
+    storage: &SqliteMemoryStore,
+    content: &str,
+    tags: &[&str],
+    vector: Vec<f32>,
+) -> String {
     let node = storage
         .ingest(IngestInput {
             content: content.to_string(),

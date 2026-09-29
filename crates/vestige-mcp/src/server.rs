@@ -4431,7 +4431,11 @@ mod tests {
         // w3d: +2 with `selftest` + `forgotten_lesson`; v3.2: `causal_walk`
         // replaced `backfill` on the advertised surface (backfill stays
         // dispatchable as a hidden alias).
-        assert_eq!(tools.len(), 11, "4.0 tools/list is the expected_tools_4.0.txt set");
+        assert_eq!(
+            tools.len(),
+            11,
+            "4.0 tools/list is the expected_tools_4.0.txt set"
+        );
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
@@ -4489,10 +4493,7 @@ mod tests {
         assert!(tool_names.contains(&"memory"));
         assert!(tool_names.contains(&"codebase"));
         for gone in EXCLUDED_4_0 {
-            assert!(
-                !tool_names.contains(gone),
-                "{gone} returns in 4.0.x"
-            );
+            assert!(!tool_names.contains(gone), "{gone} returns in 4.0.x");
         }
         assert!(
             !tool_names.contains(&"backfill"),
@@ -4634,7 +4635,6 @@ mod tests {
                 "{old} should be folded into 'recall' in v2.2"
             );
         }
-
     }
 
     /// v2.2: the 8 tools folded into `dedup` must still dispatch (hidden
@@ -5478,10 +5478,7 @@ mod tools_4_0 {
     async fn tools_list_matches_expected_tools_4_0() {
         let dir = tempfile::tempdir().unwrap();
         let storage = crate::strata_memory::open(dir.path()).unwrap();
-        let server = McpServer::new(
-            storage,
-            Arc::new(Mutex::new(CognitiveEngine::new())),
-        );
+        let server = McpServer::new(storage, Arc::new(Mutex::new(CognitiveEngine::new())));
         server
             .handle_request(request(
                 "initialize",

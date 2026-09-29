@@ -746,7 +746,12 @@ fn verify_segment_dir(dir: &Path) -> PathReport {
         segments: scan.segments,
         failures: Vec::new(),
     };
-    path_from(true, &report, Vec::new(), pin::segment_only(&scan.segment_key))
+    path_from(
+        true,
+        &report,
+        Vec::new(),
+        pin::segment_only(&scan.segment_key),
+    )
 }
 
 fn segment_key(log_dir: &Path) -> pin::KeyUse {
@@ -788,8 +793,12 @@ fn receipt_key(dir: &Path, scan: &readonly::Scan) -> pin::KeyUse {
 
 fn embedded_receipt_key(frames: &[readonly::ScannedFrame]) -> Option<[u8; 32]> {
     use strata_migrate::records::{KIND_MIGRATION_RECEIPT, decode_receipt};
-    let frame = frames.iter().find(|frame| frame.kind == KIND_MIGRATION_RECEIPT)?;
-    decode_receipt(&frame.payload).ok().map(|receipt| receipt.verifying_key)
+    let frame = frames
+        .iter()
+        .find(|frame| frame.kind == KIND_MIGRATION_RECEIPT)?;
+    decode_receipt(&frame.payload)
+        .ok()
+        .map(|receipt| receipt.verifying_key)
 }
 
 fn path_failure(err: String) -> PathReport {

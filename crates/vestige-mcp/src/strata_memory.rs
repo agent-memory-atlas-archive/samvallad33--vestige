@@ -118,10 +118,7 @@ fn is_memory_id(id: &str) -> bool {
 /// are refused before a frame is appended, the same gate v3 applied on write.
 fn normalize_scope(scope: &str) -> Result<&str, StorageError> {
     let normalized = scope.trim();
-    if normalized.is_empty()
-        || normalized.len() > 200
-        || normalized.chars().any(char::is_control)
-    {
+    if normalized.is_empty() || normalized.len() > 200 || normalized.chars().any(char::is_control) {
         return Err(StorageError::InvalidScope(
             "expected a non-empty identifier of at most 200 visible characters".into(),
         ));
@@ -166,7 +163,8 @@ fn nonempty(value: Option<&str>) -> Option<&str> {
 /// `None` when the input has neither.
 fn store_provenance(input: &IngestInput) -> (Option<strata_store::SourceKey>, Option<i64>) {
     let envelope = input.source_envelope.as_ref();
-    let updated = envelope.and_then(|env| env.source_updated_at.map(|time| time.timestamp_millis()));
+    let updated =
+        envelope.and_then(|env| env.source_updated_at.map(|time| time.timestamp_millis()));
     if let Some(env) = envelope
         && let (Some(system), Some(id)) = (
             nonempty(env.source_system.as_deref()),

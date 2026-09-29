@@ -33,10 +33,7 @@ pub(crate) fn segment_only(segment_key: &[u8; 32]) -> KeyUse {
 }
 
 /// Receipt present. Trust the embedded key only when the pin file matches.
-pub(crate) fn require_receipt_pin(
-    log_dir: &Path,
-    embedded: &[u8; 32],
-) -> Result<KeyUse, String> {
+pub(crate) fn require_receipt_pin(log_dir: &Path, embedded: &[u8; 32]) -> Result<KeyUse, String> {
     let Some(path) = find_receipt_pin(log_dir) else {
         return Err(
             "no receipt-signing.key pinned beside the log; refusing to trust the verifying key embedded in the receipt"

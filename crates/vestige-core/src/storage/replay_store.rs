@@ -1793,9 +1793,7 @@ fn scrub_dependent_replay_receipts(tx: &Transaction<'_>, capsule_id: &str) -> Re
 #[cfg(all(test, feature = "v3-engine"))]
 mod tests {
     use super::*;
-    use crate::storage::{
-        RetrievalReplayItemDraft, private_evidence_digest, replay_policy_digest,
-    };
+    use crate::storage::{RetrievalReplayItemDraft, private_evidence_digest, replay_policy_digest};
     // Only the rollback fixture drives a transaction by hand; production
     // writers go through SqliteMemoryStore::begin_write_transaction.
     use rusqlite::TransactionBehavior;

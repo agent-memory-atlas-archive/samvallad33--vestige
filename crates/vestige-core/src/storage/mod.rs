@@ -24,6 +24,10 @@ mod blast;
 mod cloud_crypto;
 #[cfg(all(feature = "cloud-sync", feature = "legacy-sqlite"))]
 mod cloud_sync;
+/// Feature-independent type definitions shared by every backend and the
+/// `LocalMemoryStore` trait surface. Available with AND without
+/// `legacy-sqlite` — dual-mode compilation (strata/fix-00a).
+mod contracts;
 #[cfg(feature = "legacy-sqlite")]
 mod edges;
 #[cfg(feature = "legacy-sqlite")]
@@ -44,17 +48,13 @@ mod replay_store;
 mod resolver;
 #[cfg(feature = "legacy-sqlite")]
 mod session_queries;
+mod signing_seed;
 #[cfg(feature = "legacy-sqlite")]
 mod sqlite;
 #[cfg(feature = "legacy-sqlite")]
 mod synaptic_store;
 #[cfg(feature = "legacy-sqlite")]
 mod trace_store;
-/// Feature-independent type definitions shared by every backend and the
-/// `LocalMemoryStore` trait surface. Available with AND without
-/// `legacy-sqlite` — dual-mode compilation (strata/fix-00a).
-mod contracts;
-mod signing_seed;
 pub mod types;
 pub mod unlearning;
 #[cfg(feature = "legacy-sqlite")]
@@ -69,23 +69,25 @@ mod walk_receipts;
 // Every type the backend-agnostic `LocalMemoryStore` trait names is defined
 // in `types` and re-exported here UNGATED so the trait (and its callers)
 // compile with or without `legacy-sqlite`.
-pub use types::*;
 pub use contracts::{
     BLAST_LINK_TYPES, BLAST_MAX_DEPTH, BLAST_SCAN_NODE_CAP, PORTABLE_ARCHIVE_FORMAT,
-    REPLAY_ALGORITHM_VERSION, REPLAY_CLAIM_BOUNDARY, REPLAY_SCHEMA_VERSION, REPLAY_SELECTION_BOUNDARY,
-    SYNAPTIC_CAPTURE_ALGORITHM_V1, SYNAPTIC_CAPTURE_ALGORITHM_V2, SYNAPTIC_CAPTURE_CLAIM_BOUNDARY,
-    SYNAPTIC_CAPTURE_SCHEMA_V1, SYNAPTIC_CAPTURE_SCHEMA_V2, SYNAPTIC_CONTEXT_ALGORITHM_V1,
-    SYNAPTIC_CONTEXT_THRESHOLD_V1, canonical_walk_json, commit_sha_of, private_evidence_digest,
-    replay_evidence_slot, replay_idempotency_key, replay_policy_digest,
+    REPLAY_ALGORITHM_VERSION, REPLAY_CLAIM_BOUNDARY, REPLAY_SCHEMA_VERSION,
+    REPLAY_SELECTION_BOUNDARY, SYNAPTIC_CAPTURE_ALGORITHM_V1, SYNAPTIC_CAPTURE_ALGORITHM_V2,
+    SYNAPTIC_CAPTURE_CLAIM_BOUNDARY, SYNAPTIC_CAPTURE_SCHEMA_V1, SYNAPTIC_CAPTURE_SCHEMA_V2,
+    SYNAPTIC_CONTEXT_ALGORITHM_V1, SYNAPTIC_CONTEXT_THRESHOLD_V1, canonical_walk_json,
+    commit_sha_of, private_evidence_digest, replay_evidence_slot, replay_idempotency_key,
+    replay_policy_digest,
 };
 pub use signing_seed::load_receipt_signing_seed;
+pub use types::*;
 
 #[cfg(all(feature = "cloud-sync", feature = "legacy-sqlite"))]
 pub use cloud_sync::HttpPortableSyncBackend;
 
 #[cfg(feature = "legacy-sqlite")]
 pub use attestation_store::{
-    ProvisionedReceiptSigningKey, ReceiptSigningKeyTransition, provision_receipt_signing_key_sidecar,
+    ProvisionedReceiptSigningKey, ReceiptSigningKeyTransition,
+    provision_receipt_signing_key_sidecar,
 };
 #[cfg(feature = "legacy-sqlite")]
 pub use edges::{
@@ -107,9 +109,9 @@ pub use replay_store::{
 pub use session_queries::FAILED_CALLS_MAX;
 #[cfg(feature = "legacy-sqlite")]
 pub use sqlite::{
-    EmbeddingProfileIntegrityManifest,
-    EmbeddingProfileMigrationNodeCheckpoint, EmbeddingProfileMigrationRecord,
-    EmbeddingProfileVector, FilePortableSyncBackend, PortableSyncBackend, SqliteMemoryStore,
+    EmbeddingProfileIntegrityManifest, EmbeddingProfileMigrationNodeCheckpoint,
+    EmbeddingProfileMigrationRecord, EmbeddingProfileVector, FilePortableSyncBackend,
+    PortableSyncBackend, SqliteMemoryStore,
 };
 pub use unlearning::{
     AntiResurrectionCommitments, ArtifactKind, ArtifactRef, CheckStatus, Commitment, CommitmentKey,
