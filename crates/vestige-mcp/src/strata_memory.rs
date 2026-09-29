@@ -5,7 +5,7 @@
 //! keyword or name match) is refused; a link exists only when the log
 //! recorded an edge.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -1217,6 +1217,92 @@ impl MemoryStoreSend for StrataMemory {
             .into_iter()
             .map(|(id, _)| id)
             .collect())
+    }
+
+    /// Recorded-edge subgraph for `graph` action `memory_graph`.
+    ///
+    /// Walks only edges the log admitted. Superseded nodes are omitted when
+    /// that trail exists, so a retired record cannot stay in the picture or
+    /// bridge two live ones. Node order is BFS by hop, each hop sorted by id;
+    /// edges are sorted by source, target, link type, then creation time.
+    fn get_memory_subgraph(
+        &self,
+        center_id: &str,
+        depth: u32,
+        max_nodes: usize,
+    ) -> Result<(Vec<KnowledgeNode>, Vec<VestigeEdge>), StorageError> {
+        let store = self.lock();
+        let superseded: HashSet<String> = store
+            .supersession_pairs()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let live = |id: &str| {
+            !superseded.contains(id)
+                && store
+                    .get_node(id)
+                    .is_some_and(|record| record.is_live())
+        };
+        if !live(center_id) {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let mut visited = vec![center_id.to_string()];
+        let mut seen = HashSet::from([center_id.to_string()]);
+        let mut frontier = vec![center_id.to_string()];
+        for _ in 0..depth {
+            if visited.len() >= max_nodes {
+                break;
+            }
+            let mut next = BTreeSet::new();
+            for id in &frontier {
+                for edge in store.get_connections_for_memory(id) {
+                    let other = if edge.source_id == *id {
+                        edge.target_id
+                    } else {
+                        edge.source_id
+                    };
+                    if !seen.contains(&other) && live(&other) {
+                        next.insert(other);
+                    }
+                }
+            }
+            let room = max_nodes.saturating_sub(visited.len());
+            let taken: Vec<String> = next.into_iter().take(room).collect();
+            if taken.is_empty() {
+                break;
+            }
+            for id in &taken {
+                seen.insert(id.clone());
+                visited.push(id.clone());
+            }
+            frontier = taken;
+        }
+
+        let mut edges: Vec<VestigeEdge> = store
+            .edges()
+            .iter()
+            .filter(|edge| seen.contains(&edge.source_id) && seen.contains(&edge.target_id))
+            .map(project_edge)
+            .collect();
+        edges.sort_by(|a, b| {
+            (&a.source_id, &a.target_id, &a.link_type, a.created_at).cmp(&(
+                &b.source_id,
+                &b.target_id,
+                &b.link_type,
+                b.created_at,
+            ))
+        });
+        let nodes = visited
+            .iter()
+            .filter_map(|id| {
+                store
+                    .get_node(id)
+                    .filter(|record| record.is_live())
+                    .map(|record| project_node(&store, &record))
+            })
+            .collect();
+        Ok((nodes, edges))
     }
 
     fn supersession_pairs(&self) -> Result<Vec<(String, String)>, StorageError> {
