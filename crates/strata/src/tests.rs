@@ -1,0 +1,410 @@
+//! In-crate tests. Each test uses its own temp directory and resets the
+//! failpoint hooks; segment syncs are counted through `SYNC_COUNT`.
+
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
+
+use crate::format::{self, SegmentHeader, HEADER_WIRE_SIZE};
+use crate::sync::{reset_failpoints, FAIL_ON_SYNC_N, SYNC_COUNT};
+use crate::{SeqAck, StrataError, StrataLog};
+
+static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The failpoint statics (`SYNC_COUNT`, `FAIL_ON_SYNC_N`) are process-wide, so
+/// every test takes this lock for its whole body: `cargo test` stays
+/// deterministic even though libtest runs tests on parallel threads.
+static SERIAL_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serialize() -> std::sync::MutexGuard<'static, ()> {
+    match SERIAL_TESTS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn test_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "strata-test-{}-{tag}-{}",
+        std::process::id(),
+        DIR_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn only_segment(dir: &Path) -> PathBuf {
+    let segs = crate::log::list_segments(dir).unwrap();
+    assert_eq!(segs.len(), 1, "expected exactly one segment");
+    segs[0].1.clone()
+}
+
+fn append_many(log: &StrataLog, n: usize) -> Vec<SeqAck> {
+    let batch: Vec<(u8, Vec<u8>)> = (0..n)
+        .map(|i| ((i % 7) as u8, format!("payload-{i}").into_bytes()))
+        .collect();
+    log.append_batch(batch).unwrap()
+}
+
+#[test]
+fn round_trip_and_reopen() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("roundtrip");
+    {
+        let log = StrataLog::open(&dir).unwrap();
+        let a1 = log.append(1, b"hello").unwrap();
+        let a2 = log.append(2, b"").unwrap(); // empty payload is legal
+        let a3 = log.append(3, b"world").unwrap();
+        assert_eq!((a1.seq, a2.seq, a3.seq), (1, 2, 3));
+        assert_ne!(a1.frame_hash, a2.frame_hash);
+        let head = log.head();
+        assert_eq!(head.last_acked_seq, 3);
+        assert_eq!(head.next_seq, 4);
+        assert_eq!(head.frames_total, 3);
+        assert_eq!(head.segment_no, 0);
+        let frames = log.read_frames(1).unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].payload, b"hello");
+        assert!(frames[1].payload.is_empty());
+        assert_eq!(frames[2].kind, 3);
+        assert_eq!(log.verify_tail().unwrap().frames_verified, 3);
+        assert_eq!(log.read_frames(3).unwrap().len(), 1);
+    } // DirLock released on drop
+    {
+        let log = StrataLog::open(&dir).unwrap();
+        let frames = log.read_frames(1).unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].payload, b"hello");
+        let a4 = log.append(9, b"after-reopen").unwrap();
+        assert_eq!(a4.seq, 4);
+        assert_eq!(log.head().last_acked_seq, 4);
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn chain_integrity_1000_frames_and_seal() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("chain1000");
+    let log = StrataLog::open(&dir).unwrap();
+    for _ in 0..10 {
+        append_many(&log, 100);
+    }
+    let frames = log.read_frames(1).unwrap();
+    assert_eq!(frames.len(), 1000);
+    for (i, rec) in frames.iter().enumerate() {
+        assert_eq!(rec.seq, i as u64 + 1);
+        assert_eq!(
+            rec.payload_blake3,
+            format::payload_blake3(rec.kind, &rec.payload)
+        );
+        if i > 0 {
+            assert_eq!(
+                rec.prev_frame_hash,
+                frames[i - 1].frame_hash,
+                "chain break at index {i}"
+            );
+        }
+    }
+    // First frame chains off the segment header hash.
+    let seg = only_segment(&dir);
+    let header_bytes = fs::read(&seg).unwrap();
+    let header_hash = format::hash_slice(&header_bytes[..HEADER_WIRE_SIZE]);
+    assert_eq!(frames[0].prev_frame_hash, header_hash);
+    assert_eq!(log.read_frames(999).unwrap().len(), 2);
+
+    // Seal: signed trailer lands, next segment chains to the sealed hash.
+    let seal = log.seal().unwrap();
+    assert_eq!(seal.sealed_segment_no, 0);
+    assert_eq!(seal.frame_count, 1000);
+    let ack = log.append(42, b"seg2").unwrap();
+    assert_eq!(ack.seq, 1001);
+    let segs = crate::log::list_segments(&dir).unwrap();
+    assert_eq!(segs.len(), 2);
+    let b2 = fs::read(&segs[1].1).unwrap();
+    let h2: SegmentHeader = borsh::from_slice(&b2[..HEADER_WIRE_SIZE]).unwrap();
+    assert_eq!(h2.prev_segment_hash, seal.segment_hash);
+    drop(log);
+
+    // Reopen: sealed trailer + signature verified, chain continues.
+    let log = StrataLog::open(&dir).unwrap();
+    let frames = log.read_frames(1).unwrap();
+    assert_eq!(frames.len(), 1001);
+    assert_eq!(frames[1000].payload, b"seg2");
+    let tail = log.verify_tail().unwrap();
+    assert_eq!(tail.segment_no, 1);
+    assert_eq!(tail.frames_verified, 1);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn torn_tail_recovery_truncates_unacked_frames() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("tornA");
+    {
+        let log = StrataLog::open(&dir).unwrap();
+        append_many(&log, 4);
+        let head = log.head();
+        assert_eq!(head.last_acked_seq, 4);
+        // Hand-craft a torn frame 5: valid encoding, cut mid-way, never acked.
+        let frame = format::Frame {
+            kind: 9,
+            payload: b"never-acked".to_vec(),
+            payload_blake3: format::payload_blake3(9, b"never-acked"),
+            prev_frame_hash: head.last_frame_hash,
+        };
+        let wire = borsh::to_vec(&frame).unwrap();
+        let seg = only_segment(&dir);
+        let mut f = fs::OpenOptions::new().append(true).open(&seg).unwrap();
+        f.write_all(&wire[..25]).unwrap(); // torn: mid-frame
+        f.sync_all().unwrap();
+    }
+    {
+        let log = StrataLog::open(&dir).unwrap();
+        let frames = log.read_frames(1).unwrap();
+        assert_eq!(frames.len(), 4, "acked prefix must survive");
+        assert_eq!(log.head().last_acked_seq, 4);
+        assert_eq!(log.head().next_seq, 5);
+        let a = log.append(5, b"fresh").unwrap();
+        assert_eq!(a.seq, 5);
+        assert_eq!(log.read_frames(1).unwrap().len(), 5);
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn torn_tail_short_read_truncates() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("tornB");
+    {
+        let log = StrataLog::open(&dir).unwrap();
+        append_many(&log, 3);
+        drop(log);
+        // Frame 3's write "tore": chop bytes off the file, and the durable
+        // watermark only covers frames 1..=2.
+        let seg = only_segment(&dir);
+        let len = fs::metadata(&seg).unwrap().len();
+        let f = fs::OpenOptions::new().write(true).open(&seg).unwrap();
+        f.set_len(len - 10).unwrap();
+        drop(f);
+        crate::log::write_head_state(&dir, 2).unwrap();
+    }
+    let log = StrataLog::open(&dir).unwrap();
+    assert_eq!(log.read_frames(1).unwrap().len(), 2);
+    assert_eq!(log.head().last_acked_seq, 2);
+    assert_eq!(log.append(7, b"next").unwrap().seq, 3);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn corruption_below_watermark_halts() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("halt");
+    {
+        let log = StrataLog::open(&dir).unwrap();
+        append_many(&log, 3);
+        drop(log);
+    }
+    // Flip a payload byte of frame 2 (acked; watermark is 3).
+    let seg = only_segment(&dir);
+    let mut bytes = fs::read(&seg).unwrap();
+    let (_f1, n1) = format::parse_frame(&bytes[HEADER_WIRE_SIZE..]).unwrap();
+    let f2_start = HEADER_WIRE_SIZE + n1;
+    bytes[f2_start + 5] ^= 0xff; // inside frame 2's payload ("payload-1")
+    fs::write(&seg, &bytes).unwrap();
+
+    let err = StrataLog::open(&dir).unwrap_err();
+    match &err {
+        StrataError::Halt(d) => {
+            assert_eq!(d.last_acked_seq, 3);
+            assert!(d.reason.contains("blake3"), "reason: {}", d.reason);
+        }
+        other => panic!("expected Halt, got {other:?}"),
+    }
+    // History is never truncated: the damaged bytes are still on disk.
+    let after = fs::read(&seg).unwrap();
+    assert_eq!(after.len(), bytes.len());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn group_commit_batch_shares_one_sync() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("group");
+    let log = StrataLog::open(&dir).unwrap();
+    reset_failpoints(); // count only post-open segment syncs
+
+    let acks = append_many(&log, 10);
+    let seqs: Vec<u64> = acks.iter().map(|a| a.seq).collect();
+    assert_eq!(seqs, (1..=10).collect::<Vec<_>>());
+    assert_eq!(
+        SYNC_COUNT.load(Ordering::SeqCst),
+        1,
+        "one batch must share exactly one segment sync"
+    );
+    assert_eq!(log.head().last_acked_seq, 10);
+
+    // Batches larger than MAX_BATCH_FRAMES chunk: 130 frames -> 64+64+2.
+    let acks2 = append_many(&log, 130);
+    assert_eq!(acks2.len(), 130);
+    assert_eq!(acks2.last().unwrap().seq, 140);
+    assert_eq!(SYNC_COUNT.load(Ordering::SeqCst), 1 + 3);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn group_commit_concurrent_appenders_coalesce() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("gthreads");
+    let log = Arc::new(StrataLog::open(&dir).unwrap());
+    reset_failpoints(); // count only post-open segment syncs
+
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 4;
+    let total: u64 = (THREADS * PER_THREAD) as u64;
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let mut handles = Vec::new();
+    for t in 0..THREADS {
+        let log = Arc::clone(&log);
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            (0..PER_THREAD)
+                .map(|i| log.append(t as u8, format!("t{t}-i{i}").as_bytes()).unwrap())
+                .collect::<Vec<_>>()
+        }));
+    }
+    let mut all: Vec<SeqAck> = Vec::new();
+    for h in handles {
+        all.extend(h.join().unwrap());
+    }
+    assert_eq!(all.len() as u64, total);
+    let mut seqs: Vec<u64> = all.iter().map(|a| a.seq).collect();
+    seqs.sort_unstable();
+    assert_eq!(seqs, (1..=total).collect::<Vec<_>>(), "seqs are unique and dense");
+    assert_eq!(log.head().last_acked_seq, total);
+
+    let syncs = SYNC_COUNT.load(Ordering::SeqCst);
+    assert!(
+        syncs < total as usize,
+        "group commit must coalesce concurrent appends (syncs={syncs})"
+    );
+    drop(log);
+    let log = StrataLog::open(&dir).unwrap();
+    assert_eq!(log.read_frames(1).unwrap().len() as u64, total);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn failpoint_third_sync_panics_fail_stop() {
+    let _serial = serialize();
+    let dir = test_dir("failpoint");
+    let log = StrataLog::open(&dir).unwrap();
+    reset_failpoints();
+
+    log.append(1, b"one").unwrap(); // segment sync 1
+    log.append(2, b"two").unwrap(); // segment sync 2
+    FAIL_ON_SYNC_N.store(3, Ordering::SeqCst);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        log.append(3, b"three") // segment sync 3 -> injected failure
+    }));
+    let payload = result.expect_err("the 3rd segment sync must panic");
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .expect("panic payload is a String");
+    assert!(msg.contains("strata fail-stop"), "{msg}");
+    assert!(msg.contains("op: sync"), "{msg}");
+    assert!(msg.contains("last_acked_seq: 2"), "{msg}");
+
+    // Watermark on disk still covers only the first two frames: the failed
+    // commit never reached DURABLE. Frame 3's bytes were fully written
+    // before the sync failure, so the recovery scan legitimately retains
+    // the valid frame — its ACK was lost, not its bytes — and the sequence
+    // continues past it.
+    drop(log);
+    let log = StrataLog::open(&dir).unwrap();
+    assert_eq!(log.head().last_acked_seq, 2, "failed commit must not advance the watermark");
+    assert_eq!(log.read_frames(1).unwrap().len(), 3);
+    assert_eq!(log.append(4, b"four").unwrap().seq, 4);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn single_writer_lock_and_stale_takeover() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("lock");
+    let log = StrataLog::open(&dir).unwrap();
+    match StrataLog::open(&dir) {
+        Err(StrataError::Locked { pid }) => assert!(pid > 0),
+        other => panic!("expected Locked, got {other:?}"),
+    }
+    drop(log); // releases strata.lock
+    let log2 = StrataLog::open(&dir).unwrap();
+    log2.append(1, b"x").unwrap();
+    drop(log2);
+
+    // A stale lock (pid that cannot exist) is detected and taken over.
+    fs::write(dir.join(crate::lockfile::LOCK_NAME), 4_000_000u64.to_le_bytes()).unwrap();
+    let log3 = StrataLog::open(&dir).unwrap();
+    log3.append(2, b"y").unwrap();
+    assert_eq!(log3.read_frames(1).unwrap().len(), 2);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn merkle_tree_shapes() {
+    let _serial = serialize();
+    // Independent reference recomputation of the RFC6962-shaped tree.
+    fn leaf(p: &[u8; 32]) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(&[0x00]);
+        h.update(p);
+        h.finalize().into()
+    }
+    fn node(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(&[0x01]);
+        h.update(l);
+        h.update(r);
+        h.finalize().into()
+    }
+    fn reference(hs: &[[u8; 32]]) -> [u8; 32] {
+        match hs.len() {
+            0 => blake3::hash(&[]).into(),
+            1 => hs[0],
+            n => {
+                let mut k = 1usize;
+                while k * 2 < n {
+                    k *= 2;
+                }
+                node(&reference(&hs[..k]), &reference(&hs[k..]))
+            }
+        }
+    }
+
+    let l: Vec<[u8; 32]> = (1u8..=5).map(|i| [i; 32]).collect();
+    // `format::merkle_root` takes raw payload hashes and leaf-hashes inside,
+    // so the reference folds the leaf-hashed values.
+    let leaves: Vec<[u8; 32]> = l.iter().map(leaf).collect();
+    let empty_root: [u8; 32] = blake3::hash(&[]).into();
+    assert_eq!(format::merkle_root(&[]), empty_root);
+    assert_eq!(format::merkle_root(&l[..1]), leaf(&l[0]));
+    assert_eq!(format::merkle_root(&l[..2]), node(&leaf(&l[0]), &leaf(&l[1])));
+    assert_eq!(format::merkle_root(&l[..3]), reference(&leaves[..3]));
+    assert_eq!(format::merkle_root(&l), reference(&leaves));
+    assert_ne!(format::merkle_root(&l[..2]), format::merkle_root(&l[..3]));
+}
