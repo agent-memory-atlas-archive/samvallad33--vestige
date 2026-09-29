@@ -322,8 +322,13 @@ fn free_bytes(dir: &Path) -> Option<u64> {
     }
     // Safety: `statvfs` returned 0, so it wrote a complete `statvfs`.
     let stat = unsafe { stat.assume_init() };
-    let frsize = stat.f_frsize;
-    let avail = stat.f_bavail;
+    // The field widths differ by platform: macOS has a u32 `f_bavail` and a
+    // u64 `f_frsize`, Linux has both as u64. Widen both so one expression
+    // compiles everywhere; on Linux the conversions are no-ops.
+    #[allow(clippy::useless_conversion)]
+    let frsize = u64::from(stat.f_frsize);
+    #[allow(clippy::useless_conversion)]
+    let avail = u64::from(stat.f_bavail);
     if frsize == 0 {
         return None;
     }
