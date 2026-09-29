@@ -10,8 +10,7 @@ use std::path::{Path, PathBuf};
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use strata::StrataLog;
-use strata_gate::inputs::{BlastRadius, GateInputs};
-use strata_gate::policy::{gate_verdict, ANY_KIND, WILDCARD_PREFIX};
+use strata_gate::policy::{ANY_KIND, WILDCARD_PREFIX};
 use strata_gate::record::{action_kind, EffectRecord, GateRecord, Propose, RecordKind, Verdict};
 use strata_gate::{GateRuntime, Policy, Rule, SeqAck};
 use strata_kernel::checkpoint::{checkpoint_hash, Checkpoint};
@@ -49,8 +48,7 @@ struct StoreMeta {
 ///
 /// Rule 1 holds every `RETIRE` action (supersession); rule 2 allows anything
 /// else under a generous blast-radius cap. First match wins; empty policy =
-/// deny everything (useful for tests). The memory server pins
-/// [`server_policy`] instead, so an explicit edit can land its retire.
+/// deny everything (useful for tests).
 pub fn default_policy() -> Policy {
     Policy {
         rules: vec![
@@ -74,32 +72,6 @@ pub fn default_policy() -> Policy {
     }
 }
 
-/// Policy pinned by the memory server. Same write cap as [`default_policy`],
-/// and RETIRE is Allow: `memory edit` supersedes the previous node. A Hold
-/// cannot be released in this runtime — gate inputs carry no human signal.
-pub fn server_policy() -> Policy {
-    Policy {
-        rules: vec![
-            Rule {
-                match_kind: action_kind::RETIRE,
-                match_params_hash_prefix: WILDCARD_PREFIX,
-                max_blast_radius: 10_000,
-                forbid_forgotten_lessons: false,
-                require_human: false,
-                verdict: Verdict::Allow,
-            },
-            Rule {
-                match_kind: ANY_KIND,
-                match_params_hash_prefix: WILDCARD_PREFIX,
-                max_blast_radius: 10_000,
-                forbid_forgotten_lessons: false,
-                require_human: false,
-                verdict: Verdict::Allow,
-            },
-        ],
-    }
-}
-
 /// What an admitted node effect did. Derived by replaying the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectAction {
@@ -107,7 +79,7 @@ pub enum EffectAction {
     Create,
     /// Later upsert of an existing node (`set_created_at`). No new review.
     Rewrite,
-    /// Superseding edit. The proof names the successor node.
+    /// Content replacement. No new review.
     Edit,
     /// Explicit FSRS review. `rating` is 1..=4.
     Review,
@@ -341,6 +313,13 @@ impl StrataStore {
             }
             StoreOp::ReviewNode { card_id, rating } => {
                 self.fold_review(*card_id, *rating, ALGO_V2, frame_seq)?;
+            }
+            StoreOp::EditContent { id, content } => {
+                let record = self
+                    .nodes
+                    .get_mut(id)
+                    .ok_or_else(|| StoreError::NotFound(format!("edit target {id}")))?;
+                record.content = content.clone();
             }
         }
         Ok(())
@@ -594,7 +573,7 @@ impl StrataStore {
     ///
     /// Routed as a destructive `RETIRE` action: the default policy HOLDS it;
     /// a review-gated (permissive) policy lands it.
-    pub fn supersede(&mut self, id: &str, superseded_by: &str) -> Result<u64, StoreError> {
+    pub fn supersede(&mut self, id: &str, superseded_by: &str) -> Result<(), StoreError> {
         self.require_node(id)?;
         self.require_node(superseded_by)?;
         if id == superseded_by {
@@ -608,7 +587,7 @@ impl StrataStore {
             )));
         }
         let context = self.context_for(&[id, superseded_by]);
-        let (effect_seq, _) = self.admit_write(
+        self.admit_write(
             StoreOp::SupersedeNode {
                 id: id.to_string(),
                 superseded_by: superseded_by.to_string(),
@@ -616,79 +595,7 @@ impl StrataStore {
             action_kind::RETIRE,
             context,
         )?;
-        Ok(effect_seq)
-    }
-
-    /// Would a small RETIRE be Allowed under the pinned policy?
-    ///
-    /// Checked before any edit frame is appended. A Hold or Deny returns
-    /// without a successor node left behind.
-    fn retire_is_allowed(&self) -> bool {
-        let propose = Propose {
-            action_hash: [0; 32],
-            action_kind: action_kind::RETIRE,
-            params_hash: [0; 32],
-            context: Vec::new(),
-        };
-        let inputs = GateInputs {
-            live_facts_digest: [0; 32],
-            retired_facts_digest: [0; 32],
-            blast_radius: BlastRadius {
-                closure_size: 2,
-                tiers: 1,
-            },
-            forgotten_lessons: Vec::new(),
-            canary_hits: 0,
-        };
-        gate_verdict(&self.policy, &propose, &inputs) == Verdict::Allow
-    }
-
-    /// Replace `id` with a new node whose content is `content`.
-    ///
-    /// Three admitted ops: `UpsertNode` (the successor), `SaveEdge`
-    /// (`supersedes`, successor → predecessor), `SupersedeNode`. The
-    /// predecessor stays in the log. The successor gets the ingest FSRS card
-    /// for its own id. The predecessor's card is not copied: the card id is
-    /// `handle_of(node id)`, and none of the four ops transplants `CardState`.
-    ///
-    /// Returns `(successor_id, supersede effect seq)`.
-    pub fn edit(&mut self, id: &str, content: &str) -> Result<(String, u64), StoreError> {
-        if content.trim().is_empty() {
-            return Err(StoreError::InvalidInput("content must not be empty".into()));
-        }
-        let prior = self.require_node(id)?.clone();
-        if prior.superseded_by.is_some() {
-            return Err(StoreError::InvalidInput(format!(
-                "node {id} is already superseded"
-            )));
-        }
-        if !self.retire_is_allowed() {
-            return Err(StoreError::InvalidInput(
-                "pinned policy does not allow RETIRE; edit was not admitted".into(),
-            ));
-        }
-        let successor = self.ingest_in_scope(
-            IngestInput {
-                content: content.to_string(),
-                node_type: prior.node_type.clone(),
-                tags: prior.tags.clone(),
-                created_at_ms: Some(prior.created_at_ms),
-                valid_from_ms: Some(prior.valid_from_ms),
-                valid_until_ms: Some(prior.valid_until_ms),
-            },
-            &prior.scope,
-        )?;
-        self.save_connection(&ConnectionRecord {
-            source_id: successor.clone(),
-            target_id: id.to_string(),
-            strength_milli: 1000,
-            link_type: EdgeKind::Supersedes.as_str().to_string(),
-            meta_sha: None,
-            created_at_ms: prior.created_at_ms,
-            activation_count: 0,
-        })?;
-        let effect_seq = self.supersede(id, &successor)?;
-        Ok((successor, effect_seq))
+        Ok(())
     }
 
     /// All (superseded, superseder) pairs, ordered by superseded id.
@@ -712,6 +619,25 @@ impl StrataStore {
             StoreOp::ReviewNode {
                 card_id: handle_of(id),
                 rating,
+            },
+            action_kind::WRITE,
+            context,
+        )?;
+        Ok(effect_seq)
+    }
+
+    /// Admit a content edit. The previous content remains in the earlier frame.
+    /// No review is folded.
+    pub fn edit_content(&mut self, id: &str, content: &str) -> Result<u64, StoreError> {
+        if content.trim().is_empty() {
+            return Err(StoreError::InvalidInput("content must not be empty".into()));
+        }
+        self.require_node(id)?;
+        let context = self.context_for(&[id]);
+        let (effect_seq, _) = self.admit_write(
+            StoreOp::EditContent {
+                id: id.to_string(),
+                content: content.to_string(),
             },
             action_kind::WRITE,
             context,
@@ -819,13 +745,10 @@ impl StrataStore {
                             rating: None,
                         }
                     }
-                    StoreOp::SupersedeNode {
-                        id: _,
-                        superseded_by,
-                    } => EffectProof {
+                    StoreOp::EditContent { id, content: _ } => EffectProof {
                         effect_seq,
                         data_seq: frame.seq,
-                        node_id: superseded_by,
+                        node_id: id,
                         action: EffectAction::Edit,
                         payload_digest: digest,
                         rating: None,
@@ -845,7 +768,7 @@ impl StrataStore {
                             rating: Some(rating),
                         }
                     }
-                    StoreOp::SaveEdge { .. } => continue,
+                    StoreOp::SaveEdge { .. } | StoreOp::SupersedeNode { .. } => continue,
                 };
                 proofs.push(proof);
             }

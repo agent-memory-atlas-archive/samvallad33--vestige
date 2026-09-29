@@ -46,4 +46,12 @@ pub enum StoreOp {
         /// Rating 1..=4 (clamped by the kernel fold if outside).
         rating: u8,
     },
+    /// Replace a node's content. A new admitted event: the previous bytes stay
+    /// in the earlier frame. Does not fold a review, so the FSRS card is unchanged.
+    EditContent {
+        /// Existing node id.
+        id: String,
+        /// Replacement content. Empty strings are rejected before admission.
+        content: String,
+    },
 }

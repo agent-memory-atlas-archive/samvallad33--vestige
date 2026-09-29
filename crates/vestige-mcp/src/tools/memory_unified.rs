@@ -55,7 +55,7 @@ pub fn schema() -> Value {
             "action": {
                 "type": "string",
                 "enum": ["get", "get_batch", "delete", "purge", "state", "promote", "demote", "edit"],
-                "description": "'get', 'get_batch' (ids), 'state', 'promote' / 'demote' (retrieval strength; demote never deletes), 'edit' (new node supersedes the previous one), 'purge' (content and embeddings gone; confirm=true). 'delete' aliases purge"
+                "description": "'get', 'get_batch' (ids), 'state', 'promote' / 'demote' (retrieval strength; demote never deletes), 'edit' (replace content, keep FSRS state), 'purge' (content and embeddings gone; confirm=true). 'delete' aliases purge"
             },
             "id": {
                 "type": "string",
@@ -81,7 +81,7 @@ pub fn schema() -> Value {
             },
             "content": {
                 "type": "string",
-                "description": "[edit] New content. On Strata this admits a successor node; embeddings stay refused."
+                "description": "[edit] New content; embedding regenerated, FSRS state kept."
             }
         },
         "required": ["action"]
@@ -661,28 +661,10 @@ async fn execute_edit(
     };
 
     let strata = crate::strata_memory::is_strata_backend(storage.as_ref());
-    let (node_id, note) = if strata {
-        let successor = storage
-            .supersession_pairs()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|(old, _)| old == id)
-            .map(|(_, successor)| successor)
-            .ok_or_else(|| format!("edit of {id} did not admit a successor"))?;
-        (
-            successor,
-            "Admitted a successor node with a supersedes edge. Previous bytes stay in the log. The successor has its own FSRS-6 ingest card; the previous card stays on the superseded node.",
-        )
-    } else {
-        (
-            id.to_string(),
-            "FSRS state preserved (stability, difficulty, reps, lapses unchanged). Embedding state was invalidated with the content update; regeneration may complete now or in maintenance. Inspect embeddingStatus.",
-        )
-    };
     let embedding_status = if strata {
         "refused"
     } else if storage
-        .get_node(&node_id)
+        .get_node(id)
         .map_err(|e| e.to_string())?
         .is_some_and(|node| node.has_embedding == Some(true))
     {
@@ -693,15 +675,18 @@ async fn execute_edit(
     let mut result = serde_json::json!({
         "success": true,
         "action": "edit",
-        "nodeId": node_id,
+        "nodeId": id,
         "oldContentPreview": old_preview,
         "newContentPreview": new_preview,
         "embeddingStatus": embedding_status,
-        "note": note
+        "note": if strata {
+            "FSRS state preserved (stability, difficulty, reps, lapses unchanged). Admitted as a new event; the previous content stays in the log."
+        } else {
+            "FSRS state preserved (stability, difficulty, reps, lapses unchanged). Embedding state was invalidated with the content update; regeneration may complete now or in maintenance. Inspect embeddingStatus."
+        }
     });
     if strata {
-        result["supersededId"] = serde_json::json!(id);
-        result["receiptId"] = serde_json::json!(strata_receipt_id(storage, &node_id)?);
+        result["receiptId"] = serde_json::json!(strata_receipt_id(storage, id)?);
     }
     Ok(result)
 }
@@ -1537,103 +1522,37 @@ mod strata_tests {
             .unwrap();
             assert_eq!(edited["action"], "edit");
             assert_eq!(edited["embeddingStatus"], "refused");
-            assert_eq!(edited["supersededId"], id);
-            let successor = edited["nodeId"].as_str().unwrap().to_string();
-            assert_ne!(successor, id);
-            let edit_receipt = edited["receiptId"].as_str().unwrap().to_string();
-            proved(&storage, &edit_receipt, &successor, "edited").await;
-            assert_eq!(
-                mem.card_q(&id).unwrap(),
-                after_demote,
-                "the superseded node's FSRS card stays put"
-            );
-            let fresh = mem.card_q(&successor).unwrap();
-            assert_eq!(fresh.3, 1, "successor card is the ingest fold");
-            assert_eq!(fresh.4, 0);
-
-            let got = execute(
-                &storage,
-                &cognitive(),
-                Some(serde_json::json!({"action": "get", "id": successor})),
-            )
-            .await
-            .unwrap();
-            assert_eq!(got["node"]["content"], "replacement cause text");
-            let got_old = execute(
-                &storage,
-                &cognitive(),
-                Some(serde_json::json!({"action": "get", "id": id})),
-            )
-            .await
-            .unwrap();
-            assert_eq!(got_old["node"]["content"], "original cause text");
-
-            let superseded = storage.superseded_node_ids().unwrap();
-            assert!(superseded.contains(&id));
-            let live: Vec<_> = storage
-                .get_all_nodes(50, 0)
-                .unwrap()
-                .into_iter()
-                .filter(|node| !superseded.contains(&node.id))
-                .collect();
             assert!(
-                live.iter()
-                    .any(|node| node.id == successor && node.content == "replacement cause text")
-            );
-            assert!(live.iter().all(|node| node.id != id));
-
-            let edges = storage.get_connections_for_memory(&successor).unwrap();
-            assert!(
-                edges
-                    .iter()
-                    .any(|edge| edge.link_type == "supersedes" && edge.target_id == id)
-            );
-            let recalled = crate::tools::recall::execute(
-                &storage,
-                &cognitive(),
-                &vestige_core::OutputConfig::default(),
-                Some(serde_json::json!({"handle": successor})),
-            )
-            .await
-            .unwrap();
-            assert!(
-                recalled["nodes"]
-                    .as_array()
+                edited["note"]
+                    .as_str()
                     .unwrap()
-                    .iter()
-                    .any(|node| node["content"] == "replacement cause text")
+                    .contains("FSRS state preserved")
+            );
+            let edit_receipt = edited["receiptId"].as_str().unwrap().to_string();
+            proved(&storage, &edit_receipt, &id, "edited").await;
+            let after_edit = mem.card_q(&id).unwrap();
+            assert_eq!(after_edit, after_demote, "edit does not fold a review");
+            assert_eq!(
+                storage.get_node(&id).unwrap().unwrap().content,
+                "replacement cause text"
             );
             assert!(log_contains(dir.path(), "original cause text"));
             assert!(log_contains(dir.path(), "replacement cause text"));
             (
-                (promote_receipt, demote_receipt, edit_receipt, id, successor),
-                after_demote,
+                (promote_receipt, demote_receipt, edit_receipt, id),
+                after_edit,
             )
         };
 
-        {
-            let mut store = strata_store::StrataStore::open_with_policy(
-                dir.path(),
-                strata_store::server_policy(),
-            )
-            .unwrap();
-            store.seal_checkpoint().unwrap();
-        }
-
         let storage = crate::strata_memory::open(dir.path()).unwrap();
-        let (promote_receipt, demote_receipt, edit_receipt, id, successor) = receipts;
+        let (promote_receipt, demote_receipt, edit_receipt, id) = receipts;
         proved(&storage, &promote_receipt, &id, "promoted").await;
         proved(&storage, &demote_receipt, &id, "demoted").await;
-        proved(&storage, &edit_receipt, &successor, "edited").await;
-        assert_eq!(
-            storage.get_node(&successor).unwrap().unwrap().content,
-            "replacement cause text"
-        );
-        let old = storage.get_node(&id).unwrap().unwrap();
-        assert_eq!(old.content, "original cause text");
-        assert_eq!(old.reps, i32::try_from(cards.3).unwrap());
-        assert_eq!(old.lapses, i32::try_from(cards.4).unwrap());
-        assert_eq!(storage.get_node(&successor).unwrap().unwrap().reps, 1);
+        proved(&storage, &edit_receipt, &id, "edited").await;
+        let node = storage.get_node(&id).unwrap().unwrap();
+        assert_eq!(node.content, "replacement cause text");
+        assert_eq!(node.reps, i32::try_from(cards.3).unwrap());
+        assert_eq!(node.lapses, i32::try_from(cards.4).unwrap());
     }
 
     #[tokio::test]

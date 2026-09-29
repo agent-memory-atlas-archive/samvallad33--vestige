@@ -521,47 +521,24 @@ fn review_card_matches_independent_fsrs6_fold() {
 }
 
 #[test]
-fn edit_supersedes_and_leaves_the_old_card_in_place() {
+fn edit_keeps_prior_bytes_and_does_not_fold_a_review() {
     let dir = temp_dir("edit-bytes");
-    let (id, successor, before) = {
-        let mut store = StrataStore::open_with_policy(&dir, crate::server_policy()).expect("open");
-        let id = store
-            .ingest(input("original strata edit bytes", &["cause"]))
-            .expect("ingest");
-        store.review(&id, 4).expect("easy");
-        let before = store.card_state(&id).expect("card");
-        let (successor, effect_seq) = store
-            .edit(&id, "replacement strata edit bytes")
-            .expect("edit");
-        assert_ne!(successor, id);
-        assert!(effect_seq > 0);
-        let old = store.get_node(&id).expect("old");
-        assert_eq!(old.content, "original strata edit bytes");
-        assert_eq!(old.superseded_by.as_deref(), Some(successor.as_str()));
-        let new = store.get_node(&successor).expect("new");
-        assert_eq!(new.content, "replacement strata edit bytes");
-        assert!(new.superseded_by.is_none());
-        assert_eq!(new.tags, old.tags);
-        assert_eq!(store.card_state(&id).expect("old card"), before);
-        let fresh = store.card_state(&successor).expect("new card");
-        assert_eq!(fresh.review_count, 1, "successor is an ingest card");
-        assert_eq!(fresh.lapse_count, 0);
-        assert_ne!(fresh.review_count, before.review_count);
-        let edges = store.get_edges_for(
-            &successor,
-            EdgeDirection::Outgoing,
-            Some(EdgeKind::Supersedes),
-        );
-        assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].target_id, id);
-        assert_eq!(edges[0].link_type, "supersedes");
-        let live = store.get_all_nodes_in_scope("");
-        assert!(live.iter().any(|node| node.id == successor));
-        assert!(live.iter().all(|node| node.id != id));
-        assert!(store.sweep().is_empty(), "edit must not leave a gate gap");
-        store.seal_checkpoint().expect("seal");
-        (id, successor, before)
-    };
+    let mut store = StrataStore::open(&dir).expect("open");
+    let id = store
+        .ingest(input("original strata edit bytes", &[]))
+        .expect("ingest");
+    let before = store.card_state(&id).expect("card");
+    let reviews = store.review_events().len();
+    store
+        .edit_content(&id, "replacement strata edit bytes")
+        .expect("edit");
+    assert_eq!(
+        store.get_node(&id).expect("node").content,
+        "replacement strata edit bytes"
+    );
+    assert_eq!(store.card_state(&id).expect("card"), before);
+    assert_eq!(store.review_events().len(), reviews);
+    drop(store);
     let mut blob = Vec::new();
     for entry in std::fs::read_dir(dir.join("log")).expect("log dir") {
         let path = entry.expect("entry").path();
@@ -575,36 +552,15 @@ fn edit_supersedes_and_leaves_the_old_card_in_place() {
     assert!(blob
         .windows(b"replacement strata edit bytes".len())
         .any(|w| w == b"replacement strata edit bytes"));
-    let store = StrataStore::open(&dir).expect("reopen under default policy");
+    let store = StrataStore::open(&dir).expect("reopen");
     assert_eq!(
-        store.get_node(&successor).expect("new").content,
+        store.get_node(&id).expect("node").content,
         "replacement strata edit bytes"
     );
-    assert_eq!(
-        store.get_node(&id).expect("old").superseded_by.as_deref(),
-        Some(successor.as_str())
-    );
-    assert_eq!(store.card_state(&id).expect("old card"), before);
-    assert_eq!(
-        store.card_state(&successor).expect("new card").review_count,
-        1
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn edit_is_refused_when_retire_is_held() {
-    let dir = temp_dir("edit-held");
-    let mut store = StrataStore::open(&dir).expect("open");
-    let id = store.ingest(input("stays put", &[])).expect("ingest");
-    let before = store.card_state(&id).expect("card");
-    let err = store.edit(&id, "should not land").expect_err("held retire");
-    assert!(err.to_string().contains("does not allow RETIRE"), "{err}");
-    assert_eq!(store.node_count(), 1);
-    assert_eq!(store.edge_count(), 0);
-    assert!(store.get_node(&id).expect("node").superseded_by.is_none());
-    assert_eq!(store.get_node(&id).expect("node").content, "stays put");
-    assert_eq!(store.card_state(&id).expect("card"), before);
+    let card = store.card_state(&id).expect("card");
+    assert_eq!(card.stability_q, before.stability_q);
+    assert_eq!(card.review_count, before.review_count);
+    assert_eq!(card.lapse_count, before.lapse_count);
     std::fs::remove_dir_all(&dir).ok();
 }
 

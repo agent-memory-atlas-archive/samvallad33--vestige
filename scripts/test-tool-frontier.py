@@ -174,15 +174,10 @@ def run(binary, output):
             assert demoted["receiptId"].startswith("eff-") and demoted["receiptId"] != promote_receipt
             edited = tool("memory", {"action": "edit", "id": node_id, "content": "edited fixture"})
             assert edited["action"] == "edit" and edited["embeddingStatus"] == "refused"
-            successor = edited["nodeId"]
-            assert successor != node_id and successor.startswith("mem-")
-            assert edited["supersededId"] == node_id
             edit_receipt = tool("receipt", {"action": "get", "receipt_id": edited["receiptId"]})
             assert edit_receipt["attestation"]["verification"]["locallyVerified"] is True
             assert edit_receipt["receipt"]["mutations"][0]["kind"] == "edited"
-            assert "edited fixture" in json.dumps(tool("memory", {"action": "get", "id": successor}))
-            assert marker in json.dumps(tool("memory", {"action": "get", "id": node_id}))
-            assert "edited fixture" in json.dumps(tool("recall", {"handle": successor}))
+            assert "edited fixture" in json.dumps(tool("memory", {"action": "get", "id": node_id}))
             typed("memory", {"action": "promote", "id": "not-a-handle"}, "Invalid memory ID")
             typed("memory", {"action": "edit", "id": "mem-ffffffffffffffff", "content": "nope"}, "not found")
             typed("purge", {"id": node_id, "confirm": True}, "pending_strata")
