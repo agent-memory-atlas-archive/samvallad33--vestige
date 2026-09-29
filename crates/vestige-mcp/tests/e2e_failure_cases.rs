@@ -317,9 +317,14 @@ fn unknown_tool_names_are_protocol_errors_with_no_result_body() {
     let mut server = Server::spawn(dir.path());
     server.handshake();
 
-    let mut names = vec!["no_such_tool", "", "RECALL", "recall "];
-    #[cfg(not(feature = "connectors"))]
-    names.push("source_sync");
+    let names = [
+        "no_such_tool",
+        "",
+        "RECALL",
+        "recall ",
+        #[cfg(not(feature = "connectors"))]
+        "source_sync",
+    ];
     for name in names {
         let response = server.request("tools/call", Some(json!({ "name": name, "arguments": {} })));
         assert!(
