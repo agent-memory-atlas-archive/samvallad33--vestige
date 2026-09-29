@@ -3773,7 +3773,7 @@ fn run_causal_walk(
     }
 
     let storage = open_storage()?;
-    #[cfg(feature = "embeddings")]
+    #[cfg(vestige_embeddings_removed)]
     {
         let _ = storage.init_embeddings();
     }

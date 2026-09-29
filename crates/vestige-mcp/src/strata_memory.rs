@@ -30,7 +30,7 @@ const RECEIPT_PREFIX: &str = "eff-";
 
 /// The durable directory this process opened is a Strata log, not a SQLite file.
 pub fn is_strata_backend(storage: &Storage) -> bool {
-    storage.db_path().file_name().and_then(|name| name.to_str()) == Some("log")
+    storage.is_strata()
 }
 
 /// Open (or create) a Strata log under `dir`. Creates no SQLite file.
@@ -480,6 +480,10 @@ impl MemoryStoreSend for StrataMemory {
 
     fn db_path(&self) -> &Path {
         &self.log_dir
+    }
+
+    fn is_strata(&self) -> bool {
+        true
     }
 
     fn last_backup_timestamp(&self) -> Option<DateTime<Utc>> {

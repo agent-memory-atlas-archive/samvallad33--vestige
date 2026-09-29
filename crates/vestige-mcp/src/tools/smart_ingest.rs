@@ -854,7 +854,7 @@ async fn execute_verbose(
     } else {
         SecretPolicy::Reject
     };
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     let input_has_secret_finding = !scan_secrets(&content).is_empty();
 
     // Validate content
@@ -996,7 +996,7 @@ async fn execute_verbose(
     // failure hooks (backfill and failure feedback).
     let hook_tags: Vec<String> = input.tags.clone();
 
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     {
         // Reconsolidation handoff: snapshot the live labile set so a conflict
         // or supersede against one of these memories is routed through a
@@ -1110,7 +1110,7 @@ async fn execute_verbose(
         Ok(response)
     }
 
-    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+    #[cfg(not(vestige_embeddings_removed))]
     {
         let node = storage
             .ingest_in_scope_with_secret_policy(input, &scope, secret_policy)
@@ -1161,7 +1161,7 @@ async fn execute_verbose(
 /// never sees it, so the MCP layer carries the live set into each ingest call.
 /// If the cognitive engine lock is contended, an empty set is passed and the
 /// ingest behaves exactly as before — the handoff must never block a write.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 fn current_labile_candidates(
     cognitive: &Arc<Mutex<CognitiveEngine>>,
 ) -> Vec<vestige_core::LabileCandidate> {
@@ -1174,7 +1174,7 @@ fn current_labile_candidates(
 /// The reconsolidation verdict surface embedded in an ingest response: the
 /// plan id plus how to act on it through the existing `dedup` decision
 /// surface. Present only when a plan was created.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 fn reconsolidation_surface(plan_id: &str, decision: &str) -> Value {
     serde_json::json!({
         "planId": plan_id,
@@ -1343,9 +1343,9 @@ async fn execute_batch(
 
     let mut results = Vec::new();
     let mut created = 0u32;
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     let mut updated = 0u32;
-    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+    #[cfg(not(vestige_embeddings_removed))]
     let updated = 0u32;
     let mut skipped = 0u32;
     let mut errors = 0u32;
@@ -1402,7 +1402,7 @@ async fn execute_batch(
         } else {
             SecretPolicy::Reject
         };
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         let input_has_secret_finding = !scan_secrets(&item.content).is_empty();
 
         // ================================================================
@@ -1541,7 +1541,7 @@ async fn execute_batch(
             continue;
         }
 
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         {
             // Reconsolidation handoff for the batch: one snapshot of the live
             // labile set covers the whole batch (ingest does not open windows;
@@ -1625,7 +1625,7 @@ async fn execute_batch(
             }
         }
 
-        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+        #[cfg(not(vestige_embeddings_removed))]
         {
             match storage.ingest_in_scope_with_secret_policy(input, &scope, secret_policy) {
                 Ok(node) => {

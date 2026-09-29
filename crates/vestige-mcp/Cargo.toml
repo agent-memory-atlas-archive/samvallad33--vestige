@@ -32,9 +32,9 @@ migrate-to-strata = ["dep:strata", "dep:strata-migrate", "dep:strata-verify"]
 # guard + creation block armed.
 v3-engine = ["legacy-sqlite", "vestige-core/v3-engine"]
 # w1b vector removal: `embeddings` and `vector-search` no longer select any
-# dependencies — they exist only as declared (always-off) stubs so legacy
-# `#[cfg(feature = ...)]` sites in this crate don't trip `unexpected_cfgs`.
-# Mirrors the stub in vestige-core's Cargo.toml. Do not gate new code on them.
+# dependencies. They stay declared so manifests that still forward the names
+# resolve. Code does not key off them (`vestige_embeddings_removed` is an
+# unset cfg), so `--all-features` does not compile the deleted paths.
 embeddings = []
 vector-search = []
 # Git history for the codebase tool (libgit2, OpenSSL, libssh2). On by default;
@@ -191,3 +191,6 @@ required-features = ["legacy-sqlite"]
 [[test]]
 name = "views_sized_store"
 required-features = ["legacy-sqlite"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(vestige_embeddings_removed)"] }

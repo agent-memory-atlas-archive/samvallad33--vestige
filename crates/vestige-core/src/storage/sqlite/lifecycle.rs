@@ -1155,15 +1155,15 @@ impl SqliteMemoryStore {
 
         // 3. Generate missing and model-mismatched embeddings.
         // This must drain the whole set so embedder upgrades do not strand v1 corpora.
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         let embeddings_generated = self.generate_missing_embeddings()?;
-        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+        #[cfg(not(vestige_embeddings_removed))]
         let embeddings_generated = 0i64;
 
         // 4. Auto-dedup: merge similar memories (episodic → semantic consolidation)
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         let duplicates_merged = self.auto_dedup_consolidation().unwrap_or(0);
-        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+        #[cfg(not(vestige_embeddings_removed))]
         let duplicates_merged = 0i64;
 
         // 5. Compute ACT-R activations from access history
@@ -1564,7 +1564,7 @@ impl SqliteMemoryStore {
     /// The raw `VESTIGE_AUTO_CONSOLIDATE_MERGE` value, or a test's pinned
     /// value for this thread. Parsing stays in the caller so the fail-closed
     /// rule is read next to the destructive pass it guards.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub(super) fn auto_consolidate_merge_value() -> Option<String> {
         #[cfg(test)]
         if let Some(pinned) = AUTO_CONSOLIDATE_MERGE_FOR_TEST.with(|cell| cell.borrow().clone()) {
@@ -1579,7 +1579,7 @@ impl SqliteMemoryStore {
     /// appends unique content from weaker nodes, and deletes duplicates.
     /// Honors the `VESTIGE_AUTO_CONSOLIDATE_MERGE` opt-out (unset → on) and
     /// never merges away or deletes protected (pinned) nodes (#142).
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub(super) fn auto_dedup_consolidation(&self) -> Result<i64> {
         // OPT-IN (v2.6.0, reversing the #142 opt-out): this pass concat-merges
         // near-duplicate memories and HARD-DELETES the weaker ones with no

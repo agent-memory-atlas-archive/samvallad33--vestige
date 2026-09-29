@@ -3604,7 +3604,7 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("two"), "{body}");
     }
 
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     #[tokio::test]
     async fn duplicates_plan_then_apply_merges_through_the_reversible_reflog() {
         let (_dir, storage) = seed_storage();

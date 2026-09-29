@@ -4,17 +4,17 @@
 
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use directories::{BaseDirs, ProjectDirs};
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 use lru::LruCache;
 use rusqlite::types::{Type, Value, ValueRef};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
@@ -117,7 +117,7 @@ type TagMutationState = (
 // `HygieneNodeSummary`, `HygieneSnapshot`, and `TagVocabulary` are defined
 // in (and re-exported from) `crate::storage::types`.
 
-#[cfg(any(test, all(feature = "embeddings", feature = "vector-search")))]
+#[cfg(any(test, vestige_embeddings_removed))]
 fn temporal_candidate_is_eligible(
     incoming_from: Option<DateTime<Utc>>,
     incoming_until: Option<DateTime<Utc>>,
@@ -513,7 +513,7 @@ const DATABASE_FILE: &str = "vestige.db";
 // this gate decides whether consolidation hard-deletes near-duplicates, so a
 // process-wide flag would reach every consolidation test running at once.
 // `Some(None)` pins the variable unset; `Some(Some(v))` pins a value.
-#[cfg(all(test, feature = "embeddings", feature = "vector-search"))]
+#[cfg(all(test, vestige_embeddings_removed, vestige_embeddings_removed))]
 thread_local! {
     static AUTO_CONSOLIDATE_MERGE_FOR_TEST: std::cell::RefCell<Option<Option<String>>> =
         const { std::cell::RefCell::new(None) };
@@ -543,30 +543,30 @@ pub struct SqliteMemoryStore {
     pub(crate) writer: Mutex<Connection>,
     pub(crate) reader: Mutex<Connection>,
     scheduler: Mutex<FSRSScheduler>,
-    #[cfg(feature = "embeddings")]
+    #[cfg(vestige_embeddings_removed)]
     embedding_service: EmbeddingService,
-    #[cfg(feature = "vector-search")]
+    #[cfg(vestige_embeddings_removed)]
     vector_index: Option<Mutex<VectorIndex>>,
     /// LRU cache for query embeddings to avoid re-embedding repeated queries
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     query_cache: Option<Mutex<LruCache<String, Vec<f32>>>>,
     /// Explicit, process-local runtime for an active optional embedding
     /// profile.  It is never restored from disk: a caller must re-verify and
     /// attach local artifacts in every process before Qwen retrieval can run.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     attached_profile_runtime: RwLock<Option<AttachedProfileRuntime>>,
     /// Cached model signature. `None` until the first embedding is written.
     registered_model: std::sync::RwLock<Option<crate::storage::memory_store::ModelSignature>>,
     /// Where this process's vector index stands relative to the shared
     /// database: the last `PRAGMA data_version` it saw and the last
     /// `vector_journal.seq` it absorbed. See `refresh_vector_index_if_stale`.
-    #[cfg(feature = "vector-search")]
+    #[cfg(vestige_embeddings_removed)]
     vector_index_watermark: Mutex<VectorIndexWatermark>,
 }
 
 /// Where the in-process vector index stands relative to the shared database
 /// (#181). See `SqliteMemoryStore::refresh_vector_index_if_stale`.
-#[cfg(feature = "vector-search")]
+#[cfg(vestige_embeddings_removed)]
 #[derive(Debug, Clone, Copy)]
 struct VectorIndexWatermark {
     /// Last `PRAGMA data_version` observed on the reader connection.
@@ -583,7 +583,7 @@ struct VectorIndexWatermark {
     journal_seq: i64,
 }
 
-#[cfg(feature = "vector-search")]
+#[cfg(vestige_embeddings_removed)]
 impl Default for VectorIndexWatermark {
     fn default() -> Self {
         Self {
@@ -594,7 +594,7 @@ impl Default for VectorIndexWatermark {
 }
 
 /// What a refresh found in the journal past the watermark.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 enum VectorRefreshPlan {
     /// The journal is intact: apply exactly these per-node changes (`None` is a
     /// removal) and move the watermark to `head`.
@@ -607,7 +607,7 @@ enum VectorRefreshPlan {
     Reconcile,
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[derive(Clone)]
 struct AttachedProfileRuntime {
     profile_id: EmbeddingProfileId,
@@ -640,7 +640,7 @@ fn warn_skipped_row<T>(operation: &'static str) -> impl FnMut(rusqlite::Result<T
 /// not consult the busy handler for that upgrade. Writers go through
 /// [`SqliteMemoryStore::begin_write_transaction`], which begins IMMEDIATE. The
 /// `write_transaction_policy` lint enforces both halves of that split.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 fn begin_read_snapshot(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
     Ok(rusqlite::Transaction::new_unchecked(
         conn,
@@ -1046,7 +1046,7 @@ impl SqliteMemoryStore {
 
     /// Hash only mutation-relevant state. Access counters and passive decay do
     /// not invalidate a plan; content, source identity and control state do.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     fn merge_state_on(
         conn: &Connection,
         ids: &[String],
@@ -1072,7 +1072,7 @@ impl SqliteMemoryStore {
         Ok(state)
     }
 
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     fn merge_state_snapshot(
         &self,
         ids: &[String],
@@ -1422,7 +1422,7 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
         // A supplied embedding is indexed under the active profile or the
         // insert fails; it is never accepted and silently left unsearchable.
         if let Some(vector) = &record.embedding {
-            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+            #[cfg(vestige_embeddings_removed)]
             {
                 self.index_supplied_embedding(
                     &id_str,
@@ -1431,7 +1431,7 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
                     &record.content,
                 )?;
             }
-            #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+            #[cfg(not(vestige_embeddings_removed))]
             {
                 let _ = (vector, supplied_model);
                 return Err(MemoryStoreError::InvalidInput(
@@ -1457,9 +1457,9 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
             return Ok(None);
         };
         let (domains, domain_scores) = self.read_domain_columns(&id.to_string());
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         let embedding = self.get_node_embedding(&id.to_string()).ok().flatten();
-        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+        #[cfg(not(vestige_embeddings_removed))]
         let embedding: Option<Vec<f32>> = None;
         let mut rec = Self::node_to_record(node, embedding);
         rec.domains = domains;
@@ -1508,7 +1508,7 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
         use crate::storage::memory_store::{MemoryStoreError, SearchResult};
         // For Phase 1 we delegate to hybrid_search or keyword_search based on what is provided.
         let limit = if query.limit == 0 { 10 } else { query.limit };
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         {
             if let Some(ref text) = query.text {
                 let results = self
@@ -1532,7 +1532,7 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
                 return Ok(out);
             }
         }
-        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+        #[cfg(not(vestige_embeddings_removed))]
         {
             if let Some(ref text) = query.text {
                 // Use individual-term matching so multi-word queries find documents

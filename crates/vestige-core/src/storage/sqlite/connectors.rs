@@ -167,7 +167,7 @@ impl SqliteMemoryStore {
             )?;
         }
 
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         {
             if let Some(index) = self.vector_index.as_ref()
                 && let Ok(mut index) = index.lock()
