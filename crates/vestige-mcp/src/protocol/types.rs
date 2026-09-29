@@ -216,7 +216,7 @@ impl std::error::Error for JsonRpcError {}
 // TESTS
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
 

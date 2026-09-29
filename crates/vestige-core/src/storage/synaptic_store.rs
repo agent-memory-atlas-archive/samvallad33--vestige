@@ -20,15 +20,11 @@ use crate::trace::{
     SynapticCaptureEvidence, SynapticCaptureTrigger, SynapticCaptureWindow, SynapticStrengthChange,
 };
 
-pub const SYNAPTIC_CAPTURE_ALGORITHM_V1: &str = "vestige.synaptic_capture.v1";
-pub const SYNAPTIC_CAPTURE_SCHEMA_V1: &str =
-    "https://vestige.dev/schemas/receipt/synaptic-capture/v1";
-pub const SYNAPTIC_CAPTURE_ALGORITHM_V2: &str = "vestige.synaptic_capture.v2";
-pub const SYNAPTIC_CAPTURE_SCHEMA_V2: &str =
-    "https://vestige.dev/schemas/receipt/synaptic-capture/v2";
-pub const SYNAPTIC_CONTEXT_ALGORITHM_V1: &str = "vestige.synaptic_context.v1";
-pub const SYNAPTIC_CONTEXT_THRESHOLD_V1: f64 = 0.25;
-pub const SYNAPTIC_CAPTURE_CLAIM_BOUNDARY: &str = "Evidence-backed temporal association with a measured memory-state change; not proof that the trigger caused the earlier memory or a downstream outcome.";
+pub use super::contracts::{
+    SYNAPTIC_CAPTURE_ALGORITHM_V1, SYNAPTIC_CAPTURE_ALGORITHM_V2, SYNAPTIC_CAPTURE_CLAIM_BOUNDARY,
+    SYNAPTIC_CAPTURE_SCHEMA_V1, SYNAPTIC_CAPTURE_SCHEMA_V2, SYNAPTIC_CONTEXT_ALGORITHM_V1,
+    SYNAPTIC_CONTEXT_THRESHOLD_V1,
+};
 
 // `SynapticCapturePolicy`, `SynapticCaptureRequest`, `DurableSynapticCapture`,
 // `SynapticSignalSnapshot`, `SynapticImportanceEvent`, `SynapticIngestRequest`,

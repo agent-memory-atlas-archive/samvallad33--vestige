@@ -172,6 +172,11 @@ struct Args {
 }
 
 pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
+    if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        return Err(
+            "pending_strata: forgotten_lesson entity overlap is not a recorded edge".into(),
+        );
+    }
     let args: Args = match args {
         Some(v) => serde_json::from_value(v).map_err(|e| e.to_string())?,
         None => Args::default(),

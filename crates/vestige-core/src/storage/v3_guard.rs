@@ -32,6 +32,27 @@ pub struct V3Info {
     pub schema_version: u32,
 }
 
+impl V3Info {
+    /// Operator line. A schema version is included only when one was read;
+    /// `0` means the table was not read (the default binary does not link rusqlite).
+    pub fn refusal_message(&self) -> String {
+        if self.schema_version == 0 {
+            format!(
+                "v3 SQLite store at {} cannot be opened by 4.0. {}",
+                self.path.display(),
+                MIGRATION_HINT
+            )
+        } else {
+            format!(
+                "v3 SQLite store at {} (schema version {}) cannot be opened by 4.0. {}",
+                self.path.display(),
+                self.schema_version,
+                MIGRATION_HINT
+            )
+        }
+    }
+}
+
 /// Detect a v3 SQLite file at `path`.
 ///
 /// Reads at most the 100-byte database header (std file read, no write

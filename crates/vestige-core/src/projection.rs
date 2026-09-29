@@ -17,9 +17,7 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(not(feature = "legacy-sqlite"), allow(unused_imports))]
 use std::sync::Arc;
 
-#[cfg(feature = "legacy-sqlite")]
 use crate::Storage;
-#[cfg(feature = "legacy-sqlite")]
 use crate::storage::Result;
 
 /// Which client file shape to render.
@@ -108,7 +106,6 @@ const CANDIDATE_LIMIT: i32 = 500;
 /// Longest single projected line before it is cut.
 const MAX_LINE_CHARS: usize = 400;
 
-#[cfg(feature = "legacy-sqlite")]
 /// Pick the durable subset of `opts.scope`.
 pub fn select_durable(
     storage: &Arc<Storage>,
@@ -246,7 +243,6 @@ pub fn render(format: ProjectionFormat, scope: &str, items: &[ProjectedItem]) ->
     out
 }
 
-#[cfg(feature = "legacy-sqlite")]
 /// Build the full projection for a scope.
 pub fn project(storage: &Arc<Storage>, opts: &ProjectionOptions) -> Result<Projection> {
     let mut items = select_durable(storage, opts)?;

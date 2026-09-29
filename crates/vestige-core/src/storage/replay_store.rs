@@ -23,22 +23,15 @@ use super::sqlite::SqliteMemoryStore;
 use super::{Result, StorageError};
 use crate::trace::Receipt;
 
-/// The only selection boundary implemented by replay v1.
-pub const REPLAY_SELECTION_BOUNDARY: &str = "post_retrieval_context_ablation";
-/// Stable algorithm identifier included in every capsule, digest, and replay.
-pub const REPLAY_ALGORITHM_VERSION: &str = "vestige.post_retrieval_context_ablation.v1";
-/// Schema version for persisted capsule and replay payloads.
-pub const REPLAY_SCHEMA_VERSION: u32 = 1;
-/// Public claim boundary. Product surfaces must show this verbatim.
-pub const REPLAY_CLAIM_BOUNDARY: &str = "Controlled replay shows how the recorded memory context changes when specified evidence is withheld. It does not establish that a memory caused an agent answer or any real-world outcome.";
+pub use super::contracts::{
+    REPLAY_ALGORITHM_VERSION, REPLAY_CLAIM_BOUNDARY, REPLAY_SCHEMA_VERSION,
+    REPLAY_SELECTION_BOUNDARY, replay_evidence_slot, replay_idempotency_key,
+};
 
-const PRIVATE_DIGEST_DOMAIN: &[u8] = b"vestige.replay.private-item.v1";
-const POLICY_DIGEST_DOMAIN: &[u8] = b"vestige.replay.policy.v1";
 const ITEM_LEAF_DOMAIN: &[u8] = b"vestige.replay.item-leaf.v1";
 const SET_DIGEST_DOMAIN: &[u8] = b"vestige.replay.ordered-set.v1";
 const EMPTY_MERKLE_DOMAIN: &[u8] = b"vestige.replay.merkle-empty.v1";
 const MERKLE_PARENT_DOMAIN: &[u8] = b"vestige.replay.merkle-parent.v1";
-const IDEMPOTENCY_DOMAIN: &[u8] = b"vestige.replay.idempotency.v1";
 
 // `ReplayPrivacyState` and `ReplayDecayRisk` are defined in (and re-exported
 // from) `crate::storage::types`.
@@ -205,22 +198,7 @@ impl std::error::Error for ReplayBuildError {}
 
 // `RetrievalReplayItemDraft` and `RetrievalReplayCapsuleDraft` are defined
 // in (and re-exported from) `crate::storage::types`.
-pub use crate::storage::types::{RetrievalReplayCapsuleDraft, RetrievalReplayItemDraft};
-
-impl RetrievalReplayCapsuleDraft {
-    pub fn new(
-        source_receipt_id: impl Into<String>,
-        policy_digest: impl Into<String>,
-        items: Vec<RetrievalReplayItemDraft>,
-    ) -> Self {
-        Self {
-            source_receipt_id: source_receipt_id.into(),
-            policy_digest: policy_digest.into(),
-            items,
-            created_at: Utc::now(),
-        }
-    }
-}
+pub use crate::storage::types::RetrievalReplayCapsuleDraft;
 
 /// Persisted frozen item. Suppression nulls evidence and size-derived fields;
 /// the memory locator remains private until purge deletes the item row.
@@ -296,57 +274,6 @@ pub enum ReplayMaterializationCheck {
     Match,
     ContentChanged,
     Unavailable,
-}
-
-/// Build a non-public, keyed digest of one exact evidence fragment.
-///
-/// The key must come from a local secret and must not be persisted next to the
-/// digest. Including the receipt-local slot prevents cross-slot equality leaks.
-pub fn private_evidence_digest(
-    private_key: &[u8; 32],
-    evidence_slot: &str,
-    evidence_bytes: &[u8],
-) -> String {
-    let mut hasher = blake3::Hasher::new_keyed(private_key);
-    put_field(&mut hasher, PRIVATE_DIGEST_DOMAIN);
-    put_field(&mut hasher, evidence_slot.as_bytes());
-    put_field(&mut hasher, evidence_bytes);
-    format!("b3k:{}", hasher.finalize().to_hex())
-}
-
-/// Digest a canonical, non-content selection-policy representation.
-pub fn replay_policy_digest(canonical_policy: &[u8]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    put_field(&mut hasher, POLICY_DIGEST_DOMAIN);
-    put_field(&mut hasher, canonical_policy);
-    format!("b3:{}", hasher.finalize().to_hex())
-}
-
-/// Generate the only accepted receipt-local slot format for a one-based rank.
-pub fn replay_evidence_slot(rank: usize) -> String {
-    format!("evidence_{rank}")
-}
-
-/// Canonical idempotency key for a replay request.
-///
-/// Withheld slots are sorted and deduplicated, so retry order and accidental
-/// duplicate arguments do not mint a second replay.
-pub fn replay_idempotency_key(
-    algorithm_version: &str,
-    source_receipt_id: &str,
-    redaction_generation: u64,
-    withheld_slots: &[String],
-) -> String {
-    let normalized = normalize_withheld_slots(withheld_slots);
-    let mut hasher = blake3::Hasher::new();
-    put_field(&mut hasher, IDEMPOTENCY_DOMAIN);
-    put_field(&mut hasher, algorithm_version.as_bytes());
-    put_field(&mut hasher, source_receipt_id.as_bytes());
-    put_field(&mut hasher, &redaction_generation.to_be_bytes());
-    for slot in normalized {
-        put_field(&mut hasher, slot.as_bytes());
-    }
-    format!("b3:{}", hasher.finalize().to_hex())
 }
 
 /// Pure post-retrieval context ablation.
@@ -1866,6 +1793,9 @@ fn scrub_dependent_replay_receipts(tx: &Transaction<'_>, capsule_id: &str) -> Re
 #[cfg(all(test, feature = "v3-engine"))]
 mod tests {
     use super::*;
+    use crate::storage::{
+        RetrievalReplayItemDraft, private_evidence_digest, replay_policy_digest,
+    };
     // Only the rollback fixture drives a transaction by hand; production
     // writers go through SqliteMemoryStore::begin_write_transaction.
     use rusqlite::TransactionBehavior;

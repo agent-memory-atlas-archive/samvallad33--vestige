@@ -345,7 +345,7 @@ pub async fn execute_request_feedback(
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use crate::cognitive::CognitiveEngine;

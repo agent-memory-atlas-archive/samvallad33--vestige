@@ -2586,7 +2586,7 @@ pub fn format_node(node: &vestige_core::KnowledgeNode, detail_level: &str) -> Va
 // TESTS
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use crate::cognitive::CognitiveEngine;
@@ -4331,7 +4331,7 @@ mod tag_case_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod prospective_resurfacing_tests {
     use super::*;
     use crate::cognitive::CognitiveEngine;

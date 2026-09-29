@@ -1030,7 +1030,6 @@ fn git_lines(repo: &str, git_args: &[&str]) -> Option<Vec<String>> {
 /// Assemble the record pool + out-of-band evidence from `storage`, then run
 /// the pure walk. `Err` only for storage/IO failures; refusals are
 /// `needs_report`, not errors.
-#[cfg(feature = "legacy-sqlite")]
 pub fn walk_storage(
     storage: &crate::storage::Storage,
     req: &CausalWalkRequest,
@@ -1151,7 +1150,6 @@ pub fn walk_storage(
 
 /// Persist the trail as `evidence_of` edges (cause → evidence records).
 /// Called ONLY on promote; preview writes nothing. Returns the edges written.
-#[cfg(feature = "legacy-sqlite")]
 pub fn persist_evidence_edges(
     storage: &crate::storage::Storage,
     result: &CausalWalkResult,

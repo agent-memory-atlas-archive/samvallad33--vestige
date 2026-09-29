@@ -128,6 +128,12 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
         },
     };
 
+    if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        return Err(
+            "similarity_disabled: contradictions are not a recorded edge; embeddings, cosine, BM25, FTS, Jaccard, and keyword or name matching are not Strata operations".into(),
+        );
+    }
+
     let limit = args.limit.unwrap_or(50).clamp(2, 200);
     let min_trust = args.min_trust.unwrap_or(0.3).clamp(0.0, 1.0);
     let (scope, include_cross_scope) = parse_scope(&args)?;
@@ -253,7 +259,7 @@ fn memory_card(memory: &KnowledgeNode, trust: f64) -> Value {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;

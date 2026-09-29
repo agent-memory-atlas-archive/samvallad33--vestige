@@ -102,6 +102,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
+      # strata-migrate is workspace-excluded, so the step above never lints it.
+      - name: Clippy strata-migrate (all features, warnings are errors)
+        run: cargo clippy --manifest-path crates/strata-migrate/Cargo.toml -p strata-migrate --all-features -- -D warnings
+
       - name: Test
         run: cargo test --workspace
 
@@ -119,6 +123,8 @@ jobs:
 
       - name: strata-verify (migrated-log verification)
         run: cargo test --manifest-path crates/strata-verify/Cargo.toml
+      - name: Test strata-store
+        run: cargo test --manifest-path crates/strata-store/Cargo.toml
 
       - name: Test paid cloud-sync path
         # `cloud_sync` is cfg'd on cloud-sync AND legacy-sqlite. The sqlite

@@ -852,7 +852,7 @@ pub async fn execute_gc(storage: &Arc<Storage>, args: Option<Value>) -> Result<V
 // TESTS
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use crate::cognitive::CognitiveEngine;

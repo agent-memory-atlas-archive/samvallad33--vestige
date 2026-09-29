@@ -265,7 +265,6 @@ impl RedactionSafeReceiptBindingV1 {
             Some(ReceiptEvidence::SynapticCapture(_)) => {
                 Some(ReceiptBindingEvidenceKind::SynapticCapture)
             }
-            #[cfg(feature = "legacy-sqlite")]
             Some(ReceiptEvidence::CounterfactualReplay { .. }) => {
                 Some(ReceiptBindingEvidenceKind::CounterfactualReplay)
             }
@@ -2184,7 +2183,6 @@ fn receipt_memory_ids(receipt: &Receipt) -> HashSet<&str> {
             );
         }
         None => {}
-        #[cfg(feature = "legacy-sqlite")]
         Some(ReceiptEvidence::CounterfactualReplay { .. }) => {}
     }
     ids

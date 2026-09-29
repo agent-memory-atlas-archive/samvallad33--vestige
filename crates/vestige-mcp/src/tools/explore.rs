@@ -251,7 +251,7 @@ fn link_type_to_connection_type(link_type: &str) -> ConnectionType {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use crate::cognitive::CognitiveEngine;

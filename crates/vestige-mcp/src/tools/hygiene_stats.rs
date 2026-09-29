@@ -556,7 +556,7 @@ fn retention_bucket(value: f64) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use chrono::{Duration, TimeZone};

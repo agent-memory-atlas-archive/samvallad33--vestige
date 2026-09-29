@@ -58,11 +58,13 @@ pub const RECEIPT_KEY_FILE: &str = "receipt-signing.key";
 /// ed25519 signing domain for the MIGRATION_RECEIPT signature.
 const RECEIPT_SIGNATURE_CONTEXT: &[u8] = b"vestige strata migration receipt v1";
 
-/// The blake3 CHECKSUM over the receipt body: tamper-evidence only. It
-/// proves nothing about authorship (anyone can recompute it) — the ed25519
-/// signature is the authorship proof. (Audit finding: a keyed-BLAKE3
-/// "signature" was presented as verification while anyone could re-derive
-/// both the key and the digest.)
+// Not a doc comment: this note is about the receipt checksum, and a `///`
+// block here would document `GenesisRecord`.
+// The blake3 CHECKSUM over the receipt body: tamper-evidence only. It
+// proves nothing about authorship (anyone can recompute it) — the ed25519
+// signature is the authorship proof. (Audit finding: a keyed-BLAKE3
+// "signature" was presented as verification while anyone could re-derive
+// both the key and the digest.)
 
 /// First frame of a fresh migration log: provenance for everything after it.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

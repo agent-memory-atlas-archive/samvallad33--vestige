@@ -32,7 +32,9 @@
 #![warn(missing_docs)]
 
 pub mod layout;
+mod live;
 pub mod migration;
+mod readonly;
 
 use std::fmt;
 use std::path::Path;
@@ -662,3 +664,87 @@ pub use layout::{
     FRAME_LEN_BYTES as VERIFY_FRAME_LEN_BYTES, GateFrame, KernelRecord,
     MAGIC_BYTES as VERIFY_STORE_MAGIC, StoreFiles, StorePaths,
 };
+
+/// One verification of a directory. `json` is the pretty-printed report.
+/// The check never creates or modifies a file under `dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathReport {
+    /// True when every check for the detected layout passed.
+    pub ok: bool,
+    /// Pretty JSON of the layout-specific report.
+    pub json: String,
+    /// Human-readable failures. Empty when `ok` is true.
+    pub failures: Vec<String>,
+}
+
+/// Verify `dir` without writing.
+///
+/// Layout detection, in order:
+/// * segment files in `dir` — a migrated log when a receipt frame is
+///   present, otherwise a raw strata log (chain only);
+/// * `log/*.seg` plus `store.meta` — a live strata-store;
+/// * otherwise the kernel.log / gate.log layout.
+///
+/// A successful migrated-log check does not continue into the kernel
+/// layout. A missing path is a failure and is not created.
+pub fn verify_path(dir: &Path) -> PathReport {
+    if !dir.exists() {
+        return path_failure(format!("path does not exist: {}", dir.display()));
+    }
+    if readonly::dir_has_segments(dir) {
+        return verify_segment_dir(dir);
+    }
+    if live::is_live_store(dir) {
+        let report = live::verify_live_store(dir);
+        let failures = report.failures.clone();
+        return path_from(report.ok, &report, failures);
+    }
+    let report = verify_store(dir);
+    let failures = report.failures.iter().map(|f| f.to_string()).collect();
+    path_from(report.ok(), &report, failures)
+}
+
+fn verify_segment_dir(dir: &Path) -> PathReport {
+    let scan = match readonly::scan_log(dir) {
+        Ok(scan) => scan,
+        Err(err) => return path_failure(err),
+    };
+    let has_receipt = scan
+        .frames
+        .iter()
+        .any(|frame| frame.kind == strata_migrate::records::KIND_MIGRATION_RECEIPT);
+    if has_receipt {
+        return match migration::verify_migrated_log(dir) {
+            Ok(report) => {
+                let failures = report.failures.clone();
+                let ok = report.ok;
+                path_from(ok, &report, failures)
+            }
+            Err(err) => path_failure(err),
+        };
+    }
+    let report = live::LiveVerifyReport {
+        ok: true,
+        frames_total: scan.frames.len() as u64,
+        segments: scan.segments,
+        failures: Vec::new(),
+    };
+    path_from(true, &report, Vec::new())
+}
+
+fn path_failure(err: String) -> PathReport {
+    let body = serde_json::json!({ "ok": false, "failures": [err.clone()] });
+    PathReport {
+        ok: false,
+        json: serde_json::to_string_pretty(&body).expect("failure report serializes"),
+        failures: vec![err],
+    }
+}
+
+fn path_from(ok: bool, body: &impl serde::Serialize, failures: Vec<String>) -> PathReport {
+    PathReport {
+        ok,
+        json: serde_json::to_string_pretty(body).expect("verify report serializes"),
+        failures,
+    }
+}

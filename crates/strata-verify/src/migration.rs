@@ -2,13 +2,12 @@
 //! strata-migrate writes, verified end to end.
 //!
 //! `verify_migrated_log(dir)`:
-//! 1. opens the log — `StrataLog::open` halts on a flipped sealed byte,
-//!    truncation, or a wrong `strata.key`, so pass 1 is the chain check;
-//! 2. runs `verify_tail` plus a full re-scan of every segment;
-//! 3. decodes the MIGRATION_RECEIPT (frame kind 46) and verifies its
+//! 1. reads every segment in place — a flipped sealed byte, a truncation,
+//!    or a wrong `strata.key` fails the chain check, and nothing is written;
+//! 2. decodes the MIGRATION_RECEIPT (frame kind 46) and verifies its
 //!    blake3 checksum and its ed25519 signature under the in-log
 //!    verifying key;
-//! 4. REPLAYS the frames against the receipt's per-table counts — a
+//! 3. REPLAYS the frames against the receipt's per-table counts — a
 //!    dropped frame (possible only with the signing key, i.e. a lying
 //!    receipt) still fails here because the frame counts no longer match.
 //!
@@ -16,10 +15,11 @@
 
 use std::path::Path;
 
-use strata::StrataLog;
 use strata_migrate::records::{
     KIND_EDGE, KIND_MIGRATION_RECEIPT, KIND_NODE, KIND_TOMBSTONE, decode_receipt,
 };
+
+use crate::readonly;
 
 /// Outcome of a full migrated-log verification.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -67,10 +67,9 @@ fn expected_counts(
 /// Verify a migrated log directory. See the module docs.
 pub fn verify_migrated_log(dir: &Path) -> Result<MigrationVerifyReport, String> {
     // Pass 1: chain. A flipped sealed byte, truncation, or the wrong
-    // strata.key halts here.
-    let log = StrataLog::open(dir).map_err(|e| format!("log open/chain: {e}"))?;
-    log.verify_tail().map_err(|e| format!("tail verify: {e}"))?;
-    let frames = log.read_frames(1).map_err(|e| format!("frame scan: {e}"))?;
+    // strata.key fails here. The scan only reads.
+    let scan = readonly::scan_log(dir)?;
+    let frames = scan.frames;
     let frames_total = frames.len() as u64;
 
     let mut failures: Vec<String> = Vec::new();

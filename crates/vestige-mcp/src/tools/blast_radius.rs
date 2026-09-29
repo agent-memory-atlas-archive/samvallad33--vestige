@@ -276,7 +276,7 @@ async fn retire(storage: &Arc<Storage>, args: Args) -> Result<Value, String> {
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;

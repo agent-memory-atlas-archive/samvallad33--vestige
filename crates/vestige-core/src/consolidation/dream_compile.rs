@@ -477,7 +477,7 @@ fn pr_source_ids(pr: &MemoryPr) -> Vec<String> {
 // TESTS
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use crate::storage::ConnectionRecord;

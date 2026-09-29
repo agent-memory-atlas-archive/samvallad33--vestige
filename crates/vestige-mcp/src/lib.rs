@@ -4,27 +4,23 @@
 //!
 //! Every module that touches the legacy SQLite store (`Storage`) is
 //! quarantined behind the `legacy-sqlite` feature (build/t5-legacy-isolation,
-//! mirroring vestige-core). That feature is not a default: the 4.0 binaries
-//! do not link rusqlite. Opt in with `--features legacy-sqlite`.
+//! mirroring vestige-core). Default ON; flips off with the STRATA backend.
+//! A `legacy-sqlite`-free build still compiles every binary — they open
+//! storage through `vestige_core::open_storage()` and exit with its clear
+//! `LegacySqliteDisabled` error at runtime.
 
-#[cfg(feature = "legacy-sqlite")]
 pub mod actor_surface;
 
-#[cfg(feature = "legacy-sqlite")]
 pub mod autopilot;
-#[cfg(feature = "legacy-sqlite")]
 pub mod cognitive;
-#[cfg(feature = "legacy-sqlite")]
 pub mod dashboard;
-#[cfg(feature = "legacy-sqlite")]
 pub mod protocol;
-#[cfg(feature = "legacy-sqlite")]
+#[cfg(all(test, not(feature = "legacy-sqlite")))]
+mod protocol_stdio_store;
 pub mod resources;
-#[cfg(feature = "legacy-sqlite")]
 pub mod server;
-#[cfg(feature = "legacy-sqlite")]
+pub mod strata_memory;
 pub mod tools;
-#[cfg(feature = "legacy-sqlite")]
 pub mod trace_recorder;
 
 /// Whether this binary was compiled with an embedding runtime and a vector

@@ -28,12 +28,7 @@ use crate::memory::KnowledgeNode;
 use super::sqlite::SqliteMemoryStore;
 use super::{Result, StorageError};
 
-/// Causal lineage edge types followed by the default blast traversal.
-pub const BLAST_LINK_TYPES: [&str; 3] = ["derived_from", "backfill_candidate", "evidence_of"];
-
-/// BFS depth cap. A->B->... chains deeper than this are not reported; the
-/// edge chain that deep is already well past hypothesis strength.
-pub const BLAST_MAX_DEPTH: u32 = 5;
+pub use super::contracts::{BLAST_LINK_TYPES, BLAST_MAX_DEPTH, BLAST_SCAN_NODE_CAP, commit_sha_of};
 
 /// Minimum hex length accepted for a `commit <sha>` line and for sha-prefix
 /// root resolution (guards against prose false positives).
@@ -42,28 +37,6 @@ const MIN_SHA_CHARS: usize = 6;
 // `BlastAffected`, `BlastReport`, and `RetireOutcome` are defined in (and
 // re-exported from) `crate::storage::types`.
 pub use crate::storage::types::{BlastAffected, BlastReport, RetireOutcome};
-
-/// Extract the sha from a record's `commit <sha> ...` line, if any.
-///
-/// Commit records are persisted with a first line of
-/// `commit <sha> <subject>` (see `advanced::git_records::record_content`).
-/// The hex + minimum-length guard keeps prose mentions of the word "commit"
-/// from matching.
-pub fn commit_sha_of(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let line = line.trim_start();
-        let Some(rest) = line.strip_prefix("commit ") else {
-            continue;
-        };
-        let Some(token) = rest.split_whitespace().next() else {
-            continue;
-        };
-        if token.len() >= MIN_SHA_CHARS && token.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Some(token.to_ascii_lowercase());
-        }
-    }
-    None
-}
 
 /// valid_until IS NULL or > now.
 fn is_open(node: &KnowledgeNode, now: chrono::DateTime<Utc>) -> bool {
@@ -258,11 +231,6 @@ impl SqliteMemoryStore {
         Ok(all)
     }
 }
-
-/// Upper bound on nodes scanned for shared-sha siblings / sha-prefix root
-/// resolution. 20k covers operational stores; larger stores should shard
-/// scopes.
-pub const BLAST_SCAN_NODE_CAP: usize = 20_000;
 
 #[cfg(test)]
 mod tests {

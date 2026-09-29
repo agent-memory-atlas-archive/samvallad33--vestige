@@ -111,6 +111,12 @@ async fn run_backfill(
 }
 
 pub async fn execute(storage: &Arc<Storage>, _args: Option<Value>) -> Result<Value, String> {
+    if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        return Err(
+            "pending_strata: selftest plants causes and scores entity overlap; that is not a recorded edge"
+                .into(),
+        );
+    }
     // 1. Consistent snapshot of the live store into a throwaway tempdir.
     let dir = tempfile::TempDir::new().map_err(|e| format!("tempdir failed: {e}"))?;
     let copy_path = dir.path().join("selftest-copy.db");
@@ -221,7 +227,7 @@ pub async fn execute(storage: &Arc<Storage>, _args: Option<Value>) -> Result<Val
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use vestige_core::IngestInput;

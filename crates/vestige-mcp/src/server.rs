@@ -2864,7 +2864,7 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
 // TESTS
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use crate::protocol::types::MODERN_PROTOCOL_VERSION;

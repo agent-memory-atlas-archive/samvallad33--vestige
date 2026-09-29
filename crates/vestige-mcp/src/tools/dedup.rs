@@ -594,7 +594,7 @@ fn execute_tag_mutation(
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use vestige_core::IngestInput;

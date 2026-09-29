@@ -298,6 +298,16 @@ pub struct IntentionRecord {
     pub scope: Option<String>,
 }
 
+impl IntentionRecord {
+    /// Normalized namespace: blank or `None` is `user`.
+    pub fn effective_scope(&self) -> &str {
+        match self.scope.as_deref() {
+            Some(scope) if !scope.trim().is_empty() => scope.trim(),
+            _ => "user",
+        }
+    }
+}
+
 /// Insight data for persistence (matches the insights table schema)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InsightRecord {
@@ -614,6 +624,23 @@ pub enum HandleKind {
     Unknown,
 }
 
+impl HandleKind {
+    /// Stable lowercase name (matches the serde serialization).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HandleKind::Memory => "memory",
+            HandleKind::Commit => "commit",
+            HandleKind::File => "file",
+            HandleKind::Symbol => "symbol",
+            HandleKind::Test => "test",
+            HandleKind::Run => "run",
+            HandleKind::ToolCall => "tool_call",
+            HandleKind::Tag => "tag",
+            HandleKind::Unknown => "unknown",
+        }
+    }
+}
+
 /// Outcome of resolving one query against the store.
 ///
 /// - `ids` non-empty: resolved. When `exact` is false the match was a unique
@@ -779,6 +806,21 @@ pub struct RetrievalReplayCapsuleDraft {
     pub policy_digest: String,
     pub items: Vec<RetrievalReplayItemDraft>,
     pub created_at: DateTime<Utc>,
+}
+
+impl RetrievalReplayCapsuleDraft {
+    pub fn new(
+        source_receipt_id: impl Into<String>,
+        policy_digest: impl Into<String>,
+        items: Vec<RetrievalReplayItemDraft>,
+    ) -> Self {
+        Self {
+            source_receipt_id: source_receipt_id.into(),
+            policy_digest: policy_digest.into(),
+            items,
+            created_at: Utc::now(),
+        }
+    }
 }
 
 /// Public capsule projection. Stable memory ids and private item digests never
@@ -953,6 +995,12 @@ pub struct StoredReceiptAttestationVerification {
     pub receipt_binding_valid: bool,
 }
 
+impl StoredReceiptAttestationVerification {
+    pub fn is_valid(&self) -> bool {
+        self.report.is_valid() && self.receipt_binding_valid
+    }
+}
+
 // ----------------------------------------------------------------------------
 // SYNAPTIC CAPTURE
 // ----------------------------------------------------------------------------
@@ -1059,6 +1107,13 @@ pub struct PortableArchive {
     pub mode: String,
     /// Dumped storage tables in deterministic import order.
     pub tables: Vec<PortableTable>,
+}
+
+impl PortableArchive {
+    /// Count all rows across all tables.
+    pub fn total_rows(&self) -> usize {
+        self.tables.iter().map(|table| table.rows.len()).sum()
+    }
 }
 
 /// One table in a portable archive.

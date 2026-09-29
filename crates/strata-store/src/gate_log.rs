@@ -8,13 +8,12 @@
 //! invariants (propose < gate < effect windows, blast-radius fact ids,
 //! `ReadNoReceipt` duty checks) are consistent within that space.
 //!
-//! The frame cache is shared across clones (single-writer, single-threaded
-//! v1), so a runtime constructed per mutation sees every prior append without
-//! re-reading the log. The cache is `Rc`-backed: `StrataEventLog` (and a
-//! `StrataStore` holding one) is intentionally `!Send`.
+//! The frame cache is shared across clones (single-writer v1), so a runtime
+//! constructed per mutation sees every prior append without re-reading the
+//! log. The cache is `Arc<Mutex>`-backed so `StrataStore` is `Send` and the
+//! MCP runtime can hold it. Callers still admit one write at a time.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use strata::StrataLog;
 use strata_gate::record::{GateEvent, RecordKind};
@@ -25,7 +24,7 @@ use strata_gate::{EventLog, SeqAck};
 pub struct StrataEventLog {
     log: StrataLog,
     /// Gate frames only, in append order; index == gate seq.
-    cache: Rc<RefCell<Vec<GateEvent>>>,
+    cache: Arc<Mutex<Vec<GateEvent>>>,
 }
 
 impl StrataEventLog {
@@ -52,8 +51,14 @@ impl StrataEventLog {
         }
         Ok(Self {
             log,
-            cache: Rc::new(RefCell::new(cache)),
+            cache: Arc::new(Mutex::new(cache)),
         })
+    }
+
+    fn cache(&self) -> std::sync::MutexGuard<'_, Vec<GateEvent>> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| panic!("strata-store: gate cache poisoned: {e}"))
     }
 
     /// The underlying durable log (shared handle).
@@ -63,14 +68,13 @@ impl StrataEventLog {
 
     /// Number of gate frames visible to the gate runtime.
     pub fn gate_frame_count(&self) -> u64 {
-        self.cache.borrow().len() as u64
+        self.cache().len() as u64
     }
 }
 
 impl EventLog for StrataEventLog {
     fn events_before(&self, bound: u64) -> Vec<GateEvent> {
-        self.cache
-            .borrow()
+        self.cache()
             .iter()
             .take_while(|e| e.seq < bound)
             .cloned()
@@ -82,8 +86,9 @@ impl EventLog for StrataEventLog {
             .log
             .append(kind.to_u8(), &payload)
             .unwrap_or_else(|e| panic!("strata-store: durable append failed (fail-stop): {e}"));
-        let gate_seq = self.cache.borrow().len() as u64;
-        self.cache.borrow_mut().push(GateEvent {
+        let mut cache = self.cache();
+        let gate_seq = cache.len() as u64;
+        cache.push(GateEvent {
             seq: gate_seq,
             kind,
             payload,
@@ -95,6 +100,6 @@ impl EventLog for StrataEventLog {
     }
 
     fn tip(&self) -> u64 {
-        self.cache.borrow().len() as u64
+        self.cache().len() as u64
     }
 }

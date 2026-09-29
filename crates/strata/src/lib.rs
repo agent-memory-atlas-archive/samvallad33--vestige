@@ -68,8 +68,9 @@ mod tests;
 
 pub use error::{HaltDetail, StrataError};
 pub use format::{
-    Frame, FrameRecord, SegmentHeader, SegmentTrailer, GENESIS_PREV_SEGMENT_HASH, SEGMENT_MAGIC,
-    SEGMENT_VERSION,
+    FRAME_FIXED_WIRE_SIZE, Frame, FrameRecord, GENESIS_PREV_SEGMENT_HASH, HEADER_WIRE_SIZE,
+    SEGMENT_MAGIC, SEGMENT_VERSION, SegmentHeader, SegmentTrailer, TRAILER_WIRE_SIZE, frame_hash,
+    header_hash, merkle_root, parse_frame, payload_blake3, signature_message,
 };
 pub use log::{
     HeadInfo, SealInfo, SeqAck, StrataLog, TailReport, TrailerCheck, GROUP_COMMIT_WINDOW_MS,

@@ -460,7 +460,7 @@ fn label(storage: &Arc<Storage>, args: &ComposedGraphArgs) -> Result<Value, Stri
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;

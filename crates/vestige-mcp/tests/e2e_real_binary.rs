@@ -112,7 +112,6 @@ fn purge_tool_purges_refuses_without_confirm_and_alias_matches() {
 // Re-lands with the strata runtime boot: this journey starts from an
 // EMPTY data dir, and a guard-armed 4.0 binary creates no SQLite store
 // (audit blocker 1) — there is nothing to boot until strata lands.
-#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn discover_answers_before_any_handshake_and_does_not_overclaim() {
     let dir = data_dir();
@@ -153,6 +152,9 @@ fn discover_answers_before_any_handshake_and_does_not_overclaim() {
         "#241: the server implements the 2026-07-28 stateless core, resultType \
          and the receipt-card app, so it must advertise it: {versions:?}"
     );
+    // One writer per log. Release this process before the probes open the
+    // same directory.
+    server.shutdown();
     // Every LEGACY advertised revision must be one initialize will actually
     // accept. The modern revision is deliberately absent from the handshake:
     // a 2026-07-28 client never shakes hands at all, it sends per-request
@@ -172,15 +174,12 @@ fn discover_answers_before_any_handshake_and_does_not_overclaim() {
             json!(version),
             "discover advertised {version} but initialize negotiated something else"
         );
-        probe.abandon();
+        probe.shutdown();
     }
-
-    server.shutdown();
 }
 
 /// Everything except `initialize` and `server/discover` must be refused before
 /// the handshake, and refused cleanly rather than by panicking.
-#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn uninitialized_requests_are_refused_but_discover_is_exempt() {
     let dir = data_dir();
@@ -219,7 +218,6 @@ fn uninitialized_requests_are_refused_but_discover_is_exempt() {
 /// Catches: a client that believes it is paginating looping on page one forever,
 /// and a conformance suite that cannot verify the templates surface at all while
 /// it errors (#175).
-#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn list_methods_reject_unknown_cursors_and_templates_list_is_empty() {
     let dir = data_dir();
@@ -271,7 +269,6 @@ fn list_methods_reject_unknown_cursors_and_templates_list_is_empty() {
 /// silently busts every client's prompt cache and re-sends ~28 KB of schema on
 /// every session start), and a dropped `ttlMs`/`cacheScope`, which leaves the
 /// client no way to know it could have kept its copy.
-#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn tools_list_is_deterministic_across_restarts_and_carries_cache_hints() {
     let first_dir = data_dir();
@@ -396,7 +393,6 @@ fn tools_list_is_deterministic_across_restarts_and_carries_cache_hints() {
 /// Catches: a panic or a hang on hostile input, and — via the trailing `ping` —
 /// a framing desync where one bad message shifts every later response onto the
 /// wrong request id.
-#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn hostile_input_produces_clean_errors_without_panicking_or_desyncing() {
     let dir = data_dir();
@@ -478,7 +474,6 @@ fn hostile_input_produces_clean_errors_without_panicking_or_desyncing() {
 /// Catches: a transport that answers a notification (which would leave the
 /// client one response ahead forever) or that treats a blank keepalive line as
 /// a message.
-#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn blank_lines_and_notifications_produce_no_response() {
     let dir = data_dir();
@@ -1777,7 +1772,6 @@ fn session_start_returns_a_budgeted_context_and_rejects_a_bad_budget() {
     server.shutdown();
 }
 
-#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn memory_status_every_view_has_its_shape_and_an_unknown_view_errors() {
     let dir = data_dir();
@@ -1956,7 +1950,6 @@ fn intention_set_list_check_update_round_trip_and_a_bad_trigger_errors() {
     server.shutdown();
 }
 
-#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn maintain_scores_importance_dry_runs_gc_consolidates_and_restore_needs_a_path() {
     let dir = data_dir();
@@ -2013,7 +2006,6 @@ fn maintain_scores_importance_dry_runs_gc_consolidates_and_restore_needs_a_path(
     server.shutdown();
 }
 
-#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn codebase_remembers_a_decision_returns_context_verifies_and_needs_its_fields() {
     let dir = data_dir();
@@ -2139,7 +2131,6 @@ fn receipt_get_returns_the_receipt_a_recall_produced_and_an_unknown_id_errors() 
 /// `source_sync` reaches an external system, so it has no offline happy path.
 /// Both of its tests are error paths by design; the connector itself is
 /// covered by the unit tests in `vestige-core`.
-#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn source_sync_rejects_an_unknown_source_and_a_missing_repo_without_touching_the_network() {
     let dir = data_dir();
@@ -2160,7 +2151,6 @@ fn source_sync_rejects_an_unknown_source_and_a_missing_repo_without_touching_the
     server.shutdown();
 }
 
-#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn smart_ingest_and_suppress_reject_calls_without_their_subject() {
     let dir = data_dir();
@@ -2237,7 +2227,6 @@ fn causal_walk_selftest_and_forgotten_lesson_are_called_over_stdio() {
 /// The guard: every tool the server advertises has at least two calls in this
 /// file. Adding a tool without driving it over stdio fails here, not in a
 /// user's client.
-#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn every_advertised_tool_is_called_at_least_twice_in_this_suite() {
     let dir = data_dir();

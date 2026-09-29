@@ -525,6 +525,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctor"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec09e802f5081de6157da9a75701d6c713d8dc3ba52571fd4bd25f412644e8a6"
+dependencies = [
+ "ctor-proc-macro",
+ "dtor",
+]
+
+[[package]]
+name = "ctor-proc-macro"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2931af7e13dc045d8e9d26afccc6fa115d64e115c9c84b1166288b46f6782c2"
+
+[[package]]
 name = "ctutils"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -620,6 +636,21 @@ dependencies = [
  "quote",
  "syn 3.0.6",
 ]
+
+[[package]]
+name = "dtor"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97cbdf2ad6846025e8e25df05171abfb30e3ababa12ee0a0e44b9bbe570633a8"
+dependencies = [
+ "dtor-proc-macro",
+]
+
+[[package]]
+name = "dtor-proc-macro"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7454e41ff9012c00d53cf7f475c5e3afa3b91b7c90568495495e8d9bf47a1055"
 
 [[package]]
 name = "dunce"
@@ -2335,11 +2366,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "strata-store"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "borsh",
+ "strata",
+ "strata-gate",
+ "strata-kernel",
+]
+
+[[package]]
 name = "strata-verify"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "borsh",
+ "ed25519-dalek",
  "serde",
  "serde_json",
  "strata",
@@ -2885,6 +2928,7 @@ dependencies = [
  "chrono",
  "clap",
  "colored",
+ "ctor",
  "directories",
  "ed25519-dalek",
  "futures-util",
@@ -2896,6 +2940,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "strata-migrate",
+ "strata-store",
  "strata-verify",
  "subtle",
  "tempfile",

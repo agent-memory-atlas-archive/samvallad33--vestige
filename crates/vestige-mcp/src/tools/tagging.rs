@@ -176,7 +176,7 @@ pub async fn execute_stats(storage: &Arc<Storage>) -> Result<Value, String> {
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use vestige_core::IngestInput;

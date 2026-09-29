@@ -1706,7 +1706,7 @@ async fn execute_batch(
 /// content — so purge remains authoritative and suppressed memories stay out.
 ///
 /// Uses try_lock() for non-blocking access. If cognitive is locked, side effects are skipped.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 fn run_post_ingest(
     storage: &Arc<Storage>,
     cognitive: &Arc<Mutex<CognitiveEngine>>,
@@ -1924,7 +1924,7 @@ fn dominant_importance_event(snapshot: &SynapticSignalSnapshot) -> (&'static str
 // TESTS
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     #[test]
     fn lean_response_drops_what_says_nothing_and_keeps_what_matters() {

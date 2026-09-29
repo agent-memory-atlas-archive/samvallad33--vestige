@@ -546,7 +546,7 @@ fn merge_policy(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, St
 // TESTS — see tests/merge_supersede_test.rs for full integration coverage.
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
 

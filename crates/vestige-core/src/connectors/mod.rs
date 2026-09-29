@@ -34,9 +34,6 @@
 use chrono::{DateTime, Utc};
 
 use crate::memory::{IngestInput, SourceEnvelope};
-// Connector cursor state persists through the legacy SQLite store
-// (build/t5-legacy-isolation).
-#[cfg(feature = "legacy-sqlite")]
 use crate::storage::ConnectorCursor;
 
 #[cfg(feature = "connectors")]
@@ -223,7 +220,6 @@ pub struct SyncReport {
 ///
 /// `max_pages` bounds a single run (so a first sync of a 15-year tracker can be
 /// resumed across calls rather than blocking on one enormous fetch).
-#[cfg(feature = "legacy-sqlite")]
 pub async fn run_sync<C: Connector>(
     store: &crate::storage::Storage,
     connector: &C,

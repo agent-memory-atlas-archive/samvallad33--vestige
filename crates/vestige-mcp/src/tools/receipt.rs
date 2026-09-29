@@ -200,6 +200,10 @@ fn claim_boundary_for_receipt(receipt: &Receipt) -> &'static str {
 }
 
 fn safe_storage_error(operation: &str, error: &impl std::fmt::Display) -> String {
+    let text = error.to_string();
+    if text.contains("pending_strata") || text.contains("similarity_disabled") {
+        return text;
+    }
     tracing::warn!(%error, "receipt storage operation failed: {operation}");
     format!("Receipt {operation} is temporarily unavailable")
 }

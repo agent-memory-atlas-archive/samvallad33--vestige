@@ -10,7 +10,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{OptionalExtension, params};
 use std::collections::HashSet;
 #[cfg(unix)]
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use uuid::Uuid;
@@ -34,12 +34,6 @@ pub use crate::storage::types::{
     DurableSignedReceipt, DurableSignedRetrievalReceipt, ReceiptAttestationStatus,
     SignedReceiptWrite, StoredReceiptAttestationVerification,
 };
-
-impl StoredReceiptAttestationVerification {
-    pub fn is_valid(&self) -> bool {
-        self.report.is_valid() && self.receipt_binding_valid
-    }
-}
 
 /// Result of provisioning an Ed25519 seed sidecar before activating its public
 /// key in SQLite. Secret bytes are never included in this value or its `Debug`
@@ -184,53 +178,6 @@ pub fn provision_receipt_signing_key_sidecar(
 ) -> Result<ProvisionedReceiptSigningKey> {
     Err(StorageError::Init(
         "secure receipt signing-key sidecar provisioning currently requires Unix 0700/0600 and directory-fsync semantics"
-            .into(),
-    ))
-}
-
-/// Load a provisioned 32-byte seed after revalidating type, size, symlink, and
-/// Unix permission boundaries. Callers should minimize its lifetime.
-#[cfg(unix)]
-pub fn load_receipt_signing_seed(path: &Path) -> Result<[u8; 32]> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| StorageError::Init(format!("stat signing-key sidecar: {error}")))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(StorageError::Init(
-            "receipt signing-key sidecar must be a regular non-symlink file".into(),
-        ));
-    }
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(StorageError::Init(
-            "receipt signing-key sidecar permissions must not grant group/other access".into(),
-        ));
-    }
-    if let Some(directory) = path.parent() {
-        validate_sidecar_directory(directory)?;
-    }
-    let mut seed = [0_u8; 32];
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| StorageError::Init(format!("open signing-key sidecar: {error}")))?;
-    file.read_exact(&mut seed)
-        .map_err(|error| StorageError::Init(format!("read signing-key seed: {error}")))?;
-    let mut trailing = [0_u8; 1];
-    if file
-        .read(&mut trailing)
-        .map_err(|error| StorageError::Init(format!("read signing-key trailer: {error}")))?
-        != 0
-    {
-        return Err(StorageError::Init(
-            "receipt signing-key sidecar must contain exactly 32 bytes".into(),
-        ));
-    }
-    Ok(seed)
-}
-
-#[cfg(not(unix))]
-pub fn load_receipt_signing_seed(_path: &Path) -> Result<[u8; 32]> {
-    Err(StorageError::Init(
-        "secure receipt signing-key sidecar loading currently requires Unix permission semantics"
             .into(),
     ))
 }
@@ -1557,7 +1504,7 @@ mod tests {
             & 0o777;
         assert_eq!(directory_mode, 0o700);
         assert_eq!(file_mode, 0o600);
-        let seed = load_receipt_signing_seed(&provisioned.seed_path).unwrap();
+        let seed = crate::storage::load_receipt_signing_seed(&provisioned.seed_path).unwrap();
         assert_eq!(
             SigningKey::from_bytes(&seed).verifying_key().to_bytes(),
             provisioned.trusted_key.public_key
