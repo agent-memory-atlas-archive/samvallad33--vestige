@@ -38,6 +38,8 @@ fn permissive_policy() -> Policy {
 fn input(content: &str, tags: &[&str]) -> IngestInput {
     IngestInput {
         content: content.to_string(),
+        source: None,
+        source_updated_at_ms: None,
         node_type: String::new(),
         tags: tags.iter().map(|t| t.to_string()).collect(),
         created_at_ms: Some(1_700_000_000_000),
@@ -70,6 +72,8 @@ fn ingest_read_roundtrip() {
     assert_eq!(node.valid_from_ms, node.created_at_ms);
     assert_eq!(node.valid_until_ms, crate::VALID_FOREVER_MS);
     assert!(node.superseded_by.is_none());
+    assert!(node.source.is_none());
+    assert!(node.source_updated_at_ms.is_none());
 
     let scoped = store.get_all_nodes_in_scope("proj");
     assert_eq!(scoped.len(), 1);
@@ -93,6 +97,41 @@ fn ingest_read_roundtrip() {
     store
         .verify_checkpoint_chain()
         .expect("chain ok with no checkpoints");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn ingest_keeps_source_and_replays_it() {
+    let dir = temp_dir("source");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let updated_ms = 1_771_585_800_000;
+    let id = store
+        .ingest(IngestInput {
+            content: "imported from v3".into(),
+            source: Some(crate::SourceKey {
+                system: "fixture".into(),
+                project: String::new(),
+                id: String::new(),
+            }),
+            source_updated_at_ms: Some(updated_ms),
+            ..input("ignored", &[])
+        })
+        .expect("ingest");
+    let node = store.get_node(&id).expect("node");
+    let source = node.source.expect("source dropped");
+    assert_eq!(source.system, "fixture");
+    assert!(source.project.is_empty());
+    assert!(source.id.is_empty());
+    assert_eq!(node.source_updated_at_ms, Some(updated_ms));
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    let again = reopened.get_node(&id).expect("replayed");
+    assert_eq!(
+        again.source.as_ref().map(|key| key.system.as_str()),
+        Some("fixture")
+    );
+    assert_eq!(again.source_updated_at_ms, Some(updated_ms));
     std::fs::remove_dir_all(&dir).ok();
 }
 

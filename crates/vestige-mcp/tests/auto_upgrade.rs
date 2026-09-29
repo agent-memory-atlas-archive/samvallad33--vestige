@@ -118,6 +118,66 @@ fn assert_fixture_landed(db: &Path, log_dir: &Path) {
         .expect("touched link dropped");
     assert!(!touched.legacy_inferred);
     assert_eq!(touched.link_type, "touched");
+    assert_v3_source_kept(db, log_dir);
+}
+
+/// The v3.1.1 fixture's `source` text and its `updated_at` survive the upgrade
+/// on `source` / `source_updated_at_ms`. Rows with no source (the walk
+/// receipt) stay `None`.
+fn assert_v3_source_kept(db: &Path, log_dir: &Path) {
+    let snap = snapshot(log_dir);
+    let expected_ms = strata_migrate::source::timestamp_ms("2026-02-20T11:30:00+00:00").unwrap();
+    let ids = knowledge_ids(db);
+    assert!(ids.len() >= 4, "fixture lost its memories");
+    for id in &ids {
+        let node = snap
+            .nodes
+            .iter()
+            .find(|node| &node.legacy_id == id)
+            .unwrap_or_else(|| panic!("dropped memory {id}"));
+        let source = node
+            .source
+            .as_ref()
+            .unwrap_or_else(|| panic!("{id} dropped its v3 source"));
+        assert_eq!(source.system, "fixture", "{id}");
+        assert!(source.project.is_empty(), "{id}");
+        assert!(source.id.is_empty(), "{id}");
+        assert_eq!(node.source_updated_at_ms, Some(expected_ms), "{id}");
+        let raw = node
+            .legacy
+            .iter()
+            .find(|(key, _)| key == "knowledge_nodes.source")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(raw, Some("fixture"), "{id} legacy source column dropped");
+    }
+    let receipts: Vec<_> = snap
+        .nodes
+        .iter()
+        .filter(|node| node.node_type == "walk_receipt")
+        .collect();
+    assert!(
+        !receipts.is_empty(),
+        "fixture walk receipt missing; cannot check the None path"
+    );
+    for node in receipts {
+        assert!(
+            node.source.is_none(),
+            "walk receipt invented a source: {:?}",
+            node.source
+        );
+        assert!(node.source_updated_at_ms.is_none());
+    }
+}
+
+#[test]
+fn v311_upgrade_keeps_source_and_source_updated_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = plant(dir.path());
+    let status = auto_upgrade::upgrade_if_needed(&db).unwrap();
+    let UpgradeStatus::StrataReady { log_dir } = status else {
+        panic!("expected an installed strata log");
+    };
+    assert_v3_source_kept(&db, &log_dir);
 }
 
 #[test]

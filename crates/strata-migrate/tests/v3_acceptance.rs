@@ -517,7 +517,7 @@ fn migrate_wal_snapshot_includes_wal_only_rows() {
     let dest = dir.path().join("strata");
 
     // Hold a connection open so the commit stays in the -wal.
-    let mut conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     conn.execute(
         "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, tags)

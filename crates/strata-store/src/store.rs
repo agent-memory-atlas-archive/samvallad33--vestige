@@ -419,6 +419,8 @@ impl StrataStore {
             valid_from_ms: input.valid_from_ms.unwrap_or(created_at_ms),
             valid_until_ms: input.valid_until_ms.unwrap_or(VALID_FOREVER_MS),
             superseded_by: None,
+            source: input.source.clone(),
+            source_updated_at_ms: input.source_updated_at_ms,
         };
         // A brand-new fact references nothing yet: empty context.
         self.admit_write(

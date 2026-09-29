@@ -70,7 +70,7 @@ use vestige_core::storage::PortableArchive;
 use vestige_core::storage::PortableValue;
 
 pub use records::{
-    EdgeRecord, GenesisRecord, MigrationReceipt, NodeRecord, ParamsRecord, ReceiptBody,
+    EdgeRecord, GenesisRecord, MigrationReceipt, NodeRecord, ParamsRecord, ReceiptBody, SourceKey,
     SupersessionRecord, TombstoneRecord, KIND_MIGRATION_RECEIPT, RECEIPT_SIGNING_KEY_ID,
     RECORD_VERSION,
 };
@@ -1144,6 +1144,8 @@ fn extract_walk_receipts(
             updated_ms: row.created_ms,
             last_accessed_ms: row.created_ms,
             legacy: Vec::new(),
+            source: None,
+            source_updated_at_ms: None,
         })
         .collect();
     Ok(records)
@@ -1200,6 +1202,59 @@ type NodeSet = (
     Vec<SupersessionRecord>,
 );
 
+/// TEXT column, or `None` when the column is absent or empty.
+fn column_text<'a>(row: &source::Row<'a>, name: &str) -> Result<Option<&'a str>, MigrationError> {
+    if !row.columns().iter().any(|column| column == name) {
+        return Ok(None);
+    }
+    Ok(row.opt_text(name)?.filter(|text| !text.is_empty()))
+}
+
+/// Lift the v3 source onto the store provenance fields.
+///
+/// A `(source_system, source_id)` pair becomes a [`SourceKey`]. A free-form
+/// `source` string with no pair becomes `system = <text>`. `source_updated_at`
+/// is the timestamp when that column is set. The v3.1.1 fixture has no
+/// `source_updated_at` column, so a sourced row keeps its `updated_at`
+/// instead. A row with neither a source nor a source timestamp yields
+/// `(None, None)`.
+fn node_provenance(
+    row: &source::Row<'_>,
+) -> Result<(Option<SourceKey>, Option<i64>), MigrationError> {
+    let system = column_text(row, "source_system")?;
+    let project = column_text(row, "source_project")?.unwrap_or("");
+    let id = column_text(row, "source_id")?;
+    let label = column_text(row, "source")?;
+    let source = if let (Some(system), Some(id)) = (system, id) {
+        Some(SourceKey {
+            system: system.to_string(),
+            project: project.to_string(),
+            id: id.to_string(),
+        })
+    } else {
+        label.map(|label| SourceKey {
+            system: label.to_string(),
+            project: String::new(),
+            id: String::new(),
+        })
+    };
+    let source_updated_at_ms = if row
+        .columns()
+        .iter()
+        .any(|column| column == "source_updated_at")
+    {
+        match column_text(row, "source_updated_at")? {
+            Some(raw) => Some(source::timestamp_ms(raw)?),
+            None => None,
+        }
+    } else if source.is_some() {
+        Some(source::timestamp_ms(row.text("updated_at")?)?)
+    } else {
+        None
+    };
+    Ok((source, source_updated_at_ms))
+}
+
 /// Decode `knowledge_nodes` into node records, the legacy→kernel id map
 /// (dense, 1-based, source row order), and supersession pointers.
 fn extract_nodes(archive: &PortableArchive) -> Result<NodeSet, MigrationError> {
@@ -1216,6 +1271,7 @@ fn extract_nodes(archive: &PortableArchive) -> Result<NodeSet, MigrationError> {
         let kernel_id = (index as u64) + 1;
         kernel_ids.insert(legacy_id.clone(), kernel_id);
         let legacy = capture_legacy("knowledge_nodes", &row, NODE_MAPPED_COLUMNS)?;
+        let (source, source_updated_at_ms) = node_provenance(&row)?;
         records.push(NodeRecord {
             record_version: RECORD_VERSION,
             kernel_id,
@@ -1227,6 +1283,8 @@ fn extract_nodes(archive: &PortableArchive) -> Result<NodeSet, MigrationError> {
             last_accessed_ms: source::timestamp_ms(row.text("last_accessed")?)?,
             legacy,
             legacy_id,
+            source,
+            source_updated_at_ms,
         });
     }
 
