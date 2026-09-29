@@ -11,8 +11,8 @@ use strata_gate::{Policy, Rule};
 
 use crate::op::{StoreOp, KIND_STORE_CHECKPOINT, KIND_STORE_WRITE};
 use crate::store::{
-    classify_checkpoint_payload, classify_write_payload, decode_exact, handle_of,
-    CheckpointPayload, WritePayload,
+    classify_checkpoint_payload, classify_write_payload, decode_exact, handle_of, migration_edge,
+    migration_node, CheckpointPayload, WritePayload,
 };
 use crate::types::{ConnectionRecord, EdgeDirection, EdgeKind, IngestInput};
 use crate::{looks_like_failure, StoreError, StrataStore};
@@ -680,4 +680,125 @@ fn node_ids_are_log_derived_and_handle_is_stable() {
     assert_ne!(handle_of(&a), handle_of(&b));
     assert_eq!(store.card_state(&a).map(|c| c.review_count), Some(1));
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Classification keys off this constant. A bump has to update the guard.
+#[test]
+fn migration_record_version_is_1() {
+    assert_eq!(strata_migrate::RECORD_VERSION, 1);
+}
+
+fn crafted_version_256_node() -> Vec<u8> {
+    borsh::to_vec(&strata_migrate::NodeRecord {
+        record_version: 256,
+        legacy_id: String::new(),
+        kernel_id: 0,
+        content: String::new(),
+        node_type: "\0".to_string(),
+        tags: Vec::new(),
+        created_ms: 0,
+        updated_ms: 0,
+        last_accessed_ms: 0,
+        legacy: Vec::new(),
+    })
+    .expect("encode")
+}
+
+fn crafted_version_257_edge_bytes() -> Vec<u8> {
+    borsh::to_vec(&StoreOp::SaveEdge {
+        edge: ConnectionRecord {
+            source_id: "\0".to_string(),
+            target_id: "\0".repeat(9),
+            strength_milli: 0,
+            link_type: "\0".repeat(6),
+            meta_sha: None,
+            created_at_ms: 0,
+            activation_count: 0,
+        },
+    })
+    .expect("encode")
+}
+
+fn crafted_version_0x5453_edge() -> Vec<u8> {
+    let magic = strata_kernel::checkpoint::MAGIC;
+    borsh::to_vec(&strata_migrate::EdgeRecord {
+        record_version: u16::from_le_bytes([magic[0], magic[1]]),
+        source_kernel_id: u64::from_le_bytes([
+            magic[2], magic[3], magic[4], magic[5], magic[6], magic[7], 0, 0,
+        ]),
+        target_kernel_id: 0,
+        source_legacy_id: "12345678901234567".to_string(),
+        target_legacy_id: String::new(),
+        link_type: String::new(),
+        legacy_inferred: false,
+        legacy_link_type: String::new(),
+        strength_q32: 0,
+        created_ms: 0,
+        last_activated_ms: 0,
+        activation_count: 0,
+        legacy: Vec::new(),
+    })
+    .expect("encode")
+}
+
+fn append_payload(dir: &std::path::Path, kind: u8, payload: &[u8]) {
+    let log = strata::StrataLog::open(dir.join("log")).expect("log");
+    log.append(kind, payload).expect("append");
+}
+
+/// The three cross-decoding payloads are not migration records, so replay
+/// does not load them as imported nodes or edges.
+#[test]
+fn crafted_payloads_are_not_loaded_as_migration_records() {
+    let node_256 = crafted_version_256_node();
+    let decoded_256 =
+        decode_exact::<strata_migrate::NodeRecord>(&node_256).expect("256 decodes as a node");
+    assert_eq!(decoded_256.record_version, 256);
+    assert!(migration_node(&node_256).is_none());
+    assert!(matches!(
+        classify_write_payload(&node_256),
+        WritePayload::StoreOp(_)
+    ));
+
+    let edge_257 = crafted_version_257_edge_bytes();
+    let decoded_257 =
+        decode_exact::<strata_migrate::NodeRecord>(&edge_257).expect("257 decodes as a node");
+    assert_eq!(decoded_257.record_version, 257);
+    assert!(migration_node(&edge_257).is_none());
+    assert!(matches!(
+        classify_write_payload(&edge_257),
+        WritePayload::StoreOp(_)
+    ));
+
+    let edge_5453 = crafted_version_0x5453_edge();
+    let decoded_5453 =
+        decode_exact::<strata_migrate::EdgeRecord>(&edge_5453).expect("0x5453 decodes as an edge");
+    assert_eq!(decoded_5453.record_version, 0x5453);
+    assert!(migration_edge(&edge_5453).is_none());
+    assert!(matches!(
+        classify_checkpoint_payload(&edge_5453),
+        CheckpointPayload::Checkpoint(_)
+    ));
+
+    let nodes = temp_dir("crafted-nodes");
+    append_payload(&nodes, KIND_STORE_WRITE, &node_256);
+    append_payload(&nodes, KIND_STORE_WRITE, &edge_257);
+    let store = StrataStore::open(&nodes).expect("replay non-v1 nodes");
+    assert!(store.nodes().is_empty());
+    assert!(store.edges().is_empty());
+    assert_eq!(store.orphan_write_count(), 2);
+    drop(store);
+    std::fs::remove_dir_all(&nodes).ok();
+
+    let edges = temp_dir("crafted-edge");
+    append_payload(&edges, KIND_STORE_CHECKPOINT, &edge_5453);
+    match StrataStore::open(&edges) {
+        Ok(store) => {
+            assert!(store.edges().is_empty());
+            assert!(store.nodes().is_empty());
+        }
+        Err(StoreError::Verify(_)) => {}
+        Err(err) => panic!("unexpected open error: {err}"),
+    }
+    std::fs::remove_dir_all(&edges).ok();
 }

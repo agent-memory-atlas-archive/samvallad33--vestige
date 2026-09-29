@@ -129,10 +129,22 @@ pub(crate) enum CheckpointPayload {
     Neither,
 }
 
+/// A migration node only when the payload round-trips and its version is current.
+pub(crate) fn migration_node(payload: &[u8]) -> Option<strata_migrate::NodeRecord> {
+    decode_exact::<strata_migrate::NodeRecord>(payload)
+        .filter(|node| node.record_version == strata_migrate::RECORD_VERSION)
+}
+
+/// A migration edge only when the payload round-trips and its version is current.
+pub(crate) fn migration_edge(payload: &[u8]) -> Option<strata_migrate::EdgeRecord> {
+    decode_exact::<strata_migrate::EdgeRecord>(payload)
+        .filter(|edge| edge.record_version == strata_migrate::RECORD_VERSION)
+}
+
 pub(crate) fn classify_write_payload(payload: &[u8]) -> WritePayload {
     if let Some(op) = decode_exact::<StoreOp>(payload) {
         WritePayload::StoreOp(op)
-    } else if let Some(node) = decode_exact::<strata_migrate::NodeRecord>(payload) {
+    } else if let Some(node) = migration_node(payload) {
         WritePayload::ImportedNode(node)
     } else {
         WritePayload::Neither
@@ -144,7 +156,7 @@ pub(crate) fn classify_checkpoint_payload(payload: &[u8]) -> CheckpointPayload {
         .filter(|cp| cp.magic == strata_kernel::checkpoint::MAGIC)
     {
         CheckpointPayload::Checkpoint(cp)
-    } else if let Some(edge) = decode_exact::<strata_migrate::EdgeRecord>(payload) {
+    } else if let Some(edge) = migration_edge(payload) {
         CheckpointPayload::ImportedEdge(edge)
     } else {
         CheckpointPayload::Neither
