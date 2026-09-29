@@ -278,6 +278,20 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     }
 }
 
+/// True when any segment already holds bytes past its header. That log
+/// has a key; open must not write a replacement into the log directory.
+fn existing_log_has_writes(dir: &Path) -> Result<bool, StrataError> {
+    if !dir.exists() {
+        return Ok(false);
+    }
+    for (_, path) in list_segments(dir)? {
+        if fs::metadata(&path)?.len() > HEADER_WIRE_SIZE as u64 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn load_or_create_key(dir: &Path, log_seed: Option<&[u8; 32]>) -> Result<SigningKey, StrataError> {
     let path = dir.join(KEY_FILE);
     if path.exists() {
@@ -286,6 +300,12 @@ fn load_or_create_key(dir: &Path, log_seed: Option<&[u8; 32]>) -> Result<Signing
             .try_into()
             .map_err(|_| StrataError::Corrupt(format!("{KEY_FILE} is not 32 bytes")))?;
         Ok(SigningKey::from_bytes(&seed))
+    } else if existing_log_has_writes(dir)? {
+        // Frames are already durable. A fresh key cannot attest them, and
+        // must not be minted into the log directory.
+        Err(StrataError::Corrupt(
+            "signing key missing for an existing log; refusing to mint a new key".into(),
+        ))
     } else {
         // Seeded logs derive the signing key from the caller-supplied seed so
         // two seeded runs produce identical signatures and segment bytes.
@@ -758,7 +778,8 @@ impl StrataLog {
     /// and by tests that pin log bytes.
     ///
     /// If the directory already carries a `strata.key`, that key wins and the
-    /// seed is ignored (existing logs are never re-keyed).
+    /// seed is ignored (existing logs are never re-keyed). If frames exist
+    /// and the key file is missing, open fails instead of minting one.
     pub fn open_seeded(dir: impl AsRef<Path>, seed: [u8; 32]) -> Result<StrataLog, StrataError> {
         Self::open_inner(dir, Some(seed))
     }

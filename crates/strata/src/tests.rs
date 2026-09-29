@@ -274,6 +274,32 @@ fn damaged_segment_without_head_state_refuses_open() {
 }
 
 #[test]
+fn missing_key_on_existing_log_refuses_open() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("nokey");
+    {
+        let log = StrataLog::open(&dir).unwrap();
+        log.append(1, b"durable-frame").unwrap();
+        drop(log);
+    }
+    let key = dir.join("strata.key");
+    assert!(key.is_file(), "a new log writes its key");
+    fs::remove_file(&key).unwrap();
+    let err = StrataLog::open(&dir).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("signing key missing") && msg.contains("refusing to mint"),
+        "{msg}"
+    );
+    assert!(
+        !key.exists(),
+        "reopen must not mint a replacement key into the log directory"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn group_commit_batch_shares_one_sync() {
     let _serial = serialize();
     reset_failpoints();
