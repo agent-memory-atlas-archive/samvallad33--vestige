@@ -46,11 +46,6 @@ mod resolver;
 mod session_queries;
 #[cfg(feature = "legacy-sqlite")]
 mod sqlite;
-// Names the always-on store trait still uses after `legacy-sqlite` left the
-// default set. The real types stay in the sqlite tree.
-#[cfg(not(feature = "legacy-sqlite"))]
-#[path = "sqlite_absent.rs"]
-mod sqlite;
 #[cfg(feature = "legacy-sqlite")]
 mod synaptic_store;
 #[cfg(feature = "legacy-sqlite")]
