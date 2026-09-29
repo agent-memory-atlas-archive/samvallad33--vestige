@@ -71,7 +71,7 @@ limit = 10
 
 `lean` presets brief detail and a limit of 5. `audit` presets full detail. `research` presets full detail and a limit of 25. `default` leaves the historical tool limits alone.
 
-Verify the CLI: `vestige dashboard`. It binds `http://127.0.0.1:3927` (override with `--port`) and `/` redirects to `/dashboard`. The first start of `vestige-mcp` downloads the Nomic embedding model (about 130 MB) and logs the milestone that keyword search works immediately and semantic ranking joins when the runtime is ready. Until then, `recall` and a save that stored no vector carry a `warming` block. The Jina reranker (about 150 MB) loads in the background; until it does, ranking stays BM25. A release build also compares its version with the npm registry for `vestige-mcp-server`. When a newer version is published it sends an MCP `notifications/message` on logger `vestige.update` (`newer_version_available`). It does not update itself, and a failed check is skipped. After those downloads, memory calls stay on the machine. `source_sync` and `vestige sync --cloud` are the calls that use the network. Full walkthrough: [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md).
+Verify the CLI: `vestige dashboard`. It binds `http://127.0.0.1:3927` (override with `--port`) and `/` redirects to `/dashboard`. The first start of `vestige-mcp` downloads the Nomic embedding model (about 130 MB) and logs the milestone that keyword search works immediately and semantic ranking joins when the runtime is ready. Until then, `recall` and a save that stored no vector carry a `warming` block. The Jina reranker (about 150 MB) loads in the background; until it does, ranking stays BM25. After those downloads, memory calls stay on the machine. `source_sync` (`--features connectors`) and `vestige sync --cloud` (`--features cloud-sync`) are the calls that use the network. Neither feature is on in a 4.0 default build. Full walkthrough: [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md).
 
 `vestige --help` lists the CLI. The subcommands are `stats`, `health`, `consolidate`, `upgrade`, `update`, `sandwich`, `embeddings`, `restore`, `backup`, `export`, `portable-export`, `portable-import`, `sync`, `gc`, `dashboard`, `ingest`, `scan-secrets`, `backfill`, `recall`, `compose`, `project`, and `serve`. `--data-dir` is global.
 
@@ -184,7 +184,7 @@ The mechanisms below are implemented in the Rust engine. Write-up: [docs/SCIENCE
 | `recall` | `lookup` (hybrid search), `reason`, or `contradictions`. Retrieval does not change strength |
 | `session_start` | Memories, open intentions, status, predictions, and codebase context under one budget |
 | `smart_ingest` | Create, merge, or supersede through prediction-error gating. `items` batches up to 20 |
-| `source_sync` | Index GitHub (`GITHUB_TOKEN`) or Redmine (`REDMINE_URL`, `REDMINE_API_KEY`) into local memories |
+| `source_sync` | Index GitHub (`GITHUB_TOKEN`) or Redmine (`REDMINE_URL`, `REDMINE_API_KEY`) into local memories. Opt-in (`--features connectors`); absent from a default `tools/list` |
 | `suppress` | Hold a memory out of retrieval and speed its decay. `reverse=true` undoes it inside 24 hours when the stored snapshot still matches |
 
 Full contracts: [docs/TOOL-CONTRACTS.md](docs/TOOL-CONTRACTS.md) · Hygiene and standing habits: [docs/MEMORY_HYGIENE.md](docs/MEMORY_HYGIENE.md)

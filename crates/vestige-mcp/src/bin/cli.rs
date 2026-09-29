@@ -3121,9 +3121,8 @@ fn run_sync_cloud(endpoint: Option<String>) -> anyhow::Result<()> {
 #[cfg(not(feature = "cloud-sync"))]
 fn run_sync_cloud(_endpoint: Option<String>) -> anyhow::Result<()> {
     anyhow::bail!(
-        "this build was compiled without the `cloud-sync` feature. Official binaries from \
-         v2.3.0 include it: run `vestige update` or `npm update -g vestige-mcp-server`, \
-         then retry. Building from source? Add --features cloud-sync."
+        "this build was compiled without the `cloud-sync` feature. 4.0 builds leave \
+         it off. Building from source? Add --features cloud-sync."
     )
 }
 

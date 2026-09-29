@@ -13,11 +13,11 @@ publish = false
 autobins = false
 
 [features]
-# The shipped binaries boot a Strata log and upgrade a v3 file on first open.
-# `migrate-to-strata` is on in the default build. It is the only path that
-# enables `sqlite-reader` (bundled rusqlite). `legacy-sqlite` stays off the
-# shipped graph; unit tests and the v3-engine harness opt into it.
-default = ["connectors", "cloud-sync", "codebase-git", "migrate-to-strata"]
+# The shipped binaries boot a Strata log. `legacy-sqlite` stays available for
+# the SQLite unit tests and the v3-engine harness. `migrate-to-strata` is the
+# only path that enables `sqlite-reader` (bundled rusqlite). Connectors and
+# cloud-sync stay off so the default graph does not link reqwest.
+default = ["codebase-git"]
 # LEGACY SQLITE QUARANTINE (build/t5-legacy-isolation), mirroring
 # vestige-core. Gates every Storage/sqlite-touching module (server, tools,
 # dashboard, cognitive, resources, trace_recorder, autopilot,
@@ -25,8 +25,8 @@ default = ["connectors", "cloud-sync", "codebase-git", "migrate-to-strata"]
 # and forwards to vestige-core's `legacy-sqlite` + `bundled-sqlite`.
 # Off by default. Unit tests and the v3-engine harness opt in.
 legacy-sqlite = ["vestige-core/legacy-sqlite", "vestige-core/bundled-sqlite", "dep:rusqlite"]
-# First-launch upgrade and `vestige migrate-to-strata`. On in the shipped
-# default build. `sqlite-reader` is the edge that links bundled rusqlite.
+# First-launch upgrade and `vestige migrate-to-strata`. Not in the default
+# feature set. `sqlite-reader` is the edge that links bundled rusqlite.
 # `strata-verify` stays a direct dependency and does not enable that reader.
 migrate-to-strata = ["dep:strata", "dep:strata-migrate", "strata-migrate/sqlite-reader"]
 # Raw engine test harness for THIS crate's own test builds (feature-gated
@@ -39,18 +39,21 @@ v3-engine = ["legacy-sqlite", "vestige-core/v3-engine"]
 # unset cfg), so `--all-features` does not compile the deleted paths.
 embeddings = []
 vector-search = []
+# Same empty stubs. Release cargo flags still name them (`ort-download` on
+# Windows, `ort-dynamic` on Intel Mac). They select no crates.
+ort-download = []
+ort-dynamic = []
 # Git history for the codebase tool (libgit2, OpenSSL, libssh2). On by default;
 # off for Android/Termux builds (#145), where the tool reports git history as
 # unavailable instead of the build failing on those C libraries.
 codebase-git = ["vestige-core/codebase-git"]
 # External-source connectors (#57): GitHub Issues / Redmine indexing via the
-# `source_sync` MCP tool. On by default so the tool works out of the box; turn
-# off for a build with no HTTP client.
+# `source_sync` MCP tool. Not a 4.0 default. Enable with `--features connectors`.
+# Off, `source_sync` is absent from tools/list and dispatch.
 connectors = ["vestige-core/connectors"]
 # Hosted managed-sync (Vestige Cloud): `vestige sync --cloud` pushes/pulls the
-# portable archive to the hosted blob service. On by default so the command
-# works out of the box; the binary already links an HTTP client via
-# `connectors`, so this adds no new dependency cost.
+# portable archive to the hosted blob service. Not a 4.0 default. Enable with
+# `--features cloud-sync`.
 cloud-sync = ["vestige-core/cloud-sync"]
 
 # Fails on targets without prebuilts (notably x86_64-apple-darwin).
