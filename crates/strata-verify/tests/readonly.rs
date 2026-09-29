@@ -158,6 +158,34 @@ fn live_store_root_is_unchanged_and_passes() {
 }
 
 #[test]
+fn fresh_store_without_anchor_passes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("store");
+    {
+        let mut store = StrataStore::open(&dir).expect("open store");
+        store
+            .ingest(IngestInput {
+                content: "no checkpoint yet".into(),
+                node_type: String::new(),
+                tags: Vec::new(),
+                created_at_ms: Some(1_700_000_000_000),
+                valid_from_ms: None,
+                valid_until_ms: None,
+            })
+            .expect("ingest");
+    }
+    assert!(!dir.join("store.meta").exists());
+    let before = snapshot(&dir);
+    let report = strata_verify::verify_path(&dir);
+    assert!(
+        report.ok,
+        "unsealed live store must verify: {}",
+        report.json
+    );
+    assert_eq!(snapshot(&dir), before, "verify wrote the store root");
+}
+
+#[test]
 fn foreign_directory_is_not_initialized() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("notes");

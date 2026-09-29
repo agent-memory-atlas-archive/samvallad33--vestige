@@ -173,8 +173,7 @@ fn stdio_allows_one_retire_and_holds_another_then_strata_verify() {
         );
         writeln!(
             mcp.stdin,
-            "{}",
-            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}}"
         )
         .unwrap();
         mcp.stdin.flush().unwrap();
@@ -257,8 +256,7 @@ fn handshake(mcp: &mut Stdio) {
     );
     writeln!(
         mcp.stdin,
-        "{}",
-        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}}"
     )
     .unwrap();
     mcp.stdin.flush().unwrap();
