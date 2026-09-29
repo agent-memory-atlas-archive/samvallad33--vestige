@@ -563,6 +563,20 @@ fn scan_frames(bytes: &[u8], header_hash: [u8; 32]) -> (TailStop, ScanState) {
     }
 }
 
+/// A torn final write ends mid-frame. A complete frame that fails blake3
+/// or the chain link is corruption, not a tear, and must not be truncated.
+fn is_torn_final_write(tail: &[u8]) -> bool {
+    if tail.len() < format::FRAME_FIXED_WIRE_SIZE {
+        return !tail.is_empty();
+    }
+    let Ok(prefix) = <[u8; 4]>::try_from(&tail[..4]) else {
+        return true;
+    };
+    let declared = u32::from_le_bytes(prefix) as u64;
+    let need = 4u64 + 1 + declared + 32 + 32;
+    (tail.len() as u64) < need
+}
+
 fn validate_trailer(
     trailer: &SegmentTrailer,
     st: &ScanState,
@@ -729,11 +743,11 @@ impl StrataLog {
     /// Open (and recover) a log directory. Creates the directory, the signing
     /// key, and segment 0 on first use.
     ///
-    /// Recovery scans every segment: sealed segments must carry a valid
-    /// trailer and signature; the active segment's tail is truncated at the
-    /// first torn/short/zero/corrupt frame when that frame is above the acked
-    /// watermark, otherwise [`StrataError::Halt`] is returned and nothing is
-    /// modified.
+    /// Recovery scans every segment. A sealed segment's trailer is verified
+    /// on open and any mismatch halts, whether or not `head.state` exists.
+    /// Only the unsealed active tail may be truncated, and only at a torn
+    /// final write above the acked watermark. Anything else returns
+    /// [`StrataError::Halt`] and leaves the bytes untouched.
     pub fn open(dir: impl AsRef<Path>) -> Result<StrataLog, StrataError> {
         Self::open_inner(dir, None)
     }
@@ -866,34 +880,37 @@ impl StrataLog {
                     });
                 }
                 TailStop::Trailer { trailer, offset } => {
-                    if validate_trailer(&trailer, &st, &header, &signing).is_ok() {
-                        // Sealed, but the follow-on segment was never created
-                        // (crash between trailer sync and segment create).
-                        prev_hash_expected = format::hash_slice(&bytes);
-                        frames_total += st.frame_count;
-                        active = Some(ActiveSetup::New {
-                            no: no + 1,
-                            prev: prev_hash_expected,
-                        });
-                    } else if first_seq_here + st.frame_count <= last_acked_seq {
+                    // The trailer is the seal. A mismatch halts even when
+                    // head.state is missing — it is not an unacked tail.
+                    if let Err(reason) = validate_trailer(&trailer, &st, &header, &signing) {
                         return Err(halt_err(
                             last_acked_seq,
                             *no,
                             offset as u64,
-                            "damaged trailer covers acked frames",
+                            format!("sealed segment trailer: {reason}"),
                         ));
-                    } else {
-                        truncate_segment(path, offset as u64)?;
-                        frames_total += st.frame_count;
-                        active = Some(ActiveSetup::Existing {
-                            no: *no,
-                            path: path.clone(),
-                            header,
-                            state: st,
-                        });
                     }
+                    // Sealed, but the follow-on segment was never created
+                    // (crash between trailer sync and segment create).
+                    prev_hash_expected = format::hash_slice(&bytes);
+                    frames_total += st.frame_count;
+                    active = Some(ActiveSetup::New {
+                        no: no + 1,
+                        prev: prev_hash_expected,
+                    });
                 }
                 TailStop::Torn { offset, reason } => {
+                    // Mid-segment damage (a flipped byte in a complete frame)
+                    // is not a torn final write. Halt whether or not
+                    // head.state is present; do not rebuild a shorter log.
+                    if !is_torn_final_write(&bytes[offset..]) {
+                        return Err(halt_err(
+                            last_acked_seq,
+                            *no,
+                            offset as u64,
+                            format!("sealed segment damaged: {reason}"),
+                        ));
+                    }
                     let bad_seq = first_seq_here + st.frame_count;
                     if bad_seq <= last_acked_seq {
                         return Err(halt_err(
@@ -903,7 +920,7 @@ impl StrataLog {
                             format!("damage at/below acked watermark (seq {bad_seq}): {reason}"),
                         ));
                     }
-                    // Unacked tail frames may vanish: truncate, fsync, continue.
+                    // Unacked torn tail only: truncate, fsync, continue.
                     truncate_segment(path, offset as u64)?;
                     frames_total += st.frame_count;
                     active = Some(ActiveSetup::Existing {

@@ -40,9 +40,11 @@
 //! ## Recovery
 //!
 //! On open every segment is scanned: frame blake3s and chain links are
-//! recomputed. A torn/short/zero tail above the acked watermark is truncated
-//! at the first bad frame (unacked frames may vanish). Damage at or below the
-//! watermark returns [`StrataError::Halt`] — history is never truncated.
+//! recomputed. A sealed segment's trailer is verified whether or not
+//! `head.state` exists; any mismatch halts. Only the unsealed active tail
+//! may be truncated, and only at a torn final write above the acked
+//! watermark. Any other damage returns [`StrataError::Halt`] — history is
+//! never truncated.
 //! A fully-written, chain-valid frame above the watermark that survived the
 //! crash is retained: its bytes are durable, only its ack was lost, and the
 //! watermark is not advanced for it.
