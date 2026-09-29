@@ -98,9 +98,16 @@ pub fn upgrade_with(
     note(
         &log_path,
         &format!(
-            "vestige: v3 store detected at {} (schema {}); upgrading to strata",
+            "vestige: v3 store detected at {}{}; upgrading to strata",
             v3.path.display(),
-            v3.schema_version
+            // Without rusqlite the detector only sees the header, where
+            // Vestige leaves user_version at 0; the import reads the real
+            // schema_version table.
+            if v3.schema_version == 0 {
+                String::new()
+            } else {
+                format!(" (schema {})", v3.schema_version)
+            }
         ),
     );
 
@@ -166,7 +173,12 @@ pub fn upgrade_with(
 
     note(
         &log_path,
-        &format!("vestige: strata log ready at {}", log_dir.display()),
+        &format!(
+            "vestige: strata log ready at {} ({} memories, {} links imported)",
+            log_dir.display(),
+            report.nodes,
+            report.edges
+        ),
     );
     Ok(UpgradeStatus::StrataReady { log_dir })
 }
@@ -257,6 +269,12 @@ fn sidecar_paths(db_path: &Path) -> Vec<PathBuf> {
 }
 
 fn backup_sqlite_family(db_path: &Path) -> io::Result<PathBuf> {
+    // A retried upgrade (a client killed the first launch mid-import) must
+    // not stack another full copy per attempt: reuse a finished backup whose
+    // files are byte-identical to the store as it is now.
+    if let Some(existing) = matching_backup(db_path)? {
+        return Ok(existing);
+    }
     let stamp = format!(
         "{}-{}",
         SystemTime::now()
@@ -298,9 +316,75 @@ fn backup_sqlite_family(db_path: &Path) -> io::Result<PathBuf> {
     })
 }
 
+/// A finished backup (`<db>.v3-backup-<stamp>`, not `.partial`) whose primary
+/// file and every present sidecar match the live family byte for byte.
+fn matching_backup(db_path: &Path) -> io::Result<Option<PathBuf>> {
+    let Some(parent) = db_path.parent() else {
+        return Ok(None);
+    };
+    let Some(file_name) = db_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+    else {
+        return Ok(None);
+    };
+    let prefix = format!("{file_name}.v3-backup-");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Ok(None);
+    };
+    let mut stamps: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter_map(|name| name.strip_prefix(&prefix).map(str::to_owned))
+        .filter(|stamp| !stamp.ends_with(".partial"))
+        .collect();
+    stamps.sort();
+    'candidate: for stamp in stamps.iter().rev() {
+        for src in sidecar_paths(db_path) {
+            let Some(name) = src.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue 'candidate;
+            };
+            let copy = parent.join(format!("{name}.v3-backup-{stamp}"));
+            match (src.exists(), copy.exists()) {
+                (false, false) => continue,
+                (true, true) if same_bytes(&src, &copy)? => continue,
+                _ => continue 'candidate,
+            }
+        }
+        return Ok(Some(parent.join(format!("{file_name}.v3-backup-{stamp}"))));
+    }
+    Ok(None)
+}
+
+fn same_bytes(a: &Path, b: &Path) -> io::Result<bool> {
+    if fs::metadata(a)?.len() != fs::metadata(b)?.len() {
+        return Ok(false);
+    }
+    let (mut a, mut b) = (
+        io::BufReader::new(File::open(a)?),
+        io::BufReader::new(File::open(b)?),
+    );
+    let (mut left, mut right) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = io::Read::read(&mut a, &mut left)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        io::Read::read_exact(&mut b, &mut right[..n])?;
+        if left[..n] != right[..n] {
+            return Ok(false);
+        }
+    }
+}
+
 fn copy_file_fsync(src: &Path, dst: &Path) -> io::Result<()> {
     let mut input = File::open(src)?;
-    let mut output = OpenOptions::new().write(true).create_new(true).open(dst)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    // The backup holds every memory: owner-only, like the v3 store itself.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut output = options.open(dst)?;
     io::copy(&mut input, &mut output)?;
     output.sync_all()?;
     Ok(())
