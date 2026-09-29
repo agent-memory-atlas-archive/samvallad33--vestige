@@ -95,6 +95,41 @@ fn pending(op: &str) -> StorageError {
     ))
 }
 
+/// Reject a blank, huge, or control-character scope. Matching stays exact,
+/// the same compare `node_is_in_scope` uses.
+fn projection_scope(scope: &str) -> Result<&str, StorageError> {
+    if scope.is_empty()
+        || scope.len() > 200
+        || scope.chars().any(char::is_control)
+        || scope.trim().is_empty()
+    {
+        return Err(StorageError::InvalidScope(
+            "expected a non-empty identifier of at most 200 visible characters".into(),
+        ));
+    }
+    Ok(scope)
+}
+
+/// Decision and pattern always. Fact and note only with an exact durable tag.
+fn projection_durable(record: &strata_store::NodeRecord) -> bool {
+    matches!(record.node_type.as_str(), "decision" | "pattern")
+        || (matches!(record.node_type.as_str(), "fact" | "note")
+            && record.tags.iter().any(|tag| {
+                matches!(
+                    tag.to_ascii_lowercase().as_str(),
+                    "rule" | "preference" | "convention"
+                )
+            }))
+}
+
+fn projection_rank(node_type: &str) -> u8 {
+    match node_type {
+        "decision" => 0,
+        "pattern" => 1,
+        _ => 2,
+    }
+}
+
 fn sim_async(op: &str) -> MemoryStoreError {
     MemoryStoreError::Init(similarity(op).to_string())
 }
@@ -789,11 +824,48 @@ impl MemoryStoreSend for StrataMemory {
 
     fn projection_candidates(
         &self,
-        _scope: &str,
-        _min_retention: f64,
-        _limit: i32,
+        scope: &str,
+        min_retention: f64,
+        limit: i32,
     ) -> Result<Vec<KnowledgeNode>, StorageError> {
-        Err(pending("projection_candidates"))
+        // Same predicate as the SQLite projection query. Content is not scanned.
+        // The log has no suppression record, so that filter is empty. Read-only.
+        let scope = projection_scope(scope)?;
+        let store = self.lock();
+        let now_ms = Utc::now().timestamp_millis();
+        let cap = usize::try_from(limit.max(0)).unwrap_or(0);
+        let nodes = store.nodes();
+        let mut matched: Vec<strata_store::NodeRecord> = nodes
+            .into_iter()
+            .filter(|record| {
+                if record.scope != scope || record.superseded_by.is_some() {
+                    return false;
+                }
+                if record.valid_from_ms > now_ms || record.valid_until_ms <= now_ms {
+                    return false;
+                }
+                if !projection_durable(record) {
+                    return false;
+                }
+                let retention = store
+                    .retrievability(&record.id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0.0);
+                retention >= min_retention
+            })
+            .collect();
+        matched.sort_by(|a, b| {
+            projection_rank(&a.node_type)
+                .cmp(&projection_rank(&b.node_type))
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        matched.truncate(cap);
+        Ok(matched
+            .iter()
+            .map(|record| project_node(&store, record))
+            .collect())
     }
 
     fn get_walk_receipt(

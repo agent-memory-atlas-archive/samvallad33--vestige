@@ -319,3 +319,322 @@ mod tests {
         assert!(unknown.contains("unknown format"), "{unknown}");
     }
 }
+
+#[cfg(test)]
+mod strata_preview {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use strata_gate::policy::{ANY_KIND, WILDCARD_PREFIX};
+    use strata_gate::record::Verdict;
+    use strata_gate::{Policy, Rule};
+    use vestige_core::IngestInput;
+
+    fn permissive_policy() -> Policy {
+        Policy {
+            rules: vec![Rule {
+                match_kind: ANY_KIND,
+                match_params_hash_prefix: WILDCARD_PREFIX,
+                max_blast_radius: u32::MAX,
+                forbid_forgotten_lessons: false,
+                require_human: false,
+                verdict: Verdict::Allow,
+            }],
+        }
+    }
+
+    fn blake3_tree(root: &std::path::Path) -> blake3::Hash {
+        let mut files = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let mut entries: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.is_file() {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        let mut hasher = blake3::Hasher::new();
+        for path in files {
+            let rel = path.strip_prefix(root).unwrap();
+            hasher.update(rel.to_string_lossy().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&std::fs::read(&path).unwrap());
+            hasher.update(&[0]);
+        }
+        hasher.finalize()
+    }
+
+    fn no_sqlite(dir: &std::path::Path) -> bool {
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if name.ends_with(".sqlite")
+                    || name.ends_with(".sqlite3")
+                    || name.ends_with(".db")
+                    || name.ends_with(".db-wal")
+                    || name.ends_with(".db-shm")
+                {
+                    return false;
+                }
+                if path.is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+        true
+    }
+
+    fn ingest(
+        storage: &Arc<Storage>,
+        content: &str,
+        node_type: &str,
+        tags: &[&str],
+        scope: &str,
+        valid_from: Option<chrono::DateTime<Utc>>,
+        valid_until: Option<chrono::DateTime<Utc>>,
+    ) -> String {
+        storage
+            .ingest_in_scope(
+                IngestInput {
+                    content: content.to_string(),
+                    node_type: node_type.to_string(),
+                    tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+                    valid_from,
+                    valid_until,
+                    ..Default::default()
+                },
+                scope,
+            )
+            .unwrap()
+            .id
+    }
+
+    #[tokio::test]
+    async fn preview_reads_the_log_and_leaves_it_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        let decision = ingest(
+            &storage,
+            "Ship releases from an integration branch",
+            "decision",
+            &[],
+            "user",
+            None,
+            None,
+        );
+        let superseded = ingest(
+            &storage,
+            "Old branch policy that was replaced",
+            "decision",
+            &[],
+            "user",
+            None,
+            None,
+        );
+        let pattern = ingest(
+            &storage,
+            "Touch files after scripted edits",
+            "pattern",
+            &[],
+            "user",
+            None,
+            None,
+        );
+        let rule = ingest(
+            &storage,
+            "Prefer tabs in Svelte files",
+            "fact",
+            &["Preference"],
+            "user",
+            None,
+            None,
+        );
+        let convention = ingest(
+            &storage,
+            "Commit messages stay imperative",
+            "note",
+            &["convention"],
+            "user",
+            None,
+            None,
+        );
+        let plain = ingest(
+            &storage,
+            "The office moved in spring",
+            "fact",
+            &[],
+            "user",
+            None,
+            None,
+        );
+        let keyword = ingest(
+            &storage,
+            "A fact that mentions a decision and a preference rule",
+            "fact",
+            &["notes"],
+            "user",
+            None,
+            None,
+        );
+        let expired = ingest(
+            &storage,
+            "Expired decision that was withdrawn",
+            "decision",
+            &[],
+            "user",
+            None,
+            Some(Utc::now() - Duration::days(1)),
+        );
+        let future = ingest(
+            &storage,
+            "Future decision not yet valid",
+            "decision",
+            &[],
+            "user",
+            Some(Utc::now() + Duration::days(2)),
+            None,
+        );
+        let other = ingest(
+            &storage,
+            "Decision that belongs to another scope",
+            "decision",
+            &[],
+            "other-proj",
+            None,
+            None,
+        );
+        drop(storage);
+        {
+            let mut store =
+                strata_store::StrataStore::open_with_policy(dir.path(), permissive_policy())
+                    .unwrap();
+            store.supersede(&superseded, &decision).unwrap();
+        }
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("CLAUDE.md");
+        std::fs::write(&target, "# Mine\n\nKeep me.\n").unwrap();
+        let log_before = blake3_tree(dir.path());
+        let file_before = blake3::hash(&std::fs::read(&target).unwrap());
+
+        let value = execute(
+            &storage,
+            Some(json!({ "action": "preview", "path": "CLAUDE.md", "root": root.path() })),
+        )
+        .await
+        .unwrap();
+
+        let log_after = blake3_tree(dir.path());
+        let file_after = blake3::hash(&std::fs::read(&target).unwrap());
+        assert_eq!(log_before, log_after, "preview must not append to the log");
+        assert_eq!(file_before, file_after, "preview must not write the target");
+        assert!(no_sqlite(dir.path()));
+        assert_eq!(value["action"], "preview");
+        assert_eq!(value["scope"], "user");
+        assert_eq!(value["format"], "claude-md");
+        let ids: Vec<&str> = value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&decision.as_str()), "{ids:?}");
+        assert!(ids.contains(&pattern.as_str()), "{ids:?}");
+        assert!(ids.contains(&rule.as_str()), "{ids:?}");
+        assert!(ids.contains(&convention.as_str()), "{ids:?}");
+        for excluded in [&superseded, &plain, &keyword, &expired, &future, &other] {
+            assert!(!ids.contains(&excluded.as_str()), "{excluded} in {ids:?}");
+        }
+        let region = value["region"].as_str().unwrap();
+        assert!(region.contains(&decision));
+        assert!(!region.contains("office moved"));
+        assert!(!region.contains("mentions a decision"));
+        assert!(!region.contains("Old branch policy"));
+        assert_eq!(value["items"][0]["nodeType"], "decision");
+        assert!(value["target"]["added"].as_u64().unwrap() > 0);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "# Mine\n\nKeep me.\n"
+        );
+
+        let again = execute(
+            &storage,
+            Some(json!({ "action": "preview", "path": "CLAUDE.md", "root": root.path() })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again["region"], value["region"]);
+        assert_eq!(blake3_tree(dir.path()), log_after);
+
+        let floor = execute(
+            &storage,
+            Some(json!({ "action": "preview", "min_retention": 1.0 })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(floor["itemCount"], 0, "{floor}");
+        assert_eq!(blake3_tree(dir.path()), log_after);
+
+        let capped = execute(
+            &storage,
+            Some(json!({ "action": "preview", "max_items": 1 })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(capped["itemCount"], 1);
+        assert_eq!(capped["items"][0]["id"], decision);
+    }
+
+    #[tokio::test]
+    async fn preview_rejects_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        let before = blake3_tree(dir.path());
+        let bad_type = execute(&storage, Some(json!({ "max_items": "lots" })))
+            .await
+            .unwrap_err();
+        assert!(bad_type.contains("Invalid arguments"), "{bad_type}");
+        let bad_format = execute(&storage, Some(json!({ "format": "yaml" })))
+            .await
+            .unwrap_err();
+        assert!(bad_format.contains("unknown format"), "{bad_format}");
+        let bad_scope = execute(&storage, Some(json!({ "scope": "" })))
+            .await
+            .unwrap_err();
+        assert!(bad_scope.contains("Invalid memory scope"), "{bad_scope}");
+        let root = tempfile::tempdir().unwrap();
+        let escape = execute(
+            &storage,
+            Some(json!({ "path": "../escape.md", "root": root.path() })),
+        )
+        .await
+        .unwrap_err();
+        assert!(escape.contains("outside"), "{escape}");
+        assert_eq!(blake3_tree(dir.path()), before);
+        assert!(no_sqlite(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn preview_rejects_unknown_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        let before = blake3_tree(dir.path());
+        let unknown = execute(&storage, Some(json!({ "action": "frobnicate" })))
+            .await
+            .unwrap_err();
+        assert!(unknown.contains("unknown action 'frobnicate'"), "{unknown}");
+        assert_eq!(blake3_tree(dir.path()), before);
+    }
+}
