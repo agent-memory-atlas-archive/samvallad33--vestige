@@ -308,12 +308,14 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }} -p vestige-mcp ${{ matrix.cargo_flags }}
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p vestige-mcp ${{ matrix.cargo_flags }}
+          cargo build --release --target ${{ matrix.target }} -p vestige-upgrade
 
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../vestige-mcp-${{ matrix.target }}.tar.gz vestige-mcp vestige vestige-restore
+          tar czf ../../../vestige-mcp-${{ matrix.target }}.tar.gz vestige-mcp vestige vestige-restore vestige-upgrade
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -369,7 +371,9 @@ jobs:
           key: ${{ runner.os }}-x86_64-pc-windows-msvc-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release
-        run: cargo build --release -p vestige-mcp
+        run: |
+          cargo build --release -p vestige-mcp
+          cargo build --release -p vestige-upgrade
 
       - name: Smoke the binary
         run: ./target/release/vestige-mcp.exe --version
@@ -430,12 +434,14 @@ jobs:
           ORT_CXX_STDLIB: static=stdc++
           CXXSTDLIB: static=stdc++
           RUSTFLAGS: -C link-arg=-static-libstdc++ -L native=/usr/lib/gcc/x86_64-linux-gnu/13
-        run: cargo build --release --target x86_64-unknown-linux-gnu -p vestige-mcp
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu -p vestige-mcp
+          cargo build --release --target x86_64-unknown-linux-gnu -p vestige-upgrade
 
       - name: Package
         run: |
           cd target/x86_64-unknown-linux-gnu/release
-          tar czf ../../../vestige-mcp-x86_64-unknown-linux-gnu.tar.gz vestige-mcp vestige vestige-restore
+          tar czf ../../../vestige-mcp-x86_64-unknown-linux-gnu.tar.gz vestige-mcp vestige vestige-restore vestige-upgrade
 
       - name: Check glibc ceiling
         run: ./scripts/check-linux-glibc.sh target/x86_64-unknown-linux-gnu/release/vestige-mcp
@@ -542,12 +548,14 @@ jobs:
           ORT_CXX_STDLIB: static=stdc++
           CXXSTDLIB: static=stdc++
           RUSTFLAGS: -C link-arg=-static-libstdc++ -L native=/usr/lib/gcc/aarch64-linux-gnu/13
-        run: cargo build --release --target aarch64-unknown-linux-gnu -p vestige-mcp
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu -p vestige-mcp
+          cargo build --release --target aarch64-unknown-linux-gnu -p vestige-upgrade
 
       - name: Package
         run: |
           cd target/aarch64-unknown-linux-gnu/release
-          tar czf ../../../vestige-mcp-aarch64-unknown-linux-gnu.tar.gz vestige-mcp vestige vestige-restore
+          tar czf ../../../vestige-mcp-aarch64-unknown-linux-gnu.tar.gz vestige-mcp vestige vestige-restore vestige-upgrade
 
       - name: Check glibc ceiling
         run: ./scripts/check-linux-glibc.sh target/aarch64-unknown-linux-gnu/release/vestige-mcp

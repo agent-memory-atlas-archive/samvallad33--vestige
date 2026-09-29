@@ -13,8 +13,9 @@ publish = false
 [workspace]
 
 [features]
-# On for this crate's own tests and `vestige migrate-to-strata`. The default
-# `vestige` binary depends on strata-migrate without it.
+# SQLite source reader. Default for this crate's own test and bin builds.
+# Dependents that must not link rusqlite use `default-features = false`.
+# `vestige-upgrade` and an explicit `migrate-to-strata` rebuild turn it on.
 default = ["sqlite-reader"]
 # Importer's read-only v3 reader (`source::open_readonly`). This is the only
 # gate for checking a log against a source SQLite store. Not a store-open
