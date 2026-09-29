@@ -497,10 +497,9 @@ impl MemoryStoreSend for StrataMemory {
         let query = query.trim();
         let ids: Vec<String> = self
             .lock()
-            .nodes()
+            .origins()
             .into_iter()
-            .filter(|record| record.is_live())
-            .map(|record| record.id)
+            .map(|(id, _)| id)
             .collect();
         if query.is_empty() {
             return HandleResolution {

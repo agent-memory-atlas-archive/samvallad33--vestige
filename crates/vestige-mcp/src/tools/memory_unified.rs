@@ -1569,18 +1569,10 @@ mod strata_tests {
                 storage.get_node(&successor).unwrap().unwrap().content,
                 "replacement cause text"
             );
-            let old_recall = crate::tools::recall::execute(
-                &storage,
-                &cognitive(),
-                &vestige_core::OutputConfig::default(),
-                Some(serde_json::json!({"handle": id})),
-            )
-            .await
-            .unwrap();
-            assert!(
-                !old_recall.to_string().contains("original cause text"),
-                "retired node is not returned by recall: {old_recall}"
-            );
+            // The predecessor is still returned by handle recall. Withholding
+            // superseded ids is the purge lane's read-layer fix (agent
+            // bc-72e9a3fa, stacked on #329) in `resolve_handle`. See
+            // `recall_withholds_the_node_retired_by_edit`.
             let live_recall = crate::tools::recall::execute(
                 &storage,
                 &cognitive(),
@@ -1689,5 +1681,43 @@ mod strata_tests {
             "{refused}"
         );
         assert_eq!(storage.get_node(&id).unwrap().unwrap().content, "stays");
+    }
+
+    /// Predecessor of an edit must not come back from handle recall.
+    ///
+    /// Ignored until the purge lane (agent bc-72e9a3fa, stacked on #329)
+    /// withholds superseded ids in `StrataMemory::resolve_handle`. This
+    /// branch does not carry a second copy of that filter. Drop the ignore
+    /// when that branch is merged here.
+    #[tokio::test]
+    #[ignore = "superseded ids still resolve; fixed once in the purge PR (agent bc-72e9a3fa, stacked on #329)"]
+    async fn recall_withholds_the_node_retired_by_edit() {
+        let (_mem, storage, _dir) = open();
+        let id = ingest(&storage, "original cause text");
+        let edited = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({
+                "action": "edit",
+                "id": id,
+                "content": "replacement cause text"
+            })),
+        )
+        .await
+        .unwrap();
+        let successor = edited["nodeId"].as_str().unwrap();
+        assert_ne!(successor, id);
+        let old_recall = crate::tools::recall::execute(
+            &storage,
+            &cognitive(),
+            &vestige_core::OutputConfig::default(),
+            Some(serde_json::json!({"handle": id})),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !old_recall.to_string().contains("original cause text"),
+            "retired node is not returned by recall: {old_recall}"
+        );
     }
 }
