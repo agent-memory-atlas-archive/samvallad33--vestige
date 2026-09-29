@@ -308,17 +308,6 @@ fn log_level_rank(level: &str) -> Option<usize> {
     .position(|item| *item == level)
 }
 
-/// returns in 4.0.x
-const EXCLUDED_4_0: &[&str] = &[
-    "causal_walk",
-    "forgotten_lesson",
-    "intention",
-    "project",
-    "purge",
-    "selftest",
-    "suppress",
-];
-
 /// MCP Server implementation
 pub struct McpServer {
     storage: Arc<Storage>,
@@ -1132,7 +1121,6 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
         // hidden redirects in handle_tools_call. See
         // docs/launch/tool-consolidation-v2.2.0.md.
         let mut tools = Self::tool_catalog();
-        tools.retain(|tool| !EXCLUDED_4_0.contains(&tool.name.as_str()));
 
         // Per-tool result-size annotation `_meta["anthropic/maxResultSizeChars"]`.
         //
@@ -1579,12 +1567,6 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
         &self,
         request: CallToolRequest,
     ) -> Result<Result<serde_json::Value, String>, JsonRpcError> {
-        if EXCLUDED_4_0.contains(&request.name.as_str()) {
-            return Err(JsonRpcError::invalid_params(&format!(
-                "Unknown tool: {}",
-                request.name
-            )));
-        }
         let result = match request.name.as_str() {
             // ================================================================
             // UNIFIED TOOLS (v1.1+) - Preferred API
@@ -4433,8 +4415,11 @@ mod tests {
         // dispatchable as a hidden alias).
         assert_eq!(
             tools.len(),
-            11,
-            "4.0 tools/list is the expected_tools_4.0.txt set"
+            18,
+            "Expected 18 tools: the v2.3/v3 consolidated set (dedup + memory_status + \
+             graph + maintain + recall; session_context renamed) plus `receipt`, \
+             `causal_walk`, `project`, the #219 standalone `purge`, and the w3d \
+             `selftest` + `forgotten_lesson`"
         );
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -4476,10 +4461,30 @@ mod tests {
         }
         read_only.sort();
         destructive.sort();
-        assert_eq!(read_only, ["memory_status", "session_start"]);
+        // w3d: `selftest` (writes only a temp copy) and `forgotten_lesson`
+        // (pure query) join the read-only set.
+        assert_eq!(
+            read_only,
+            [
+                "forgotten_lesson",
+                "memory_status",
+                "selftest",
+                "session_start"
+            ]
+        );
         // Reanchoring replaces existing evidence, so the mixed codebase tool
         // must advertise its destructive action conservatively.
-        assert_eq!(destructive, ["codebase", "dedup", "maintain", "memory"]);
+        assert_eq!(
+            destructive,
+            [
+                "codebase",
+                "dedup",
+                "intention",
+                "maintain",
+                "memory",
+                "purge"
+            ]
+        );
         assert_eq!(
             open_world,
             ["source_sync"],
@@ -4492,9 +4497,11 @@ mod tests {
         assert!(tool_names.contains(&"receipt"));
         assert!(tool_names.contains(&"memory"));
         assert!(tool_names.contains(&"codebase"));
-        for gone in EXCLUDED_4_0 {
-            assert!(!tool_names.contains(gone), "{gone} returns in 4.0.x");
-        }
+        assert!(tool_names.contains(&"intention"));
+
+        // Flagship causal walk is advertised; its predecessor backfill dropped
+        // to a hidden dispatch-only alias in v3.2 (causal_walk replaces it).
+        assert!(tool_names.contains(&"causal_walk"));
         assert!(
             !tool_names.contains(&"backfill"),
             "backfill is hidden in v3.2: dispatchable, not advertised"
@@ -4635,6 +4642,9 @@ mod tests {
                 "{old} should be folded into 'recall' in v2.2"
             );
         }
+
+        // Active forgetting (v2.0.5) — Anderson 2025 + Davis Rac1
+        assert!(tool_names.contains(&"suppress"));
     }
 
     /// v2.2: the 8 tools folded into `dedup` must still dispatch (hidden
@@ -5458,65 +5468,5 @@ mod tests {
         let stored_actor = stored.actor.expect("persisted provenance");
         assert_eq!(stored_actor.claimed_role.as_deref(), Some("operator"));
         assert_eq!(stored_actor.resolution_disposition, "unregistered_claim");
-    }
-}
-
-#[cfg(test)]
-mod tools_4_0 {
-    use super::*;
-
-    fn request(method: &str, params: Option<serde_json::Value>) -> JsonRpcRequest {
-        JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(serde_json::json!(1)),
-            method: method.to_string(),
-            params,
-        }
-    }
-
-    #[tokio::test]
-    async fn tools_list_matches_expected_tools_4_0() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::strata_memory::open(dir.path()).unwrap();
-        let server = McpServer::new(storage, Arc::new(Mutex::new(CognitiveEngine::new())));
-        server
-            .handle_request(request(
-                "initialize",
-                Some(serde_json::json!({
-                    "protocolVersion": MCP_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {"name": "tools-4.0", "version": "1"}
-                })),
-            ))
-            .await;
-        let listed = server
-            .handle_request(request("tools/list", None))
-            .await
-            .unwrap()
-            .result
-            .unwrap();
-        let names: Vec<&str> = listed["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|tool| tool["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            names.join("\n") + "\n",
-            include_str!("../expected_tools_4.0.txt")
-        );
-        for name in EXCLUDED_4_0 {
-            let error = server
-                .handle_request(request(
-                    "tools/call",
-                    Some(serde_json::json!({"name": name, "arguments": {}})),
-                ))
-                .await
-                .unwrap()
-                .error
-                .unwrap_or_else(|| panic!("{name} dispatched"));
-            assert_eq!(error.code, -32602, "{name}");
-            assert_eq!(error.message, format!("Unknown tool: {name}"));
-        }
     }
 }

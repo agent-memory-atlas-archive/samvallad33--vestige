@@ -95,7 +95,7 @@ def run(binary, output):
             handshake()
             catalog = rpc("tools/list", {})["tools"]
             names = [x["name"] for x in catalog]
-            assert len(names) == 11, names
+            assert len(names) == 18, names
             guide = tool("memory_status", {"view": "tools"})["tools"]
             assert [x["name"] for x in guide] == names
             for entry, definition in zip(guide, catalog):
@@ -119,6 +119,7 @@ def run(binary, output):
             annotations = {x["name"]: x["annotations"] for x in catalog}
             assert annotations["recall"]["readOnlyHint"] is False
             assert annotations["recall"]["idempotentHint"] is False
+            assert annotations["suppress"]["idempotentHint"] is False
             passed("all installed tool and action definitions match progressive discovery")
 
             typed("maintain", {"action": "consolidate", "phase": "embeddings", "batchSize": 2},
@@ -162,8 +163,12 @@ def run(binary, output):
             typed("receipt", {"action": "replay", "receipt_id": node_id, "withheld_slots": []}, "pending_strata")
             typed("memory", {"action": "promote", "id": node_id, "reason": "fixture"}, "pending_strata")
             typed("memory", {"action": "edit", "id": node_id, "content": "edited"}, "pending_strata")
+            typed("purge", {"id": node_id, "confirm": True}, "pending_strata")
             context = tool("codebase", {"action": "get_context", "codebase": "fixture"})
             assert marker not in json.dumps(context)
+            typed("project", {"action": "preview"}, "pending_strata")
+            typed("intention", {"action": "set", "description": "Synthetic reminder",
+                                "trigger": {"type": "time", "at": "2020-01-01T00:00:00Z"}}, "pending_strata")
             tool("source_sync", {"source": "gitlab", "repo": "a/b"}, error=True)
             for view in ("health", "retention", "timeline", "changelog", "stats", "coverage"):
                 tool("memory_status", {"view": view})
@@ -179,11 +184,15 @@ def run(binary, output):
             never = tool("graph", {"action": "never_composed", "limit": 5})
             assert never["scope"] == "user" and never["globalNoveltyVerified"] is False
             typed("session_start", {"queries": [marker], "include_predictions": False, "include_intentions": False}, "similarity_disabled")
+            typed("suppress", {"id": node_id}, "pending_strata")
+            typed("causal_walk", {"scope": "user"}, "pending_strata")
+            typed("selftest", {}, "pending_strata")
+            typed("forgotten_lesson", {"failure_id": node_id}, "pending_strata")
             called = {row["tool"] for row in coverage}
             missing = [name for name in names if name not in called]
             assert not missing, missing
             assert_no_sqlite()
-            passed("all 11 tools answered on Strata: real writes, or a typed error")
+            passed("all 18 tools answered on Strata: real writes, or a typed error")
         finally:
             if proc and proc.poll() is None:
                 proc.terminate()
