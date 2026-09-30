@@ -103,6 +103,11 @@ pub fn merge_undo_schema() -> Value {
             "operation_id": {
                 "type": "string",
                 "description": "ID of the merge/supersede or tag rename/merge operation to reverse. Omit to list recent mixed reflog entries plus a dedicated tagOperations list that cannot be buried by merge activity."
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "Required true to undo a logged write on the Strata backend: the undo changes which version of a memory reads return and cannot itself be undone.",
+                "default": false
             }
         }
     })
@@ -407,6 +412,15 @@ fn merge_undo(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, Stri
             // Strata has no embedding runtime. Undo appends a compensating
             // UpsertNode; it does not take the SQLite merge_undo path.
             if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+                // An undo changes which version of a memory reads return and
+                // cannot itself be undone, so it applies only when confirmed.
+                let confirm = a.get("confirm").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !confirm {
+                    return Err(format!(
+                        "Undoing {op_id} changes which version of {} reads return, and an undo cannot itself be undone. Nothing was changed. Re-run with confirm=true to apply it.",
+                        original.affected_ids.join(", ")
+                    ));
+                }
                 let op = storage.merge_undo(op_id).map_err(|e| e.to_string())?;
                 return Ok(json!({
                     "undoOperationId": op.id,
@@ -624,5 +638,88 @@ mod tests {
         assert_eq!(response["tagOperations"].as_array().unwrap().len(), 1);
         assert_eq!(response["tagOperations"][0]["opType"], "tag_rename");
         assert_eq!(response["tagOperationsTruncated"], false);
+    }
+}
+
+#[cfg(test)]
+mod strata_undo_tests {
+    use super::*;
+    use vestige_core::IngestInput;
+
+    fn ingest(storage: &Arc<Storage>, content: &str) -> String {
+        storage
+            .ingest(IngestInput {
+                content: content.into(),
+                node_type: "fact".into(),
+                ..IngestInput::default()
+            })
+            .unwrap()
+            .id
+    }
+
+    fn write_op_for(storage: &Arc<Storage>, id: &str) -> String {
+        storage
+            .list_merge_operations(50)
+            .unwrap()
+            .into_iter()
+            .find(|op| op.survivor_id.as_deref() == Some(id) && op.op_type == "write")
+            .expect("the write is in the log")
+            .id
+    }
+
+    #[test]
+    fn undo_of_a_logged_write_requires_confirm() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        let id = ingest(&storage, "guarded undo fixture");
+        let op_id = write_op_for(&storage, &id);
+
+        let refused = merge_undo(&storage, Some(json!({ "operation_id": op_id })));
+        assert!(refused.is_err(), "an unconfirmed undo must be refused");
+        assert!(
+            storage.get_node(&id).unwrap().is_some(),
+            "the refused undo changed nothing"
+        );
+
+        let applied = merge_undo(
+            &storage,
+            Some(json!({ "operation_id": op_id, "confirm": true })),
+        )
+        .unwrap();
+        assert_eq!(applied["status"], "reverted");
+        assert!(storage.get_node(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn undoing_an_edit_keeps_the_previous_version_readable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        let old_id = ingest(&storage, "edit fixture version one");
+        storage
+            .update_node_content(&old_id, "edit fixture version two")
+            .unwrap();
+        let new_id = storage
+            .supersession_pairs()
+            .unwrap()
+            .into_iter()
+            .find(|(old, _)| *old == old_id)
+            .map(|(_, successor)| successor)
+            .expect("the edit admitted a successor");
+        let op_id = write_op_for(&storage, &new_id);
+
+        let applied = merge_undo(
+            &storage,
+            Some(json!({ "operation_id": op_id, "confirm": true })),
+        )
+        .unwrap();
+        let affected = applied["affectedIds"].as_array().unwrap();
+        assert!(affected.iter().any(|v| *v == json!(old_id)));
+        assert!(affected.iter().any(|v| *v == json!(new_id)));
+        let restored = storage
+            .get_node(&old_id)
+            .unwrap()
+            .expect("the pre-edit memory is readable again");
+        assert_eq!(restored.content, "edit fixture version one");
+        assert!(storage.get_node(&new_id).unwrap().is_none());
     }
 }
