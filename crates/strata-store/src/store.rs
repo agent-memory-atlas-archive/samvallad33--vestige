@@ -1837,6 +1837,16 @@ impl StrataStore {
         self.nodes.values().cloned().collect()
     }
 
+    /// Ids of nodes (native and imported) that satisfy `keep`, in id order.
+    /// Borrows each record instead of cloning its content.
+    pub fn node_ids_where(&self, keep: impl Fn(&NodeRecord) -> bool) -> Vec<String> {
+        self.nodes
+            .values()
+            .filter(|record| keep(record))
+            .map(|record| record.id.clone())
+            .collect()
+    }
+
     /// Every typed edge, in landing order.
     pub fn edges(&self) -> Vec<ConnectionRecord> {
         self.edges.clone()

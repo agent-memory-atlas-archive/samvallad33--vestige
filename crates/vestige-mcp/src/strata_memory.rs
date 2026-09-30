@@ -123,7 +123,40 @@ pub fn execute_node_provenance(storage: &Storage, args: Option<&Value>) -> Resul
         .ok_or_else(|| "provenance: strata log is not open in this process".to_string())?;
     let store = memory.lock();
     let origin = store.recorded_origin(id).map_err(|err| err.to_string())?;
+    let current = store.get_node(id);
     let Some(origin) = origin else {
+        // A memory imported by the v3 upgrade has no admitted write on this
+        // log: its record came from the migration frames the signed
+        // migration receipt covers.
+        if let Some(record) = current.filter(retrievable) {
+            let valid_until =
+                (record.valid_until_ms != VALID_FOREVER_MS).then_some(record.valid_until_ms);
+            return Ok(json!({
+                "view": "provenance",
+                "status": "completed",
+                "found": true,
+                "memoryId": record.id,
+                "origin": {
+                    "kind": "v3_import",
+                    "note": "Imported from a v3 store by the upgrade. The signed migration receipt covers it; no admitted write frame exists for it on this log.",
+                    "actor": Value::Null,
+                    "timestamps": {
+                        "createdAtMs": record.created_at_ms,
+                        "validFromMs": record.valid_from_ms,
+                        "validUntilMs": valid_until,
+                    },
+                    "record": {
+                        "id": record.id,
+                        "scope": record.scope,
+                        "content": record.content,
+                        "nodeType": record.node_type,
+                        "tags": record.tags,
+                        "kernelId": record.kernel_id,
+                    },
+                },
+                "supersedeChain": [],
+            }));
+        }
         return Ok(json!({
             "view": "provenance",
             "status": "completed",
@@ -131,6 +164,14 @@ pub fn execute_node_provenance(storage: &Storage, args: Option<&Value>) -> Resul
             "memoryId": id,
         }));
     };
+    // A memory hidden without a successor (v3-suppressed, or an undone
+    // creation) keeps its provenance but not its content, since every other
+    // read hides it. An edited or merged memory names its successor and its
+    // original text is history, so that stays readable.
+    let hidden = current
+        .as_ref()
+        .and_then(|record| record.superseded_by.as_deref())
+        .is_some_and(|successor| store.get_node(successor).is_none());
     let record = &origin.record;
     let valid_until = (record.valid_until_ms != VALID_FOREVER_MS).then_some(record.valid_until_ms);
     let chain: Vec<Value> = origin
@@ -173,7 +214,8 @@ pub fn execute_node_provenance(storage: &Storage, args: Option<&Value>) -> Resul
             "record": {
                 "id": record.id,
                 "scope": record.scope,
-                "content": record.content,
+                "content": if hidden { Value::Null } else { json!(record.content) },
+                "withheld": hidden,
                 "nodeType": record.node_type,
                 "tags": record.tags,
                 "kernelId": record.kernel_id,
@@ -936,17 +978,19 @@ impl MemoryStoreSend for StrataMemory {
     fn resolve_handle(&self, query: &str) -> HandleResolution {
         let query = query.trim();
         let store = self.lock();
-        // Origins keep retired ids. Handle recall only sees nodes with no successor.
-        let ids: Vec<String> = store
-            .origins()
-            .into_iter()
-            .filter(|(id, _)| {
-                store
-                    .get_node(id)
-                    .is_some_and(|record| retrievable(&record))
+        // Every live node, native or imported from v3: origins only list
+        // natively admitted writes, so an upgraded store's memories were
+        // unreachable by handle. Retired nodes stay out.
+        let ids: Vec<String> = store.node_ids_where(retrievable);
+        // Exact tag handle (case-sensitive, like the SQLite resolver): every
+        // live node carrying exactly this tag. No prefix or fuzzy matching.
+        let tagged: Vec<String> = if query.is_empty() {
+            Vec::new()
+        } else {
+            store.node_ids_where(|record| {
+                retrievable(record) && record.tags.iter().any(|tag| tag == query)
             })
-            .map(|(id, _)| id)
-            .collect();
+        };
         drop(store);
         if query.is_empty() {
             return HandleResolution {
@@ -990,6 +1034,15 @@ impl MemoryStoreSend for StrataMemory {
                     handle_required: None,
                 };
             }
+        }
+        if !tagged.is_empty() {
+            return HandleResolution {
+                kind: HandleKind::Tag,
+                ids: tagged,
+                exact: true,
+                candidates: Vec::new(),
+                handle_required: None,
+            };
         }
         HandleResolution {
             kind: HandleKind::Unknown,
