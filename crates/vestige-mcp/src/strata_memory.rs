@@ -285,6 +285,79 @@ impl StrataMemory {
     }
 }
 
+/// What kind of stored record an audit row describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditKind {
+    Memory,
+    Intention,
+}
+
+/// One stored record with every text field it carries, for the credential
+/// audit. Retired and suppressed memories are included: their bytes stay in
+/// the append-only log.
+#[derive(Debug, Clone)]
+pub struct AuditRecord {
+    pub id: String,
+    pub kind: AuditKind,
+    pub retired: bool,
+    pub created_at: DateTime<Utc>,
+    pub texts: Vec<String>,
+}
+
+/// Every record of the open Strata log, for `scan-secrets`. `None` when
+/// `storage` is not a Strata log opened in this process.
+pub fn secret_audit_records(storage: &Storage) -> Option<Vec<AuditRecord>> {
+    live_memory(storage).map(|memory| memory.audit_records())
+}
+
+impl StrataMemory {
+    fn audit_records(&self) -> Vec<AuditRecord> {
+        let store = self.lock();
+        let mut rows: Vec<AuditRecord> = store
+            .nodes()
+            .iter()
+            .map(|record| {
+                let mut texts = vec![
+                    record.content.clone(),
+                    record.node_type.clone(),
+                    record.scope.clone(),
+                ];
+                texts.extend(record.tags.iter().cloned());
+                if let Some(source) = record.source.as_ref() {
+                    texts.extend([
+                        source.system.clone(),
+                        source.project.clone(),
+                        source.id.clone(),
+                    ]);
+                }
+                AuditRecord {
+                    id: record.id.clone(),
+                    kind: AuditKind::Memory,
+                    retired: !record.is_live(),
+                    created_at: ms_to_dt(record.created_at_ms),
+                    texts,
+                }
+            })
+            .collect();
+        rows.extend(store.intentions().iter().map(|record| {
+            let mut texts = vec![record.content.clone(), record.trigger_data.clone()];
+            texts.extend(record.notes.clone());
+            texts.extend(record.source_data.clone());
+            texts.extend(record.scope.clone());
+            texts.extend(record.tags.iter().cloned());
+            AuditRecord {
+                id: record.id.clone(),
+                kind: AuditKind::Intention,
+                retired: false,
+                created_at: ms_to_dt(record.created_at_ms),
+                texts,
+            }
+        }));
+        rows.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        rows
+    }
+}
+
 fn map_store(err: strata_store::StoreError) -> StorageError {
     use strata_store::StoreError::*;
     match err {
@@ -646,6 +719,63 @@ fn blocking_secrets(text: &str) -> Vec<String> {
         .filter(|finding| finding.blocks_ingestion())
         .map(|finding| finding.kind.to_string())
         .collect()
+}
+
+/// Credential kinds found across `texts`, each kind once, in first-seen order.
+pub(crate) fn blocking_secrets_in<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut kinds: Vec<String> = Vec::new();
+    for text in texts {
+        for kind in blocking_secrets(text) {
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+    }
+    kinds
+}
+
+/// Every text field an ingest stores: content, type, tags and provenance.
+fn stored_ingest_texts(input: &IngestInput) -> Vec<&str> {
+    let mut texts = vec![input.content.as_str(), input.node_type.as_str()];
+    texts.extend(input.tags.iter().map(String::as_str));
+    texts.extend(input.source.as_deref());
+    if let Some(envelope) = input.source_envelope.as_ref() {
+        texts.extend(envelope.source_system.as_deref());
+        texts.extend(envelope.source_id.as_deref());
+        texts.extend(envelope.source_project.as_deref());
+    }
+    texts
+}
+
+/// The credential gate for one ingest. The scope is checked under every
+/// policy: it names a namespace that reads and write responses repeat, so the
+/// explicit override covers the memory's own text, never the scope.
+fn gate_ingest(input: &IngestInput, scope: &str, policy: SecretPolicy) -> Result<(), StorageError> {
+    let mut texts = vec![scope];
+    if policy != SecretPolicy::AllowExplicitly {
+        texts.extend(stored_ingest_texts(input));
+    }
+    let kinds = blocking_secrets_in(texts);
+    if kinds.is_empty() {
+        Ok(())
+    } else {
+        Err(StorageError::SecretDetected { kinds })
+    }
+}
+
+/// The credential gate for one intention: every text field it stores.
+fn gate_intention(intention: &vestige_core::storage::IntentionRecord) -> Result<(), StorageError> {
+    let mut texts = vec![intention.content.as_str(), intention.trigger_data.as_str()];
+    texts.extend(intention.notes.as_deref());
+    texts.extend(intention.source_data.as_deref());
+    texts.extend(intention.scope.as_deref());
+    texts.extend(intention.tags.iter().map(String::as_str));
+    let kinds = blocking_secrets_in(texts);
+    if kinds.is_empty() {
+        Ok(())
+    } else {
+        Err(StorageError::SecretDetected { kinds })
+    }
 }
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
@@ -1232,12 +1362,7 @@ impl MemoryStoreSend for StrataMemory {
         scope: &str,
         policy: SecretPolicy,
     ) -> Result<KnowledgeNode, StorageError> {
-        if policy != SecretPolicy::AllowExplicitly {
-            let kinds = blocking_secrets(&input.content);
-            if !kinds.is_empty() {
-                return Err(StorageError::SecretDetected { kinds });
-            }
-        }
+        gate_ingest(&input, scope, policy)?;
         if input.content.trim().is_empty() {
             return Err(StorageError::Init("content must not be empty".into()));
         }
@@ -2413,6 +2538,7 @@ impl MemoryStoreSend for StrataMemory {
         &self,
         intention: &vestige_core::storage::IntentionRecord,
     ) -> Result<(), StorageError> {
+        gate_intention(intention)?;
         self.lock()
             .upsert_intentions(vec![stored_intention(intention)])
             .map_err(map_store)
@@ -3856,5 +3982,186 @@ mod tests {
         let reopened = super::open(dir.path()).unwrap();
         assert!(reopened.get_node(&record).unwrap().is_none());
         assert!(reopened.get_node(&kept).unwrap().is_some());
+    }
+
+    fn token(fill: &str) -> String {
+        format!("ghp_{}", fill.repeat(36))
+    }
+
+    fn plain_input() -> IngestInput {
+        IngestInput {
+            content: "Synthetic note with no credential".into(),
+            node_type: "fact".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ingest_gate_refuses_a_credential_in_any_stored_field() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = StrataMemory::open(dir.path()).unwrap();
+        let secret = token("A");
+
+        let mut in_tag = plain_input();
+        in_tag.tags = vec!["safe".into(), secret.clone()];
+        let mut in_source = plain_input();
+        in_source.source = Some(format!("https://example.invalid/?t={secret}"));
+        let mut in_envelope = plain_input();
+        let mut envelope = SourceEnvelope::default();
+        envelope.source_system = Some("tracker".into());
+        envelope.source_id = Some(secret.clone());
+        in_envelope.source_envelope = Some(envelope);
+        let mut in_project = plain_input();
+        let mut envelope = SourceEnvelope::default();
+        envelope.source_system = Some("tracker".into());
+        envelope.source_id = Some("42".into());
+        envelope.source_project = Some(secret.clone());
+        in_project.source_envelope = Some(envelope);
+        let mut in_type = plain_input();
+        in_type.node_type = secret.clone();
+
+        for (field, input) in [
+            ("tag", in_tag),
+            ("source", in_source),
+            ("envelope id", in_envelope),
+            ("envelope project", in_project),
+            ("node type", in_type),
+        ] {
+            let err = store.ingest(input).expect_err(field);
+            assert!(
+                matches!(err, StorageError::SecretDetected { .. }),
+                "{field}: {err}"
+            );
+            assert!(
+                !err.to_string().contains(&secret),
+                "{field}: the refusal must not echo the credential"
+            );
+        }
+        let err = store
+            .ingest_in_scope(plain_input(), &secret)
+            .expect_err("scope");
+        assert!(
+            matches!(err, StorageError::SecretDetected { .. }),
+            "scope: {err}"
+        );
+        assert!(!err.to_string().contains(&secret));
+        assert!(
+            store.nodes().is_empty(),
+            "a refused write must leave nothing in the log"
+        );
+
+        // The explicit override covers the memory's own text, never a scope
+        // name, which is echoed by every read and write response.
+        let mut allowed = plain_input();
+        allowed.tags = vec![secret.clone()];
+        store
+            .ingest_with_secret_policy(allowed, SecretPolicy::AllowExplicitly)
+            .expect("explicit override keeps working for tags");
+        let err = store
+            .ingest_in_scope_with_secret_policy(
+                plain_input(),
+                &secret,
+                SecretPolicy::AllowExplicitly,
+            )
+            .expect_err("scope stays gated under the override");
+        assert!(matches!(err, StorageError::SecretDetected { .. }));
+        assert!(store.ingest(plain_input()).is_ok(), "clean input passes");
+    }
+
+    #[test]
+    fn save_intention_refuses_a_credential_in_any_stored_field() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = StrataMemory::open(dir.path()).unwrap();
+        let secret = token("B");
+
+        let mut in_content = sample_intention("int-content");
+        in_content.content = format!("rotate {secret} on Friday");
+        let mut in_tags = sample_intention("int-tags");
+        in_tags.tags = vec![secret.clone()];
+        let mut in_notes = sample_intention("int-notes");
+        in_notes.notes = Some(secret.clone());
+        let mut in_scope = sample_intention("int-scope");
+        in_scope.scope = Some(secret.clone());
+        let mut in_trigger = sample_intention("int-trigger");
+        in_trigger.trigger_data = format!("{{\"condition\":\"{secret}\"}}");
+        let mut in_source = sample_intention("int-source");
+        in_source.source_data = Some(secret.clone());
+
+        for (field, record) in [
+            ("content", in_content),
+            ("tags", in_tags),
+            ("notes", in_notes),
+            ("scope", in_scope),
+            ("trigger", in_trigger),
+            ("source data", in_source),
+        ] {
+            let err = store.save_intention(&record).expect_err(field);
+            assert!(
+                matches!(err, StorageError::SecretDetected { .. }),
+                "{field}: {err}"
+            );
+            assert!(
+                !err.to_string().contains(&secret),
+                "{field}: the refusal must not echo the credential"
+            );
+        }
+        assert!(
+            store.lock().intentions().is_empty(),
+            "a refused intention must leave nothing in the log"
+        );
+        store
+            .save_intention(&sample_intention("int-clean"))
+            .expect("clean intention passes");
+    }
+
+    #[test]
+    fn audit_records_reach_retired_memories_scopes_and_intentions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let secret = token("C");
+        // Records written before the gate covered every field still sit in
+        // the log. Seed them below the gate, as an older binary would have.
+        let (retired_id, scoped_id) = {
+            let mut raw = strata_store::StrataStore::open(dir.path()).unwrap();
+            let node = |tags: Vec<String>| strata_store::IngestInput {
+                content: "Synthetic note".into(),
+                source: None,
+                source_updated_at_ms: None,
+                node_type: "fact".into(),
+                tags,
+                created_at_ms: Some(1),
+                valid_from_ms: None,
+                valid_until_ms: None,
+            };
+            let retired = raw
+                .ingest_in_scope(node(vec![secret.clone()]), "user")
+                .unwrap();
+            let scoped = raw.ingest_in_scope(node(Vec::new()), &secret).unwrap();
+            let mut intention = stored_intention(&sample_intention("int-audit"));
+            intention.content = format!("rotate {secret}");
+            raw.upsert_intentions(vec![intention]).unwrap();
+            (retired, scoped)
+        };
+        let store = StrataMemory::open(dir.path()).unwrap();
+        store.suppress_memory(&retired_id).unwrap();
+        assert!(store.get_node(&retired_id).unwrap().is_none());
+
+        let records = store.audit_records();
+        let find = |id: &str| {
+            records
+                .iter()
+                .find(|record| record.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from the audit set"))
+        };
+        let hit = |id: &str| {
+            find(id)
+                .texts
+                .iter()
+                .any(|text| !blocking_secrets(text).is_empty())
+        };
+        assert!(find(&retired_id).retired, "suppressed memory is audited");
+        assert!(hit(&retired_id), "tag on a suppressed memory is scanned");
+        assert!(hit(&scoped_id), "a scope name is scanned");
+        assert!(hit("int-audit"), "an intention is scanned");
+        assert_eq!(find("int-audit").kind, AuditKind::Intention);
     }
 }

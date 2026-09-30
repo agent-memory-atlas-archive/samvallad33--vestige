@@ -156,6 +156,12 @@ pub(crate) fn apply(
     if command_json.len() > MAX_COMMAND_BYTES {
         return Err("intention graph command exceeds 128 KiB".into());
     }
+    let kinds = crate::strata_memory::blocking_secrets_in([command_json.as_str()]);
+    if !kinds.is_empty() {
+        return Err(format!(
+            "Refused to store probable credential(s): {kinds:?}. Secret bytes were not stored, logged, or returned."
+        ));
+    }
     let prior = load_journal(store, scope)?;
     let mut graph = load_graph(store, scope)?;
     let before = serde_json::to_string(&graph).map_err(storage_error)?;
@@ -306,6 +312,24 @@ mod tests {
         assert_eq!(replayed["matched"], true);
         assert_eq!(replayed["commands"], 1);
         assert_eq!(replayed["state_digest"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn graph_command_with_a_credential_is_refused_without_echo_or_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = strata_store::StrataStore::open(dir.path()).unwrap();
+        let secret = format!("ghp_{}", "D".repeat(36));
+        let command: Command = serde_json::from_value(json!({
+            "action": "plan",
+            "id": "p-secret",
+            "description": format!("rotate {secret}"),
+            "requirements": [],
+            "conflict_keys": []
+        }))
+        .unwrap();
+        let err = apply(&mut store, "user", command, at()).unwrap_err();
+        assert!(!err.contains(&secret), "{err}");
+        assert!(store.intentions().is_empty(), "a refused command left rows");
     }
 
     #[test]
