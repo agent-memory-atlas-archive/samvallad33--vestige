@@ -332,6 +332,14 @@ fn strata_withheld_call(tool: &str, arguments: Option<&serde_json::Value>) -> Op
     if STRATA_WITHHELD_TOOLS.contains(&tool) {
         return Some(crate::strata_memory::withheld_message(tool));
     }
+    if tool == "memory_status"
+        && field("view") == Some("changelog")
+        && arguments.and_then(|args| args.get("memory_id")).is_some()
+    {
+        return Some(
+            "unavailable_in_4_0: memory_status changelog for one memory_id is not available on Strata in Vestige 4.0: a Strata log does not record per-memory state transitions. Use memory_status view='provenance' with memoryId, or receipt get, for that memory's recorded history.".to_string(),
+        );
+    }
     let action = field("action")?;
     if tool == "maintain" && action == "export" && field("format") == Some("portable") {
         return Some(
