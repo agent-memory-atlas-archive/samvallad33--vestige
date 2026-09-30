@@ -348,6 +348,8 @@ fn missing_required_arguments_error_per_tool() {
     let mut server = Server::spawn(dir.path());
     server.handshake();
 
+    // Only the connectors build pushes another case.
+    #[cfg_attr(not(feature = "connectors"), allow(unused_mut))]
     let mut cases: Vec<(&str, Value)> = vec![
         ("recall", json!({})),
         ("smart_ingest", json!({ "tags": ["orphan"] })),
@@ -393,6 +395,8 @@ fn wrong_typed_arguments_are_rejected_and_the_server_stays_healthy() {
     let mut server = Server::spawn(dir.path());
     server.handshake();
 
+    // Only the connectors build pushes another case.
+    #[cfg_attr(not(feature = "connectors"), allow(unused_mut))]
     let mut cases = vec![
         ("recall", json!({ "query": 42 })),
         ("suppress", json!({ "id": { "deep": 1 } })),

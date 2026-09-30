@@ -321,12 +321,10 @@ fn tools_list_is_deterministic_across_restarts_and_carries_cache_hints() {
         );
     }
     // purge is withheld on Strata in 4.0 (not advertised).
-    for withheld in ["purge"] {
-        assert!(
-            !names.contains(&withheld.to_string()),
-            "withheld tool advertised on Strata: {names:?}"
-        );
-    }
+    assert!(
+        !names.contains(&"purge".to_string()),
+        "withheld tool advertised on Strata: {names:?}"
+    );
     for required in ["recall", "smart_ingest", "memory", "suppress"] {
         assert!(
             names.contains(&required.to_string()),
