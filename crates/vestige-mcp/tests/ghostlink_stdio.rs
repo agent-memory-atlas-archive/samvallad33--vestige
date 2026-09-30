@@ -505,8 +505,43 @@ fn chain_lists_every_memory_origin_first_and_keeps_the_no_chain_contract() {
         "{none}"
     );
 
+    // The legacy fields a chain answer carried stay, read from the
+    // recorded edges' own strengths: a woven edge is written at full
+    // strength.
+    assert_eq!(chain["confidence"], json!(1.0), "{chain}");
+    assert_eq!(steps[0]["connection_strength"], json!(1.0), "{chain}");
+    assert_eq!(steps[1]["connection_strength"], json!(1.0), "{chain}");
+    assert!(
+        steps[1]["reasoning"]
+            .as_str()
+            .is_some_and(|r| r.contains("derived_from")),
+        "{chain}"
+    );
+
     // The hidden graph alias answers with the same contract.
     let alias = server.call_tool_ok("graph", json!({ "action": "chain", "from": a, "to": b }));
     assert_eq!(alias["steps"], chain["steps"], "{alias}");
+
+    // bridges stays a list of memory ids; the described bridges ride along.
+    let bridges = server.call_tool_ok("graph", json!({ "action": "bridges", "from": a, "to": b }));
+    assert_eq!(bridges["bridges"], json!([record]), "{bridges}");
+    assert_eq!(
+        bridges["bridgeDetails"][0]["memory_id"],
+        json!(record),
+        "{bridges}"
+    );
+    assert_eq!(bridges["count"], json!(1), "{bridges}");
+
+    // associations keep a strength per neighbor.
+    let assoc = server.call_tool_ok("graph", json!({ "action": "associations", "from": a }));
+    let rows = assoc["associations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{assoc}"));
+    let row = rows
+        .iter()
+        .find(|row| row["memory_id"] == json!(record))
+        .unwrap_or_else(|| panic!("{assoc}"));
+    assert_eq!(row["strength"], json!(1.0), "{assoc}");
+    assert_eq!(row["link_type"], json!("derived_from"), "{assoc}");
     server.shutdown();
 }

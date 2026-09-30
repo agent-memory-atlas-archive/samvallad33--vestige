@@ -1030,14 +1030,44 @@ pub fn explore(
                     // as the legacy chain contract does. The origin arrives
                     // by no edge; each later step names the recorded edge it
                     // arrived by. `path` carries the edges themselves.
+                    // connection_strength is the recorded edge's own strength
+                    // and confidence their geometric mean (the legacy
+                    // formula), read as written: no score is derived.
+                    let strengths: Vec<f64> = path
+                        .iter()
+                        .map(|step| {
+                            let milli = snapshot
+                                .recorded_strengths(&step.from)
+                                .get(&(step.to.clone(), step.kind.clone()))
+                                .copied()
+                                .unwrap_or(1000);
+                            milli as f64 / 1000.0
+                        })
+                        .collect();
+                    let confidence = if strengths.is_empty() {
+                        1.0
+                    } else {
+                        strengths
+                            .iter()
+                            .product::<f64>()
+                            .powf(1.0 / strengths.len() as f64)
+                    };
                     let mut origin = describe(from);
                     origin["connection_type"] = json!("origin");
                     origin["reversed"] = json!(false);
+                    origin["connection_strength"] = json!(1.0);
+                    origin["reasoning"] = json!("origin of the chain");
                     let steps: Vec<Value> = std::iter::once(origin)
-                        .chain(path.iter().map(|step| {
+                        .chain(path.iter().zip(&strengths).map(|(step, strength)| {
                             let mut item = describe(&step.to);
                             item["connection_type"] = json!(step.kind);
                             item["reversed"] = json!(step.reversed);
+                            item["connection_strength"] = json!(strength);
+                            item["reasoning"] = json!(if step.reversed {
+                                format!("recorded {} edge, walked from its target", step.kind)
+                            } else {
+                                format!("recorded {} edge", step.kind)
+                            });
                             item
                         }))
                         .collect();
@@ -1048,6 +1078,7 @@ pub fn explore(
                         "steps": steps,
                         "path": path_json(&path),
                         "total_hops": path.len(),
+                        "confidence": confidence,
                         "basis": basis,
                         "headSeq": snapshot.head_seq(),
                     }))
@@ -1088,11 +1119,17 @@ pub fn explore(
             } else {
                 (Vec::new(), 0)
             };
+            let strengths = snapshot.recorded_strengths(from);
             let associations: Vec<Value> = typed
                 .iter()
                 .take(limit)
                 .map(|(neighbor, kind, forward)| {
                     let mut item = describe(neighbor);
+                    let milli = strengths
+                        .get(&(neighbor.clone(), kind.clone()))
+                        .copied()
+                        .unwrap_or(1000);
+                    item["strength"] = json!(milli as f64 / 1000.0);
                     item["link_type"] = json!(kind);
                     item["direction"] = json!(if *forward { "outgoing" } else { "incoming" });
                     item["source"] = json!("recorded_edge");
@@ -1119,7 +1156,9 @@ pub fn explore(
             } else {
                 Vec::new()
             };
-            let bridges: Vec<Value> = bridges
+            // `bridges` stays the legacy list of memory ids; each described
+            // bridge rides along in `bridgeDetails`, in the same order.
+            let details: Vec<Value> = bridges
                 .iter()
                 .take(limit)
                 .map(|(id, hops)| {
@@ -1128,12 +1167,18 @@ pub fn explore(
                     item
                 })
                 .collect();
+            let ids: Vec<&str> = bridges
+                .iter()
+                .take(limit)
+                .map(|(id, _)| id.as_str())
+                .collect();
             Ok(json!({
                 "action": "bridges",
                 "from": from,
                 "to": to,
-                "bridges": bridges,
-                "count": bridges.len(),
+                "bridges": ids,
+                "bridgeDetails": details,
+                "count": ids.len(),
                 "basis": basis,
                 "headSeq": snapshot.head_seq(),
             }))

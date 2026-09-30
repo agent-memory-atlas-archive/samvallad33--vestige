@@ -12,11 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **GhostLink on the Strata log.** `ghostlink` replaces `graph` in `tools/list` (the catalog stays at 16 tools; `graph` still answers as a hidden alias). It proposes memory pairs that were never composed, and every pair carries its proof from recorded structure only: no text, tag-name or vector similarity is used to admit, rank or explain anything.
   - `propose` with lens `bridge` (default): pairs within three undirected hops over recorded `touched`, `derived_from` or `closed_by` edges, never woven, scored by hop proximity, composition novelty, retention and prior outcomes. Each pair carries its shortest typed path.
   - `propose` with lens `divergent`: pairs no recorded edge of any kind joins. `Path_min` walks every recorded edge (migrated `legacy_inferred` edges can only shorten it, so they only ever dampen), divergence is measured on typed neighbor ids only, and a pair whose members have no typed profile is a forced juxtaposition with no score, picked by a deterministic sampler that shows each memory at most once per page.
+  - Expired and future memories are not candidates, and a proposal scoped to one project walks and names only that project's memories.
   - An empty proposal says why, with counts.
-  - `weave` records what a tested pair showed: a composition record and two `derived_from` edges, each through the gate with its receipt. The pair leaves both lenses, and its members gain typed profiles.
+  - `weave` records what a tested pair showed: a composition record and two `derived_from` edges, each through the gate with its receipt. The pair leaves both lenses, and its members gain typed profiles. Suppressing a member withdraws the records composed from it, each with its own receipt.
   - `inspect` reads woven compositions (`recent`, `get`, `memory`, `neighbors`).
   - `harden` seeds invariant laws from `<data-dir>/ghostlink-laws.json`, then `~/.vestige/ghostlink-laws.json`, then six built-in laws. It is idempotent by law id, reports seeded, already present and failed counts, and names a malformed laws file instead of skipping it.
 - `vestige compose --lens bridge|divergent` runs the same engine from the terminal.
+
+### Changed
+
+- On a Strata log, `graph` (and `explore`) `chain`, `associations` and `bridges` walk recorded typed edges only. `connection_type` names the recorded edge kind (for example `derived_from`) instead of a similarity class, and `connection_strength`, `strength` and `confidence` are the recorded edges' own strengths. `chain` steps list every memory, origin first, and a missing chain keeps the message `No chain found between these memories` with a `reason`. `bridges` stays a list of memory ids, with each bridge described in `bridgeDetails`.
+- On a Strata log, `predict` refuses free-text `current_topics` with `similarity_disabled`; `current_file` is an exact handle.
 
 ### Fixed
 

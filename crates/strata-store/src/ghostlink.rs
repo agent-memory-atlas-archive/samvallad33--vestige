@@ -813,6 +813,27 @@ impl<'s> GhostSnapshot<'s> {
             .collect()
     }
 
+    /// The recorded strength (milli) of every edge touching `id`, keyed by
+    /// `(other endpoint, kind)`; parallel edges keep the strongest. One pass
+    /// over the log's edges, read as written: no score is derived.
+    pub fn recorded_strengths(&self, id: &str) -> HashMap<(String, String), i64> {
+        let mut out: HashMap<(String, String), i64> = HashMap::new();
+        for edge in self.store.edge_list() {
+            let other = if edge.source_id == id {
+                &edge.target_id
+            } else if edge.target_id == id {
+                &edge.source_id
+            } else {
+                continue;
+            };
+            let slot = out
+                .entry((other.clone(), edge.link_type.clone()))
+                .or_insert(edge.strength_milli);
+            *slot = (*slot).max(edge.strength_milli);
+        }
+        out
+    }
+
     // ------------------------------------------------------------------
     // Walks
     // ------------------------------------------------------------------
