@@ -66,9 +66,22 @@ fn platform_sync(file: &File) -> io::Result<()> {
 }
 
 /// Durability barrier for directory entries (segment creation, watermark rename).
+///
+/// Unix: fsync the directory. Windows has no equivalent: `File::open` on a
+/// directory fails with ERROR_ACCESS_DENIED (os error 5), which made every
+/// `StrataLog::open` fail there. NTFS records the entry change in its
+/// metadata journal; there is no per-directory barrier to call, so on
+/// Windows this is a no-op and a new entry is as durable as NTFS makes it.
 pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
-    let d = std::fs::File::open(dir)?;
-    d.sync_all()
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]

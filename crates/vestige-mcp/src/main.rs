@@ -34,6 +34,7 @@
 #[path = "glibc_compat.rs"]
 mod glibc_compat;
 
+use vestige_mcp::attach;
 use vestige_mcp::cognitive;
 use vestige_mcp::protocol;
 use vestige_mcp::server;
@@ -42,7 +43,7 @@ use directories::BaseDirs;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -418,34 +419,6 @@ fn main() {
     );
 }
 
-/// Exclusive lock held for the life of `serve`. The kernel releases it when
-/// the process dies. Not a pid file and not a timeout.
-fn hold_serve_lock(data_dir: &Path) -> fs::File {
-    let path = data_dir.join(".serve.lock");
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-    {
-        Ok(file) => file,
-        Err(e) => {
-            error!("Failed to create the serve lock {}: {}", path.display(), e);
-            std::process::exit(1);
-        }
-    };
-    if let Err(e) = file.lock() {
-        error!(
-            "Failed to lock {} (another vestige-mcp holds it): {}",
-            path.display(),
-            e
-        );
-        std::process::exit(1);
-    }
-    file
-}
-
 async fn serve() {
     // Parse CLI arguments first (before logging init, so --help/--version work cleanly)
     let config = parse_args();
@@ -507,12 +480,48 @@ async fn serve() {
         std::process::exit(err.code());
     }
 
-    // Two servers must not open the same log. `File::lock` dies with this
-    // process, including SIGKILL. `log/strata.lock` is a pid file: while this
-    // process is alive it also stops a reader (`dump-migration` opens that
-    // same directory with `StrataLog::open`). Take the flock first, then drop
-    // the pid file so the reader can reopen the log this process is serving.
-    let _serve_lock = hold_serve_lock(&strata_dir);
+    // Two servers must not open the same log, and every agent on the machine
+    // must still get the store. `.serve.lock` elects one owner (the kernel
+    // drops it with its holder, SIGKILL included); every other process
+    // attaches to the owner and relays its stdio there. See `attach`.
+    let wait = attach::election_wait();
+    let (serve_lock, promoted) = match attach::elect(&strata_dir, wait).await {
+        Ok(attach::Role::Owner(lock)) => (lock, None),
+        Ok(attach::Role::Attached(attachment)) => {
+            info!(
+                owner_pid = attachment.owner_pid,
+                "{} is served by another vestige-mcp; relaying this client to it",
+                strata_dir.display()
+            );
+            match attach::proxy_stdio(attachment, &strata_dir, wait).await {
+                Ok(attach::ProxyEnd::Closed) => {
+                    info!("attached client closed");
+                    return;
+                }
+                Ok(attach::ProxyEnd::Promoted { lock, client }) => {
+                    info!(
+                        "the owner went away; this process now serves {}",
+                        strata_dir.display()
+                    );
+                    (lock, Some(client))
+                }
+                Err(e) => {
+                    error!("Lost the Vestige server and could not elect another: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            error!("Could not serve or attach to {}: {}", strata_dir.display(), e);
+            std::process::exit(1);
+        }
+    };
+    // Held for the life of `serve`. `log/strata.lock` is a pid file: while
+    // this process is alive it also stops a reader (`dump-migration` opens
+    // that same directory with `StrataLog::open`). The serve lock is taken
+    // first, then the pid file is dropped so the reader can reopen the log
+    // this process is serving.
+    let _serve_lock = serve_lock;
     let storage = match vestige_mcp::strata_memory::open(&strata_dir) {
         Ok(s) => {
             info!("Strata log initialized at {}", strata_dir.display());
@@ -803,13 +812,45 @@ async fn serve() {
         info!("HTTP MCP transport disabled; set VESTIGE_HTTP_ENABLED=1 or pass --http to enable");
     }
 
+    // Other local clients attach here: one MCP session each, same storage,
+    // same cognitive engine, same event bus.
+    let attach_point = {
+        let storage = Arc::clone(&storage);
+        let cognitive = Arc::clone(&cognitive);
+        let event_tx = event_tx.clone();
+        match attach::AttachPoint::open(&strata_dir, move || {
+            McpServer::new_with_events(Arc::clone(&storage), Arc::clone(&cognitive), event_tx.clone())
+        })
+        .await
+        {
+            Ok(point) => Some(point),
+            Err(e) => {
+                warn!(
+                    "Other Vestige clients cannot attach to this server ({}); they will wait for it to exit",
+                    e
+                );
+                None
+            }
+        }
+    };
+
     // Create MCP server with shared event channel for dashboard broadcasts
     let server = McpServer::new_with_events(storage, cognitive, event_tx);
 
     info!("Starting MCP server on stdio...");
 
-    // Run the server
-    if let Err(e) = transport.run(server).await {
+    // Run the server: this process's own client, or the attached client this
+    // process took over when its owner went away.
+    let result = match promoted {
+        None => transport.run(server).await,
+        Some(client) => client.serve(server).await,
+    };
+    // Attached sessions outlive this process's own client: keep serving them,
+    // then stop accepting and retire the endpoint while still holding the lock.
+    if let Some(point) = attach_point {
+        point.close().await;
+    }
+    if let Err(e) = result {
         error!("Server error: {}", e);
         // Not `std::process::exit`: this runs on a runtime thread with the
         // warm-up tasks possibly still inside ONNX Runtime, which is the state

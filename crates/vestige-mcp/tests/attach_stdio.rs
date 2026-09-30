@@ -1,0 +1,390 @@
+//! Real binaries: every MCP client on a machine can use one Vestige store.
+//!
+//! The Strata log has one writer. These tests start `vestige-mcp` the way an
+//! MCP client does (a child process speaking line-framed JSON-RPC on stdio)
+//! several times against one data directory, and check what a user sees:
+//! every client connects, every client reads what the others wrote, a client
+//! keeps working when the process that owned the store is killed, and the
+//! `vestige` CLI backs up through a running server instead of opening the log
+//! as a second writer.
+
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+/// Bound on one JSON-RPC answer. A hang is a failure, never a wedged job.
+const RPC_TIMEOUT: Duration = Duration::from_secs(90);
+
+struct Client {
+    name: &'static str,
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: Receiver<String>,
+    stderr: Arc<Mutex<Vec<String>>>,
+    next_id: u64,
+}
+
+impl Client {
+    fn spawn(name: &'static str, data_dir: &Path) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_vestige-mcp"))
+            .env("VESTIGE_DATA_DIR", data_dir)
+            .env("VESTIGE_DASHBOARD_ENABLED", "false")
+            .env("VESTIGE_HTTP_ENABLED", "0")
+            .env("VESTIGE_AUTOPILOT_ENABLED", "0")
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn vestige-mcp");
+        let stdin = child.stdin.take().expect("stdin");
+        let raw_stdout = child.stdout.take().expect("stdout");
+        let raw_stderr = child.stderr.take().expect("stderr");
+        let (tx, stdout) = channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(raw_stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        {
+            let sink = Arc::clone(&stderr);
+            std::thread::spawn(move || {
+                for line in BufReader::new(raw_stderr).lines().map_while(Result::ok) {
+                    sink.lock().unwrap().push(line);
+                }
+            });
+        }
+        Self {
+            name,
+            child,
+            stdin: Some(stdin),
+            stdout,
+            stderr,
+            next_id: 0,
+        }
+    }
+
+    fn stderr(&self) -> String {
+        self.stderr.lock().unwrap().join("\n")
+    }
+
+    fn send(&mut self, message: &Value) {
+        let stdin = self.stdin.as_mut().expect("stdin still open");
+        writeln!(stdin, "{message}").expect("write request");
+        stdin.flush().expect("flush request");
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.stdout.recv_timeout(left) {
+                Ok(line) => {
+                    let message: Value = serde_json::from_str(&line).unwrap_or_else(|e| {
+                        panic!("{}: stdout line is not JSON ({e}): {line}", self.name)
+                    });
+                    if message.get("method").is_none() && message["id"] == json!(id) {
+                        return message;
+                    }
+                    assert!(
+                        message.get("method").is_some(),
+                        "{}: answer for an id nobody asked about: {line}",
+                        self.name
+                    );
+                }
+                Err(RecvTimeoutError::Timeout) => panic!(
+                    "{}: no answer to {method} within {RPC_TIMEOUT:?}\nstderr:\n{}",
+                    self.name,
+                    self.stderr()
+                ),
+                Err(RecvTimeoutError::Disconnected) => panic!(
+                    "{}: stdout closed before answering {method}\nstderr:\n{}",
+                    self.name,
+                    self.stderr()
+                ),
+            }
+        }
+    }
+
+    fn initialize(&mut self) {
+        let answer = self.request(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": self.name, "version": "1"}
+            }),
+        );
+        assert!(
+            answer["result"]["serverInfo"]["name"].is_string(),
+            "{}: initialize failed: {answer}",
+            self.name
+        );
+        self.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    }
+
+    /// A tool call's structured result; panics on any error answer.
+    fn call(&mut self, tool: &str, arguments: Value) -> Value {
+        let answer = self.request("tools/call", json!({"name": tool, "arguments": arguments}));
+        let result = &answer["result"];
+        assert!(
+            answer.get("error").is_none() && result["isError"] != json!(true),
+            "{}: {tool} failed: {answer}\nstderr:\n{}",
+            self.name,
+            self.stderr()
+        );
+        if !result["structuredContent"].is_null() {
+            return result["structuredContent"].clone();
+        }
+        let text = result["content"][0]["text"].as_str().unwrap_or("null");
+        serde_json::from_str(text).unwrap_or(Value::String(text.to_string()))
+    }
+
+    fn remember(&mut self, content: &str) -> String {
+        let saved = self.call(
+            "smart_ingest",
+            json!({"content": content, "forceCreate": true, "tags": ["attach-test"]}),
+        );
+        saved["nodeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{}: smart_ingest gave no nodeId: {saved}", self.name))
+            .to_string()
+    }
+
+    fn sees(&mut self, id: &str) -> bool {
+        let got = self.call("memory", json!({"action": "get", "id": id}));
+        got["found"] != json!(false) && got.to_string().contains(id)
+    }
+
+    fn close_stdin(&mut self) {
+        self.stdin.take();
+    }
+
+    fn wait_exit(&mut self, within: Duration) -> ExitStatus {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll child") {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{}: did not exit within {within:?}\nstderr:\n{}",
+                self.name,
+                self.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn running(&mut self) -> bool {
+        self.child.try_wait().expect("poll child").is_none()
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn cli(data_dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_vestige"))
+        .arg("--data-dir")
+        .arg(data_dir)
+        .args(args)
+        .env_remove("VESTIGE_DATA_DIR")
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run vestige CLI")
+}
+
+fn text(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[test]
+fn three_clients_share_one_store_through_one_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Client::spawn("owner", dir.path());
+    owner.initialize();
+
+    // Before the attach layer, the second server blocked on the lock forever.
+    let started = Instant::now();
+    let mut second = Client::spawn("second", dir.path());
+    second.initialize();
+    let mut third = Client::spawn("third", dir.path());
+    third.initialize();
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "attaching took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        second.stderr().contains("relaying this client"),
+        "{}",
+        second.stderr()
+    );
+    assert!(
+        third.stderr().contains("relaying this client"),
+        "{}",
+        third.stderr()
+    );
+
+    let by_owner = owner.remember("attach test: written by the owning process");
+    let by_second = second.remember("attach test: written by the second client");
+    let by_third = third.remember("attach test: written by the third client");
+    for id in [&by_owner, &by_second, &by_third] {
+        assert!(owner.sees(id), "owner cannot read {id}");
+        assert!(second.sees(id), "second cannot read {id}");
+        assert!(third.sees(id), "third cannot read {id}");
+    }
+
+    // The owner's own client leaves; the owner keeps serving the others.
+    owner.close_stdin();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        owner.running(),
+        "the owner exited with clients still attached"
+    );
+    let late = second.remember("attach test: written after the owner's client left");
+    assert!(third.sees(&late));
+
+    second.close_stdin();
+    third.close_stdin();
+    assert!(second.wait_exit(Duration::from_secs(30)).success());
+    assert!(third.wait_exit(Duration::from_secs(30)).success());
+    assert!(owner.wait_exit(Duration::from_secs(30)).success());
+    assert!(
+        !dir.path().join(".serve.endpoint").exists(),
+        "a clean exit retires the endpoint file"
+    );
+
+    // Everything any client wrote is in the log a fresh process opens.
+    let mut reopened = Client::spawn("reopened", dir.path());
+    reopened.initialize();
+    for id in [&by_owner, &by_second, &by_third, &late] {
+        assert!(reopened.sees(id), "{id} did not survive a restart");
+    }
+}
+
+#[test]
+fn an_attached_client_survives_its_owner_being_killed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Client::spawn("owner", dir.path());
+    owner.initialize();
+    let mut survivor = Client::spawn("survivor", dir.path());
+    survivor.initialize();
+    let before = survivor.remember("attach test: written before the owner died");
+
+    // An MCP client killing its server on exit looks exactly like this.
+    owner.child.kill().expect("kill the owner");
+    owner.child.wait().expect("reap the owner");
+
+    // The same session, no new handshake from the client: the survivor
+    // takes the lock and serves itself.
+    let after = survivor.remember("attach test: written after the owner died");
+    assert!(
+        survivor.sees(&before),
+        "a memory acknowledged before the kill was lost"
+    );
+    assert!(survivor.sees(&after));
+    assert!(
+        survivor.stderr().contains("now serves"),
+        "{}",
+        survivor.stderr()
+    );
+
+    // A client started now attaches to the survivor.
+    let mut newcomer = Client::spawn("newcomer", dir.path());
+    newcomer.initialize();
+    assert!(
+        newcomer.stderr().contains("relaying this client"),
+        "{}",
+        newcomer.stderr()
+    );
+    assert!(newcomer.sees(&before));
+    assert!(newcomer.sees(&after));
+
+    newcomer.close_stdin();
+    survivor.close_stdin();
+    assert!(newcomer.wait_exit(Duration::from_secs(30)).success());
+    assert!(survivor.wait_exit(Duration::from_secs(30)).success());
+
+    let log = dir.path().join("log");
+    let verify = cli(dir.path(), &["strata-verify", &log.to_string_lossy()]);
+    assert!(
+        verify.status.success(),
+        "the log fails verification:\n{}",
+        text(&verify)
+    );
+}
+
+#[test]
+fn cli_backs_up_through_a_running_server_and_never_opens_a_served_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = Client::spawn("server", dir.path());
+    server.initialize();
+    let id = server.remember("attach test: must be in the backup");
+
+    // A command that opens the log directly refuses instead of becoming a
+    // second writer.
+    let stats = cli(dir.path(), &["stats"]);
+    assert!(
+        !stats.status.success(),
+        "stats opened a served log:\n{}",
+        text(&stats)
+    );
+    assert!(text(&stats).contains("is serving"), "{}", text(&stats));
+
+    // Backup goes through the server.
+    let out = dir.path().join("nightly").join("backup.strata");
+    let backup = cli(dir.path(), &["backup", &out.to_string_lossy()]);
+    assert!(backup.status.success(), "backup failed:\n{}", text(&backup));
+    assert!(
+        text(&backup).contains("backing up through it"),
+        "{}",
+        text(&backup)
+    );
+    assert!(out.join("log").is_dir(), "no log/ in the backup");
+    let leftovers = std::fs::read_dir(dir.path().join("backups"))
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        leftovers, 0,
+        "the server-side copy was left behind after the move"
+    );
+
+    // The server keeps working after the backup.
+    assert!(server.sees(&id));
+    server.close_stdin();
+    assert!(server.wait_exit(Duration::from_secs(30)).success());
+
+    // With no server running, the CLI opens the store itself.
+    let stats = cli(dir.path(), &["stats"]);
+    assert!(
+        stats.status.success(),
+        "stats failed with no server:\n{}",
+        text(&stats)
+    );
+
+    // The backup is a working store on its own.
+    let mut restored = Client::spawn("restored", &out);
+    restored.initialize();
+    assert!(restored.sees(&id), "the backup does not hold the memory");
+}

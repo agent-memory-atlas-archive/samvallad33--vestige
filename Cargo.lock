@@ -2936,6 +2936,7 @@ dependencies = [
  "directories",
  "ed25519-dalek",
  "futures-util",
+ "getrandom 0.4.3",
  "include_dir",
  "libc",
  "mime_guess",

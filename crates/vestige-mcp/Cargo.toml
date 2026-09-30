@@ -132,6 +132,9 @@ ed25519-dalek = "3"
 # Constant-time comparison for auth tokens (prevents timing side-channels)
 subtle = "2"
 
+# Attach tokens for the local serve endpoint (OS CSPRNG).
+getrandom = "0.4"
+
 # Error handling
 thiserror = "2"
 anyhow = "1"

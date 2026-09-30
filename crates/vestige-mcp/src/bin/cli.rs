@@ -49,6 +49,10 @@ struct Cli {
 
 static CLI_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// `.serve.lock`, held from the first `open_storage` to exit. The Strata log
+/// has one writer; a CLI command that opens it is that writer while it runs.
+static CLI_SERVE_LOCK: OnceLock<fs::File> = OnceLock::new();
+
 #[derive(Debug, Clone, Default, Args)]
 struct SandwichInstallOptions {
     /// Overwrite existing staged Vestige hook and agent files.
@@ -2698,8 +2702,43 @@ fn run_migrate_to_strata_linked(
 fn open_storage() -> anyhow::Result<std::sync::Arc<Storage>> {
     let dir = cli_data_dir()?;
     // Same check `vestige-mcp` runs before stdio. `vestige.db` is not opened.
+    // It runs before the lock: the upgrade helper takes that lock itself.
     vestige_mcp::v3_launch::upgrade_or_refuse(&dir.join("vestige.db"))?;
+    if !take_cli_lock(&dir)? {
+        return Err(served_elsewhere(&dir));
+    }
     Ok(vestige_mcp::strata_memory::open(&dir)?)
+}
+
+/// Take the store's serve lock for the rest of this process. `false` when a
+/// Vestige server (or another command) holds it.
+fn take_cli_lock(dir: &Path) -> anyhow::Result<bool> {
+    if CLI_SERVE_LOCK.get().is_some() {
+        return Ok(true);
+    }
+    fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create the data directory {}", dir.display()))?;
+    match vestige_mcp::attach::try_serve_lock(dir)? {
+        Some(lock) => {
+            let _ = CLI_SERVE_LOCK.set(lock);
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Why a command that opens the log cannot run while the store is served.
+fn served_elsewhere(dir: &Path) -> anyhow::Error {
+    let holder = vestige_mcp::attach::read_endpoint(dir)
+        .map(|endpoint| format!("vestige-mcp (pid {})", endpoint.pid))
+        .unwrap_or_else(|| "another Vestige process".to_string());
+    anyhow::anyhow!(
+        "{holder} is serving {}. This command opens the log directly, and the log has one \
+         writer, so it runs only while no Vestige server holds the store. Use the matching \
+         MCP tool through your agent, or stop the Vestige server and run it again. \
+         `vestige backup` works while a server runs.",
+        dir.display()
+    )
 }
 
 /// Fetch all nodes from storage using pagination
@@ -2737,6 +2776,12 @@ fn run_backup(output: PathBuf) -> anyhow::Result<()> {
             "no Vestige store in {}: no Strata log/ and no vestige.db (nothing to back up)",
             data_dir.display()
         );
+    }
+
+    // A running server holds the store: back up through it.
+    vestige_mcp::v3_launch::upgrade_or_refuse(&db_path)?;
+    if !take_cli_lock(&data_dir)? {
+        return run_backup_through_server(&data_dir, &output);
     }
 
     let storage = open_storage()?;
@@ -2781,6 +2826,79 @@ fn run_backup(output: PathBuf) -> anyhow::Result<()> {
 /// log file except its lock (plus `store.meta`) is copied. `vestige.db` is
 /// never part of it, even when the v3 file is still beside the log.
 fn run_strata_backup(storage: &Arc<Storage>, data_dir: &Path, output: &Path) -> anyhow::Result<()> {
+    check_strata_backup_destination(data_dir, output)?;
+    let log_dir = data_dir.join("log");
+    println!("Sealing and copying the Strata log...");
+    println!("  {} {}", "From:".dimmed(), log_dir.display());
+    println!("  {}   {}", "To:".dimmed(), output.display());
+    storage
+        .backup_to(output)
+        .map_err(|err| anyhow::anyhow!("Strata backup failed: {err}"))?;
+    print_strata_backup_summary(data_dir, output);
+    Ok(())
+}
+
+/// The same backup, made by the `vestige-mcp` that serves the store (its
+/// `maintain backup`, into `<data-dir>/backups`) and then moved to `output`.
+fn run_backup_through_server(data_dir: &Path, output: &Path) -> anyhow::Result<()> {
+    check_strata_backup_destination(data_dir, output)?;
+    let holder = vestige_mcp::attach::read_endpoint(data_dir)
+        .map(|endpoint| format!("vestige-mcp (pid {})", endpoint.pid))
+        .unwrap_or_else(|| "a Vestige server".to_string());
+    println!("{holder} is serving this store; backing up through it...");
+    let rt = tokio::runtime::Runtime::new()?;
+    let made = rt
+        .block_on(vestige_mcp::attach::call_tool(
+            data_dir,
+            "maintain",
+            serde_json::json!({"action": "backup"}),
+        ))
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "{err}. Stop the Vestige server and run `vestige backup` again, or ask your agent to run maintain backup."
+            )
+        })?;
+    let made = made
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("the server's backup answer named no path: {made}"))?;
+    println!("  {} {}", "Made:".dimmed(), made.display());
+    println!("  {}   {}", "To:".dimmed(), output.display());
+    if made != output {
+        // The destination check allows an empty directory; `rename` onto one
+        // is not portable, so it goes first.
+        if output.is_dir() {
+            fs::remove_dir(output)?;
+        }
+        if fs::rename(&made, output).is_err() {
+            copy_dir_all(&made, output)
+                .with_context(|| format!("failed to copy {} to {}", made.display(), output.display()))?;
+            fs::remove_dir_all(&made)
+                .with_context(|| format!("copied the backup, but could not remove {}", made.display()))?;
+        }
+    }
+    print_strata_backup_summary(data_dir, output);
+    Ok(())
+}
+
+/// Copy a directory tree (a Strata backup: plain files in plain directories).
+fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// A Strata backup goes to a new (or empty) directory outside the live log.
+fn check_strata_backup_destination(data_dir: &Path, output: &Path) -> anyhow::Result<()> {
     let log_dir = data_dir.join("log");
     if let Ok(meta) = std::fs::metadata(output) {
         let empty_dir = meta.is_dir() && std::fs::read_dir(output)?.next().is_none();
@@ -2806,14 +2924,10 @@ fn run_strata_backup(storage: &Arc<Storage>, data_dir: &Path, output: &Path) -> 
     {
         std::fs::create_dir_all(parent)?;
     }
+    Ok(())
+}
 
-    println!("Sealing and copying the Strata log...");
-    println!("  {} {}", "From:".dimmed(), log_dir.display());
-    println!("  {}   {}", "To:".dimmed(), output.display());
-    storage
-        .backup_to(output)
-        .map_err(|err| anyhow::anyhow!("Strata backup failed: {err}"))?;
-
+fn print_strata_backup_summary(data_dir: &Path, output: &Path) {
     let files = std::fs::read_dir(output.join("log"))
         .map(|entries| entries.flatten().count())
         .unwrap_or(0);
@@ -2865,7 +2979,6 @@ fn run_strata_backup(storage: &Arc<Storage>, data_dir: &Path, output: &Path) -> 
         "Restore:".dimmed(),
         output.join("log").display()
     );
-    Ok(())
 }
 
 /// Run the planted-cause selftest (the MCP `selftest` tool) from the CLI.
@@ -4911,10 +5024,22 @@ fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
             let mut cog = cognitive.lock().await;
             cog.hydrate(&storage); // Load persisted connections
         }
+        let (event_tx, _) = tokio::sync::broadcast::channel::<
+            vestige_mcp::dashboard::events::VestigeEvent,
+        >(vestige_mcp::dashboard::state::EVENT_CHANNEL_CAPACITY);
+        // This process holds the store, so MCP clients started meanwhile
+        // attach here instead of waiting for it to exit.
+        let _attach_point = open_cli_attach_point(&storage, &cognitive, &event_tx).await;
 
-        vestige_mcp::dashboard::start_dashboard(storage, Some(cognitive), port, open_browser)
-            .await
-            .map_err(|e| anyhow::anyhow!("Dashboard error: {}", e))
+        vestige_mcp::dashboard::start_dashboard_with_event_tx(
+            storage,
+            Some(cognitive),
+            event_tx,
+            port,
+            open_browser,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Dashboard error: {}", e))
     })
 }
 
@@ -4963,6 +5088,10 @@ fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Re
             });
         }
 
+        // This process holds the store, so MCP stdio clients started
+        // meanwhile attach here instead of waiting for it to exit.
+        let _attach_point = open_cli_attach_point(&storage, &cognitive, &event_tx).await;
+
         // Get auth token
         let token = vestige_mcp::protocol::auth::get_or_create_auth_token()
             .map_err(|e| anyhow::anyhow!("Failed to create auth token: {}", e))?;
@@ -4998,6 +5127,38 @@ fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Re
 
         Ok(())
     })
+}
+
+/// Accept attached MCP sessions for as long as this long-running command
+/// holds the store. A failure only means clients wait for this to exit.
+async fn open_cli_attach_point(
+    storage: &Arc<Storage>,
+    cognitive: &Arc<tokio::sync::Mutex<vestige_mcp::cognitive::CognitiveEngine>>,
+    event_tx: &tokio::sync::broadcast::Sender<vestige_mcp::dashboard::events::VestigeEvent>,
+) -> Option<vestige_mcp::attach::AttachPoint> {
+    let dir = cli_data_dir().ok()?;
+    let storage = Arc::clone(storage);
+    let cognitive = Arc::clone(cognitive);
+    let event_tx = event_tx.clone();
+    match vestige_mcp::attach::AttachPoint::open(&dir, move || {
+        vestige_mcp::server::McpServer::new_with_events(
+            Arc::clone(&storage),
+            Arc::clone(&cognitive),
+            event_tx.clone(),
+        )
+    })
+    .await
+    {
+        Ok(point) => Some(point),
+        Err(err) => {
+            eprintln!(
+                "  {} MCP clients cannot attach while this runs: {}",
+                "!".yellow(),
+                err
+            );
+            None
+        }
+    }
 }
 
 /// Truncate a string for display (UTF-8 safe)

@@ -254,6 +254,27 @@ pub async fn start_dashboard(
     open_browser: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (app, _state) = build_router(storage, cognitive, port);
+    serve_dashboard(app, port, open_browser).await
+}
+
+/// [`start_dashboard`] on an external event channel, so MCP sessions attached
+/// to this process show up in the dashboard's live feed.
+pub async fn start_dashboard_with_event_tx(
+    storage: Arc<Storage>,
+    cognitive: Option<Arc<Mutex<CognitiveEngine>>>,
+    event_tx: tokio::sync::broadcast::Sender<events::VestigeEvent>,
+    port: u16,
+    open_browser: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (app, _state) = build_router_with_event_tx(storage, cognitive, event_tx, port);
+    serve_dashboard(app, port, open_browser).await
+}
+
+async fn serve_dashboard(
+    app: Router,
+    port: u16,
+    open_browser: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
     info!("Dashboard starting at http://127.0.0.1:{}", port);
