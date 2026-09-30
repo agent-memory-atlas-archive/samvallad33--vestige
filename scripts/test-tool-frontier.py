@@ -327,6 +327,11 @@ def run(binary, output):
             assert recent.get("events", recent.get("compositions", [])) == [] or recent.get("count", 0) == 0 or "events" in recent
             never = tool("graph", {"action": "never_composed", "limit": 5})
             assert never["scope"] == "user" and never["globalNoveltyVerified"] is False
+            bridge = tool("ghostlink", {"mode": "propose", "limit": 5})
+            assert bridge["lens"] == "bridge" and bridge["globalNoveltyVerified"] is False
+            assert "admission" in bridge, bridge
+            divergent = tool("ghostlink", {"mode": "propose", "lens": "divergent", "limit": 5})
+            assert all(c["proof"]["noEdgeVerified"] is True for c in divergent["candidates"]), divergent
             typed("session_start", {"queries": [marker], "include_predictions": False, "include_intentions": False}, "similarity_disabled")
             doomed_suppress = tool("smart_ingest", {"content": "STRATA_SUPPRESS_DOOMED", "forceCreate": True})
             suppress_id = doomed_suppress["nodeId"]

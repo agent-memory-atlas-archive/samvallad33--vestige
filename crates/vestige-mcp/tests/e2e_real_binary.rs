@@ -2306,6 +2306,43 @@ fn causal_walk_selftest_and_forgotten_lesson_are_called_over_stdio() {
     server.shutdown();
 }
 
+/// GhostLink over stdio on a fresh 4.0 store: the bridge lens explains an
+/// empty answer, and every divergent candidate carries its no-edge proof.
+#[test]
+fn ghostlink_propose_answers_both_lenses_with_proofs() {
+    let dir = data_dir();
+    let mut server = Server::spawn(dir.path());
+    server.handshake();
+    for content in [
+        "GhostLink e2e: refunds need multi-row transactions",
+        "GhostLink e2e: the March outage began in the retry loop",
+        "GhostLink e2e: invoices are rendered by the PDF worker",
+    ] {
+        server.call_tool_ok("smart_ingest", json!({ "content": content }));
+    }
+    let bridge = server.call_tool_ok("ghostlink", json!({ "mode": "propose", "limit": 5 }));
+    assert_eq!(bridge["lens"], json!("bridge"), "{bridge}");
+    assert_eq!(bridge["globalNoveltyVerified"], json!(false), "{bridge}");
+    assert!(
+        bridge["admission"].is_object(),
+        "a proposal says what admits a pair: {bridge}"
+    );
+    let divergent = server.call_tool_ok(
+        "ghostlink",
+        json!({ "mode": "propose", "lens": "divergent", "limit": 5 }),
+    );
+    let candidates = divergent["candidates"].as_array().expect("candidates");
+    assert!(!candidates.is_empty(), "{divergent}");
+    for candidate in candidates {
+        assert_eq!(
+            candidate["proof"]["noEdgeVerified"],
+            json!(true),
+            "{candidate}"
+        );
+    }
+    server.shutdown();
+}
+
 /// The guard: every tool the server advertises has at least two calls in this
 /// file. Adding a tool without driving it over stdio fails here, not in a
 /// user's client.
