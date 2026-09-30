@@ -265,6 +265,9 @@ pub struct DivergentSummary {
     pub juxtaposition_eligible_pairs: u64,
     /// Typed-profile members the measured lane evaluated this page.
     pub measured_members_evaluated: usize,
+    /// Typed-profile members past [`MEASURED_MEMBER_CAP`] (id order). Their
+    /// pairs belong to the sampler, so every eligible pair stays reachable.
+    pub measured_members_beyond_cap: usize,
     /// Sampler schedule positions scanned this page.
     pub positions_scanned: u64,
 }
@@ -442,6 +445,10 @@ pub struct GhostSnapshot<'s> {
     weave_degree: HashMap<u32, usize>,
     outcomes: HashMap<u32, BTreeSet<String>>,
     pool: Vec<u32>,
+    /// The measured lane's window: the first `measured_cap` typed pool
+    /// members in id order. The lane owns exactly the pairs inside it.
+    measured_window: Vec<bool>,
+    measured_cap: usize,
     in_pool: Vec<bool>,
     scratch: RefCell<Scratch>,
     components: RefCell<Option<(Vec<u32>, Vec<u32>)>>,
@@ -593,6 +600,8 @@ impl<'s> GhostSnapshot<'s> {
             weave_degree: HashMap::new(),
             outcomes: HashMap::new(),
             pool: Vec::new(),
+            measured_window: Vec::new(),
+            measured_cap: MEASURED_MEMBER_CAP,
             components: RefCell::new(None),
         };
         for at in 0..snapshot.ids.len() {
@@ -602,7 +611,29 @@ impl<'s> GhostSnapshot<'s> {
         }
         snapshot.load_records(nodes);
         snapshot.select_pool(nodes);
+        snapshot.fill_measured_window();
         snapshot
+    }
+
+    fn fill_measured_window(&mut self) {
+        self.measured_window = vec![false; self.ids.len()];
+        for &at in self
+            .pool
+            .iter()
+            .filter(|&&at| self.typed_profile[at as usize])
+            .take(self.measured_cap)
+        {
+            self.measured_window[at as usize] = true;
+        }
+    }
+
+    /// The same snapshot with a smaller measured window (tests exercise the
+    /// cap without thousands of members).
+    #[cfg(test)]
+    pub(crate) fn with_measured_cap(mut self, cap: usize) -> Self {
+        self.measured_cap = cap;
+        self.fill_measured_window();
+        self
     }
 
     fn load_records(&mut self, nodes: &BTreeMap<String, NodeRecord>) {
@@ -1271,6 +1302,8 @@ impl<'s> GhostSnapshot<'s> {
         };
         // (has legacy link, has any other link) per pool pair.
         let mut links: HashMap<(u32, u32), (bool, bool)> = HashMap::new();
+        // A reciprocal pair of edges of one kind is one link.
+        let mut distinct: HashSet<(u32, u32, u16)> = HashSet::new();
         let mut typed_member = 0u64;
         for &a in &self.pool {
             if self.adj[a as usize].is_empty() {
@@ -1286,9 +1319,14 @@ impl<'s> GhostSnapshot<'s> {
                 let entry = links.entry((a, edge.to)).or_insert((false, false));
                 if self.kind_legacy[edge.kind as usize] {
                     entry.0 = true;
-                    summary.legacy_edges_in_pool += 1;
                 } else {
                     entry.1 = true;
+                }
+                if !distinct.insert((a, edge.to, edge.kind)) {
+                    continue;
+                }
+                if self.kind_legacy[edge.kind as usize] {
+                    summary.legacy_edges_in_pool += 1;
                 }
                 if self.kind_typed[edge.kind as usize] {
                     summary.typed_edges_in_pool += 1;
@@ -1306,12 +1344,15 @@ impl<'s> GhostSnapshot<'s> {
                 excluded.insert((a, b));
             }
         }
+        let in_window = |at: u32| self.measured_window[at as usize];
+        let window = self.pool.iter().filter(|&&at| in_window(at)).count() as u64;
         let excluded_measured = excluded
             .iter()
-            .filter(|(a, b)| self.typed_profile[*a as usize] && self.typed_profile[*b as usize])
+            .filter(|(a, b)| in_window(*a) && in_window(*b))
             .count() as u64;
+        summary.measured_members_beyond_cap = (typed_member - window) as usize;
         summary.eligible_pairs = pairs(self.pool.len() as u64) - excluded.len() as u64;
-        summary.measured_eligible_pairs = pairs(typed_member) - excluded_measured;
+        summary.measured_eligible_pairs = pairs(window) - excluded_measured;
         summary.juxtaposition_eligible_pairs =
             summary.eligible_pairs - summary.measured_eligible_pairs;
         summary
@@ -1324,8 +1365,7 @@ impl<'s> GhostSnapshot<'s> {
             .pool
             .iter()
             .copied()
-            .filter(|&at| self.typed_profile[at as usize])
-            .take(MEASURED_MEMBER_CAP)
+            .filter(|&at| self.measured_window[at as usize])
             .collect();
         let sets: HashMap<u32, Vec<u32>> =
             typed.iter().map(|&at| (at, self.typed_set(at))).collect();
@@ -1407,8 +1447,8 @@ impl<'s> GhostSnapshot<'s> {
                 continue;
             }
             let (a, b) = (x.min(y), x.max(y));
-            if self.typed_profile[a as usize] && self.typed_profile[b as usize] {
-                // Both profiles exist: the measured lane owns this pair.
+            if self.measured_window[a as usize] && self.measured_window[b as usize] {
+                // Both inside the measured window: the measured lane owns it.
                 continue;
             }
             if self.linked_idx(a, b) || self.woven_idx(a, b) {
@@ -1470,6 +1510,11 @@ impl<'s> GhostSnapshot<'s> {
         let measured_done = measured_offset as u64 >= measured_total;
         let room = limit - measured.len();
         let mut slot = cursor.slot;
+        if measured_done && summary.juxtaposition_eligible_pairs == 0 {
+            // No pair belongs to the sampler: the measured lane was the whole
+            // schedule, so the cursor ends here instead of paging empty.
+            slot = None;
+        }
         let mut juxtaposition = Vec::new();
         if measured_done && room > 0 && slot.is_some() {
             let order = self.spread_order();

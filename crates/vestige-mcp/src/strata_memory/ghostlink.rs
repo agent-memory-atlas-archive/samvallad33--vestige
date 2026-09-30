@@ -566,6 +566,7 @@ fn propose_divergent(memory: &StrataMemory, request: &ProposeRequest) -> Result<
             "legacyOnlyPairsInPool": s.legacy_only_pairs_in_pool,
             "typedEdgesInPool": s.typed_edges_in_pool,
             "measuredMembersEvaluated": s.measured_members_evaluated,
+            "measuredMembersBeyondCap": s.measured_members_beyond_cap,
             "positionsScanned": s.positions_scanned,
         },
         "nextCursor": page.next_cursor,

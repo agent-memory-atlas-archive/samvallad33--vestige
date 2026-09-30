@@ -754,6 +754,99 @@ fn a_crafted_cursor_is_refused_never_a_panic() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Page until the cursor ends, checking no pair repeats; every pair seen.
+fn page_all(
+    snapshot: &crate::ghostlink::GhostSnapshot<'_>,
+    limit: usize,
+) -> HashSet<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..200 {
+        let page = snapshot
+            .divergent_page(cursor.as_deref(), limit)
+            .expect("page");
+        for c in page.measured.iter().chain(page.juxtaposition.iter()) {
+            assert!(
+                seen.insert((c.first_id.clone(), c.second_id.clone())),
+                "pair repeated across pages: {c:?}"
+            );
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return seen,
+        }
+    }
+    panic!("paging never ended");
+}
+
+#[test]
+fn every_eligible_pair_is_reachable_past_the_measured_cap() {
+    let dir = temp_dir("div-cap");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let ids: Vec<String> = (0..6)
+        .map(|at| node(&mut store, &format!("m{at}"), &[], "fact"))
+        .collect();
+    // Four members gain a typed profile through their own file artifact;
+    // no two members are linked, so every one of the 15 pairs is eligible.
+    for (at, id) in ids.iter().take(4).enumerate() {
+        edge(&mut store, id, &format!("file:src/f{at}.rs"), "touched");
+    }
+    let snapshot = store.ghost_snapshot(user()).with_measured_cap(2);
+    let summary = snapshot.divergent_page(None, 2).expect("page").summary;
+    assert_eq!(summary.eligible_pairs, 15, "{summary:?}");
+    // The measured lane ranks the pairs inside its window only; the rest,
+    // typed pairs beyond the cap included, belong to the sampler.
+    assert_eq!(summary.measured_eligible_pairs, 1, "{summary:?}");
+    assert_eq!(summary.juxtaposition_eligible_pairs, 14, "{summary:?}");
+    assert_eq!(summary.measured_members_beyond_cap, 2, "{summary:?}");
+    // One pair per page passes nothing over, so paging reaches every
+    // eligible pair: pairs of typed members beyond the cap included.
+    assert_eq!(
+        page_all(&snapshot, 1).len(),
+        15,
+        "every eligible pair is reachable"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn paging_ends_when_no_juxtaposition_remains() {
+    let dir = temp_dir("div-all-typed");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let ids: Vec<String> = (0..5)
+        .map(|at| node(&mut store, &format!("t{at}"), &[], "fact"))
+        .collect();
+    for (at, id) in ids.iter().enumerate() {
+        edge(&mut store, id, &format!("file:src/t{at}.rs"), "touched");
+    }
+    let snapshot = store.ghost_snapshot(user());
+    // Every member is typed: the measured lane owns all 10 pairs, and the
+    // last page of that lane ends the cursor instead of empty pages.
+    let first = snapshot.divergent_page(None, 10).expect("page");
+    assert_eq!(first.measured.len(), 10, "{first:?}");
+    assert_eq!(first.next_cursor, None, "{first:?}");
+    assert_eq!(page_all(&snapshot, 3).len(), 10);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_reciprocal_link_counts_once() {
+    let dir = temp_dir("div-reciprocal");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let a = node(&mut store, "a", &[], "fact");
+    let b = node(&mut store, "b", &[], "fact");
+    node(&mut store, "c", &[], "fact");
+    edge(&mut store, &a, &b, "derived_from");
+    edge(&mut store, &b, &a, "derived_from");
+    let summary = store
+        .ghost_snapshot(user())
+        .divergent_page(None, 3)
+        .expect("page")
+        .summary;
+    assert_eq!(summary.typed_edges_in_pool, 1, "{summary:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn identical_content_and_tags_give_no_advantage() {
     let same = temp_dir("div-same-content");
