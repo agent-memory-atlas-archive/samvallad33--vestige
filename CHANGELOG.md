@@ -50,6 +50,21 @@ default binaries.
 - `maintain backup` on Strata writes a copy of the log directory
   (`backups/vestige-<time>.strata`) and reports its real size. `maintain
   export` writes JSON or JSONL.
+- Every agent on a machine can use Vestige at once. The log has one writer:
+  the first `vestige-mcp` to start takes `.serve.lock` and serves the store,
+  and every later one connects to it over a loopback endpoint (a 0600
+  `.serve.endpoint` file holds its port and a random token) and relays its
+  client's stdio there. When the serving process exits, another takes the
+  lock and serves in place, replaying its client's MCP handshake so the
+  session continues. Before this, a second `vestige-mcp` on the same data
+  directory waited on the lock until the first one exited.
+- CLI commands that open the log (`stats`, `ingest`, `gc` and the rest) take
+  the same lock and refuse, naming the holder, while a server runs; they no
+  longer open the log as a second writer beside it. `vestige backup` works
+  while a server runs, through that server. `vestige dashboard` works while
+  a server runs too: the server starts its dashboard on request and keeps it
+  up until the command exits. `vestige dashboard` and `vestige serve` accept
+  attached agents while they hold the store.
 
 ### Withheld in 4.0
 
@@ -69,9 +84,14 @@ back), `maintain` `export` format `portable`, and `memory_status`
 
 ### Known limits
 
-- The upgrade runs before the first MCP handshake. It took about 16 seconds
-  on a 297 MB store. A much larger store could exceed an MCP client's
-  startup timeout on that first launch.
+- The upgrade runs before the first MCP handshake. It took about 17 seconds
+  on a 297 MB store, with two agents starting at once (the second waits for
+  the import, then connects). A much larger store could exceed an MCP
+  client's startup timeout on that first launch.
+- When the agent whose process serves the store quits, a request another
+  agent had in flight at that instant returns an error instead of being
+  resent, because it may already have taken effect. The agent's session
+  itself continues on the new server.
 - Memory PR review modes (`risk_gated`, `paranoid`) are not available on a
   Strata log. A review setting carried over from v3 reads as `fast` (logged
   once, the file is left as written), and the dashboard's Memory PR list
@@ -84,6 +104,13 @@ back), `maintain` `export` format `portable`, and `memory_status`
 
 ### Fixed
 
+- Strata logs open on Windows. Every directory fsync opened the directory
+  with `File::open`, which Windows refuses (os error 5), so no log could be
+  created or opened there. Directory fsync is Unix-only now; CI runs the
+  log, store, upgrade and multi-agent suites on Windows.
+- `strata-verify <data-dir>`, the documented form, verifies an upgraded
+  store's migration receipt. It used to scan only the chain, so a swapped
+  receipt-signing key still printed OK unless `<data-dir>/log` was passed.
 - The v3 to Strata upgrade keeps intentions. The importer had no mapping for
   the v3 `intentions` table, so after the first 4.0 launch `intention list`
   returned nothing (54 of 54 rows lost on a real store). `vestige-upgrade`

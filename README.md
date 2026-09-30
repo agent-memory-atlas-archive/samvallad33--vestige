@@ -30,17 +30,50 @@ Agents re-learn the same lessons. They recommend a change you already tested and
 
 ## Install
 
-Download a release archive from [GitHub Releases](https://github.com/samvallad33/vestige/releases/latest). No Docker, no signup, no compile step, and nothing to download on first start. The archives are `vestige-mcp-aarch64-apple-darwin.tar.gz` (macOS ARM), `vestige-mcp-x86_64-apple-darwin.tar.gz` (macOS Intel), `vestige-mcp-x86_64-unknown-linux-gnu.tar.gz` (Linux x86_64), `vestige-mcp-aarch64-unknown-linux-gnu.tar.gz` (Linux arm64), and `vestige-mcp-x86_64-pc-windows-msvc.zip` (Windows x86_64). Each one contains four binaries: `vestige` (the CLI), `vestige-mcp` (the MCP server), `vestige-restore`, and `vestige-upgrade` (the v3 importer). Keep them together: the first launch on a v3 store runs `vestige-upgrade`.
+Each release archive holds four binaries: `vestige-mcp` (the MCP server your agents run), `vestige` (the CLI), `vestige-upgrade` (the v3 importer) and `vestige-restore`. Keep all four in one folder. No Docker, no signup, no compile step, and nothing downloads on first start.
 
-Prefer Homebrew?
+**macOS and Linux.** Two commands put the binaries in `~/.local/bin`:
 
 ```bash
-brew install samvallad33/tap/vestige
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/samvallad33/vestige/releases/latest/download/vestige-mcp-aarch64-apple-darwin.tar.gz | tar -xz -C ~/.local/bin
 ```
 
-`eget samvallad33/vestige` installs those same GitHub Release archives. Do not install this version with npm.
+Use the archive for your machine:
 
-Connect the MCP server. The client command is `vestige-mcp`:
+| Machine | Archive |
+|---|---|
+| Mac with Apple silicon | `vestige-mcp-aarch64-apple-darwin.tar.gz` |
+| Mac with Intel | `vestige-mcp-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 (glibc 2.35+: Ubuntu 22.04, Debian 12 and newer) | `vestige-mcp-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (same glibc floor) | `vestige-mcp-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `vestige-mcp-x86_64-pc-windows-msvc.zip` |
+
+Then check it:
+
+```bash
+vestige-mcp --version
+```
+
+It should print `vestige-mcp 4.0.0`. If the shell says command not found, `~/.local/bin` is not on your PATH yet: add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` (or `~/.bashrc`) and open a new terminal. If it prints an older version, an older install comes first on your PATH; `which -a vestige-mcp` lists them.
+
+On a Mac, download with `curl` as above rather than a browser. A browser marks the files as quarantined and macOS then refuses to run them. If you already used a browser, clear the flag with `xattr -d com.apple.quarantine ~/.local/bin/vestige*`.
+
+**Windows.** Download `vestige-mcp-x86_64-pc-windows-msvc.zip` from [the latest release](https://github.com/samvallad33/vestige/releases/latest), unzip all four `.exe` files into one folder, and add that folder to your PATH.
+
+**Homebrew** (macOS and Linux): `brew install samvallad33/tap/vestige`.
+
+Every archive has a `.sha256` file beside it on the release page. Do not install this version with npm; the npm package is not 4.0.
+
+**Connect your agents.** The MCP command is `vestige-mcp`:
+
+| Client | Setup |
+|---|---|
+| Claude Code | `claude mcp add vestige vestige-mcp -s user` |
+| Codex | `codex mcp add vestige -- vestige-mcp` |
+| Cursor / VS Code / Windsurf | [docs/integrations/](docs/integrations/) |
+| Claude Desktop, and any other app you start from the Dock or Start menu | the JSON below, with the full path from `which vestige-mcp` (desktop apps do not read your shell's PATH) |
+| Cline / Continue / Zed / Goose | the JSON below, in that client's MCP settings |
 
 ```json
 {
@@ -50,13 +83,7 @@ Connect the MCP server. The client command is `vestige-mcp`:
 }
 ```
 
-| Client | Setup |
-|---|---|
-| Claude Code | `claude mcp add vestige vestige-mcp -s user` |
-| Codex | `codex mcp add vestige -- vestige-mcp` |
-| Cursor / VS Code / Windsurf | [docs/integrations/](docs/integrations/) |
-| Claude Desktop | [docs/CONFIGURATION.md](docs/CONFIGURATION.md#claude-desktop-macos) |
-| Cline / Continue / Zed / Goose | the JSON above, in that client's MCP settings |
+**Use it from every agent at once.** Claude Code in three terminals, Cursor, Codex and Claude Desktop can all run Vestige at the same time on one machine. The first one to start serves the store and the others connect to it, so every agent reads and writes the same memory through one writer. When that first agent quits, one of the others takes over and keeps its session.
 
 `vestige-mcp` also takes `--data-dir <PATH>`, `--http`, `--no-http`, and `--http-port <PORT>` (default 3928, and passing the flag turns HTTP on). HTTP binds to `127.0.0.1` unless `VESTIGE_HTTP_BIND` is set. `VESTIGE_AUTH_TOKEN` overrides the bearer token. `VESTIGE_HTTP_ALLOWED_ORIGINS` is a comma-separated browser allowlist. `VESTIGE_DASHBOARD_ENABLED=1` starts the dashboard from the server; `VESTIGE_DASHBOARD_PORT` defaults to 3927. `VESTIGE_SYSTEM_PROMPT_MODE` is `minimal` or `full`. `RUST_LOG` filters logs. `VESTIGE_DATA_DIR` is the data directory when `--data-dir` is absent. The Strata log lives in `log/` inside that directory.
 
@@ -82,9 +109,11 @@ Point 4.0 at your existing data directory. The first launch finds `vestige.db`, 
 
 What carries over: every memory with its scope, tags and scheduling state; links; supersession; suppression (suppressed memories stay hidden); intentions; and code anchors. Links v3 inferred by similarity come across as `legacy_inferred` history. They are kept, and they never count as recorded evidence.
 
-On a real 297 MB store with 8,902 memories in 34 scopes, the first launch took about 16 seconds before the MCP handshake answered, and average retention right after the upgrade was 0.810 against 0.8105 computed by v3 itself.
+On a real 297 MB store with 8,902 memories in 34 scopes, the first launch took about 17 seconds before the MCP handshake answered, and average retention right after the upgrade was 0.810 against 0.8105 computed by v3 itself. Agents that start during the upgrade wait for it and then connect; there is nothing to coordinate by hand.
 
 If the upgrade fails, the v3 data is untouched and the message says so. You can keep using v3.1.1 meanwhile. `vestige strata-verify <data-dir>` checks the log and its migration receipt at any time.
+
+If you installed v3 with npm, make sure your agents now run the 4.0 binary: `vestige-mcp --version` should print 4.0.0, and `which -a vestige-mcp` shows every copy on your PATH in the order they are found.
 
 <a id="recall-by-handle-not-resemblance"></a>
 ## Recall by handle, not resemblance
@@ -115,7 +144,9 @@ The Memory PR review modes from v3 (`risk_gated`, `paranoid`) are not available 
 <a id="backups-and-export"></a>
 ## 🔄 Backups and export
 
-`maintain` action `backup` copies the whole Strata log into `<data-dir>/backups/` and reports its size. To restore, stop Vestige and copy the backup's `log/` back into the data directory. `maintain` action `export` writes every live memory as JSON or JSONL into `<data-dir>/exports/`.
+`maintain` action `backup` copies the whole Strata log into `<data-dir>/backups/` and reports its size. From a terminal, `vestige backup <new-folder>` does the same, and it works while your agents are running: it asks their Vestige server for the copy. To restore, stop Vestige and copy the backup's `log/` back into the data directory.
+
+The log has one writer. CLI commands that open it directly, such as `vestige stats` or `vestige ingest`, run only while no Vestige server holds the store, and they name the process that does. `maintain` action `export` writes every live memory as JSON or JSONL into `<data-dir>/exports/`.
 
 Portable archives, file sync and hosted sync are not available on a Strata log in 4.0. The CLI says so when you call them.
 
@@ -178,7 +209,7 @@ Full contracts: [docs/TOOL-CONTRACTS.md](docs/TOOL-CONTRACTS.md) · Hygiene and 
 vestige dashboard
 ```
 
-The server binds **http://127.0.0.1:3927** and redirects `/` to **/dashboard**. The observatory steps a fixed 60fps clock, 720 frames, 12 seconds, and can export that loop as an mp4. Share artifacts are structure-only: the shape of the store, not the memory text.
+The server binds **http://127.0.0.1:3927** and redirects `/` to **/dashboard**. It works while your agents are running: the Vestige server they share serves the dashboard until you press Ctrl+C. The observatory steps a fixed 60fps clock, 720 frames, 12 seconds, and can export that loop as an mp4. Share artifacts are structure-only: the shape of the store, not the memory text.
 
 ## Under the hood
 
