@@ -660,6 +660,15 @@ impl<'s> GhostSnapshot<'s> {
             if !record.is_live() || composition_pair(record).is_some() {
                 continue;
             }
+            // Expired and future memories are not composition candidates
+            // (docs/TOOL-CONTRACTS.md). Validity is read at the log's own
+            // head clock, the clock retention is read at, so a page stays a
+            // function of the log head.
+            if record.valid_from_ms > self.head_clock_ms
+                || record.valid_until_ms <= self.head_clock_ms
+            {
+                continue;
+            }
             if self
                 .filter
                 .scope

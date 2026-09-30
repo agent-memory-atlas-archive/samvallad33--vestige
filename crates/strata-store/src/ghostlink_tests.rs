@@ -230,6 +230,82 @@ fn bridge_admits_one_to_three_hops_and_refuses_four() {
 }
 
 #[test]
+fn expired_and_future_memories_are_not_candidates() {
+    let dir = temp_dir("bridge-validity");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let windowed =
+        |store: &mut StrataStore, content: &str, from: Option<i64>, until: Option<i64>| {
+            store
+                .ingest_in_scope(
+                    IngestInput {
+                        content: content.to_string(),
+                        node_type: "fact".to_string(),
+                        created_at_ms: Some(BASE_MS),
+                        valid_from_ms: from,
+                        valid_until_ms: until,
+                        ..IngestInput::default()
+                    },
+                    "user",
+                )
+                .expect("ingest")
+        };
+    let hub = node_at(&mut store, "hub", &[], "fact", "user", BASE_MS);
+    let live = node_at(&mut store, "live", &[], "fact", "user", BASE_MS);
+    let expired = windowed(&mut store, "expired", None, Some(BASE_MS - MONTH_MS));
+    let future = windowed(&mut store, "future", Some(BASE_MS + 12 * MONTH_MS), None);
+    // The log's own clock moves past the expiry and stays before the start.
+    node_at(
+        &mut store,
+        "latest",
+        &[],
+        "fact",
+        "user",
+        BASE_MS + MONTH_MS,
+    );
+    for id in [&live, &expired, &future] {
+        edge(&mut store, id, &hub, "derived_from");
+    }
+
+    let snapshot = store.ghost_snapshot(user());
+    let pool = snapshot.pool_ids();
+    assert!(
+        pool.contains(&live.as_str()) && pool.contains(&hub.as_str()),
+        "{pool:?}"
+    );
+    assert!(
+        !pool.contains(&expired.as_str()),
+        "expired is not a candidate: {pool:?}"
+    );
+    assert!(
+        !pool.contains(&future.as_str()),
+        "future is not a candidate: {pool:?}"
+    );
+    let report = snapshot.bridge();
+    let named: Vec<&str> = report
+        .candidates
+        .iter()
+        .flat_map(|c| [c.first_id.as_str(), c.second_id.as_str()])
+        .collect();
+    assert!(named.contains(&live.as_str()), "{named:?}");
+    assert!(
+        !named.contains(&expired.as_str()) && !named.contains(&future.as_str()),
+        "{named:?}"
+    );
+    let page = snapshot.divergent_page(None, 20).expect("page");
+    let paired: Vec<&str> = page
+        .measured
+        .iter()
+        .chain(page.juxtaposition.iter())
+        .flat_map(|c| [c.first_id.as_str(), c.second_id.as_str()])
+        .collect();
+    assert!(
+        !paired.contains(&expired.as_str()) && !paired.contains(&future.as_str()),
+        "{paired:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn bridge_excludes_woven_pairs_and_records_leave_the_pool() {
     let dir = temp_dir("bridge-woven");
     let mut store = StrataStore::open(&dir).expect("open");
