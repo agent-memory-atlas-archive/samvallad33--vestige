@@ -58,8 +58,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-mod card;
 mod anchor;
+mod card;
 mod error;
 mod gate_log;
 mod op;

@@ -20,8 +20,8 @@ use strata_kernel::kernel::Kernel;
 use strata_kernel::state::State;
 use strata_kernel::verify::verify_with_head;
 
-use crate::card::{CardEvent, ImportedCard};
 use crate::anchor::AnchorIndex;
+use crate::card::{CardEvent, ImportedCard};
 use crate::error::StoreError;
 use crate::gate_log::StrataEventLog;
 use crate::op::{StoreOp, KIND_STORE_CHECKPOINT, KIND_STORE_WRITE};
