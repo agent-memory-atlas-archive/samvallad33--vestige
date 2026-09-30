@@ -76,10 +76,11 @@ pub fn verify_migrated_log(dir: &Path) -> Result<MigrationVerifyReport, String> 
     let mut failures: Vec<String> = Vec::new();
 
     // Pass 2: the receipt.
-    let receipt_frame = frames
+    let receipt_index = frames
         .iter()
-        .find(|f| f.kind == KIND_MIGRATION_RECEIPT)
+        .position(|f| f.kind == KIND_MIGRATION_RECEIPT)
         .ok_or_else(|| "no MIGRATION_RECEIPT (frame 46) in the log".to_string())?;
+    let receipt_frame = &frames[receipt_index];
     let receipt =
         decode_receipt(&receipt_frame.payload).map_err(|e| format!("receipt decode: {e}"))?;
 
@@ -101,9 +102,12 @@ pub fn verify_migrated_log(dir: &Path) -> Result<MigrationVerifyReport, String> 
         );
     }
 
-    // Pass 3: replay frame counts against the receipt.
+    // Pass 3: replay frame counts against the receipt. The importer appends
+    // the receipt last, so only frames before it are the migration's; memory
+    // written after the upgrade (a new node is also kind 0x20) is not part of
+    // what the receipt counted.
     let mut counts: std::collections::BTreeMap<u8, u64> = Default::default();
-    for frame in &frames {
+    for frame in &frames[..receipt_index] {
         *counts.entry(frame.kind).or_default() += 1;
     }
     let mut counts_match = true;
