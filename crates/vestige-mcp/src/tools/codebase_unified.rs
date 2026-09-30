@@ -1840,15 +1840,17 @@ pub fn load_config(path: &str) -> Config {
                 .unwrap()
                 .is_empty()
         );
-        // A verdict for the retired memory's anchor is accepted and ignored.
+        // The edit moved the anchor to the successor, so a verdict for that
+        // anchor id lands there, never on the retired memory.
         storage
             .record_anchor_verification(&anchor_id, AnchorStatus::Drifted, chrono::Utc::now())
             .unwrap();
         assert!(storage.code_anchors_for_node(&id).unwrap().is_empty());
         let refused = reanchor(&storage, &cog, &repo, &id).await.unwrap_err();
         assert!(refused.contains("not found"), "{refused}");
+        // The live successor still matches its source.
         let report = verify(&storage, &cog, &repo).await;
-        assert_eq!(report["fresh"], 0, "{report}");
+        assert_eq!(report["fresh"], 1, "{report}");
         assert_eq!(report["stale"], 0, "{report}");
     }
 
