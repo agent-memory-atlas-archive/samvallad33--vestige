@@ -252,47 +252,150 @@ const DISCOVER_TTL_MS: u64 = 3_600_000;
 ///
 /// `null` and `""` are treated as absent, so a client that always serialises
 /// the field is not punished for a cursor it never really set.
-/// The erasure-class call a Strata log withholds in 4.0, with its refusal.
-/// Covers every advertised and hidden route to purge, delete or suppress.
+/// Tools a Strata log withholds in 4.0, with every hidden alias. Erasure:
+/// the log is append-only, so these would hide a memory but keep its bytes.
+const STRATA_WITHHELD_TOOLS: &[&str] = &["purge", "suppress", "delete_knowledge"];
+
+/// `(tool, action, why)` a Strata log cannot honor in 4.0. `None` is erasure
+/// (shared wording with the store). Each is dropped from the advertised
+/// schema and refused on call, so every advertised action works.
+const STRATA_WITHHELD_ACTIONS: &[(&str, &str, Option<&str>)] = &[
+    ("memory", "purge", None),
+    ("memory", "delete", None),
+    ("blast_radius", "retire", None),
+    (
+        "dedup",
+        "plan_merge",
+        Some("merge planning needs embeddings, which 4.0 removed"),
+    ),
+    (
+        "dedup",
+        "plan_supersede",
+        Some("supersede planning needs embeddings, which 4.0 removed"),
+    ),
+    (
+        "dedup",
+        "apply",
+        Some("there are no merge or supersede plans without embeddings"),
+    ),
+    (
+        "dedup",
+        "verdict",
+        Some("reconsolidation verdicts need embeddings, which 4.0 removed"),
+    ),
+    (
+        "dedup",
+        "protect",
+        Some("the Strata log has no protect flag yet"),
+    ),
+    (
+        "graph",
+        "get",
+        Some("composition events are not recorded on a Strata log"),
+    ),
+    (
+        "graph",
+        "memory",
+        Some("composition events are not recorded on a Strata log"),
+    ),
+    (
+        "graph",
+        "neighbors",
+        Some("composition events are not recorded on a Strata log"),
+    ),
+    (
+        "graph",
+        "label",
+        Some("composition events are not recorded on a Strata log"),
+    ),
+    (
+        "receipt",
+        "save_walk",
+        Some("walk receipts are not recorded on a Strata log yet"),
+    ),
+    (
+        "maintain",
+        "restore",
+        Some(
+            "Strata backups are directory copies; stop Vestige and copy a backup's log/ into the data directory",
+        ),
+    ),
+];
+
+/// The refusal for a call a Strata log withholds in 4.0, or `None`.
 fn strata_withheld_call(tool: &str, arguments: Option<&serde_json::Value>) -> Option<String> {
-    let action = arguments
-        .and_then(|args| args.get("action"))
-        .and_then(|value| value.as_str());
-    let what = match (tool, action) {
-        ("purge", _) => "purge",
-        ("suppress", _) => "suppress",
-        ("delete_knowledge", _) => "delete_knowledge",
-        ("memory", Some("purge")) => "memory action 'purge'",
-        ("memory", Some("delete")) => "memory action 'delete'",
-        ("blast_radius", Some("retire")) => "blast_radius action 'retire'",
-        _ => return None,
+    let field = |name: &str| {
+        arguments
+            .and_then(|args| args.get(name))
+            .and_then(|value| value.as_str())
     };
-    Some(crate::strata_memory::withheld_message(what))
+    if STRATA_WITHHELD_TOOLS.contains(&tool) {
+        return Some(crate::strata_memory::withheld_message(tool));
+    }
+    let action = field("action")?;
+    if tool == "maintain" && action == "export" && field("format") == Some("portable") {
+        return Some(
+            "unavailable_in_4_0: maintain export format 'portable' is not written from a Strata log yet; use format 'json' or 'jsonl'.".to_string(),
+        );
+    }
+    let (_, _, why) = STRATA_WITHHELD_ACTIONS
+        .iter()
+        .find(|(name, withheld, _)| *name == tool && *withheld == action)?;
+    Some(match why {
+        None => crate::strata_memory::withheld_message(&format!("{tool} action '{action}'")),
+        Some(why) => format!(
+            "unavailable_in_4_0: {tool} action '{action}' is not available on Strata in Vestige 4.0: {why}."
+        ),
+    })
 }
 
-/// Drop the withheld tools and memory actions from a Strata tool list, so
-/// the advertised surface matches what the log can honestly do.
-fn withhold_erasure_from_catalog(tools: &mut Vec<ToolDescription>) {
-    tools.retain(|tool| tool.name != "purge" && tool.name != "suppress");
-    for tool in tools.iter_mut().filter(|tool| tool.name == "memory") {
-        strip_withheld_memory_actions(&mut tool.input_schema);
-        tool.description = Some("Manage one memory: 'get', 'get_batch', 'state', 'promote' / 'demote' (demote never deletes), 'edit' (admit a successor, retire the previous node). Erasure is withheld on Strata in 4.0.".to_string());
+/// Drop what a Strata log withholds from the advertised tool list, so the
+/// surface matches what the log can honestly do.
+fn withhold_on_strata(tools: &mut Vec<ToolDescription>) {
+    tools.retain(|tool| !STRATA_WITHHELD_TOOLS.contains(&tool.name.as_str()));
+    for tool in tools.iter_mut() {
+        let removed = strip_withheld_actions(&tool.name, &mut tool.input_schema);
+        if tool.name == "memory" {
+            tool.description = Some("Manage one memory: 'get', 'get_batch', 'state', 'promote' / 'demote' (demote never deletes), 'edit' (admit a successor, retire the previous node). Erasure is withheld on Strata in 4.0.".to_string());
+        } else if !removed.is_empty() {
+            let note = format!(" Withheld on Strata in 4.0: {}.", removed.join(", "));
+            tool.description = tool.description.take().map(|text| text + &note);
+        }
     }
 }
 
-/// Remove `purge` and `delete` from a memory schema's action selector.
-fn strip_withheld_memory_actions(schema: &mut serde_json::Value) {
+/// Remove withheld selector values from one tool's schema; returns them.
+fn strip_withheld_actions(tool: &str, schema: &mut serde_json::Value) -> Vec<&'static str> {
+    let withheld: Vec<&'static str> = STRATA_WITHHELD_ACTIONS
+        .iter()
+        .filter(|(name, _, _)| *name == tool)
+        .map(|(_, action, _)| *action)
+        .collect();
     if let Some(values) = schema
         .pointer_mut("/properties/action/enum")
         .and_then(|values| values.as_array_mut())
     {
-        values.retain(|value| value != "purge" && value != "delete");
+        values.retain(|value| {
+            value
+                .as_str()
+                .is_none_or(|value| !withheld.contains(&value))
+        });
     }
-    if let Some(description) = schema.pointer_mut("/properties/action/description") {
+    if tool == "memory"
+        && let Some(description) = schema.pointer_mut("/properties/action/description")
+    {
         *description = serde_json::json!(
             "'get', 'get_batch' (ids), 'state', 'promote' / 'demote' (retrieval strength; demote never deletes), 'edit' (admit a successor under rule edit, then retire the previous node). Erasure is withheld on Strata in 4.0."
         );
     }
+    if tool == "maintain"
+        && let Some(formats) = schema
+            .pointer_mut("/properties/format/enum")
+            .and_then(|values| values.as_array_mut())
+    {
+        formats.retain(|value| value != "portable");
+    }
+    withheld
 }
 
 fn reject_unknown_cursor(params: Option<&serde_json::Value>) -> Result<(), JsonRpcError> {
@@ -1165,7 +1268,7 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
         // docs/launch/tool-consolidation-v2.2.0.md.
         let mut tools = Self::tool_catalog();
         if crate::strata_memory::is_strata_backend(self.storage.as_ref()) {
-            withhold_erasure_from_catalog(&mut tools);
+            withhold_on_strata(&mut tools);
         }
 
         // Per-tool result-size annotation `_meta["anthropic/maxResultSizeChars"]`.
@@ -1842,9 +1945,10 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
                     && let Ok(guide) = guide.as_mut()
                     && let Some(entries) = guide["tools"].as_array_mut()
                 {
-                    for entry in entries.iter_mut().filter(|entry| entry["name"] == "memory") {
+                    for entry in entries.iter_mut() {
+                        let name = entry["name"].as_str().unwrap_or_default().to_string();
                         if let Some(schema) = entry.get_mut("inputSchema") {
-                            strip_withheld_memory_actions(schema);
+                            strip_withheld_actions(&name, schema);
                         }
                     }
                 }
