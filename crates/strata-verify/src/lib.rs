@@ -686,7 +686,9 @@ pub struct PathReport {
 /// Layout detection, in order:
 /// * segment files in `dir` — a migrated log when a receipt frame is
 ///   present, otherwise a raw strata log (chain only);
-/// * `log/*.seg` — a live strata-store (`store.meta` checked when sealed);
+/// * `log/*.seg` — a data directory: its `log/` is checked exactly as if it
+///   had been passed itself (so an upgraded store's migration receipt is
+///   verified), plus `store.meta` when sealed;
 /// * otherwise the kernel.log / gate.log layout.
 ///
 /// A successful migrated-log check does not continue into the kernel
@@ -699,10 +701,30 @@ pub fn verify_path(dir: &Path) -> PathReport {
         return verify_segment_dir(dir);
     }
     if live::is_live_store(dir) {
-        let report = live::verify_live_store(dir);
-        let failures = report.failures.clone();
-        let key = segment_key(&dir.join("log"));
-        return path_from(report.ok, &report, failures, key);
+        // `strata-verify <data-dir>` is the documented form. It has to check
+        // as much as `strata-verify <data-dir>/log`: before this, a data
+        // directory only had its chain scanned and an upgraded store's
+        // migration receipt went unverified.
+        let mut report = verify_segment_dir(&dir.join("log"));
+        let meta_failures = live::store_meta_failures(dir);
+        if !meta_failures.is_empty() {
+            report.ok = false;
+            if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&report.json)
+                && let Some(obj) = value.as_object_mut()
+            {
+                obj.insert("ok".into(), serde_json::Value::Bool(false));
+                let listed = obj
+                    .entry("failures")
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                if let Some(listed) = listed.as_array_mut() {
+                    listed.extend(meta_failures.iter().cloned().map(serde_json::Value::String));
+                }
+                report.json =
+                    serde_json::to_string_pretty(&value).expect("verify report serializes");
+            }
+            report.failures.extend(meta_failures);
+        }
+        return report;
     }
     // Fresh strata-store: `log/*.seg` exists before the first checkpoint
     // writes `store.meta`. Check that log; do not fall through to kernel.log.
@@ -752,17 +774,6 @@ fn verify_segment_dir(dir: &Path) -> PathReport {
         Vec::new(),
         pin::segment_only(&scan.segment_key),
     )
-}
-
-fn segment_key(log_dir: &Path) -> pin::KeyUse {
-    match readonly::scan_log(log_dir) {
-        Ok(scan) => pin::segment_only(&scan.segment_key),
-        Err(err) => pin::KeyUse {
-            fingerprint: String::new(),
-            pin: "none",
-            note: err,
-        },
-    }
 }
 
 /// Pin decision for a log that carries a receipt. A mismatch still reports

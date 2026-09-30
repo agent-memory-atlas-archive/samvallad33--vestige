@@ -212,3 +212,28 @@ fn store_writes_after_the_receipt_keep_the_counts() {
     assert!(report.counts_match);
     assert!(strata_verify::verify_path(&log_dir).ok);
 }
+
+/// `strata-verify <data-dir>` is the form the README documents. For an
+/// upgraded store it must check the migration receipt in `log/` exactly as
+/// `strata-verify <data-dir>/log` does. It used to scan only the chain, so a
+/// swapped receipt-signing key beside the log still printed OK.
+#[test]
+fn data_dir_form_verifies_the_migration_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    build_log(&dir.path().join("log"));
+
+    let report = strata_verify::verify_path(dir.path());
+    assert!(report.ok, "{}", report.failures.join("; "));
+    let json: serde_json::Value = serde_json::from_str(&report.json).unwrap();
+    assert_eq!(json["signature_ok"], true, "{}", report.json);
+    assert_eq!(json["counts_match"], true, "{}", report.json);
+    assert_eq!(json["key_pin"], "receipt-signing.key", "{}", report.json);
+
+    std::fs::write(dir.path().join("receipt-signing.key"), [9u8; 32]).unwrap();
+    let swapped = strata_verify::verify_path(dir.path());
+    assert!(
+        !swapped.ok,
+        "a receipt key that no longer matches the pin must fail the data-dir form: {}",
+        swapped.json
+    );
+}
