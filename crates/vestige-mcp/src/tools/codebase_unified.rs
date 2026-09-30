@@ -1885,6 +1885,9 @@ pub fn load_config(path: &str) -> Config {
         let mut again = capture_anchor(&pattern.id, repo.path(), &draft);
         again.id = first.id.clone();
         again.symbol_kind = Some("fn".into());
+        // Same capture instant: two captures can straddle a millisecond, and
+        // this test is about replacement by id, not about the clock.
+        again.captured_at = first.captured_at;
 
         assert_eq!(storage.record_code_anchors(&[]).unwrap(), 0);
         // A repeated id keeps the last row, as SQLite's INSERT OR REPLACE does.
