@@ -79,6 +79,24 @@ fn truncate(s: &str, limit: usize) -> String {
     }
 }
 
+/// Keywords a union node keeps from its own schema.
+const UNION_OWN_KEYWORDS: &[&str] = &[
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "enum",
+    "description",
+    "minimum",
+    "maximum",
+    "minItems",
+    "maxItems",
+    "minLength",
+    "maxLength",
+    "pattern",
+];
+
 /// JSON type name of a discriminator value.
 fn json_type(value: &Value) -> &'static str {
     match value {
@@ -134,9 +152,11 @@ fn compact_union(map: &Map<String, Value>, depth: usize, keep_desc: bool) -> Val
         };
     }
 
+    // The node's own schema keywords only. Annotations some unions carry
+    // (`$schema`, `algorithm_version`, `limits`, ...) make strict JSON Schema
+    // compilers reject the whole tool.
     let mut own = map.clone();
-    own.remove("oneOf");
-    own.remove("anyOf");
+    own.retain(|key, _| UNION_OWN_KEYWORDS.contains(&key.as_str()));
     let mut out = match compact(&Value::Object(own), depth, keep_desc) {
         Value::Object(out) => out,
         _ => Map::new(),
@@ -530,6 +550,30 @@ mod wire_tests {
         assert!(items["properties"]["run_id"].is_object());
         assert!(items["properties"].get("action").is_none());
         assert_eq!(items["required"], json!(["kind"]));
+    }
+
+    #[test]
+    fn a_union_keeps_only_schema_keywords_of_its_own() {
+        let full = json!({"type": "object", "properties": {"command": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Intention graph command",
+            "algorithm_version": 3,
+            "limits": {"max": 1},
+            "type": "object",
+            "oneOf": [
+                {"type": "object", "properties": {"action": {"const": "plan"}, "goal": {"type": "string"}}},
+                {"type": "object", "properties": {"action": {"const": "cancel"}, "id": {"type": "string"}}}
+            ]
+        }}});
+        let command = &of(&full)["properties"]["command"];
+        for key in ["$schema", "title", "algorithm_version", "limits"] {
+            assert!(command.get(key).is_none(), "{key} leaked: {command}");
+        }
+        assert_eq!(
+            command["properties"]["action"]["enum"],
+            json!(["plan", "cancel"])
+        );
+        assert!(command["properties"]["goal"].is_object());
     }
 
     #[test]

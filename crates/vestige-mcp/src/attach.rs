@@ -29,7 +29,7 @@
 //! it. The client's `initialize` is replayed to the new owner under a private
 //! id whose response is dropped, so the client keeps its session.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, TryLockError};
 use std::io::{self, Write};
 use std::net::Ipv4Addr;
@@ -47,7 +47,7 @@ use tokio::io::{
 use tokio::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -70,9 +70,12 @@ const WELCOME: &str = "vestige-attached/1";
 const REFUSED: &str = "vestige-refused/1";
 /// Bound on each side of the attach handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the owner waits for a new connection's hello. Clients send it
+/// right after connecting.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 /// A handshake line longer than this is not one.
 const HANDSHAKE_LINE_MAX: u64 = 256;
-/// Connections still in their handshake. More are closed unread.
+/// Connections still in their handshake. A newer one evicts the oldest.
 const MAX_HANDSHAKES: usize = 16;
 /// Attached sessions one owner serves at once.
 const MAX_ATTACHED: usize = 256;
@@ -90,23 +93,56 @@ const STDOUT_QUEUE: usize = 256;
 const CLOSE_DRAIN: Duration = Duration::from_secs(20);
 /// Bound on one tool call made through [`call_tool`].
 const CALL_TIMEOUT: Duration = Duration::from_secs(600);
+/// When the owner is lost, how long the proxy keeps reading answers the
+/// owner had already sent.
+const OWNER_LOST_DRAIN: Duration = Duration::from_secs(2);
+/// Consecutive stdin read errors before a proxy gives up, as `run_io` does.
+const MAX_STDIN_ERRORS: u32 = 5;
 
 // ============================================================================
 // Election
 // ============================================================================
 
 /// Take `.serve.lock` without waiting. `None` when another process holds it.
+///
+/// The lock file is owner-only: an exclusive lock can be taken through a
+/// read-only descriptor, so a lock file other users can read is one they can
+/// hold to lock the owner out. The data directory is tightened to 0700 too,
+/// as v3 did for its token file, since the log holds every memory.
 pub fn try_serve_lock(data_dir: &Path) -> io::Result<Option<File>> {
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(data_dir.join(LOCK_FILE))?;
+    let path = data_dir.join(LOCK_FILE);
+    let mut options = File::options();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path)?;
+    #[cfg(unix)]
+    {
+        owner_only(&path, 0o600);
+        owner_only(data_dir, 0o700);
+    }
     match file.try_lock() {
         Ok(()) => Ok(Some(file)),
         Err(TryLockError::WouldBlock) => Ok(None),
         Err(TryLockError::Error(err)) => Err(err),
+    }
+}
+
+/// Drop group and other permission bits from a path this user owns. Never
+/// loosens, and leaves a path owned by someone else alone.
+#[cfg(unix)]
+fn owner_only(path: &Path, mode: u32) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = fs::metadata(path) else {
+        return;
+    };
+    // Safety: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() == me && meta.mode() & 0o077 != 0 {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
     }
 }
 
@@ -494,7 +530,7 @@ impl AttachPoint {
 
     /// Call once this process's own client is gone. Serves the attached
     /// sessions until the last one closes, then stops accepting and removes
-    /// the endpoint file. The serve lock is still held throughout.
+    /// the endpoint file (on drop). The serve lock is still held throughout.
     pub async fn close(self) {
         let attached = self.gate.attached();
         if attached > 0 {
@@ -504,11 +540,20 @@ impl AttachPoint {
             );
         }
         self.gate.close_when_idle().await;
+    }
+}
+
+impl Drop for AttachPoint {
+    /// Stop accepting and retire the endpoint, whether or not `close` ran: a
+    /// long-running CLI command drops its attach point without closing it.
+    fn drop(&mut self) {
         self.accept.abort();
-        let _ = self.accept.await;
         retire_endpoint(&self.data_dir, &self.endpoint);
     }
 }
+
+/// Handshakes in progress, oldest first: (connection id, its eviction signal).
+type PendingHandshakes = Arc<Mutex<VecDeque<(u64, Arc<Notify>)>>>;
 
 async fn accept_loop(
     listener: Listener,
@@ -516,7 +561,11 @@ async fn accept_loop(
     gate: Arc<Gate>,
     services: Arc<Services>,
 ) {
-    let handshakes = Arc::new(Semaphore::new(MAX_HANDSHAKES));
+    // Connections still in their handshake, oldest first. Past the cap the
+    // oldest is evicted rather than the newest refused, so connections that
+    // never say hello cannot lock real clients out.
+    let pending: PendingHandshakes = Arc::default();
+    let mut next_id: u64 = 0;
     loop {
         let (read, write) = match listener.accept().await {
             Ok(halves) => halves,
@@ -526,15 +575,32 @@ async fn accept_loop(
                 continue;
             }
         };
-        let Ok(permit) = Arc::clone(&handshakes).try_acquire_owned() else {
-            debug!("too many attach handshakes in flight; closing a connection");
-            continue;
-        };
+        next_id += 1;
+        let id = next_id;
+        let evict = Arc::new(Notify::new());
+        {
+            let mut queue = pending.lock().unwrap_or_else(PoisonError::into_inner);
+            while queue.len() >= MAX_HANDSHAKES {
+                if let Some((_, oldest)) = queue.pop_front() {
+                    oldest.notify_one();
+                }
+            }
+            queue.push_back((id, Arc::clone(&evict)));
+        }
+        let pending = Arc::clone(&pending);
         let token = Arc::clone(&token);
         let gate = Arc::clone(&gate);
         let services = Arc::clone(&services);
         tokio::spawn(async move {
-            let Some(admitted) = admit(read, write, &token, &gate, permit).await else {
+            let admitted = tokio::select! {
+                admitted = admit(read, write, &token, &gate) => admitted,
+                _ = evict.notified() => None,
+            };
+            pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(entry, _)| *entry != id);
+            let Some(admitted) = admitted else {
                 return;
             };
             let pid = std::process::id();
@@ -604,10 +670,11 @@ async fn admit(
     writer: WriteHalf,
     token: &str,
     gate: &Arc<Gate>,
-    permit: OwnedSemaphorePermit,
 ) -> Option<Admitted> {
     let mut reader = BufReader::new(read);
-    let hello = read_handshake_line(&mut reader).await?;
+    let hello = tokio::time::timeout(HELLO_TIMEOUT, read_handshake_line(&mut reader))
+        .await
+        .ok()??;
     let mut words = hello
         .strip_prefix(HELLO)
         .and_then(|rest| rest.strip_prefix(' '))
@@ -624,12 +691,12 @@ async fn admit(
             port: port.parse().ok()?,
         },
         _ => {
-            debug!("attach refused: unknown request {hello:?}");
+            // The line carries the token; it stays out of the log.
+            debug!("attach refused: unknown request");
             return None;
         }
     };
     let guard = gate.try_enter()?;
-    drop(permit);
     Some(Admitted {
         request,
         reader,
@@ -823,10 +890,53 @@ pub enum ProxyEnd {
     Promoted { lock: File, client: PromotedClient },
 }
 
+/// Lines from stdin that survive cancellation. `read_until` appends into
+/// `pending`, which outlives a cancelled call, so a line the relay's other
+/// branches interrupt is completed on the next call, or handed whole to a
+/// promoted server. (`Lines::into_inner` would discard it.)
+struct StdinLines {
+    reader: BufReader<tokio::io::Stdin>,
+    pending: Vec<u8>,
+}
+
+impl StdinLines {
+    fn new() -> Self {
+        Self {
+            reader: BufReader::new(tokio::io::stdin()),
+            pending: Vec::new(),
+        }
+    }
+
+    /// The next line without its line ending, `None` at EOF. A line that is
+    /// not UTF-8 is consumed and returned as an `InvalidData` error, which
+    /// the relay counts and skips, as `run_io` does for its own stdin.
+    async fn next_line(&mut self) -> io::Result<Option<String>> {
+        loop {
+            let read = self.reader.read_until(b'\n', &mut self.pending).await?;
+            if read == 0 && self.pending.is_empty() {
+                return Ok(None);
+            }
+            if read == 0 || self.pending.last() == Some(&b'\n') {
+                let mut bytes = std::mem::take(&mut self.pending);
+                if bytes.last() == Some(&b'\n') {
+                    bytes.pop();
+                }
+                if bytes.last() == Some(&b'\r') {
+                    bytes.pop();
+                }
+                return String::from_utf8(bytes)
+                    .map(Some)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
+            }
+        }
+    }
+}
+
 /// A proxied client whose server now runs in this process.
 pub struct PromotedClient {
     stdin: BufReader<tokio::io::Stdin>,
-    replay: Vec<String>,
+    /// The replayed handshake, then any partly read client line.
+    prefix: Vec<u8>,
     replay_id: Value,
     stdout: mpsc::Sender<String>,
     stdout_writer: JoinHandle<io::Result<()>>,
@@ -857,7 +967,7 @@ pub async fn proxy_stdio(
 ) -> io::Result<ProxyEnd> {
     let (stdout, stdout_rx) = mpsc::channel::<String>(STDOUT_QUEUE);
     let stdout_writer = tokio::spawn(write_lines(tokio::io::stdout(), stdout_rx));
-    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdin = StdinLines::new();
     let mut session = ClientSession::new();
     let mut attachment = first;
 
@@ -885,11 +995,13 @@ pub async fn proxy_stdio(
                         attachment = next;
                     }
                     Role::Owner(lock) => {
+                        let mut prefix = session.replay().concat().into_bytes();
+                        prefix.append(&mut stdin.pending);
                         return Ok(ProxyEnd::Promoted {
                             lock,
                             client: PromotedClient {
-                                stdin: stdin.into_inner(),
-                                replay: session.replay(),
+                                stdin: stdin.reader,
+                                prefix,
                                 replay_id: session.replay_id.clone(),
                                 stdout,
                                 stdout_writer,
@@ -904,7 +1016,7 @@ pub async fn proxy_stdio(
 
 /// One attachment's worth of relaying.
 async fn relay(
-    stdin: &mut Lines<BufReader<tokio::io::Stdin>>,
+    stdin: &mut StdinLines,
     attachment: Attachment,
     stdout: &mpsc::Sender<String>,
     session: &mut ClientSession,
@@ -923,11 +1035,13 @@ async fn relay(
     // A client line the owner queue had no room for; stdin is not read again
     // until it is queued.
     let mut blocked: Option<String> = None;
+    let mut read_errors: u32 = 0;
 
     let outcome = loop {
         tokio::select! {
             line = stdin.next_line(), if blocked.is_none() => match line {
                 Ok(Some(line)) => {
+                    read_errors = 0;
                     if line.trim().is_empty() {
                         continue;
                     }
@@ -946,8 +1060,12 @@ async fn relay(
                 }
                 Ok(None) => break Relayed::ClientClosed,
                 Err(err) => {
-                    warn!("reading stdin failed: {err}");
-                    break Relayed::ClientClosed;
+                    read_errors += 1;
+                    warn!("reading stdin failed ({read_errors}/{MAX_STDIN_ERRORS}): {err}");
+                    if read_errors >= MAX_STDIN_ERRORS {
+                        break Relayed::ClientClosed;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             },
             permit = owner_tx.reserve(), if blocked.is_some() => match permit {
@@ -1003,6 +1121,18 @@ async fn relay(
             Relayed::ClientClosed
         }
         Relayed::OwnerLost => {
+            // The owner may have answered before it went (the writer can fail
+            // first). Those answers are real and reach the client, instead of
+            // the lost-owner error for their ids.
+            let _ = tokio::time::timeout(OWNER_LOST_DRAIN, async {
+                while let Ok(Some(line)) = owner_lines.next_line().await {
+                    if session.owner_line(&line) && stdout.send(format!("{line}\n")).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .await;
             owner_writer.abort();
             Relayed::OwnerLost
         }
@@ -1016,12 +1146,12 @@ impl PromotedClient {
     pub async fn serve(self, server: McpServer) -> io::Result<()> {
         let Self {
             stdin,
-            replay,
+            prefix,
             replay_id,
             stdout,
             stdout_writer,
         } = self;
-        let reader = std::io::Cursor::new(replay.concat().into_bytes()).chain(stdin);
+        let reader = std::io::Cursor::new(prefix).chain(stdin);
         let (server_out, filter_in) = tokio::io::duplex(64 * 1024);
         let filter = tokio::spawn(async move {
             let mut lines = BufReader::new(filter_in).lines();
@@ -1089,7 +1219,8 @@ pub async fn request_dashboard(data_dir: &Path, port: u16) -> io::Result<Dashboa
         .strip_prefix(REFUSED)
         .map(|rest| rest.trim().to_string())
     {
-        return Err(io::Error::other(reason));
+        // A definite answer: callers stop asking instead of retrying.
+        return Err(io::Error::new(io::ErrorKind::ConnectionRefused, reason));
     }
     let mut words = answer
         .strip_prefix(WELCOME)
@@ -1109,6 +1240,33 @@ pub async fn request_dashboard(data_dir: &Path, port: u16) -> io::Result<Dashboa
             "unexpected answer from the Vestige server: {answer}"
         ))),
     }
+}
+
+/// The pid of the process serving `data_dir`, when it answers the attach
+/// handshake. The endpoint file alone can name a process that is gone.
+pub async fn probe_owner(data_dir: &Path) -> Option<u32> {
+    let (_reader, _writer, welcome) = greet(data_dir, "", HANDSHAKE_TIMEOUT).await?;
+    welcome
+        .strip_prefix(WELCOME)?
+        .strip_prefix(' ')?
+        .parse()
+        .ok()
+}
+
+/// [`probe_owner`] for synchronous code, on its own thread and runtime so it
+/// works whether or not the caller is inside one.
+pub fn probe_owner_blocking(data_dir: &Path) -> Option<u32> {
+    let dir = data_dir.to_path_buf();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?
+            .block_on(probe_owner(&dir))
+    })
+    .join()
+    .ok()
+    .flatten()
 }
 
 /// Call one MCP tool through the process serving `data_dir`, as a

@@ -50,6 +50,26 @@ default binaries.
 - `maintain backup` on Strata writes a copy of the log directory
   (`backups/vestige-<time>.strata`) and reports its real size. `maintain
   export` writes JSON or JSONL.
+- A default `vestige-mcp` boot no longer contacts the npm registry. There is
+  no startup version check and no `newer_version_available` notification.
+- `cloud-sync` is not a default feature of `vestige-mcp` or `vestige` in 4.0.
+  The feature and its code stay; release builds do not pass it.
+  `vestige-core`'s default remains `codebase-git` only.
+- `connectors` is not a default feature of `vestige-mcp` or `vestige` in 4.0.
+  The feature and its code stay. A default `tools/list` does not advertise
+  `source_sync`, and `tools/call` for that name is the unknown-tool protocol
+  error. `strata-migrate` does not enable `connectors` on `vestige-core`, so
+  `migrate-to-strata` cannot unify `reqwest` back into the binary. Release
+  cargo flags do not pass `connectors` or `cloud-sync` on any target. The
+  release workflow rejects a target feature set that links `reqwest`.
+- `tools/list` payloads dropped from 56 KB to 21,079 bytes on the 4.0
+  surface (#212): every field a call can send stays on the wire with its
+  type and discriminator enums, while per-field prose and deep structure move
+  one call deeper. `memory_status` `view='tools'` with `tool='<name>'` serves
+  the full schema for the selected tool, and a build-time guard fails if the
+  catalog ever exceeds 22 KiB. Recall's investigation filters are grouped
+  into `source` and `filters` objects in the compact form; a call may send
+  them grouped or flat.
 - Every agent on a machine can use Vestige at once. The log has one writer:
   the first `vestige-mcp` to start takes `.serve.lock` and serves the store,
   and every later one connects to it and relays its client's stdio there.
@@ -127,6 +147,15 @@ back), `maintain` `export` format `portable`, and `memory_status`
   grouped or flat. On Strata, `recall`, `smart_ingest` and `receipt` describe
   what 4.0 does instead of v3's similarity search and walk receipts. The
   catalog budget is 22 KiB (it was 20 KiB while fields were missing).
+- `vestige-restore` honors `VESTIGE_DATA_DIR`, upgrades a v3 store before
+  touching it, and refuses while a Vestige server holds the store. It used to
+  open the log as a second writer beside a running server, which lost
+  acknowledged writes, and on a v3 data directory it created an empty log
+  that made every later launch skip the v3 import.
+- The store is owner-only on Unix: `.serve.lock`, the attach socket and its
+  endpoint file are 0600 and the data directory is tightened to 0700, as v3
+  did for its token. A lock file other users could read was one they could
+  hold to lock the owner out.
 - `strata-verify <data-dir>`, the documented form, verifies an upgraded
   store's migration receipt. It used to scan only the chain, so a swapped
   receipt-signing key still printed OK unless `<data-dir>/log` was passed.
@@ -154,28 +183,6 @@ back), `maintain` `export` format `portable`, and `memory_status`
   untouched. Also corrects the `exclude_types` schema description, which
   wrongly claimed reflections are excluded by default.
 
-### Changed
-
-- A default `vestige-mcp` boot no longer contacts the npm registry. There is
-  no startup version check and no `newer_version_available` notification.
-- `cloud-sync` is not a default feature of `vestige-mcp` or `vestige` in 4.0.
-  The feature and its code stay; release builds do not pass it.
-  `vestige-core`'s default remains `codebase-git` only.
-- `connectors` is not a default feature of `vestige-mcp` or `vestige` in 4.0.
-  The feature and its code stay. A default `tools/list` does not advertise
-  `source_sync`, and `tools/call` for that name is the unknown-tool protocol
-  error. `strata-migrate` does not enable `connectors` on `vestige-core`, so
-  `migrate-to-strata` cannot unify `reqwest` back into the binary. Release
-  cargo flags do not pass `connectors` or `cloud-sync` on any target. The
-  release workflow rejects a target feature set that links `reqwest`.
-
-- `tools/list` payloads dropped from 56 KB to 19,359 bytes on the 4.0
-  surface (#212): discriminator enums and types stay on the wire, deep
-  variant trees and per-field prose move one call deeper. `memory_status`
-  `view='tools'` with `tool='<name>'` serves the full schema for the selected
-  tool, so no detail is lost, and a build-time guard fails if the wire
-  payload ever exceeds 20 KiB again. Recall's investigation filters are grouped into `source` and
-  `filters` objects in the compact form; the full schema keeps them flat.
 
 ## [3.1.1] - 2026-09-28
 

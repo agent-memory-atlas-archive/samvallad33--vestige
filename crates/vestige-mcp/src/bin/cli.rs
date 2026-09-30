@@ -2727,11 +2727,18 @@ fn take_cli_lock(dir: &Path) -> anyhow::Result<bool> {
     }
 }
 
+/// Who holds the store, for messages. A pid is named only when that process
+/// answers the attach handshake; the endpoint file can outlive it.
+fn store_holder(dir: &Path) -> String {
+    match vestige_mcp::attach::probe_owner_blocking(dir) {
+        Some(pid) => format!("vestige-mcp (pid {pid})"),
+        None => "another Vestige process (a vestige command, vestige-upgrade, or a server that is not answering)".to_string(),
+    }
+}
+
 /// Why a command that opens the log cannot run while the store is served.
 fn served_elsewhere(dir: &Path) -> anyhow::Error {
-    let holder = vestige_mcp::attach::read_endpoint(dir)
-        .map(|endpoint| format!("vestige-mcp (pid {})", endpoint.pid))
-        .unwrap_or_else(|| "another Vestige process".to_string());
+    let holder = store_holder(dir);
     anyhow::anyhow!(
         "{holder} is serving {}. This command opens the log directly, and the log has one \
          writer, so it runs only while no Vestige server holds the store. Use the matching \
@@ -2842,10 +2849,8 @@ fn run_strata_backup(storage: &Arc<Storage>, data_dir: &Path, output: &Path) -> 
 /// `maintain backup`, into `<data-dir>/backups`) and then moved to `output`.
 fn run_backup_through_server(data_dir: &Path, output: &Path) -> anyhow::Result<()> {
     check_strata_backup_destination(data_dir, output)?;
-    let holder = vestige_mcp::attach::read_endpoint(data_dir)
-        .map(|endpoint| format!("vestige-mcp (pid {})", endpoint.pid))
-        .unwrap_or_else(|| "a Vestige server".to_string());
-    println!("{holder} is serving this store; backing up through it...");
+    let holder = store_holder(data_dir);
+    println!("{holder} holds this store; backing up through it...");
     let rt = tokio::runtime::Runtime::new()?;
     let made = rt
         .block_on(vestige_mcp::attach::call_tool(
@@ -2872,9 +2877,26 @@ fn run_backup_through_server(data_dir: &Path, output: &Path) -> anyhow::Result<(
             fs::remove_dir(output)?;
         }
         if fs::rename(&made, output).is_err() {
-            copy_dir_all(&made, output).with_context(|| {
-                format!("failed to copy {} to {}", made.display(), output.display())
-            })?;
+            // Another filesystem: copy into a sibling, sync it, then rename
+            // it into place, so a failed copy never leaves a partial backup
+            // at the requested path.
+            let staged = output.with_file_name(format!(
+                ".{}.partial-{}",
+                output
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "backup".to_string()),
+                std::process::id()
+            ));
+            let copied = copy_dir_all(&made, &staged).and_then(|()| fs::rename(&staged, output));
+            if let Err(err) = copied {
+                let _ = fs::remove_dir_all(&staged);
+                anyhow::bail!(
+                    "failed to copy the backup to {}: {err}. The server's copy is still at {}",
+                    output.display(),
+                    made.display()
+                );
+            }
             fs::remove_dir_all(&made).with_context(|| {
                 format!("copied the backup, but could not remove {}", made.display())
             })?;
@@ -2894,6 +2916,7 @@ fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
             copy_dir_all(&entry.path(), &target)?;
         } else {
             fs::copy(entry.path(), &target)?;
+            fs::File::open(&target)?.sync_all()?;
         }
     }
     Ok(())
@@ -5043,12 +5066,17 @@ fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
                 deadline = std::time::Instant::now() + wait;
             }
             Err(err) => {
-                if std::time::Instant::now() >= deadline {
-                    let holder = vestige_mcp::attach::read_endpoint(&dir)
-                        .map(|endpoint| format!("vestige-mcp (pid {})", endpoint.pid))
-                        .unwrap_or_else(|| "another Vestige process".to_string());
+                // A definite refusal (the port is taken, say) is not retried.
+                if err.kind() == std::io::ErrorKind::ConnectionRefused {
                     anyhow::bail!(
-                        "{holder} holds {} and did not start the dashboard: {err}",
+                        "the Vestige server holding {} could not start the dashboard: {err}",
+                        dir.display()
+                    );
+                }
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "{} holds {} and did not start the dashboard: {err}",
+                        store_holder(&dir),
                         dir.display()
                     );
                 }

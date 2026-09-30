@@ -192,6 +192,38 @@ impl Client {
     }
 }
 
+impl Client {
+    fn send_raw(&mut self, bytes: &[u8]) {
+        let stdin = self.stdin.as_mut().expect("stdin still open");
+        stdin.write_all(bytes).expect("write raw");
+        stdin.flush().expect("flush raw");
+    }
+
+    fn wait_stderr(&self, needle: &str, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if self.stderr().contains(needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Every stdout line that arrives within `within`.
+    fn drain(&mut self, within: Duration) -> Vec<Value> {
+        let deadline = Instant::now() + within;
+        let mut out = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.stdout.recv_timeout(left) {
+                Ok(line) => out.push(serde_json::from_str(&line).unwrap_or(Value::String(line))),
+                Err(_) => return out,
+            }
+        }
+    }
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -516,4 +548,144 @@ fn a_data_dir_too_long_for_a_socket_attaches_over_loopback_tcp() {
     owner.close_stdin();
     assert!(second.wait_exit(Duration::from_secs(30)).success());
     assert!(owner.wait_exit(Duration::from_secs(30)).success());
+}
+
+/// A request the relay had half read when its owner died reaches the server
+/// the relay turns into, and is answered.
+#[test]
+fn promotion_keeps_a_half_read_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Client::spawn("owner", dir.path());
+    owner.initialize();
+    let mut proxy = Client::spawn("proxy", dir.path());
+    proxy.initialize();
+
+    let request = json!({"jsonrpc": "2.0", "id": 99, "method": "tools/call",
+        "params": {"name": "memory_status", "arguments": {"view": "health"}}})
+    .to_string();
+    let (head, tail) = request.split_at(request.len() / 2);
+    proxy.send_raw(head.as_bytes());
+    std::thread::sleep(Duration::from_millis(500));
+
+    owner.child.kill().unwrap();
+    owner.child.wait().unwrap();
+    assert!(
+        proxy.wait_stderr("now serves", Duration::from_secs(30)),
+        "{}",
+        proxy.stderr()
+    );
+    proxy.send_raw(format!("{tail}\n").as_bytes());
+    let seen = proxy.drain(Duration::from_secs(10));
+    assert!(
+        seen.iter()
+            .any(|m| m["id"] == json!(99) && m.get("result").is_some()),
+        "request 99 was never answered; got {seen:?}"
+    );
+}
+
+/// One line of invalid UTF-8 does not end a relayed session.
+#[test]
+fn a_relayed_session_survives_an_invalid_utf8_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Client::spawn("owner", dir.path());
+    owner.initialize();
+    let mut proxy = Client::spawn("proxy", dir.path());
+    proxy.initialize();
+
+    proxy.send_raw(b"\xff\xfe garbage\n");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(proxy.running(), "the relayed session ended on one bad line");
+    let answer = proxy.request("ping", json!({}));
+    assert!(answer.get("result").is_some(), "proxy: {answer}");
+}
+
+/// A definite refusal from the serving process (its dashboard port is taken)
+/// is reported at once, not retried for the whole election wait.
+#[test]
+fn a_dashboard_refusal_is_reported_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = Client::spawn("server", dir.path());
+    server.initialize();
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = busy.local_addr().unwrap().port();
+    let started = Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_vestige"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .args(["dashboard", "--port", &port.to_string(), "--no-open"])
+        .env_remove("VESTIGE_DATA_DIR")
+        .env("VESTIGE_ATTACH_WAIT_SECS", "15")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let took = started.elapsed();
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        took < Duration::from_secs(5),
+        "a refusal took {took:?} to report"
+    );
+    assert!(
+        text(&out).contains("could not start the dashboard"),
+        "{}",
+        text(&out)
+    );
+    drop(busy);
+}
+
+/// vestige-restore writes to the log directly, so it refuses a served store
+/// instead of becoming a second writer.
+#[test]
+fn restore_refuses_a_store_a_server_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = Client::spawn("server", dir.path());
+    server.initialize();
+    let backup = dir.path().join("backup.json");
+    let inner = json!({"results": [{"content": "restored while served"}]}).to_string();
+    std::fs::write(
+        &backup,
+        json!([{"type": "text", "text": inner}]).to_string(),
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_vestige-restore"))
+        .arg(&backup)
+        .env("VESTIGE_DATA_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "restore ran beside a server:\n{}",
+        text(&out)
+    );
+    assert!(text(&out).contains("is serving"), "{}", text(&out));
+
+    server.close_stdin();
+    assert!(server.wait_exit(Duration::from_secs(30)).success());
+    let out = Command::new(env!("CARGO_BIN_EXE_vestige-restore"))
+        .arg(&backup)
+        .env("VESTIGE_DATA_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "restore failed with no server:\n{}",
+        text(&out)
+    );
+}
+
+/// The lock file and the data directory are owner-only: another user who
+/// could read the lock could hold it and lock the owner out.
+#[cfg(unix)]
+#[test]
+fn the_lock_file_and_data_dir_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut server = Client::spawn("server", dir.path());
+    server.initialize();
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir.path().join(".serve.lock")), 0o600);
+    assert_eq!(mode(&dir.path().join(".serve.sock")), 0o600);
+    assert_eq!(mode(&dir.path().join(".serve.endpoint")), 0o600);
+    assert_eq!(mode(dir.path()), 0o700);
 }
