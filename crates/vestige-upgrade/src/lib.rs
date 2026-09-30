@@ -22,8 +22,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use strata_migrate::{Carryover, IntentionRow, MigrateOptions};
-use strata_store::{EffectAction, IntentionRecord, StrataStore};
+use strata_migrate::{AnchorRow, Carryover, IntentionRow, MigrateOptions};
+use strata_store::{AnchorRecord, EffectAction, IntentionRecord, StrataStore};
 
 /// Installed strata log. Same relative path `StrataStore` opens.
 /// Staging for this destination is `log` plus [`strata_migrate::STAGING_SUFFIX`]:
@@ -184,8 +184,19 @@ pub fn upgrade_with(
                         ),
                     );
                 }
-                carry_intentions(&carry_dir, staging, &carryover.intentions)
-                    .map_err(|err| format!("intention carry-over failed: {err}"))
+                let carried = carry_intentions(&carry_dir, staging, &carryover.intentions)
+                    .map_err(|err| format!("intention carry-over failed: {err}"))?;
+                let (anchors, skipped) = carry_anchors(&carry_dir, staging, &carryover.anchors)
+                    .map_err(|err| format!("code anchor carry-over failed: {err}"))?;
+                if !carryover.anchors.is_empty() {
+                    note(
+                        &carry_log,
+                        &format!(
+                            "vestige: carried {anchors} code anchors ({skipped} belonged to suppressed or superseded memories)"
+                        ),
+                    );
+                }
+                Ok(carried)
             })),
             ..MigrateOptions::default()
         },
@@ -267,6 +278,62 @@ fn carry_intentions(data_dir: &Path, staging: &Path, rows: &[IntentionRow]) -> R
         ));
     }
     Ok(held as u64)
+}
+
+/// Admit v3 code anchors into the staged log through the store's anchor
+/// write, the path the codebase tool uses, and prove they replay intact.
+/// Anchors of a memory that is not live on the staged log (v3-suppressed or
+/// superseded) are skipped: the store holds anchors only for live memories.
+/// Returns `(carried, skipped)`.
+fn carry_anchors(
+    data_dir: &Path,
+    staging: &Path,
+    rows: &[AnchorRow],
+) -> Result<(u64, u64), String> {
+    if rows.is_empty() {
+        return Ok((0, 0));
+    }
+    let open = || {
+        StrataStore::open_log_with_policy(data_dir, staging, strata_store::default_policy())
+            .map_err(|err| format!("open staged store: {err}"))
+    };
+    let mut store = open()?;
+    let (live, skipped): (Vec<&AnchorRow>, Vec<&AnchorRow>) = rows.iter().partition(|row| {
+        store
+            .get_node(&row.node_id)
+            .is_some_and(|node| node.is_live())
+    });
+    let records: Vec<AnchorRecord> = live.iter().map(|row| anchor_record(row)).collect();
+    for batch in records.chunks(INTENTION_BATCH) {
+        store
+            .record_anchors(batch.to_vec())
+            .map_err(|err| format!("admit anchors: {err}"))?;
+    }
+    drop(store);
+    let store = open()?;
+    for record in &records {
+        if store.anchor(&record.id).as_ref() != Some(record) {
+            return Err(format!("anchor {} did not replay intact", record.id));
+        }
+    }
+    Ok((records.len() as u64, skipped.len() as u64))
+}
+
+fn anchor_record(row: &AnchorRow) -> AnchorRecord {
+    AnchorRecord {
+        id: row.id.clone(),
+        node_id: row.node_id.clone(),
+        file_path: row.file_path.clone(),
+        symbol: row.symbol.clone(),
+        symbol_kind: row.symbol_kind.clone(),
+        start_line: row.start_line,
+        end_line: row.end_line,
+        span_lines: row.span_lines,
+        content_hash: row.content_hash.clone(),
+        captured_at_ms: row.captured_at_ms,
+        last_verified_at_ms: row.last_verified_at_ms,
+        last_status: row.last_status.clone(),
+    }
 }
 
 fn intention_record(row: &IntentionRow) -> IntentionRecord {

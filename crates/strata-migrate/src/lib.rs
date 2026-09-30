@@ -195,6 +195,8 @@ pub type BeforePublish = Box<dyn FnOnce(&Path) -> Result<(), String>>;
 
 /// Source table whose rows ride in [`Carryover::intentions`].
 pub const INTENTIONS_TABLE: &str = "intentions";
+/// v3 code anchors: carried like intentions, as admitted store writes.
+pub const CODE_ANCHORS_TABLE: &str = "code_memory_anchors";
 
 /// One v3 `intentions` row, decoded from the snapshot the receipt hashes.
 ///
@@ -228,11 +230,32 @@ pub struct IntentionRow {
     pub scope: Option<String>,
 }
 
+/// One v3 `code_memory_anchors` row. Field for field this is
+/// `strata_store::AnchorRecord`; timestamps are unix milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorRow {
+    pub id: String,
+    pub node_id: String,
+    pub file_path: String,
+    pub symbol: Option<String>,
+    pub symbol_kind: Option<String>,
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
+    pub span_lines: Option<u32>,
+    pub content_hash: Option<String>,
+    pub captured_at_ms: i64,
+    pub last_verified_at_ms: Option<i64>,
+    pub last_status: Option<String>,
+}
+
 /// v3 rows the migration log has no frame kind for, in source row order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Carryover {
     /// Every `intentions` row.
     pub intentions: Vec<IntentionRow>,
+    /// Every `code_memory_anchors` row. The hook admits the ones whose
+    /// memory is live on the staged log.
+    pub anchors: Vec<AnchorRow>,
 }
 
 /// Admits a [`Carryover`] into the staged log and returns how many
@@ -735,7 +758,7 @@ fn import_holding_lock(
                 report.intentions_carried = carried;
                 report
                     .skipped_tables
-                    .retain(|table| table != INTENTIONS_TABLE);
+                    .retain(|table| table != INTENTIONS_TABLE && table != CODE_ANCHORS_TABLE);
             }
             Ok(carried) => {
                 return Err(discard_staging(
@@ -1905,8 +1928,70 @@ fn extract_tombstones(archive: &PortableArchive) -> Result<Vec<TombstoneRecord>,
 /// of becoming "now" or `None`, and the run stops.
 #[cfg(feature = "sqlite-reader")]
 fn extract_carryover(archive: &PortableArchive) -> Result<Carryover, MigrationError> {
+    Ok(Carryover {
+        intentions: extract_intention_rows(archive)?,
+        anchors: extract_anchor_rows(archive)?,
+    })
+}
+
+/// Decode `code_memory_anchors` rows, source row order. A missing table (v3
+/// before code anchors) is no rows.
+#[cfg(feature = "sqlite-reader")]
+fn extract_anchor_rows(archive: &PortableArchive) -> Result<Vec<AnchorRow>, MigrationError> {
+    let Some(table) = source::table(archive, CODE_ANCHORS_TABLE) else {
+        return Ok(Vec::new());
+    };
+    let has = |name: &str| table.columns.iter().any(|column| column == name);
+    let mut anchors = Vec::with_capacity(table.rows.len());
+    for index in 0..table.rows.len() {
+        let row = source::Row::new(table, index);
+        let opt_text = |name: &str| -> Result<Option<String>, MigrationError> {
+            if !has(name) {
+                return Ok(None);
+            }
+            Ok(row.opt_text(name)?.map(str::to_string))
+        };
+        let opt_line = |name: &str| -> Result<Option<u32>, MigrationError> {
+            if !has(name) {
+                return Ok(None);
+            }
+            match row.integer_or(name, -1)? {
+                -1 => Ok(None),
+                value => u32::try_from(value).map(Some).map_err(|_| {
+                    MigrationError::Corrupt(format!(
+                        "code_memory_anchors row {index} column {name}: {value} is out of range"
+                    ))
+                }),
+            }
+        };
+        let opt_ms = |name: &str| -> Result<Option<i64>, MigrationError> {
+            match opt_text(name)? {
+                Some(raw) if !raw.is_empty() => Ok(Some(source::timestamp_ms(&raw)?)),
+                _ => Ok(None),
+            }
+        };
+        anchors.push(AnchorRow {
+            id: row.text("id")?.to_string(),
+            node_id: row.text("node_id")?.to_string(),
+            file_path: row.text("file_path")?.to_string(),
+            symbol: opt_text("symbol")?,
+            symbol_kind: opt_text("symbol_kind")?,
+            start_line: opt_line("start_line")?,
+            end_line: opt_line("end_line")?,
+            span_lines: opt_line("span_lines")?,
+            content_hash: opt_text("content_hash")?,
+            captured_at_ms: source::timestamp_ms(row.text("captured_at")?)?,
+            last_verified_at_ms: opt_ms("last_verified_at")?,
+            last_status: opt_text("last_status")?,
+        });
+    }
+    Ok(anchors)
+}
+
+#[cfg(feature = "sqlite-reader")]
+fn extract_intention_rows(archive: &PortableArchive) -> Result<Vec<IntentionRow>, MigrationError> {
     let Some(table) = source::table(archive, INTENTIONS_TABLE) else {
-        return Ok(Carryover::default());
+        return Ok(Vec::new());
     };
     let has = |name: &str| table.columns.iter().any(|column| column == name);
     let mut intentions = Vec::with_capacity(table.rows.len());
@@ -1957,7 +2042,7 @@ fn extract_carryover(archive: &PortableArchive) -> Result<Carryover, MigrationEr
             scope: opt_text("scope")?,
         });
     }
-    Ok(Carryover { intentions })
+    Ok(intentions)
 }
 
 #[cfg(test)]

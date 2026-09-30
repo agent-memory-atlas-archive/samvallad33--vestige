@@ -886,3 +886,57 @@ fn a_failed_intention_carry_installs_no_log() {
         "a failed carry-over left an installed log the next launch would skip"
     );
 }
+
+/// v3 code anchors ride the same staged carry-over as intentions: each live
+/// memory keeps its anchors, admitted through the gate, after a reopen.
+#[test]
+fn v3_code_anchors_survive_the_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = plant(dir.path());
+    let node = "11111111-1111-4111-8111-111111111111";
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS code_memory_anchors (
+                id TEXT PRIMARY KEY, node_id TEXT NOT NULL, file_path TEXT NOT NULL,
+                symbol TEXT, symbol_kind TEXT, start_line INTEGER, end_line INTEGER,
+                span_lines INTEGER, content_hash TEXT, captured_at TEXT NOT NULL,
+                last_verified_at TEXT, last_status TEXT)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_memory_anchors VALUES
+             ('anchor-a', ?1, 'src/state.rs', 'load_config', 'fn', 3, 6, 4,
+              'v2:0123456789abcdef', '2026-03-01 09:15:00', NULL, NULL)",
+            [node],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_memory_anchors VALUES
+             ('anchor-b', ?1, 'README.md', NULL, NULL, NULL, NULL, NULL, NULL,
+              '2026-03-01T09:15:00+00:00', '2026-03-02T09:15:00+00:00', 'verified')",
+            [node],
+        )
+        .unwrap();
+    }
+    let before = sha256_file(&db);
+    let status = vestige_upgrade::upgrade_if_needed(&db).unwrap();
+    assert!(matches!(status, UpgradeStatus::StrataReady { .. }));
+    assert_eq!(before, sha256_file(&db), "upgrade modified the v3 file");
+
+    let store = strata_store::StrataStore::open(dir.path()).unwrap();
+    let anchors = store.anchors_for(node);
+    assert_eq!(anchors.len(), 2, "{anchors:?}");
+    let symbol = anchors.iter().find(|a| a.id == "anchor-a").unwrap();
+    assert_eq!(symbol.symbol.as_deref(), Some("load_config"));
+    assert_eq!(
+        (symbol.start_line, symbol.end_line, symbol.span_lines),
+        (Some(3), Some(6), Some(4))
+    );
+    assert_eq!(symbol.content_hash.as_deref(), Some("v2:0123456789abcdef"));
+    let path = anchors.iter().find(|a| a.id == "anchor-b").unwrap();
+    assert_eq!(path.last_status.as_deref(), Some("verified"));
+    assert!(path.last_verified_at_ms.is_some());
+    let logged = fs::read_to_string(dir.path().join(UPGRADE_LOG_NAME)).unwrap();
+    assert!(logged.contains("carried 2 code anchors"), "{logged}");
+}

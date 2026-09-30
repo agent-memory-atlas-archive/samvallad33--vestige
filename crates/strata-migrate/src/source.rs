@@ -49,6 +49,8 @@ const PORTABLE_TABLES: &[&str] = &[
     "memory_access_log",
     "state_transitions",
     "intentions",
+    // Carried as admitted anchor writes by the upgrade (see Carryover).
+    "code_memory_anchors",
     "insights",
     "sessions",
     "fsrs_config",
