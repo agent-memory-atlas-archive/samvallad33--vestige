@@ -1026,14 +1026,20 @@ pub fn explore(
             };
             match path {
                 Some(path) => {
-                    let steps: Vec<Value> = path
-                        .iter()
-                        .map(|step| {
+                    // `steps` lists every memory on the chain, origin first,
+                    // as the legacy chain contract does. The origin arrives
+                    // by no edge; each later step names the recorded edge it
+                    // arrived by. `path` carries the edges themselves.
+                    let mut origin = describe(from);
+                    origin["connection_type"] = json!("origin");
+                    origin["reversed"] = json!(false);
+                    let steps: Vec<Value> = std::iter::once(origin)
+                        .chain(path.iter().map(|step| {
                             let mut item = describe(&step.to);
                             item["connection_type"] = json!(step.kind);
                             item["reversed"] = json!(step.reversed);
                             item
-                        })
+                        }))
                         .collect();
                     Ok(json!({
                         "action": "chain",
@@ -1046,15 +1052,29 @@ pub fn explore(
                         "headSeq": snapshot.head_seq(),
                     }))
                 }
-                None => Ok(json!({
-                    "action": "chain",
-                    "from": from,
-                    "to": to,
-                    "steps": [],
-                    "message": "No recorded typed path within 6 hops between these memories",
-                    "basis": basis,
-                    "headSeq": snapshot.head_seq(),
-                })),
+                None => {
+                    // `message` is the stable no-chain contract; `reason`
+                    // says which way the walk ended.
+                    let reason = if !live(from) {
+                        format!("'from' {from} is not a live memory")
+                    } else if !live(to) {
+                        format!("'to' {to} is not a live memory")
+                    } else {
+                        format!(
+                            "no recorded typed path within {EXPLORE_MAX_HOPS} hops between these memories"
+                        )
+                    };
+                    Ok(json!({
+                        "action": "chain",
+                        "from": from,
+                        "to": to,
+                        "steps": [],
+                        "message": "No chain found between these memories",
+                        "reason": reason,
+                        "basis": basis,
+                        "headSeq": snapshot.head_seq(),
+                    }))
+                }
             }
         }
         "associations" => {

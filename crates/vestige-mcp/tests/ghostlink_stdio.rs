@@ -5,8 +5,10 @@
 //! graph out, 16 tools), both propose lenses with their proofs, weave writing
 //! through the gate with a receipt per write and removing the pair, inspect,
 //! harden seeding once and then reporting every law as already present, a
-//! laws file taking precedence, a malformed laws file naming itself, and the
-//! hidden graph alias still answering.
+//! laws file taking precedence, a malformed laws file naming itself, the
+//! hidden graph alias still answering, and explore chain keeping the legacy
+//! contract (every memory on the chain, origin first; the stable no-chain
+//! message).
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -437,5 +439,74 @@ fn a_laws_file_wins_and_a_malformed_one_names_itself() {
         text.contains("ghostlink-laws.json") && text.contains("malformed"),
         "a malformed laws file must be named, not skipped: {refused}"
     );
+    server.shutdown();
+}
+
+#[test]
+fn chain_lists_every_memory_origin_first_and_keeps_the_no_chain_contract() {
+    let dir = data_dir();
+    let home = data_dir();
+    let mut server = spawn(dir.path(), home.path());
+    let a = save(&mut server, "The billing export runs nightly.", "fact");
+    let b = save(
+        &mut server,
+        "Ledger rows are immutable once posted.",
+        "decision",
+    );
+    let c = save(&mut server, "The office plant needs light.", "fact");
+    let woven = server.call_tool_ok(
+        "ghostlink",
+        json!({ "mode": "weave", "first_id": a, "second_id": b, "outcome_type": "helpful" }),
+    );
+    let record = woven["recordId"].as_str().unwrap().to_string();
+
+    // a <-derived_from- record -derived_from-> b: steps name every memory on
+    // the chain, origin first, and each later step the edge it arrived by.
+    let chain = server.call_tool_ok(
+        "ghostlink",
+        json!({ "mode": "explore", "kind": "chain", "from": a, "to": b }),
+    );
+    let steps = chain["steps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{chain}"));
+    let ids: Vec<&str> = steps
+        .iter()
+        .filter_map(|step| step["memory_id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![a.as_str(), record.as_str(), b.as_str()],
+        "{chain}"
+    );
+    assert_eq!(steps[0]["connection_type"], json!("origin"), "{chain}");
+    assert_eq!(
+        steps[1]["connection_type"],
+        json!("derived_from"),
+        "{chain}"
+    );
+    assert_eq!(chain["total_hops"], json!(2), "{chain}");
+    assert_eq!(chain["path"].as_array().map(Vec::len), Some(2), "{chain}");
+
+    // No recorded path keeps the stable message and says why.
+    let none = server.call_tool_ok(
+        "ghostlink",
+        json!({ "mode": "explore", "kind": "chain", "from": a, "to": c }),
+    );
+    assert_eq!(none["steps"], json!([]), "{none}");
+    assert_eq!(
+        none["message"],
+        json!("No chain found between these memories"),
+        "{none}"
+    );
+    assert!(
+        none["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("no recorded typed path")),
+        "{none}"
+    );
+
+    // The hidden graph alias answers with the same contract.
+    let alias = server.call_tool_ok("graph", json!({ "action": "chain", "from": a, "to": b }));
+    assert_eq!(alias["steps"], chain["steps"], "{alias}");
     server.shutdown();
 }
