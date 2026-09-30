@@ -124,12 +124,15 @@ pub fn upgrade_with(
         ),
     );
 
-    if let Err(detail) = ensure_space(&data_dir, db_path) {
+    // A symlinked vestige.db keeps its -wal/-shm and gets its backup beside
+    // the real file, so the size check and the backup follow the link.
+    let real_db = fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    if let Err(detail) = ensure_space(&data_dir, &real_db) {
         return Err(fail(&log_path, detail));
     }
 
     let log_path_hook = log_path.clone();
-    let backup_db = db_path.to_path_buf();
+    let backup_db = real_db.clone();
     let backup_dir = data_dir.clone();
     let backup_log = log_path.clone();
     let carry_dir = data_dir.clone();

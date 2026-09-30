@@ -104,9 +104,21 @@ pub struct SourceFiles {
     pub wal: Option<PathBuf>,
     /// `-shm` sidecar next to `db`, when present.
     pub shm: Option<PathBuf>,
+    /// The files the source-change guard hashes: the user's original db and
+    /// sidecars, never the scratch snapshot copy. Equal to `db`/`wal`/`shm`
+    /// when no snapshot copy was made.
+    pub guard: GuardFiles,
 }
 
-impl SourceFiles {
+/// The original db + sidecars covered by the source-change guard.
+#[derive(Clone)]
+pub struct GuardFiles {
+    pub db: PathBuf,
+    pub wal: Option<PathBuf>,
+    pub shm: Option<PathBuf>,
+}
+
+impl GuardFiles {
     /// Canonical BLAKE3 over db → wal → shm (only existing files).
     pub fn blake3_hex(&self) -> Result<String, MigrationError> {
         let mut hasher = blake3::Hasher::new();
@@ -129,6 +141,14 @@ impl SourceFiles {
     }
 }
 
+impl SourceFiles {
+    /// Canonical BLAKE3 over the ORIGINAL db → wal → shm (only existing
+    /// files), so a write to the source after the snapshot copy is seen.
+    pub fn blake3_hex(&self) -> Result<String, MigrationError> {
+        self.guard.blake3_hex()
+    }
+}
+
 /// Resolve `<src>` to concrete files, enforce the WAL policy, and apply the
 /// snapshot copy when `accept_wal` is set. `scratch` is only used when a
 /// snapshot copy is made.
@@ -142,6 +162,11 @@ pub fn prepare_source(
         // Portable-archive JSON: no SQLite files involved.
         return Ok((
             SourceFiles {
+                guard: GuardFiles {
+                    db: db.clone(),
+                    wal: None,
+                    shm: None,
+                },
                 db,
                 wal: None,
                 shm: None,
@@ -166,6 +191,12 @@ pub fn prepare_source(
         // Snapshot: copy db + wal + shm into scratch and read the copy so
         // the immutable read sees a consistent image. The originals are
         // only ever read (std::fs::copy opens for reading).
+        let guard = GuardFiles {
+            db: db.clone(),
+            wal: wal.clone(),
+            shm: shm.clone(),
+        };
+        let guard_before = guard.blake3_hex()?;
         std::fs::create_dir_all(scratch)?;
         // Sidecar names MUST line up with the snapshot db name or SQLite
         // will not associate the copied -wal with it (audit finding: the
@@ -179,6 +210,15 @@ pub fn prepare_source(
         }
         if let Some(shm) = &shm {
             std::fs::copy(shm, &shm_copy)?;
+        }
+        // A writer that touched the original while it was being copied would
+        // leave the copy inconsistent with the hash: refuse rather than seal.
+        let guard_after = guard.blake3_hex()?;
+        if guard_before != guard_after {
+            return Err(MigrationError::SourceTampered {
+                before: guard_before,
+                after: guard_after,
+            });
         }
         {
             // immutable=1 does NOT see WAL-resident commits (audit finding:
@@ -195,10 +235,24 @@ pub fn prepare_source(
             db: db_copy,
             wal: wal_copy.exists().then_some(wal_copy),
             shm: shm_copy.exists().then_some(shm_copy),
+            guard,
         };
         Ok((files, true))
     } else {
-        Ok((SourceFiles { db, wal, shm }, false))
+        let guard = GuardFiles {
+            db: db.clone(),
+            wal: wal.clone(),
+            shm: shm.clone(),
+        };
+        Ok((
+            SourceFiles {
+                db,
+                wal,
+                shm,
+                guard,
+            },
+            false,
+        ))
     }
 }
 
@@ -626,10 +680,13 @@ fn parse_archive_json(bytes: &[u8]) -> Result<PortableArchive, MigrationError> {
 
 /// Resolve a directory source to its `vestige.db`; pass files through.
 fn resolve_source(source: &Path) -> Result<PathBuf, MigrationError> {
+    // A symlinked db resolves to the real file: its -wal/-shm live beside
+    // the real file, not beside the link.
+    let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if source.is_dir() {
         let db = source.join("vestige.db");
         if db.is_file() {
-            Ok(db)
+            Ok(real(&db))
         } else {
             Err(MigrationError::UnsupportedSource(format!(
                 "directory {} has no vestige.db",
@@ -637,7 +694,7 @@ fn resolve_source(source: &Path) -> Result<PathBuf, MigrationError> {
             )))
         }
     } else if source.is_file() {
-        Ok(source.to_path_buf())
+        Ok(real(source))
     } else {
         Err(MigrationError::SourceNotFound(source.display().to_string()))
     }
