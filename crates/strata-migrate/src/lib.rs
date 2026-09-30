@@ -501,15 +501,9 @@ struct Hooks {
 /// `<data-dir>/log.strata-staging`.
 pub const STAGING_SUFFIX: &str = ".strata-staging";
 
-/// Lock file inside the staging directory. A dotfile, so destination
-/// occupancy and the migrator ignore it. Held with `File::try_lock`.
+/// How often a process that finds the staging lock held checks again.
 #[cfg(feature = "sqlite-reader")]
-const STAGING_LOCK_NAME: &str = ".upgrade.lock";
-
-/// How long a loser looks for the lock file after `create_dir` and before
-/// `try_lock`. This covers that gap only. A held lock is not abandoned on a timer.
-#[cfg(feature = "sqlite-reader")]
-const LOCK_FILE_APPEAR: Duration = Duration::from_millis(200);
+const STAGING_LOCK_POLL: Duration = Duration::from_millis(20);
 
 /// Sibling of `dest`: `<dest>`'s file name plus [`STAGING_SUFFIX`].
 #[cfg(feature = "sqlite-reader")]
@@ -518,6 +512,20 @@ fn staging_path(dest: &Path) -> std::path::PathBuf {
     let mut staging_name = name.to_os_string();
     staging_name.push(STAGING_SUFFIX);
     dest.with_file_name(staging_name)
+}
+
+/// The staging lock: a dotfile beside the staging directory, `.<staging>.lock`.
+/// Beside it, not inside: Windows cannot rename a directory while a file in it
+/// is open, and the lock stays held until staging is renamed onto `dest`.
+#[cfg(feature = "sqlite-reader")]
+fn staging_lock_path(staging: &Path) -> std::path::PathBuf {
+    let name = staging
+        .file_name()
+        .unwrap_or(std::ffi::OsStr::new("strata-staging"));
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(name);
+    lock_name.push(".lock");
+    staging.with_file_name(lock_name)
 }
 
 /// True when `dir` contains anything other than dotfiles. A missing path
@@ -586,11 +594,11 @@ fn receipt_matching(dir: &Path, source_blake3: &str) -> Option<records::Migratio
 ///
 /// `allow_idempotent` is set for SQLite sources, whose receipt is keyed by
 /// the source BLAKE3. Nothing is written to `dest` until every pre-check
-/// has passed. The winner is `create_dir` of the staging directory plus
-/// `File::try_lock` on a file inside it. The kernel drops that lock when
-/// the process dies, including SIGKILL. A later process that can take the
-/// lock wipes the staging directory and starts over. A process that finds
-/// the lock held waits until the rename publishes `dest`.
+/// has passed. The winner is whoever takes the staging lock
+/// ([`staging_lock_path`], `File::try_lock`); the kernel drops that lock
+/// when the process dies, including SIGKILL. The holder wipes any staging
+/// directory an earlier importer left and starts over. A process that finds
+/// the lock held waits for it, then sees `dest` published or takes over.
 #[cfg(feature = "sqlite-reader")]
 #[allow(clippy::too_many_arguments)]
 fn stage_import(
@@ -607,7 +615,7 @@ fn stage_import(
     if let Some(parent) = staging.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut hooks = Some(hooks);
+    let lock_path = staging_lock_path(&staging);
     loop {
         if destination_occupied(dest)? {
             if allow_idempotent {
@@ -619,36 +627,34 @@ fn stage_import(
                 path: dest.display().to_string(),
             });
         }
-        match std::fs::create_dir(&staging) {
-            Ok(()) => {
-                let lock = match lock_new_staging(&staging) {
-                    Ok(lock) => lock,
-                    Err(err) => {
-                        let _ = std::fs::remove_dir_all(&staging);
-                        return Err(err);
-                    }
-                };
-                return import_holding_lock(
-                    lock,
-                    &staging,
-                    dest,
-                    seed,
-                    source_blake3,
-                    snapshot,
-                    started,
-                    files,
-                    hooks.take().unwrap_or(Hooks {
-                        before_import: None,
-                        before_publish: None,
-                        carry_over: None,
-                    }),
-                );
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                wait_or_reclaim(&staging, dest)?;
-            }
-            Err(err) => return Err(err.into()),
+        let Some(lock) = try_staging_lock(&lock_path)? else {
+            // Another importer holds it. It publishes `dest` (checked at the
+            // top of the loop) or dies, and the kernel frees the lock.
+            std::thread::sleep(STAGING_LOCK_POLL);
+            continue;
+        };
+        // Held now, so no importer is running: `dest` may have been
+        // published while this process waited, and any staging directory
+        // is an earlier importer's leftover.
+        if destination_occupied(dest)? {
+            drop(lock);
+            continue;
         }
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        std::fs::create_dir(&staging)?;
+        return import_holding_lock(
+            lock,
+            &staging,
+            dest,
+            seed,
+            source_blake3,
+            snapshot,
+            started,
+            files,
+            hooks,
+        );
     }
 }
 
@@ -781,7 +787,8 @@ fn import_holding_lock(
     if let Err(err) = publish(staging, dest) {
         return Err(discard_staging(lock, staging, err));
     }
-    let _ = std::fs::remove_file(dest.join(STAGING_LOCK_NAME));
+    // The lock file stays: deleting it would let one waiter lock the old
+    // file while another creates and locks a new one.
     drop(lock);
     Ok(report)
 }
@@ -793,110 +800,20 @@ fn discard_staging(lock: std::fs::File, staging: &Path, err: MigrationError) -> 
     err
 }
 
+/// Take the staging lock without waiting. `None` when another process holds it.
 #[cfg(feature = "sqlite-reader")]
-fn lock_new_staging(staging: &Path) -> Result<std::fs::File, MigrationError> {
-    let path = staging.join(STAGING_LOCK_NAME);
+fn try_staging_lock(path: &Path) -> Result<Option<std::fs::File>, MigrationError> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .create_new(true)
-        .open(&path)?;
+        .create(true)
+        .truncate(false)
+        .open(path)?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(MigrationError::Io(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "staging lock already held",
-        ))),
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(err)) => Err(err.into()),
     }
-}
-
-#[cfg(feature = "sqlite-reader")]
-enum Held {
-    Acquired(std::fs::File),
-    Busy,
-    Missing,
-}
-
-#[cfg(feature = "sqlite-reader")]
-fn try_hold(staging: &Path) -> Result<Held, MigrationError> {
-    let path = staging.join(STAGING_LOCK_NAME);
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-    {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Held::Missing),
-        Err(err) => return Err(err.into()),
-    };
-    match file.try_lock() {
-        Ok(()) => Ok(Held::Acquired(file)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(Held::Busy),
-        Err(std::fs::TryLockError::Error(err)) => Err(err.into()),
-    }
-}
-
-/// Staging already exists. Take the lock and wipe it when the owner is
-/// dead, or wait while a live owner still holds it.
-#[cfg(feature = "sqlite-reader")]
-fn wait_or_reclaim(staging: &Path, dest: &Path) -> Result<(), MigrationError> {
-    match try_hold(staging)? {
-        Held::Acquired(lock) => {
-            let _ = std::fs::remove_dir_all(staging);
-            drop(lock);
-            return Ok(());
-        }
-        Held::Missing if !lock_file_appears(staging, dest) => {
-            return reclaim_if_abandoned(staging, dest);
-        }
-        Held::Missing | Held::Busy => {}
-    }
-    loop {
-        if destination_occupied(dest)? || !staging.exists() {
-            return Ok(());
-        }
-        match try_hold(staging)? {
-            Held::Acquired(lock) => {
-                let _ = std::fs::remove_dir_all(staging);
-                drop(lock);
-                return Ok(());
-            }
-            Held::Busy => std::thread::sleep(Duration::from_millis(20)),
-            Held::Missing => {
-                if !lock_file_appears(staging, dest) {
-                    return reclaim_if_abandoned(staging, dest);
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "sqlite-reader")]
-fn lock_file_appears(staging: &Path, dest: &Path) -> bool {
-    let path = staging.join(STAGING_LOCK_NAME);
-    let started = Instant::now();
-    while started.elapsed() < LOCK_FILE_APPEAR {
-        if path.exists() {
-            return true;
-        }
-        if !staging.exists() || destination_occupied(dest).unwrap_or(false) {
-            return path.exists();
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    path.exists()
-}
-
-#[cfg(feature = "sqlite-reader")]
-fn reclaim_if_abandoned(staging: &Path, dest: &Path) -> Result<(), MigrationError> {
-    if destination_occupied(dest)? || !staging.exists() {
-        return Ok(());
-    }
-    // The directory exists and nobody holds the lock file. The creator died
-    // between `create_dir` and `try_lock`, or the file never appeared.
-    let _ = std::fs::remove_dir_all(staging);
-    Ok(())
 }
 
 #[cfg(feature = "sqlite-reader")]

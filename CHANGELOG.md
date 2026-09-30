@@ -135,7 +135,11 @@ back), `maintain` `export` format `portable`, and `memory_status`
   check also treated every Windows process id as alive, so a process killed
   while it held the log (a closed `vestige dashboard` window, say) locked the
   store until `strata.lock` was deleted by hand; it now asks Windows whether
-  that process is still running.
+  that process is still running. And the v3 upgrade could not finish on
+  Windows: the importer renamed its staging directory onto `log/` while its
+  lock file inside that directory was still open, which Windows refuses
+  ("Folders containing files that are still open cannot be renamed or
+  moved"). The lock now sits beside the staging directory.
 - `tools/list` advertises every field a call can send. A schema with a
   `oneOf` was compacted to a single invented `action` field, so
   `smart_ingest` went out without `content`, `items` or `tags`, `maintain`
