@@ -503,7 +503,18 @@ impl<'s> GhostSnapshot<'s> {
     pub fn new(store: &'s StrataStore, filter: PoolFilter) -> Self {
         let nodes = store.node_map();
         let edges = store.edge_list();
-        let hidden = |id: &str| nodes.get(id).is_some_and(|record| !record.is_live());
+        // A scoped snapshot walks only its own scope: a memory recorded in
+        // another scope neither admits a pair nor appears in a proof path.
+        // Artifact ids (edge endpoints with no memory record) stay walkable.
+        let hidden = |id: &str| {
+            nodes.get(id).is_some_and(|record| {
+                !record.is_live()
+                    || filter
+                        .scope
+                        .as_deref()
+                        .is_some_and(|scope| record.scope != scope)
+            })
+        };
 
         let mut all: BTreeSet<&'s str> = nodes.keys().map(String::as_str).collect();
         let mut kind_names: BTreeSet<&'s str> = BTreeSet::new();

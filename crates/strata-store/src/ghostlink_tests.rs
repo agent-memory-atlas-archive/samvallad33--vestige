@@ -306,6 +306,62 @@ fn expired_and_future_memories_are_not_candidates() {
 }
 
 #[test]
+fn a_scoped_proposal_never_walks_or_names_another_scope() {
+    let dir = temp_dir("scope-walk");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let a = node_at(&mut store, "a", &[], "fact", "user", BASE_MS);
+    let b = node_at(&mut store, "b", &[], "fact", "user", BASE_MS);
+    let other = node_at(&mut store, "other", &[], "fact", "project-x", BASE_MS);
+    edge(&mut store, &a, &other, "derived_from");
+    edge(&mut store, &b, &other, "derived_from");
+    // An artifact id (no memory record) stays walkable in any scope.
+    let c = node_at(&mut store, "c", &[], "fact", "user", BASE_MS);
+    let d = node_at(&mut store, "d", &[], "fact", "user", BASE_MS);
+    edge(&mut store, &c, "file:src/lib.rs", "touched");
+    edge(&mut store, &d, "file:src/lib.rs", "touched");
+
+    let snapshot = store.ghost_snapshot(user());
+    let report = snapshot.bridge();
+    let text = format!("{report:?}");
+    assert!(
+        !text.contains(&other),
+        "bridge named another scope's memory: {text}"
+    );
+    assert!(
+        !report
+            .candidates
+            .iter()
+            .any(|c| (c.first_id.clone(), c.second_id.clone()) == pair(&a, &b)),
+        "(a, b) is joined only through another scope: {text}"
+    );
+    assert!(
+        report
+            .candidates
+            .iter()
+            .any(|cand| (cand.first_id.clone(), cand.second_id.clone()) == pair(&c, &d)),
+        "an artifact hop stays admitted: {text}"
+    );
+    let page = format!("{:?}", snapshot.divergent_page(None, 20).expect("page"));
+    assert!(
+        !page.contains(&other),
+        "divergent named another scope's memory: {page}"
+    );
+
+    // Across scopes (no scope filter) the same structure admits (a, b).
+    let everywhere = store
+        .ghost_snapshot(PoolFilter {
+            scope: None,
+            tags: Vec::new(),
+        })
+        .bridge();
+    assert!(everywhere
+        .candidates
+        .iter()
+        .any(|c| (c.first_id.clone(), c.second_id.clone()) == pair(&a, &b)));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn bridge_excludes_woven_pairs_and_records_leave_the_pool() {
     let dir = temp_dir("bridge-woven");
     let mut store = StrataStore::open(&dir).expect("open");
