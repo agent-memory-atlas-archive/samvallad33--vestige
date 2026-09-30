@@ -19,6 +19,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use ed25519_dalek::Signer;
 use strata_kernel::checkpoint::Checkpoint;
 use strata_kernel::event::ReviewEvent;
+use strata_kernel::fsrs::CardPhase;
 
 /// First frame of a fresh migration log: provenance for everything after it.
 pub const KIND_GENESIS: u8 = 0x1F;
@@ -38,6 +39,10 @@ pub const KIND_TOMBSTONE: u8 = 0x23;
 pub const KIND_SUPERSESSION: u8 = 0x24;
 /// Sealed fold checkpoint (payload = kernel `Checkpoint`).
 pub const KIND_CHECKPOINT: u8 = 0x25;
+/// One imported FSRS card: the `knowledge_nodes` scheduling columns of a
+/// memory with no `fsrs_cards` row (payload = [`FsrsStateRecord`]).
+/// Written from parameter set `v4-migrate/2` on.
+pub const KIND_FSRS_STATE: u8 = 0x27;
 /// Final frame of a migration: signed MIGRATION_RECEIPT (kind 46; PR-0c's
 /// `kinds.rs` adopts this code).
 pub const KIND_MIGRATION_RECEIPT: u8 = 46;
@@ -201,6 +206,56 @@ pub struct SupersessionRecord {
     pub superseded_by_legacy_id: String,
     pub superseded_kernel_id: u64,
     pub superseded_by_kernel_id: u64,
+}
+
+/// A v3 memory's spaced-repetition state, carried as a card (kind `0x27`).
+///
+/// Real v3 stores keep scheduling on `knowledge_nodes` (`stability`,
+/// `difficulty`, `reps`, `lapses`, `learning_state`, `last_accessed`) and
+/// leave `fsrs_cards` empty. Most rows have `reps = 0`, because v3 raised
+/// stability on access without counting a review, so a rating series cannot
+/// carry them. The importer carries the state itself.
+///
+/// v3 and Strata use different forgetting curves (v3's personalized `w20`
+/// decay against Strata's pinned `algo_version` curve), so the v3 stability
+/// is not copied. `stability_q` is refit so that Strata's retrievability at
+/// `fitted_at_ms` equals v3's at that clock: `v3_retrievability_q`. The raw
+/// v3 columns still ride verbatim on the node's `legacy` capture.
+///
+/// The store folds this into the card keyed by `handle_of(legacy_id)`, with
+/// `last_seq` = this frame's seq and `reviewed_at_ms` as the review clock.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct FsrsStateRecord {
+    pub record_version: u16,
+    /// Importer kernel id of the node (same as its `NODE` frame).
+    pub kernel_id: u64,
+    /// v3 memory id. The store's card handle derives from it.
+    pub legacy_id: String,
+    /// Algorithm version whose retrievability curve `stability_q` targets.
+    pub algo_version: u32,
+    /// Refit stability in days, Q32.32, inside the kernel's stability bounds.
+    pub stability_q: i64,
+    /// v3 `difficulty`, clamped to `[1, 10]`, Q32.32.
+    pub difficulty_q: i64,
+    /// v3 `reps`.
+    pub review_count: u32,
+    /// v3 `lapses`, at most `review_count`.
+    pub lapse_count: u32,
+    /// v3 `learning_state`: `review`, `relearning`, else `Learning`.
+    pub phase: CardPhase,
+    /// Last review wall clock: v3 `last_accessed`, the clock v3's decay
+    /// measured elapsed time from. Unix ms.
+    pub reviewed_at_ms: i64,
+    /// v3 retrievability at `fitted_at_ms` (the fit target), Q32.32.
+    pub v3_retrievability_q: i64,
+    /// v3 forgetting-curve decay used for that target (`fsrs_config.w20`,
+    /// or v3's default), Q32.32. The other fit inputs ride on the node's
+    /// legacy columns.
+    pub v3_decay_q: i64,
+    /// Fit clock, unix ms: the source's latest node timestamp, or one day
+    /// after `reviewed_at_ms` when that is later. Taken from the source, not
+    /// the wall clock, so two runs write identical bytes.
+    pub fitted_at_ms: i64,
 }
 
 /// Body of the signed MIGRATION_RECEIPT. All collections are ordered Vecs
@@ -390,6 +445,11 @@ pub fn decode_tombstone(payload: &[u8]) -> Result<TombstoneRecord, borsh::io::Er
 /// Decode a `KIND_SUPERSESSION` payload.
 pub fn decode_supersession(payload: &[u8]) -> Result<SupersessionRecord, borsh::io::Error> {
     SupersessionRecord::try_from_slice(payload)
+}
+
+/// Decode a `KIND_FSRS_STATE` payload. Trailing bytes are an error.
+pub fn decode_fsrs_state(payload: &[u8]) -> Result<FsrsStateRecord, borsh::io::Error> {
+    FsrsStateRecord::try_from_slice(payload)
 }
 
 /// Decode a `KIND_CHECKPOINT` payload (kernel wire type).

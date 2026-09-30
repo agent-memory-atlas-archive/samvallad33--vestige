@@ -152,6 +152,7 @@ fn path_a_archive_end_to_end() {
     assert_eq!(report.nodes, 3);
     assert_eq!(report.edges, 1);
     assert_eq!(report.fsrs_events, 6); // 4 + 2 synthetic reviews
+    assert_eq!(report.fsrs_states, 1); // the uncarded third memory
     assert!(report.verify_passed, "kernel verify must pass: {report:?}");
     // Path A input is a portable archive: skipped_tables can only reflect
     // the archive's own tables (the schema-driven sqlite_master list is the

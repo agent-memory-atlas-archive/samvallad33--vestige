@@ -2399,11 +2399,12 @@ fn run_migrate_to_strata(
     }
     println!("{} {}", "Destination:".bold(), destination.display());
     println!(
-        "{} {} nodes, {} edges, {} fsrs events",
+        "{} {} nodes, {} edges, {} fsrs events, {} fsrs cards",
         "Migrated:".green().bold(),
         report.nodes,
         report.edges,
-        report.fsrs_events
+        report.fsrs_events,
+        report.fsrs_states
     );
     if report.dropped_vectors > 0 {
         println!(

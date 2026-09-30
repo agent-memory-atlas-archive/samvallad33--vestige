@@ -21,6 +21,8 @@ pub struct Snapshot {
     pub reviews: Vec<ReviewEvent>,
     /// Parallel to `reviews`: `reviewed_at_ms` from the required option suffix.
     pub review_times: Vec<Option<i64>>,
+    /// Imported FSRS card states (`v4-migrate/2` logs), in log order.
+    pub fsrs_states: Vec<FsrsStateRecord>,
     pub tombstones: Vec<TombstoneRecord>,
     pub supersessions: Vec<SupersessionRecord>,
     pub checkpoints: Vec<Checkpoint>,
@@ -77,6 +79,9 @@ pub fn read_snapshot(log: &StrataLog) -> Result<Snapshot, MigrationError> {
                     .review_times
                     .push(decode_reviewed_at_ms(&frame.payload).map_err(decode)?);
             }
+            KIND_FSRS_STATE => snapshot
+                .fsrs_states
+                .push(decode_fsrs_state(&frame.payload).map_err(decode)?),
             KIND_TOMBSTONE => snapshot
                 .tombstones
                 .push(decode_tombstone(&frame.payload).map_err(decode)?),

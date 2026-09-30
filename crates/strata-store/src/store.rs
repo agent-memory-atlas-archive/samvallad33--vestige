@@ -14,12 +14,13 @@ use strata_gate::policy::{ANY_KIND, WILDCARD_PREFIX};
 use strata_gate::record::{action_kind, EffectRecord, GateRecord, Propose, RecordKind, Verdict};
 use strata_gate::{GateRuntime, Policy, Rule, SeqAck};
 use strata_kernel::checkpoint::{checkpoint_hash, Checkpoint};
-use strata_kernel::event::ReviewEvent;
+use strata_kernel::event::{ReviewEvent, StrataEvent};
 use strata_kernel::fsrs::{FsrsFold, ALGO_V2};
 use strata_kernel::kernel::Kernel;
 use strata_kernel::state::State;
 use strata_kernel::verify::verify_with_head;
 
+use crate::card::{CardEvent, ImportedCard};
 use crate::error::StoreError;
 use crate::gate_log::StrataEventLog;
 use crate::op::{StoreOp, KIND_STORE_CHECKPOINT, KIND_STORE_WRITE};
@@ -394,10 +395,12 @@ pub struct StrataStore {
     reverse: BTreeMap<String, Vec<usize>>,
     /// FSRS fold state (derived, kernel-canonical).
     fsrs: State,
-    /// Review events in fold order with their hashes (reused by verification).
-    review_events: Vec<(u64, [u8; 32], ReviewEvent)>,
-    /// Latest explicit review clock per card. Rebuilt from `ReviewNode`
-    /// payloads. Empty when the latest review frame omitted the field.
+    /// Card-fold events (reviews and imported v3 cards) in fold order with
+    /// their hashes (reused by verification).
+    review_events: Vec<(u64, [u8; 32], CardEvent)>,
+    /// Latest review clock per card. Rebuilt from `ReviewNode` payloads and
+    /// imported `FSRS_REVIEW` / `FSRS_STATE` frames. Empty when the latest
+    /// review frame omitted the field.
     reviewed_at: BTreeMap<u64, i64>,
     /// Sealed checkpoints in log order.
     checkpoints: Vec<Checkpoint>,
@@ -489,6 +492,9 @@ impl StrataStore {
         // payload_digest -> admitted-but-unconsumed effect gate seqs.
         let mut pending: HashMap<[u8; 32], VecDeque<u64>> = HashMap::new();
         let mut gate_seq_counter: u64 = 0;
+        // Importer kernel id -> v3 memory id. Imported FSRS frames name
+        // cards by kernel id; the store keys cards by `handle_of(id)`.
+        let mut imported_ids: HashMap<u64, String> = HashMap::new();
 
         for frame in frames {
             let seq = frame.seq;
@@ -546,7 +552,10 @@ impl StrataStore {
                             self.orphan_writes += 1;
                         }
                     }
-                    WritePayload::ImportedNode(node) => self.apply_imported_node(&node),
+                    WritePayload::ImportedNode(node) => {
+                        imported_ids.insert(node.kernel_id, node.legacy_id.clone());
+                        self.apply_imported_node(&node);
+                    }
                     WritePayload::Neither => self.orphan_writes += 1,
                 }
             } else if frame.kind == KIND_STORE_CHECKPOINT {
@@ -561,6 +570,14 @@ impl StrataStore {
                 // node stops being live and its successor stays the answer.
                 if let Ok(link) = strata_migrate::records::decode_supersession(&frame.payload) {
                     self.apply_imported_supersession(&link);
+                }
+            } else if frame.kind == strata_migrate::records::KIND_FSRS_REVIEW {
+                // A synthetic review from a v3 `fsrs_cards` row.
+                self.apply_imported_review(&frame.payload, seq, &imported_ids)?;
+            } else if frame.kind == strata_migrate::records::KIND_FSRS_STATE {
+                // A v3 card carried from the `knowledge_nodes` columns.
+                if let Ok(record) = strata_migrate::records::decode_fsrs_state(&frame.payload) {
+                    self.apply_imported_fsrs_state(&record, seq)?;
                 }
             }
             // Unknown kinds are ignored: forward compatibility.
@@ -726,6 +743,80 @@ impl StrataStore {
         self.edges.push(record);
     }
 
+    /// Imported `FSRS_REVIEW` frame (a v3 `fsrs_cards` rating series).
+    ///
+    /// The importer names the card by its kernel id; the fold keys it by
+    /// the node's handle, like every admitted review. The frame's seq is the
+    /// event seq. The payload's `reviewed_at_ms` sets the review clock as a
+    /// `ReviewNode` would. A review naming no imported node is ignored.
+    fn apply_imported_review(
+        &mut self,
+        payload: &[u8],
+        frame_seq: u64,
+        imported_ids: &HashMap<u64, String>,
+    ) -> Result<(), StoreError> {
+        let (Ok(event), Ok(reviewed_at_ms)) = (
+            strata_migrate::records::decode_review(payload),
+            strata_migrate::records::decode_reviewed_at_ms(payload),
+        ) else {
+            return Ok(());
+        };
+        let Some(id) = imported_ids.get(&event.card_id) else {
+            return Ok(());
+        };
+        if !self.nodes.contains_key(id) {
+            return Ok(());
+        }
+        let handle = handle_of(id);
+        self.fold_review(handle, event.rating, ALGO_V2, frame_seq)?;
+        match reviewed_at_ms {
+            Some(ms) => {
+                self.reviewed_at.insert(handle, ms);
+            }
+            None => {
+                self.reviewed_at.remove(&handle);
+            }
+        }
+        Ok(())
+    }
+
+    /// Imported `FSRS_STATE` frame: the v3 card itself.
+    ///
+    /// Folds a [`CardEvent::Import`] at the frame's seq and sets the review
+    /// clock to v3's `last_accessed`. Only a node with no card yet takes
+    /// it, so a later frame never rewinds a card that already folded
+    /// reviews. A record for an unknown node, or from another wire version,
+    /// is ignored.
+    fn apply_imported_fsrs_state(
+        &mut self,
+        record: &strata_migrate::FsrsStateRecord,
+        frame_seq: u64,
+    ) -> Result<(), StoreError> {
+        if record.record_version != strata_migrate::RECORD_VERSION
+            || !self.nodes.contains_key(&record.legacy_id)
+        {
+            return Ok(());
+        }
+        let handle = handle_of(&record.legacy_id);
+        if self.fsrs.cards.contains_key(&handle) {
+            return Ok(());
+        }
+        self.fold_card(
+            CardEvent::Import(ImportedCard {
+                card_id: handle,
+                event_seq: frame_seq,
+                stability_q: record.stability_q,
+                difficulty_q: record.difficulty_q,
+                review_count: record.review_count,
+                lapse_count: record.lapse_count,
+                phase: record.phase,
+            }),
+            ALGO_V2,
+        )?;
+        self.reviewed_at.insert(handle, record.reviewed_at_ms);
+        Ok(())
+    }
+
     fn fold_review(
         &mut self,
         card_id: u64,
@@ -733,16 +824,22 @@ impl StrataStore {
         kernel_id: u32,
         event_seq: u64,
     ) -> Result<(), StoreError> {
-        let event = ReviewEvent {
-            card_id,
-            rating,
-            event_seq,
-        };
+        self.fold_card(
+            CardEvent::Review(ReviewEvent {
+                card_id,
+                rating,
+                event_seq,
+            }),
+            kernel_id,
+        )
+    }
+
+    fn fold_card(&mut self, event: CardEvent, kernel_id: u32) -> Result<(), StoreError> {
         let event_hash = hash32(&borsh_vec(&event)?);
-        let kernel = Kernel::<ReviewEvent>::for_version(kernel_id)
+        let kernel = Kernel::<CardEvent>::for_version(kernel_id)
             .map_err(|e| StoreError::Verify(e.to_string()))?;
         kernel.apply(&mut self.fsrs, &event);
-        self.review_events.push((event_seq, event_hash, event));
+        self.review_events.push((event.seq(), event_hash, event));
         Ok(())
     }
 
@@ -1349,9 +1446,22 @@ impl StrataStore {
         result
     }
 
-    /// Review events in fold order. The kernel test replays these independently.
+    /// Review events in fold order (imported cards left out). The kernel
+    /// test replays these independently.
     #[cfg(test)]
     pub(crate) fn review_events(&self) -> Vec<ReviewEvent> {
+        self.review_events
+            .iter()
+            .filter_map(|(_, _, event)| match event {
+                CardEvent::Review(review) => Some(*review),
+                CardEvent::Import(_) => None,
+            })
+            .collect()
+    }
+
+    /// Every card-fold event (reviews and imported cards) in fold order.
+    #[cfg(test)]
+    pub(crate) fn card_events(&self) -> Vec<CardEvent> {
         self.review_events
             .iter()
             .map(|(_, _, event)| *event)
@@ -1675,7 +1785,7 @@ impl StrataStore {
             }
         };
         let last_log_seq = self.checkpoints.last().map_or(0, |head| head.log_seq);
-        let events: Vec<(u64, [u8; 32], ReviewEvent)> = self
+        let events: Vec<(u64, [u8; 32], CardEvent)> = self
             .review_events
             .iter()
             .filter(|(seq, _, _)| *seq <= last_log_seq)
@@ -1893,7 +2003,8 @@ impl StrataStore {
         &self.checkpoints
     }
 
-    /// Review events retained for verification, in fold order.
+    /// Card-fold events (reviews and imported v3 cards) retained for
+    /// verification, in fold order.
     pub fn review_event_count(&self) -> usize {
         self.review_events.len()
     }

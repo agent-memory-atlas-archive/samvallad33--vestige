@@ -19,7 +19,8 @@
 use std::path::Path;
 
 use strata_migrate::records::{
-    KIND_EDGE, KIND_MIGRATION_RECEIPT, KIND_NODE, KIND_TOMBSTONE, decode_receipt,
+    KIND_EDGE, KIND_FSRS_STATE, KIND_MIGRATION_RECEIPT, KIND_NODE, KIND_PARAMS, KIND_TOMBSTONE,
+    decode_params, decode_receipt,
 };
 
 use crate::pin;
@@ -66,6 +67,31 @@ fn expected_counts(
             count_of("sync_tombstones") + count_of("deletion_tombstones"),
         ),
     ]
+}
+
+/// `FSRS_STATE` frames a log must carry: one per `knowledge_nodes` row
+/// without an `fsrs_cards` row (`fsrs_cards.memory_id` is the primary key
+/// and the migrator refuses a card for an unknown memory), so
+/// `knowledge_nodes - fsrs_cards` by the receipt's source counts. `None`
+/// for a `v4-migrate/1` log (or one with no PARAMS frame): those predate
+/// the frame.
+fn expected_fsrs_states(
+    params_id: Option<&str>,
+    receipt: &strata_migrate::records::MigrationReceipt,
+) -> Option<u64> {
+    if !strata_migrate::params_carry_fsrs_states(params_id?) {
+        return None;
+    }
+    let count_of = |name: &str| -> u64 {
+        receipt
+            .body
+            .counts
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, c)| *c)
+            .unwrap_or(0)
+    };
+    Some(count_of("knowledge_nodes").saturating_sub(count_of("fsrs_cards")))
 }
 
 /// Verify a migrated log directory. See the module docs.
@@ -125,6 +151,21 @@ pub fn verify_migrated_log(dir: &Path) -> Result<MigrationVerifyReport, String> 
             ));
         }
     }
+    // v4-migrate/2: one imported FSRS card per memory without fsrs_cards.
+    let params_id = frames
+        .iter()
+        .find(|f| f.kind == KIND_PARAMS)
+        .and_then(|f| decode_params(&f.payload).ok())
+        .map(|params| params.params_id);
+    if let Some(expected) = expected_fsrs_states(params_id.as_deref(), &receipt) {
+        let actual = counts.get(&KIND_FSRS_STATE).copied().unwrap_or(0);
+        if actual != expected {
+            counts_match = false;
+            failures.push(format!(
+                "KIND_FSRS_STATE: log has {actual} frame(s), receipt implies {expected}"
+            ));
+        }
+    }
     // Every FSRS review event must carry a dense, in-range event_seq
     // (replayed by the migrator's kernel verify; here we check presence).
     if receipt.body.schema_version == 0 {
@@ -145,6 +186,41 @@ pub fn verify_migrated_log(dir: &Path) -> Result<MigrationVerifyReport, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `v4-migrate/2` expects one state per uncarded memory; a v1 log (or a
+    /// log without PARAMS) expects none, so older migrations still verify.
+    #[test]
+    fn fsrs_state_expectation_follows_the_params_set() {
+        use ed25519_dalek::SigningKey;
+        use strata_migrate::records::{MigrationReceipt, RECEIPT_SIGNING_KEY_ID, ReceiptBody};
+
+        let receipt = MigrationReceipt::seal(
+            ReceiptBody {
+                record_version: 1,
+                source_blake3_before: "ab".repeat(32),
+                source_blake3_after: "ab".repeat(32),
+                schema_version: 40,
+                envelope_head: String::new(),
+                counts: vec![
+                    ("fsrs_cards".to_string(), 2),
+                    ("knowledge_nodes".to_string(), 8902),
+                ],
+                dropped_columns: Vec::new(),
+                dropped_vectors: 0,
+                signing_key_id: RECEIPT_SIGNING_KEY_ID.to_string(),
+            },
+            &SigningKey::from_bytes(&[5u8; 32]),
+        );
+        assert_eq!(
+            expected_fsrs_states(Some(strata_migrate::PARAMS_ID), &receipt),
+            Some(8900)
+        );
+        assert_eq!(
+            expected_fsrs_states(Some(strata_migrate::PARAMS_ID_V1), &receipt),
+            None
+        );
+        assert_eq!(expected_fsrs_states(None, &receipt), None);
+    }
 
     /// The pure count comparison: a receipt that undercounts (the
     /// kill/re-run duplication the audit reproduced) fails here even when

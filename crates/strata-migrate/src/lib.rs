@@ -11,8 +11,10 @@
 //!
 //! | SQLite source                    | STRATA record                                  |
 //! |----------------------------------|------------------------------------------------|
-//! | `GENESIS` / `PARAMS v4-migrate/1`| provenance + parameter frames on a fresh log   |
+//! | `GENESIS` / `PARAMS v4-migrate/2`| provenance + parameter frames on a fresh log   |
 //! | `knowledge_nodes` rows           | `NODE` frames (kernel_id v1 + legacy UUID)      |
+//! | `knowledge_nodes` FSRS columns   | `FSRS_STATE` frames, one per row with no        |
+//! |                                  | `fsrs_cards` row (see FSRS state below)         |
 //! | V40 `walk_receipts` rows         | reference `NODE` frames tagged migrated_from_v4 |
 //! | `knowledge_nodes.superseded_by`  | `SUPERSESSION` frames                           |
 //! | `memory_connections` rows        | `EDGE` frames (declared 8-type vocabulary;      |
@@ -46,11 +48,12 @@
 //!
 //! ## FSRS fold semantics (read before relying on it)
 //!
-//! SQLite stores only FINAL FSRS state (`reps`, `lapses`, floats) — the
-//! review history that produced it is gone. Migration therefore synthesizes
-//! a deterministic event series per card: `reps - lapses` rating-3 (good)
-//! events followed by `lapses` rating-1 (again) events. The kernel fold
-//! reproduces `review_count == reps` and `lapse_count == lapses` EXACTLY;
+//! An `fsrs_cards` row stores only FINAL FSRS state (`reps`, `lapses`,
+//! floats) — the review history that produced it is gone. Migration
+//! therefore synthesizes a deterministic event series per card:
+//! `reps - lapses` rating-3 (good) events followed by `lapses` rating-1
+//! (again) events. The kernel fold reproduces `review_count == reps` and
+//! `lapse_count == lapses` EXACTLY;
 //! stability/difficulty are recomputed by the deterministic fold and become
 //! the new truth (the legacy floats were not reproducible from any log).
 //!
@@ -66,6 +69,28 @@
 //! empty, or missing. The kernel `ReviewEvent` prefix is unchanged, so
 //! checkpoint hashes stay valid. Retrievability uses this clock instead of
 //! the import-time frame seq.
+//!
+//! ## FSRS state from `knowledge_nodes` (read before relying on it)
+//!
+//! Real v3 stores leave `fsrs_cards` empty. Scheduling lives on
+//! `knowledge_nodes` (`stability`, `difficulty`, `reps`, `lapses`,
+//! `learning_state`, `last_accessed`, `sentiment_magnitude`), and v3 raised
+//! stability on access without counting a review, so almost every row has
+//! `reps = 0`. A rating series would carry nothing for those rows. Every
+//! `knowledge_nodes` row without an `fsrs_cards` row therefore gets one
+//! `FSRS_STATE` frame ([`FsrsStateRecord`]) carrying the card itself.
+//!
+//! v3 computed retrievability as `vestige_core::fsrs::retrievability_with_decay`
+//! over `stability * (1 + 0.5 * sentiment_magnitude)` and the days since
+//! `last_accessed`, with the store's personalized `fsrs_config.w20` (default
+//! [`vestige_core::fsrs::DEFAULT_DECAY`]). Strata's pinned curve decays at a
+//! different rate, so the importer refits stability: at the fit clock (the
+//! latest `knowledge_nodes` timestamp in the source, or one day after the
+//! row's `last_accessed` when that is later), Strata's retrievability for the
+//! card equals v3's for the same row. The clock comes from the source, never
+//! the wall clock, so the frame depends only on the source. After the fit,
+//! the card decays on Strata's curve. `reps`, `lapses`, and `difficulty`
+//! carry over, and the last review clock is `last_accessed`.
 //!
 //! ## Determinism
 //!
@@ -106,15 +131,28 @@ use vestige_core::storage::PortableArchive;
 use vestige_core::storage::PortableValue;
 
 pub use records::{
-    EdgeRecord, GenesisRecord, MigrationReceipt, NodeRecord, ParamsRecord, ReceiptBody, SourceKey,
-    SupersessionRecord, TombstoneRecord, KIND_MIGRATION_RECEIPT, RECEIPT_SIGNING_KEY_ID,
-    RECORD_VERSION,
+    EdgeRecord, FsrsStateRecord, GenesisRecord, MigrationReceipt, NodeRecord, ParamsRecord,
+    ReceiptBody, SourceKey, SupersessionRecord, TombstoneRecord, KIND_FSRS_STATE,
+    KIND_MIGRATION_RECEIPT, RECEIPT_SIGNING_KEY_ID, RECORD_VERSION,
 };
 pub use snapshot::{read_snapshot, Snapshot};
 
 /// Parameter set implemented by this migrator. Written as the `PARAMS`
-/// frame on a fresh log.
-pub const PARAMS_ID: &str = "v4-migrate/1";
+/// frame on a fresh log. `v4-migrate/2` adds `FSRS_STATE` frames.
+pub const PARAMS_ID: &str = "v4-migrate/2";
+
+/// The first parameter set. Its logs carry no `FSRS_STATE` frames.
+pub const PARAMS_ID_V1: &str = "v4-migrate/1";
+
+/// Whether a log written under `params_id` carries one `FSRS_STATE` frame
+/// per `knowledge_nodes` row without an `fsrs_cards` row.
+pub fn params_carry_fsrs_states(params_id: &str) -> bool {
+    params_id != PARAMS_ID_V1
+}
+
+/// Algorithm version the `FSRS_STATE` stability fit targets: the version
+/// strata-store folds reviews and derives retrievability under.
+pub const FSRS_STATE_ALGO: u32 = strata_kernel::fsrs::ALGO_V2;
 
 /// Frames per `append_batch` call: bounds peak memory on huge stores while
 /// staying far above the log's own 64-frame group-commit cap.
@@ -328,6 +366,8 @@ pub struct MigrationReport {
     pub verify_passed: bool,
     /// `node_embeddings` rows whose vector values were never read.
     pub dropped_vectors: u64,
+    /// FSRS_STATE frames: `knowledge_nodes` rows with no `fsrs_cards` row.
+    pub fsrs_states: u64,
     /// Last verified `receipt_envelopes` entry digest (empty = none).
     pub envelope_head: String,
     /// BLAKE3 hex of the source files (identical before and after; the run
@@ -868,6 +908,7 @@ fn idempotent_report(
         skipped_tables: skipped_tables_for(snapshot),
         verify_passed: true,
         dropped_vectors: snapshot.dropped_vectors,
+        fsrs_states: planned_fsrs_states(&snapshot.archive),
         envelope_head: snapshot.envelope_head.clone().unwrap_or_default(),
         source_blake3: receipt.body.source_blake3_before.clone(),
         receipt_digest: Some(hex32(&receipt.checksum)),
@@ -918,6 +959,7 @@ fn dry_run_report(
         // the read, so reaching this point means the chain held.
         verify_passed: true,
         dropped_vectors: snapshot.dropped_vectors,
+        fsrs_states: planned_fsrs_states(&snapshot.archive),
         envelope_head: snapshot.envelope_head.clone().unwrap_or_default(),
         source_blake3: source_blake3.to_string(),
         receipt_digest: None,
@@ -952,6 +994,7 @@ struct ReplayOutcome {
     nodes: u64,
     edges: u64,
     fsrs_events: u64,
+    fsrs_states: u64,
     /// Hash of the last fold checkpoint (the replay anchor), or `[0; 32]`
     /// when the log carries no checkpoint.
     anchor: [u8; 32],
@@ -1055,6 +1098,14 @@ fn migrate_snapshot_into(
             }
         }
     }
+
+    // ---- knowledge_nodes scheduling columns -> imported card states ------
+    // Rows with an fsrs_cards row already have a rating series above.
+    let mut fsrs_states = 0u64;
+    for record in extract_fsrs_states(archive, &node_records)? {
+        writer.push(records::KIND_FSRS_STATE, borsh::to_vec(&record))?;
+        fsrs_states += 1;
+    }
     writer.flush()?;
 
     // ---- fold + checkpoint ------------------------------------------------
@@ -1093,6 +1144,7 @@ fn migrate_snapshot_into(
         nodes,
         edges,
         fsrs_events,
+        fsrs_states,
         anchor,
     })
 }
@@ -1162,6 +1214,7 @@ fn finish(
         skipped_tables: skipped_tables_for(&snapshot),
         verify_passed,
         dropped_vectors: snapshot.dropped_vectors,
+        fsrs_states: outcome.fsrs_states,
         envelope_head: snapshot.envelope_head.unwrap_or_default(),
         source_blake3: source_blake3.to_string(),
         receipt_digest: Some(hex32(&receipt.checksum)),
@@ -1336,6 +1389,203 @@ fn attach_fsrs_legacy(
         }
     }
     Ok(())
+}
+
+/// One day in unix milliseconds (Strata measures review age in whole days).
+#[cfg(feature = "sqlite-reader")]
+const DAY_MS: i64 = 86_400_000;
+
+/// v3 `apply_decay` stretched stability for emotional memories:
+/// `stability * (1 + sentiment_magnitude * 0.5)`.
+#[cfg(feature = "sqlite-reader")]
+const V3_SENTIMENT_STABILITY_BOOST: f64 = 0.5;
+
+/// Memory ids that have an `fsrs_cards` row (and so a rating series).
+#[cfg(feature = "sqlite-reader")]
+fn carded_memory_ids(
+    archive: &PortableArchive,
+) -> Result<std::collections::HashSet<String>, MigrationError> {
+    let mut ids = std::collections::HashSet::new();
+    if let Some(table) = source::table(archive, "fsrs_cards") {
+        for index in 0..table.rows.len() {
+            ids.insert(
+                source::Row::new(table, index)
+                    .text("memory_id")?
+                    .to_string(),
+            );
+        }
+    }
+    Ok(ids)
+}
+
+/// `FSRS_STATE` frames a run over this archive appends: `knowledge_nodes`
+/// rows without an `fsrs_cards` row. Used by the dry-run and idempotent
+/// reports, which write nothing.
+#[cfg(feature = "sqlite-reader")]
+fn planned_fsrs_states(archive: &PortableArchive) -> u64 {
+    let Some(table) = source::table(archive, "knowledge_nodes") else {
+        return 0;
+    };
+    let carded = carded_memory_ids(archive).unwrap_or_default();
+    (0..table.rows.len())
+        .filter(|index| {
+            source::Row::new(table, *index)
+                .text("id")
+                .is_ok_and(|id| !carded.contains(id))
+        })
+        .count() as u64
+}
+
+/// v3's forgetting-curve decay: `fsrs_config.w20` when set to a positive
+/// finite number, else `vestige_core::fsrs::DEFAULT_DECAY` (what v3's
+/// `apply_decay` fell back to).
+#[cfg(feature = "sqlite-reader")]
+fn v3_decay(archive: &PortableArchive) -> f64 {
+    let default = vestige_core::fsrs::DEFAULT_DECAY;
+    let Some(table) = source::table(archive, "fsrs_config") else {
+        return default;
+    };
+    (0..table.rows.len())
+        .map(|index| source::Row::new(table, index))
+        .find(|row| row.text("key").is_ok_and(|key| key == "w20"))
+        .and_then(|row| row.get("value").ok().and_then(portable_f64))
+        .filter(|w20| w20.is_finite() && *w20 > 0.0)
+        .unwrap_or(default)
+}
+
+/// A numeric SQLite value. v3 columns are dynamically typed, so a numeric
+/// string also counts. NULL, blobs, and other text are `None`.
+#[cfg(feature = "sqlite-reader")]
+fn portable_f64(value: &PortableValue) -> Option<f64> {
+    match value {
+        PortableValue::Real(v) => Some(*v),
+        PortableValue::Integer(v) => Some(*v as f64),
+        PortableValue::Text(text) => text.trim().parse().ok(),
+        PortableValue::Null | PortableValue::Blob(_) => None,
+    }
+}
+
+/// Scheduling column as `f64`. A missing column, NULL, non-number, or
+/// non-finite value reads as v3's column default: these are scheduling
+/// metadata, and one bad float should not stop the whole upgrade.
+#[cfg(feature = "sqlite-reader")]
+fn fsrs_column(row: &source::Row<'_>, name: &str, default: f64) -> f64 {
+    if !row.columns().iter().any(|column| column == name) {
+        return default;
+    }
+    row.get(name)
+        .ok()
+        .and_then(portable_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+}
+
+/// v3 `learning_state` as a kernel phase. The kernel has no `new` phase;
+/// a never-reviewed card is `Learning`.
+#[cfg(feature = "sqlite-reader")]
+fn v3_phase(row: &source::Row<'_>) -> strata_kernel::fsrs::CardPhase {
+    use strata_kernel::fsrs::CardPhase;
+    let state = if row.columns().iter().any(|c| c == "learning_state") {
+        row.opt_text("learning_state").ok().flatten().unwrap_or("")
+    } else {
+        ""
+    };
+    match state.trim().to_ascii_lowercase().as_str() {
+        "review" => CardPhase::Review,
+        "relearning" => CardPhase::Relearning,
+        _ => CardPhase::Learning,
+    }
+}
+
+/// One `FSRS_STATE` record per `knowledge_nodes` row without an
+/// `fsrs_cards` row, in source row order. See the crate docs.
+///
+/// `node_records[i]` must be row `i` of `knowledge_nodes`, as
+/// [`extract_nodes`] builds it.
+#[cfg(feature = "sqlite-reader")]
+fn extract_fsrs_states(
+    archive: &PortableArchive,
+    node_records: &[NodeRecord],
+) -> Result<Vec<FsrsStateRecord>, MigrationError> {
+    use strata_kernel::canonical::to_q32_32;
+    use strata_kernel::fsrs::{FsrsFold, D_MAX, D_MIN};
+
+    let Some(table) = source::table(archive, "knowledge_nodes") else {
+        return Ok(Vec::new());
+    };
+    if node_records.len() != table.rows.len() {
+        return Err(MigrationError::Corrupt(format!(
+            "knowledge_nodes has {} rows but {} node records",
+            table.rows.len(),
+            node_records.len()
+        )));
+    }
+    let carded = carded_memory_ids(archive)?;
+    let w20 = v3_decay(archive);
+    // The source's own "now": its latest node timestamp.
+    let source_clock = node_records
+        .iter()
+        .map(|node| {
+            node.created_ms
+                .max(node.updated_ms)
+                .max(node.last_accessed_ms)
+        })
+        .max()
+        .unwrap_or(0);
+
+    let mut records = Vec::new();
+    for (index, node) in node_records.iter().enumerate() {
+        let row = source::Row::new(table, index);
+        if row.text("id")? != node.legacy_id {
+            return Err(MigrationError::Corrupt(format!(
+                "knowledge_nodes row {index} is not node {}",
+                node.legacy_id
+            )));
+        }
+        if carded.contains(&node.legacy_id) {
+            continue;
+        }
+        let stability = fsrs_column(&row, "stability", 1.0);
+        let difficulty = fsrs_column(&row, "difficulty", 5.0);
+        let sentiment = fsrs_column(&row, "sentiment_magnitude", 0.0);
+        let reps = (fsrs_column(&row, "reps", 0.0) as i64).clamp(0, i64::from(u32::MAX));
+        let lapses = (fsrs_column(&row, "lapses", 0.0) as i64).clamp(0, reps);
+
+        // Fit at the source clock, or one day after the last access when
+        // that is later: Strata measures whole days, and a card younger
+        // than a day reads 1.0 whatever its stability.
+        let reviewed_at_ms = node.last_accessed_ms;
+        let fitted_at_ms = source_clock.max(reviewed_at_ms.saturating_add(DAY_MS));
+        let elapsed_ms = fitted_at_ms.saturating_sub(reviewed_at_ms);
+        // v3: (now - last_accessed).num_seconds() / 86400.
+        let v3_days = (elapsed_ms / 1000) as f64 / 86_400.0;
+        let v3_retrievability = vestige_core::fsrs::retrievability_with_decay(
+            stability * (1.0 + sentiment * V3_SENTIMENT_STABILITY_BOOST),
+            v3_days,
+            w20,
+        );
+        let whole_days = FsrsFold::elapsed_review_days(reviewed_at_ms, fitted_at_ms);
+        let fitted =
+            FsrsFold::stability_for_retrievability(v3_retrievability, whole_days, FSRS_STATE_ALGO)
+                .map_err(|e| MigrationError::Kernel(e.to_string()))?;
+
+        records.push(FsrsStateRecord {
+            record_version: RECORD_VERSION,
+            kernel_id: node.kernel_id,
+            legacy_id: node.legacy_id.clone(),
+            algo_version: FSRS_STATE_ALGO,
+            stability_q: to_q32_32(fitted),
+            difficulty_q: to_q32_32(difficulty.clamp(D_MIN, D_MAX)),
+            review_count: reps as u32,
+            lapse_count: lapses as u32,
+            phase: v3_phase(&row),
+            reviewed_at_ms,
+            v3_retrievability_q: to_q32_32(v3_retrievability),
+            v3_decay_q: to_q32_32(w20),
+            fitted_at_ms,
+        });
+    }
+    Ok(records)
 }
 
 /// V40 `walk_receipts` rows become reference nodes tagged `migrated_from_v4`
@@ -1788,6 +2038,88 @@ mod tests {
         );
         assert_eq!(source::parse_tags(Some("null")), Vec::<String>::new());
         assert_eq!(source::parse_tags(Some("{broken")), Vec::<String>::new());
+    }
+
+    #[cfg(feature = "sqlite-reader")]
+    fn portable_table(
+        name: &str,
+        columns: &[&str],
+        rows: Vec<Vec<PortableValue>>,
+    ) -> PortableArchive {
+        PortableArchive {
+            archive_format: source::PORTABLE_ARCHIVE_FORMAT.to_string(),
+            vestige_version: "3.1.1".to_string(),
+            schema_version: 40,
+            exported_at: chrono::Utc::now(),
+            mode: "exact".to_string(),
+            tables: vec![vestige_core::storage::PortableTable {
+                name: name.to_string(),
+                columns: columns.iter().map(|c| c.to_string()).collect(),
+                rows,
+            }],
+        }
+    }
+
+    #[cfg(feature = "sqlite-reader")]
+    #[test]
+    fn scheduling_columns_read_tolerantly_with_v3_defaults() {
+        use PortableValue::{Blob, Integer, Null, Real, Text};
+        let archive = portable_table(
+            "knowledge_nodes",
+            &["stability", "reps", "learning_state"],
+            vec![
+                vec![Real(2.5), Integer(4), Text("review".into())],
+                vec![Text(" 7.25 ".into()), Real(2.0), Text("Relearning".into())],
+                vec![Null, Null, Null],
+                vec![Real(f64::NAN), Text("x".into()), Text("new".into())],
+                vec![Blob("00".into()), Integer(1), Text("learning".into())],
+            ],
+        );
+        let table = &archive.tables[0];
+        let read = |index: usize| {
+            let row = source::Row::new(table, index);
+            (
+                fsrs_column(&row, "stability", 1.0),
+                fsrs_column(&row, "reps", 0.0),
+                fsrs_column(&row, "difficulty", 5.0),
+                v3_phase(&row),
+            )
+        };
+        use strata_kernel::fsrs::CardPhase::{Learning, Relearning, Review};
+        assert_eq!(read(0), (2.5, 4.0, 5.0, Review));
+        assert_eq!(read(1), (7.25, 2.0, 5.0, Relearning));
+        assert_eq!(read(2), (1.0, 0.0, 5.0, Learning));
+        assert_eq!(read(3), (1.0, 0.0, 5.0, Learning));
+        assert_eq!(read(4), (1.0, 1.0, 5.0, Learning));
+    }
+
+    #[cfg(feature = "sqlite-reader")]
+    #[test]
+    fn v3_decay_reads_w20_or_falls_back_to_the_v3_default() {
+        use PortableValue::{Real, Text};
+        let config = |value: PortableValue| {
+            portable_table(
+                "fsrs_config",
+                &["key", "value", "updated_at"],
+                vec![
+                    vec![Text("w17".into()), Real(9.0), Text(String::new())],
+                    vec![Text("w20".into()), value, Text(String::new())],
+                ],
+            )
+        };
+        assert_eq!(v3_decay(&config(Real(0.0803))), 0.0803);
+        assert_eq!(v3_decay(&config(Text("0.2".into()))), 0.2);
+        let default = vestige_core::fsrs::DEFAULT_DECAY;
+        assert_eq!(v3_decay(&config(Real(0.0))), default);
+        assert_eq!(v3_decay(&config(Real(-1.0))), default);
+        assert_eq!(v3_decay(&config(PortableValue::Null)), default);
+        assert_eq!(v3_decay(&portable_table("other", &[], Vec::new())), default);
+    }
+
+    #[test]
+    fn params_v1_logs_carry_no_fsrs_states() {
+        assert!(!params_carry_fsrs_states(PARAMS_ID_V1));
+        assert!(params_carry_fsrs_states(PARAMS_ID));
     }
 
     #[test]
