@@ -105,6 +105,8 @@ Nothing leaves the machine by default. A default 4.0 build has no embedding mode
 <a id="upgrading-from-v3"></a>
 ## Upgrading from v3
 
+Quit every app that runs Vestige v3 (each agent, the dashboard, any background job), point all of them at the 4.0 `vestige-mcp`, and start them again. A v3 server left running keeps writing to `vestige.db`, which 4.0 no longer reads after the upgrade.
+
 Point 4.0 at your existing data directory. The first launch finds `vestige.db`, builds a Strata log from it next to the file, verifies that log against a signed migration receipt, and only then publishes it as `log/`. The v3 file is never modified. A backup copy is written first, owner-only.
 
 What carries over: every memory with its scope, tags and scheduling state; links; supersession; suppression (suppressed memories stay hidden); intentions; and code anchors. Links v3 inferred by similarity come across as `legacy_inferred` history. They are kept, and they never count as recorded evidence.
