@@ -5,7 +5,24 @@ All notable changes to Vestige will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [4.0.0] - Unreleased
+## [Unreleased]
+
+### Added
+
+- **GhostLink on the Strata log.** `ghostlink` replaces `graph` in `tools/list` (the catalog stays at 16 tools; `graph` still answers as a hidden alias). It proposes memory pairs that were never composed, and every pair carries its proof from recorded structure only: no text, tag-name or vector similarity is used to admit, rank or explain anything.
+  - `propose` with lens `bridge` (default): pairs within three undirected hops over recorded `touched`, `derived_from` or `closed_by` edges, never woven, scored by hop proximity, composition novelty, retention and prior outcomes. Each pair carries its shortest typed path.
+  - `propose` with lens `divergent`: pairs no recorded edge of any kind joins. `Path_min` walks every recorded edge (migrated `legacy_inferred` edges can only shorten it, so they only ever dampen), divergence is measured on typed neighbor ids only, and a pair whose members have no typed profile is a forced juxtaposition with no score, picked by a deterministic sampler that shows each memory at most once per page.
+  - An empty proposal says why, with counts.
+  - `weave` records what a tested pair showed: a composition record and two `derived_from` edges, each through the gate with its receipt. The pair leaves both lenses, and its members gain typed profiles.
+  - `inspect` reads woven compositions (`recent`, `get`, `memory`, `neighbors`).
+  - `harden` seeds invariant laws from `<data-dir>/ghostlink-laws.json`, then `~/.vestige/ghostlink-laws.json`, then six built-in laws. It is idempotent by law id, reports seeded, already present and failed counts, and names a malformed laws file instead of skipping it.
+- `vestige compose --lens bridge|divergent` runs the same engine from the terminal.
+
+### Fixed
+
+- On a Strata log, `graph never_composed` listed unlinked pairs in memory-id order with every score at 0. It now runs the GhostLink bridge lens.
+
+## [4.0.0] - 2026-09-30
 
 Vestige 4.0 moves your memory onto Strata, an append-only signed log on your
 machine. Every write goes through a gate and leaves a receipt, every read

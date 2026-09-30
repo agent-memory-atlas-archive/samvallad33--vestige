@@ -44,11 +44,11 @@ fn build_instructions() -> String {
     let mut instructions = if mode.eq_ignore_ascii_case("full") {
         "Vestige is your long-term cognitive memory AND reasoning engine, not a RAG database. \
          Every retrieval MUST be composed into a recommendation, never summarized.\
-         \n\nCOMPOSITION MANDATE: When you receive memories from recall or graph, your response MUST follow this shape. \
+         \n\nCOMPOSITION MANDATE: When you receive memories from recall or ghostlink, your response MUST follow this shape. \
          (a) Composing: [memory IDs], followed by a brief composition rationale \
          about how the memories relate, NOT a restatement of their contents). \
-         (b) Never-composed detected: list combinations of retrieved memories that share \
-         tags/topics but have never been referenced together, or write 'None.' \
+         (b) Never-composed detected: list pairs ghostlink(mode='propose') proves from recorded \
+         edges (bridge) or forces with no recorded relation (divergent), or write 'None.' \
          (c) Recommendation: what the user should DO, as a concrete executable action. \
          If your draft begins 'Memory A says X. Memory B says Y.' STOP and rewrite.\
          \n\nBLOCKING PHRASE: If retrieved high-trust memories (retention > 0.7, reps > 0) \
@@ -65,6 +65,7 @@ fn build_instructions() -> String {
             .to_string()
     };
     instructions.push_str("\nIn a codebase, save durable conventions and design decisions with codebase(action='remember_pattern'|'remember_decision', files=['path.rs#symbol']); anchored code memories self-check against the source and are flagged when the code drifts.");
+    instructions.push_str("\nghostlink(mode='propose') surfaces never-composed memory pairs from recorded edges, each with its proof; record what a tested pair showed with mode='weave'.");
     instructions.push_str("\nDiscover all available actions with memory_status(view='tools'); pass tool='<name>' for its exact schema. Choose calls that serve the task; no tool-call quota is required.");
     instructions
 }
@@ -289,26 +290,6 @@ const STRATA_WITHHELD_ACTIONS: &[(&str, &str, Option<&str>)] = &[
         Some("the Strata log has no protect flag yet"),
     ),
     (
-        "graph",
-        "get",
-        Some("composition events are not recorded on a Strata log"),
-    ),
-    (
-        "graph",
-        "memory",
-        Some("composition events are not recorded on a Strata log"),
-    ),
-    (
-        "graph",
-        "neighbors",
-        Some("composition events are not recorded on a Strata log"),
-    ),
-    (
-        "graph",
-        "label",
-        Some("composition events are not recorded on a Strata log"),
-    ),
-    (
         "receipt",
         "save_walk",
         Some("walk receipts are not recorded on a Strata log yet"),
@@ -324,11 +305,44 @@ const STRATA_WITHHELD_ACTIONS: &[(&str, &str, Option<&str>)] = &[
 
 /// The refusal for a call a Strata log withholds in 4.0, or `None`.
 fn strata_withheld_call(tool: &str, arguments: Option<&serde_json::Value>) -> Option<String> {
+    withheld_call_in(STRATA_WITHHELD_ACTIONS, tool, arguments)
+}
+
+/// `ghostlink` is keyed by `mode` (+ `view` / `kind`), `graph` and
+/// `composed_graph` by `action`: all three resolve to one graph action, so a
+/// `("graph", action)` row withholds the same call on every surface.
+fn graph_family_action(tool: &str, arguments: Option<&serde_json::Value>) -> Option<String> {
+    match tool {
+        "ghostlink" => tools::ghostlink::graph_action_for(arguments),
+        "graph" | "composed_graph" => arguments
+            .and_then(|args| args.get("action"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+fn withheld_call_in(
+    table: &[(&str, &str, Option<&str>)],
+    tool: &str,
+    arguments: Option<&serde_json::Value>,
+) -> Option<String> {
     let field = |name: &str| {
         arguments
             .and_then(|args| args.get(name))
             .and_then(|value| value.as_str())
     };
+    if let Some(action) = graph_family_action(tool, arguments) {
+        let (_, _, why) = table
+            .iter()
+            .find(|(name, withheld, _)| *name == "graph" && *withheld == action)?;
+        return Some(match why {
+            None => crate::strata_memory::withheld_message(&format!("{tool} '{action}'")),
+            Some(why) => format!(
+                "unavailable_in_4_0: {tool} '{action}' is not available on Strata in Vestige 4.0: {why}."
+            ),
+        });
+    }
     if STRATA_WITHHELD_TOOLS.contains(&tool) {
         return Some(crate::strata_memory::withheld_message(tool));
     }
@@ -346,7 +360,7 @@ fn strata_withheld_call(tool: &str, arguments: Option<&serde_json::Value>) -> Op
             "unavailable_in_4_0: maintain export format 'portable' is not written from a Strata log yet; use format 'json' or 'jsonl'.".to_string(),
         );
     }
-    let (_, _, why) = STRATA_WITHHELD_ACTIONS
+    let (_, _, why) = table
         .iter()
         .find(|(name, withheld, _)| *name == tool && *withheld == action)?;
     Some(match why {
@@ -389,7 +403,54 @@ fn withhold_on_strata(tools: &mut Vec<ToolDescription>) {
 
 /// Remove withheld selector values from one tool's schema; returns them.
 fn strip_withheld_actions(tool: &str, schema: &mut serde_json::Value) -> Vec<&'static str> {
-    let withheld: Vec<&'static str> = STRATA_WITHHELD_ACTIONS
+    strip_withheld_in(STRATA_WITHHELD_ACTIONS, tool, schema)
+}
+
+fn strip_withheld_in(
+    table: &[(&str, &'static str, Option<&str>)],
+    tool: &str,
+    schema: &mut serde_json::Value,
+) -> Vec<&'static str> {
+    if tool == "ghostlink" {
+        // Mode, view and kind values whose graph action a row withholds.
+        let withheld: Vec<&'static str> = table
+            .iter()
+            .filter(|(name, _, _)| *name == "graph")
+            .map(|(_, action, _)| *action)
+            .collect();
+        let mut removed = Vec::new();
+        for (selector, pointer) in [
+            ("mode", "/properties/mode/enum"),
+            ("view", "/properties/view/enum"),
+            ("kind", "/properties/kind/enum"),
+        ] {
+            if let Some(values) = schema.pointer_mut(pointer).and_then(|v| v.as_array_mut()) {
+                values.retain(|value| {
+                    let Some(value) = value.as_str() else {
+                        return true;
+                    };
+                    // A mode maps to one action (inspect / explore defer to
+                    // their view / kind); a view or kind is the action.
+                    let action = if selector == "mode" {
+                        tools::ghostlink::graph_action_for(Some(
+                            &serde_json::json!({ "mode": value }),
+                        ))
+                    } else {
+                        Some(value.to_string())
+                    };
+                    match action.and_then(|a| withheld.iter().find(|w| **w == a).copied()) {
+                        Some(hit) => {
+                            removed.push(hit);
+                            false
+                        }
+                        None => true,
+                    }
+                });
+            }
+        }
+        return removed;
+    }
+    let withheld: Vec<&'static str> = table
         .iter()
         .filter(|(name, _, _)| *name == tool)
         .map(|(_, action, _)| *action)
@@ -1155,22 +1216,24 @@ description: Some("Duplicates, merges, supersession, exact tag maintenance. Acti
             // (dream folded into `maintain` action='dream' in v2.2)
             // ================================================================
             // ================================================================
-            // GRAPH — unified graph/association/prediction tool (v2.2)
-            // Folds explore_connections + predict + memory_graph + composed_graph.
+            // GHOSTLINK — the composition surface (4.0). Replaces the
+            // advertised `graph` tool, which stays a hidden alias. Every
+            // candidate carries its proof from recorded structure only.
             // ================================================================
             ToolDescription {
-                name: "graph".to_string(),
-                title: Some("Graph".to_string()),
-                // Every graph action reads, except 'label', which records a
-                // composition outcome. One write makes the tool not read-only.
+                name: "ghostlink".to_string(),
+                title: Some("GhostLink".to_string()),
+                // Reads, except 'weave' and 'harden', which write through the
+                // gate with receipts: not read-only, not destructive, and not
+                // idempotent (a re-weave appends a record).
                 annotations: Some(ToolAnnotations {
                     read_only_hint: false,
                     destructive_hint: false,
                     idempotent_hint: false,
                     open_world_hint: false,
                 }),
-description: Some("Memory graph: 'chain', 'associations', 'bridges', 'predict', 'memory_graph', composition topology ('recent', 'get', 'memory', 'neighbors', 'never_composed', 'bounty_mode'), 'label' (the only write).".to_string()),
-                input_schema: tools::compact::of(&tools::graph_unified::schema()),
+description: Some("Never-composed memory pairs with proofs from recorded edges only (no text or vector similarity). Modes: propose (lens bridge|divergent), bounty, weave (write), map, inspect, explore, predict, harden (write).".to_string()),
+                input_schema: tools::compact::of(&tools::ghostlink::schema()),
                 ..Default::default()
             },
             // ================================================================
@@ -1333,7 +1396,10 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
                 "dedup" => Some(150_000),
                 // v2.2: graph action='memory_graph' (force-directed layout) and
                 // 'bounty_mode' pagination can both produce large payloads.
-                "graph" => Some(250_000),
+                // 4.0: ghostlink carries the same payloads (map, bounty,
+                // proofs on every candidate); the hidden graph alias keeps
+                // its entry.
+                "ghostlink" | "graph" => Some(250_000),
                 _ => None,
             };
             if let Some(n) = max_chars {
@@ -2423,7 +2489,16 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
             // ================================================================
             // GRAPH — unified graph/association/prediction tool (v2.2)
             // ================================================================
+            "ghostlink" => {
+                tools::ghostlink::execute(&self.storage, &self.cognitive, request.arguments).await
+            }
+            // DEPRECATED (4.0): renamed to `ghostlink`. Hidden alias: still
+            // dispatches, and on a Strata log each action runs the matching
+            // GhostLink mode, so the two cannot disagree.
             "graph" => {
+                warn!(
+                    "Tool 'graph' is deprecated in 4.0. Use 'ghostlink' (modes: propose|bounty|weave|map|inspect|explore|predict|harden)."
+                );
                 tools::graph_unified::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
             }
@@ -4872,8 +4947,10 @@ mod tests {
         // Graph — unified `graph` tool (v2.2). explore_connections + predict +
         // memory_graph + composed_graph folded in; old names dispatch as hidden
         // aliases but are off the advertised list. (memory_health → memory_status.)
-        assert!(tool_names.contains(&"graph"));
+        // 4.0: `ghostlink` is advertised and `graph` is a hidden alias.
+        assert!(tool_names.contains(&"ghostlink"));
         for old in [
+            "graph",
             "explore_connections",
             "predict",
             "memory_graph",
@@ -4997,6 +5074,15 @@ mod tests {
             ("graph", serde_json::json!({"action": "memory_graph"})),
             ("graph", serde_json::json!({"action": "recent"})),
             ("graph", serde_json::json!({"action": "never_composed"})),
+            // 4.0: the advertised GhostLink modes.
+            ("ghostlink", serde_json::json!({"mode": "predict"})),
+            ("ghostlink", serde_json::json!({"mode": "map"})),
+            (
+                "ghostlink",
+                serde_json::json!({"mode": "inspect", "view": "recent"}),
+            ),
+            ("ghostlink", serde_json::json!({"mode": "propose"})),
+            ("ghostlink", serde_json::json!({"mode": "bounty"})),
         ];
 
         for (name, args) in calls {
@@ -5552,7 +5638,8 @@ mod tests {
             // v2.2: dedup action='scan' returns clusters + candidates + policy.
             "dedup" => Some(150_000),
             // v2.2: graph memory_graph layout + bounty_mode pagination.
-            "graph" => Some(250_000),
+            // 4.0: advertised as ghostlink; the graph alias keeps the cap.
+            "ghostlink" | "graph" => Some(250_000),
             _ => None,
         }
     }
@@ -5574,7 +5661,7 @@ mod tests {
             "memory",
             "codebase",
             "dedup",
-            "graph",
+            "ghostlink",
         ] {
             let tool = tools
                 .iter()

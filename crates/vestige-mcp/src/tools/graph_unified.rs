@@ -16,6 +16,10 @@
 //! the underlying arg structs use `deny_unknown_fields`, so unrelated fields are
 //! ignored. All actions are read-only EXCEPT `label`, which writes a composition
 //! outcome (the one mutator) and is logged for audit.
+//!
+//! Deprecated in 4.0: `ghostlink` is the advertised surface and `graph` a
+//! hidden alias. On a Strata log each action runs the matching GhostLink
+//! mode (see `tools::ghostlink::mode_for_graph_action`).
 
 use serde_json::Value;
 use std::sync::Arc;
@@ -89,6 +93,11 @@ pub async fn execute(
             .is_some_and(|a| a.get("scope").is_some() || a.get("includeCrossScope").is_some())
     {
         return Err("scope and includeCrossScope currently apply only to never_composed".into());
+    }
+    // 4.0: on a Strata log every graph action is the matching GhostLink
+    // mode, answered by the same recorded-structure engine.
+    if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        return super::ghostlink::execute_graph_action_on_strata(storage, &action, args).await;
     }
     match action.as_str() {
         // explore_connections — re-reads its own `action` (chain/associations/bridges).

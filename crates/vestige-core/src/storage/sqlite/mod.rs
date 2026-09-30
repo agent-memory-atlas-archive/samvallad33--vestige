@@ -987,23 +987,28 @@ impl SqliteMemoryStore {
                 let shared_tags = Self::shared_tags(&a.tags, &b.tags);
                 let shared_terms = Self::shared_content_terms(&a.content, &b.content, 8);
                 let boundary_tags = Self::boundary_tags_for_pair(&a.tags, &b.tags);
-                let trust_score =
-                    ((a.retention_strength + b.retention_strength) / 2.0).clamp(0.0, 1.0);
-                let degree_a = composition_degrees.get(&a.id).copied().unwrap_or(0) as f64;
-                let degree_b = composition_degrees.get(&b.id).copied().unwrap_or(0) as f64;
-                let novelty_score = ((1.0 / (1.0 + degree_a)) + (1.0 / (1.0 + degree_b))) / 2.0;
-                // proximity from the causal graph replaces the old anchor score:
-                // closer hops rank higher, purely structural
-                let bridge_score = 1.0 / hops as f64;
-                let anchor_score = 1.5 + bridge_score;
+                let trust_score = crate::composition::composition_trust(
+                    a.retention_strength,
+                    b.retention_strength,
+                );
+                let degree_a = composition_degrees.get(&a.id).copied().unwrap_or(0).max(0) as usize;
+                let degree_b = composition_degrees.get(&b.id).copied().unwrap_or(0).max(0) as usize;
+                let novelty_score = crate::composition::composition_novelty(degree_a, degree_b);
                 let prior_outcomes = Self::pair_prior_outcomes(&outcome_map, &a.id, &b.id);
                 let outcome_signal = Self::outcome_signal(&prior_outcomes);
                 let outcome_score_adjustment = Self::outcome_score_adjustment(&prior_outcomes);
-                let score = anchor_score
-                    + (bridge_score * 2.0)
-                    + (novelty_score * 1.5)
-                    + trust_score
-                    + outcome_score_adjustment;
+                // Proximity from the causal graph: closer hops rank higher,
+                // purely structural. Same arithmetic the Strata log uses.
+                let crate::composition::BridgeScore {
+                    bridge: bridge_score,
+                    score,
+                    ..
+                } = crate::composition::bridge_score(
+                    u32::try_from(hops).unwrap_or(u32::MAX),
+                    novelty_score,
+                    trust_score,
+                    outcome_score_adjustment,
+                );
 
                 let reason = format!(
                     "Connected by {} typed-edge hop{} but never composed",

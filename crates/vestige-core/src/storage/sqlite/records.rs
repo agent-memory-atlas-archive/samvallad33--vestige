@@ -722,73 +722,14 @@ impl SqliteMemoryStore {
         outcomes
     }
 
+    /// Backend-neutral: see [`crate::composition::outcome_signal`].
     pub(super) fn outcome_signal(prior_outcomes: &[String]) -> String {
-        if prior_outcomes.is_empty() {
-            return "clean".to_string();
-        }
-
-        let has_closed = prior_outcomes.iter().any(|outcome| {
-            matches!(
-                outcome.as_str(),
-                "dead_end"
-                    | "rejected"
-                    | "bad_severity"
-                    | "user_demoted"
-                    | "closed_by_scope"
-                    | "closed_by_false_assumption"
-                    | "closed_by_user"
-                    | "expired_lane"
-            )
-        });
-        let has_duplicate = prior_outcomes
-            .iter()
-            .any(|outcome| matches!(outcome.as_str(), "duplicate_risk" | "closed_by_duplicate"));
-        let has_success = prior_outcomes.iter().any(|outcome| {
-            matches!(
-                outcome.as_str(),
-                "accepted" | "helpful" | "submitted" | "user_promoted"
-            )
-        });
-        let has_needs_poc = prior_outcomes.iter().any(|outcome| outcome == "needs_poc");
-
-        if (has_closed || has_duplicate) && has_success {
-            "mixed_prior_outcomes".to_string()
-        } else if has_closed {
-            "prior_closed_door".to_string()
-        } else if has_duplicate {
-            "prior_duplicate_risk".to_string()
-        } else if has_success {
-            "prior_success".to_string()
-        } else if has_needs_poc {
-            "prior_needs_poc".to_string()
-        } else {
-            "prior_outcome".to_string()
-        }
+        crate::composition::outcome_signal(prior_outcomes)
     }
 
+    /// Backend-neutral: see [`crate::composition::outcome_score_adjustment`].
     pub(super) fn outcome_score_adjustment(prior_outcomes: &[String]) -> f64 {
-        let mut adjustment: f64 = 0.0;
-        for outcome in prior_outcomes {
-            adjustment += match outcome.as_str() {
-                "accepted" => 0.35,
-                "helpful" => 0.25,
-                "submitted" => 0.15,
-                "user_promoted" => 0.20,
-                "needs_poc" => -0.05,
-                "duplicate_risk" => -0.35,
-                "closed_by_duplicate" => -0.40,
-                "dead_end"
-                | "rejected"
-                | "bad_severity"
-                | "closed_by_scope"
-                | "closed_by_false_assumption"
-                | "closed_by_user"
-                | "expired_lane" => -0.45,
-                "user_demoted" => -0.20,
-                _ => 0.0,
-            };
-        }
-        adjustment.clamp(-0.8, 0.5)
+        crate::composition::outcome_score_adjustment(prior_outcomes)
     }
 
     pub(super) fn is_boundary_tag(tag: &str) -> bool {

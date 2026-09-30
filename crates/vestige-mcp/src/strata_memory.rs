@@ -27,6 +27,8 @@ use vestige_core::{
     SecretPolicy, SourceEnvelope, scan_secrets,
 };
 
+pub mod ghostlink;
+
 const Q32_SCALE: f64 = 4294967296.0;
 const RECEIPT_PREFIX: &str = "eff-";
 const STRATA_REPLAY_BOUNDARY: &str = "Replay re-derives state from the Strata log and compares it to the receipt. A match checks the log; it is not a claim about the world.";
@@ -2076,7 +2078,7 @@ impl MemoryStoreSend for StrataMemory {
         limit: i32,
         tag_filter: Option<&[String]>,
     ) -> Result<Vec<NeverComposedCandidate>, StorageError> {
-        self.never_composed(None, limit, tag_filter)
+        self.never_composed(Some(vestige_core::DEFAULT_MEMORY_SCOPE), limit, tag_filter)
     }
 
     fn get_never_composed_candidates_in_scope(
@@ -2653,6 +2655,11 @@ impl StrataMemory {
         Ok(nodes)
     }
 
+    /// GhostLink bridge lens (the owner ruling of 2026-09-28): pool pairs
+    /// within three undirected hops over recorded touched / derived_from /
+    /// closed_by edges, never woven, scored by hop proximity, composition
+    /// novelty, retention trust and prior outcomes. Tags filter by exact
+    /// identity; no content, tag-name or term overlap is computed.
     fn never_composed(
         &self,
         scope: Option<&str>,
@@ -2662,61 +2669,14 @@ impl StrataMemory {
         let Some(scope) = scope else {
             return Ok(Vec::new());
         };
-        let limit = usize::try_from(limit).unwrap_or(0);
-        let store = self.lock();
-        let records: Vec<_> = store
-            .nodes()
-            .into_iter()
-            .filter(|record| record.is_live())
-            .collect();
-        let pairs = store.get_never_composed(scope, limit.saturating_mul(4).max(limit));
-        let mut out = Vec::new();
-        for (first, second) in pairs {
-            let Some(a) = records.iter().find(|record| record.id == first) else {
-                continue;
-            };
-            let Some(b) = records.iter().find(|record| record.id == second) else {
-                continue;
-            };
-            if !retrievable(a) || !retrievable(b) {
-                continue;
-            }
-            if let Some(tags) = tag_filter.filter(|tags| !tags.is_empty()) {
-                let has = |record: &strata_store::NodeRecord| {
-                    record
-                        .tags
-                        .iter()
-                        .any(|tag| tags.iter().any(|want| want == tag))
-                };
-                if !has(a) || !has(b) {
-                    continue;
-                }
-            }
-            out.push(NeverComposedCandidate {
-                first_id: first,
-                second_id: second,
-                score: 0.0,
-                novelty_score: 0.0,
-                bridge_score: 0.0,
-                trust_score: 0.0,
-                outcome_score_adjustment: 0.0,
-                shared_tags: Vec::new(),
-                boundary_tags: Vec::new(),
-                shared_terms: Vec::new(),
-                prior_outcomes: Vec::new(),
-                outcome_signal: String::new(),
-                first_node_type: a.node_type.clone(),
-                second_node_type: b.node_type.clone(),
-                first_preview: a.content.chars().take(140).collect(),
-                second_preview: b.content.chars().take(140).collect(),
-                reason: "no recorded edge".into(),
-                composition_question: String::new(),
-            });
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
+        let scope = normalize_scope(scope)?;
+        let limit = usize::try_from(limit).unwrap_or(0).max(1);
+        Ok(ghostlink::bridge_trait_candidates(
+            self,
+            Some(scope),
+            tag_filter.filter(|tags| !tags.is_empty()),
+            limit,
+        ))
     }
 }
 

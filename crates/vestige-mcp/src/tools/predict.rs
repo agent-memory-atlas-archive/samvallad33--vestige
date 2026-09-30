@@ -29,11 +29,18 @@ pub fn schema() -> serde_json::Value {
 }
 
 pub async fn execute(
-    _storage: &Arc<Storage>,
+    storage: &Arc<Storage>,
     cognitive: &Arc<Mutex<CognitiveEngine>>,
     args: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let context = args.as_ref().and_then(|a| a.get("context"));
+
+    // 4.0: on a Strata log a prediction comes from exact handles only
+    // (code anchors on current_file). The learned interest model reads
+    // query text, and current_topics is free text: both stay out.
+    if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        return crate::strata_memory::ghostlink::predict(storage.as_ref(), context);
+    }
 
     let cog = cognitive.lock().await;
 

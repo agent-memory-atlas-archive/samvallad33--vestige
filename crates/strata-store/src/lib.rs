@@ -62,10 +62,13 @@ mod anchor;
 mod card;
 mod error;
 mod gate_log;
+mod ghostlink;
 mod op;
 mod store;
 mod types;
 
+#[cfg(test)]
+mod ghostlink_tests;
 #[cfg(test)]
 mod import_tests;
 #[cfg(test)]
@@ -73,6 +76,13 @@ mod tests;
 
 pub use error::StoreError;
 pub use gate_log::StrataEventLog;
+pub use ghostlink::{
+    composition_pair, parse_weave_source, weave_source, BridgeCandidate, BridgeReport,
+    CompositionRecord, DivergentEval, DivergentPage, DivergentSummary, GhostSnapshot, Lane,
+    PathStep, PathVia, PoolFilter, ADMITTING_KINDS, BEYOND_RADIUS, BRIDGE_MAX_HOPS,
+    COMPOSITION_NODE_TYPE, DIVERGENT_RADIUS, GHOSTLINK_TAG, LEGACY_INFERRED, LENS_TAG_PREFIX,
+    MEASURED_MEMBER_CAP, OUTCOME_TAG_PREFIX, WEAVE_SOURCE_PREFIX, WEAVE_TAG,
+};
 pub use op::{StoreOp, KIND_STORE_CHECKPOINT, KIND_STORE_WRITE};
 pub use store::{
     default_policy, effect_receipt_id, permissive_policy, retire_rule_id, AdmissionContext,

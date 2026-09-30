@@ -987,6 +987,17 @@ impl StrataStore {
         input: IngestInput,
         scope: &str,
     ) -> Result<String, StoreError> {
+        self.ingest_in_scope_with_receipt(input, scope)
+            .map(|(id, _)| id)
+    }
+
+    /// [`Self::ingest_in_scope`], also returning the gate-space seq of the
+    /// admitting EFFECT (the `eff-` receipt id, see [`effect_receipt_id`]).
+    pub fn ingest_in_scope_with_receipt(
+        &mut self,
+        input: IngestInput,
+        scope: &str,
+    ) -> Result<(String, u64), StoreError> {
         if input.content.trim().is_empty() {
             return Err(StoreError::InvalidInput("content must not be empty".into()));
         }
@@ -1014,12 +1025,12 @@ impl StrataStore {
             source_updated_at_ms: input.source_updated_at_ms,
         };
         // A brand-new fact references nothing yet: empty context.
-        self.admit_write(
+        let (effect_seq, _) = self.admit_write(
             StoreOp::UpsertNode { record },
             action_kind::WRITE,
             Vec::new(),
         )?;
-        Ok(id)
+        Ok((id, effect_seq))
     }
 
     /// Insert or replace intentions through one admitted write.
@@ -2164,6 +2175,28 @@ impl StrataStore {
     /// Every typed edge, in landing order.
     pub fn edges(&self) -> Vec<ConnectionRecord> {
         self.edges.clone()
+    }
+
+    /// The node registry, borrowed (GhostLink reads it without cloning).
+    pub(crate) fn node_map(&self) -> &BTreeMap<String, NodeRecord> {
+        &self.nodes
+    }
+
+    /// Every edge in landing order, borrowed.
+    pub(crate) fn edge_list(&self) -> &[ConnectionRecord] {
+        &self.edges
+    }
+
+    /// The latest clock the log records: the greatest node `created_at_ms`
+    /// or explicit review clock. Derived from the log alone, so a read that
+    /// evaluates retention at this clock is deterministic for a given head.
+    pub fn head_clock_ms(&self) -> i64 {
+        self.nodes
+            .values()
+            .map(|record| record.created_at_ms)
+            .chain(self.reviewed_at.values().copied())
+            .max()
+            .unwrap_or(0)
     }
 
     /// Number of live nodes (any scope).

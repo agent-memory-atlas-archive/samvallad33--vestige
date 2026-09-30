@@ -56,7 +56,7 @@ use the requested namespace before scan limits. Automatic failure-ingestion
 hooks preserve that namespace and explicitly preview candidates without promotion.
 They report candidate count and hypothesis status.
 
-`graph(action="never_composed")` also defaults to `user`. Supply `scope` for a
+`ghostlink(mode="propose")` (and its alias `graph(action="never_composed")`) also defaults to `user`. Supply `scope` for a
 project or `includeCrossScope=true` to deliberately investigate across projects.
 Absence from the local composition history does not establish worldwide
 novelty. The response labels `globalNoveltyVerified=false`. Suppressed,

@@ -503,44 +503,76 @@ fn ingest_backdating_ingest_git_and_gc_refuse_before_writing() {
 }
 
 #[test]
-fn compose_lists_unlinked_pairs_in_scope() {
+fn compose_runs_both_ghostlink_lenses_with_proofs() {
     let seeded = seed();
-    let run = vestige(seeded.path(), &["compose", "--limit", "10", "--json"]);
-    assert!(run.ok, "{}", run.text());
-    let pairs: Vec<Value> = serde_json::from_str(&run.stdout).unwrap();
-    let ids: Vec<(String, String)> = pairs
-        .iter()
-        .map(|p| {
-            let mut pair = [
-                p["a_id"].as_str().unwrap().to_string(),
-                p["b_id"].as_str().unwrap().to_string(),
-            ];
-            pair.sort();
-            (pair[0].clone(), pair[1].clone())
-        })
-        .collect();
     let sorted = |a: &str, b: &str| {
         let mut pair = [a.to_string(), b.to_string()];
         pair.sort();
         (pair[0].clone(), pair[1].clone())
     };
-    assert_eq!(ids.len(), 2, "{pairs:?}");
-    assert!(
-        !ids.contains(&sorted(&seeded.alpha, &seeded.beta)),
-        "linked pair listed"
-    );
-    assert!(ids.contains(&sorted(&seeded.alpha, &seeded.gamma)));
-    assert!(ids.contains(&sorted(&seeded.beta, &seeded.gamma)));
-    assert!(pairs.iter().all(|p| p["reason"] == "no recorded edge"));
+    let pairs_of = |answer: &Value| -> Vec<(String, String)> {
+        answer["candidates"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no candidates: {answer}"))
+            .iter()
+            .map(|c| {
+                sorted(
+                    c["firstId"].as_str().unwrap(),
+                    c["secondId"].as_str().unwrap(),
+                )
+            })
+            .collect()
+    };
 
+    // Bridge (default): alpha -derived_from-> beta is one typed hop and was
+    // never woven, so it is the one pair, carried with its path.
+    let bridge = vestige(seeded.path(), &["compose", "--limit", "10", "--json"]);
+    assert!(bridge.ok, "{}", bridge.text());
+    let bridge: Value = serde_json::from_str(&bridge.stdout).unwrap();
+    assert_eq!(bridge["lens"], "bridge", "{bridge}");
+    assert_eq!(
+        pairs_of(&bridge),
+        vec![sorted(&seeded.alpha, &seeded.beta)],
+        "{bridge}"
+    );
+    let only = &bridge["candidates"][0];
+    assert_eq!(only["proof"]["hops"], 1, "{only}");
+    assert!(
+        only["reason"]
+            .as_str()
+            .unwrap()
+            .contains("1 typed-edge hop"),
+        "{only}"
+    );
+
+    // Divergent: the linked pair is never eligible; gamma, joined to nothing,
+    // is paired once on the page as a forced juxtaposition with no score.
+    let divergent = vestige(
+        seeded.path(),
+        &["compose", "--lens", "divergent", "--limit", "10", "--json"],
+    );
+    assert!(divergent.ok, "{}", divergent.text());
+    let divergent: Value = serde_json::from_str(&divergent.stdout).unwrap();
+    let pairs = pairs_of(&divergent);
+    assert!(
+        !pairs.contains(&sorted(&seeded.alpha, &seeded.beta)),
+        "linked pair listed: {divergent}"
+    );
+    assert_eq!(pairs.len(), 1, "each memory once per page: {divergent}");
+    assert!(
+        pairs[0].0 == seeded.gamma || pairs[0].1 == seeded.gamma,
+        "{divergent}"
+    );
+    assert!(divergent["candidates"][0]["score"].is_null(), "{divergent}");
+
+    // Human output names the lens and the reason; an unknown lens fails.
     let human = vestige(seeded.path(), &["compose"]);
     assert!(human.ok, "{}", human.text());
-    assert!(
-        human.stdout.contains("no recorded edge"),
-        "{}",
-        human.text()
-    );
-    assert!(!human.stdout.contains("novelty"), "{}", human.text());
+    assert!(human.stdout.contains("bridge lens"), "{}", human.text());
+    assert!(human.stdout.contains("typed-edge hop"), "{}", human.text());
+    let bad = vestige(seeded.path(), &["compose", "--lens", "nearest"]);
+    assert!(!bad.ok, "{}", bad.text());
+    assert!(bad.text().contains("unknown lens"), "{}", bad.text());
 }
 
 #[test]

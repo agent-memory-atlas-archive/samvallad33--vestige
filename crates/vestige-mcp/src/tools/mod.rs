@@ -73,7 +73,13 @@ pub mod health;
 
 // v2.2: Unified graph surface — folds explore_connections + predict +
 // memory_graph + composed_graph into one action-dispatched tool.
+// 4.0: a hidden alias of `ghostlink`.
 pub mod graph_unified;
+
+// 4.0: GhostLink, the advertised composition surface (propose with the
+// bridge and divergent lenses, bounty, weave, map, inspect, explore,
+// predict, harden) over recorded structure only.
+pub mod ghostlink;
 
 // v2.1: Cross-reference (connect the dots)
 pub mod composed_graph;
