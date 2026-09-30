@@ -38,9 +38,6 @@ use vestige_core::{
 #[command(
     long_about = "Vestige is a local-first memory system for coding agents.\n\nVestige 4.0 keeps memories in a Strata log inside the data directory: an append-only log where every write passes a gate and FSRS-6 schedules review. Recall is by exact handle (memory id, id prefix, tag); a Strata log runs no similarity search. Builds with the legacy-sqlite feature keep the v3 SQLite engine."
 )]
-#[command(
-    after_help = "Vestige Pro: your memory on every machine, end-to-end encrypted. $19/mo -> https://github.com/samvallad33/vestige#vestige-pro"
-)]
 struct Cli {
     /// Use a specific Vestige data directory for this command.
     #[arg(long, global = true, value_name = "DIR")]
@@ -1751,13 +1748,10 @@ fn run_update(
         "vestige-restore",
         "vestige-upgrade",
     ];
-    let mut expected_members = binaries
+    let expected_members = binaries
         .iter()
         .map(|binary| format!("{}{}", binary, asset.binary_suffix))
         .collect::<Vec<_>>();
-    if asset.target == "x86_64-apple-darwin" {
-        expected_members.push("INSTALL-INTEL-MAC.md".to_string());
-    }
 
     println!("{}", "Extracting release archive...".cyan());
     extract_archive(
@@ -2178,15 +2172,6 @@ fn run_health() -> anyhow::Result<()> {
         };
         println!("  {} {}", icon, text);
     }
-
-    println!();
-    println!(
-        "{} {}",
-        "Pro:".cyan().bold(),
-        "sync this memory across machines, end-to-end encrypted ($19/mo) — \
-         https://github.com/samvallad33/vestige#vestige-pro"
-            .white()
-    );
 
     Ok(())
 }
