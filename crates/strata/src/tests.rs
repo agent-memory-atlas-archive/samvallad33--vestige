@@ -672,3 +672,138 @@ fn a_seal_that_cannot_roll_the_segment_does_not_hang_appends() {
     assert_eq!(reopened.read_frames(1).unwrap().len(), 2);
     fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Recovery with no recorded watermark fails closed
+// ---------------------------------------------------------------------------
+
+/// A log of `n` acked frames with `head.state` removed, plus the bytes of its
+/// only segment.
+fn log_without_watermark(tag: &str, n: usize) -> (PathBuf, PathBuf, Vec<u8>) {
+    let dir = test_dir(tag);
+    {
+        let log = StrataLog::open(&dir).unwrap();
+        append_many(&log, n);
+        drop(log);
+    }
+    fs::remove_file(dir.join("head.state")).unwrap();
+    let seg = only_segment(&dir);
+    let bytes = fs::read(&seg).unwrap();
+    (dir, seg, bytes)
+}
+
+fn assert_halt_and_untouched(dir: &Path, seg: &Path, expected: &[u8]) {
+    match StrataLog::open(dir) {
+        Err(StrataError::Halt(_)) => {}
+        Err(other) => panic!("expected Halt, got {other:?}"),
+        Ok(_) => panic!("open must not succeed over a damaged log"),
+    }
+    assert!(seg.exists(), "open must not delete the damaged segment");
+    assert_eq!(
+        fs::read(seg).unwrap(),
+        expected,
+        "open must leave the damaged bytes in place"
+    );
+}
+
+#[test]
+fn corrupt_active_header_without_head_state_halts() {
+    let _serial = serialize();
+    reset_failpoints();
+    let (dir, seg, mut bytes) = log_without_watermark("hdr-nohead", 4);
+    bytes[0] ^= 0xff; // magic
+    fs::write(&seg, &bytes).unwrap();
+    assert_halt_and_untouched(&dir, &seg, &bytes);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn torn_header_creation_still_recovers() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("hdr-torn-create");
+    {
+        let log = StrataLog::open(&dir).unwrap();
+        drop(log);
+    }
+    // First-use crash: the segment file exists but its header write tore.
+    let seg = only_segment(&dir);
+    let f = fs::OpenOptions::new().write(true).open(&seg).unwrap();
+    f.set_len(10).unwrap();
+    drop(f);
+    let log = StrataLog::open(&dir).unwrap();
+    assert_eq!(log.append(1, b"first").unwrap().seq, 1);
+    assert_eq!(log.read_frames(1).unwrap().len(), 1);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn flipped_length_in_middle_frame_without_head_state_halts() {
+    let _serial = serialize();
+    reset_failpoints();
+    let (dir, seg, mut bytes) = log_without_watermark("len-mid-nohead", 4);
+    let (_f1, n1) = format::parse_frame(&bytes[HEADER_WIRE_SIZE..]).unwrap();
+    let f2_start = HEADER_WIRE_SIZE + n1;
+    bytes[f2_start + 3] ^= 0x40; // high byte of frame 2's length prefix
+    fs::write(&seg, &bytes).unwrap();
+    assert_halt_and_untouched(&dir, &seg, &bytes);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn flipped_length_in_final_frame_without_head_state_halts() {
+    let _serial = serialize();
+    reset_failpoints();
+    let (dir, seg, mut bytes) = log_without_watermark("len-last-nohead", 4);
+    let mut off = HEADER_WIRE_SIZE;
+    for _ in 0..3 {
+        let (_f, n) = format::parse_frame(&bytes[off..]).unwrap();
+        off += n;
+    }
+    bytes[off + 3] ^= 0x40; // high byte of the last frame's length prefix
+    fs::write(&seg, &bytes).unwrap();
+    assert_halt_and_untouched(&dir, &seg, &bytes);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A final write cut anywhere inside its frame, with no watermark on disk,
+/// still recovers to the frames before it.
+#[test]
+fn torn_final_write_without_head_state_still_recovers() {
+    let _serial = serialize();
+    reset_failpoints();
+    let probe = test_dir("torn-nohead-probe");
+    let (wire, last_frame_len) = {
+        let log = StrataLog::open(&probe).unwrap();
+        append_many(&log, 4);
+        let last_frame_len = format::FRAME_FIXED_WIRE_SIZE + "payload-3".len();
+        let head = log.head();
+        let frame = format::Frame {
+            kind: 9,
+            payload: b"never-acked".to_vec(),
+            payload_blake3: format::payload_blake3(9, b"never-acked"),
+            prev_frame_hash: head.last_frame_hash,
+        };
+        (borsh::to_vec(&frame).unwrap(), last_frame_len)
+    };
+    let _ = fs::remove_dir_all(&probe);
+    for cut in 1..wire.len() {
+        // A tail that happens to be exactly trailer-sized is read as a
+        // possible seal and is refused without a watermark; that path is
+        // separate from torn-frame recovery.
+        if last_frame_len + cut == format::TRAILER_WIRE_SIZE {
+            continue;
+        }
+        let (dir, seg, _bytes) = log_without_watermark("torn-nohead", 4);
+        let mut f = fs::OpenOptions::new().append(true).open(&seg).unwrap();
+        f.write_all(&wire[..cut]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        let log = StrataLog::open(&dir)
+            .unwrap_or_else(|e| panic!("cut at {cut} of {} must recover: {e:?}", wire.len()));
+        assert_eq!(log.read_frames(1).unwrap().len(), 4, "cut at {cut}");
+        assert_eq!(log.append(5, b"fresh").unwrap().seq, 5, "cut at {cut}");
+        drop(log);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}
