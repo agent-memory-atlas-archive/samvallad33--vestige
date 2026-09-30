@@ -338,11 +338,19 @@ fn propose_weave_and_inspect_carry_proofs_and_receipts() {
         );
     }
     let record = woven["recordId"].as_str().unwrap().to_string();
-    let proof = server.call_tool_ok(
-        "receipt",
-        json!({ "action": "replay", "receipt_id": receipts[0]["receiptId"] }),
-    );
-    assert_eq!(proof["matched"], json!(true), "{proof}");
+    // Every write the weave reports resolves: the record and both edges.
+    for receipt in receipts {
+        let got = server.call_tool_ok(
+            "receipt",
+            json!({ "action": "get", "receipt_id": receipt["receiptId"] }),
+        );
+        assert!(got.get("error").is_none(), "{receipt}: {got}");
+        let proof = server.call_tool_ok(
+            "receipt",
+            json!({ "action": "replay", "receipt_id": receipt["receiptId"] }),
+        );
+        assert_eq!(proof["matched"], json!(true), "{receipt}: {proof}");
+    }
 
     let after = server.call_tool_ok(
         "ghostlink",

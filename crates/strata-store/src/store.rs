@@ -209,6 +209,10 @@ pub enum EffectAction {
     /// Verification verdict cached by `RecordAnchorVerdict`, named by the
     /// anchor id. Not a card.
     AnchorVerdict,
+    /// Typed edge admitted by `SaveEdge`, named by its source id; `edge`
+    /// carries the target and kind. Not a card: it never shadows the
+    /// source's own receipt in [`StrataStore::latest_effect`].
+    Edge,
 }
 
 /// One node, intention or anchor effect proved from the log: covering
@@ -230,6 +234,8 @@ pub struct EffectProof {
     pub payload_digest: [u8; 32],
     /// Review rating when `action` is [`EffectAction::Review`].
     pub rating: Option<u8>,
+    /// `(target_id, link_type)` when `action` is [`EffectAction::Edge`].
+    pub edge: Option<(String, String)>,
 }
 
 /// Stable u64 card handle for a node id: first 8 bytes of blake3(id),
@@ -1737,6 +1743,7 @@ impl StrataStore {
                             action,
                             payload_digest: digest,
                             rating: None,
+                            edge: None,
                         }
                     }
                     StoreOp::SupersedeNode { superseded_by, .. } if rule == Some(RULE_EDIT) => {
@@ -1747,6 +1754,7 @@ impl StrataStore {
                             action: EffectAction::Edit,
                             payload_digest: digest,
                             rating: None,
+                            edge: None,
                         }
                     }
                     StoreOp::ReviewNode {
@@ -1766,6 +1774,7 @@ impl StrataStore {
                             action: EffectAction::Review,
                             payload_digest: digest,
                             rating: Some(rating),
+                            edge: None,
                         }
                     }
                     StoreOp::UpsertIntentions { records } => {
@@ -1777,6 +1786,7 @@ impl StrataStore {
                             action: EffectAction::Intention,
                             payload_digest: digest,
                             rating: None,
+                            edge: None,
                         }));
                         continue;
                     }
@@ -1790,6 +1800,7 @@ impl StrataStore {
                             action: EffectAction::Anchor,
                             payload_digest: digest,
                             rating: None,
+                            edge: None,
                         }));
                         continue;
                     }
@@ -1800,8 +1811,18 @@ impl StrataStore {
                         action: EffectAction::AnchorVerdict,
                         payload_digest: digest,
                         rating: None,
+                        edge: None,
                     },
-                    StoreOp::SaveEdge { .. } | StoreOp::SupersedeNode { .. } => continue,
+                    StoreOp::SaveEdge { edge } => EffectProof {
+                        effect_seq,
+                        data_seq: frame.seq,
+                        node_id: edge.source_id,
+                        action: EffectAction::Edge,
+                        payload_digest: digest,
+                        rating: None,
+                        edge: Some((edge.target_id, edge.link_type)),
+                    },
+                    StoreOp::SupersedeNode { .. } => continue,
                 };
                 proofs.push(proof);
             }
@@ -1822,7 +1843,7 @@ impl StrataStore {
         Ok(self
             .prove_effects()?
             .into_iter()
-            .filter(|proof| proof.node_id == node_id)
+            .filter(|proof| proof.node_id == node_id && proof.action != EffectAction::Edge)
             .max_by_key(|proof| proof.effect_seq))
     }
 
@@ -2378,12 +2399,19 @@ fn supersede_component(hops: &[SupersedeHop], id: &str) -> Vec<SupersedeHop> {
 
 /// Fresh fold of one log. Receipt replay compares this to the live maps.
 pub struct Refold {
+    /// Frames the refold read.
     pub frames: u64,
+    /// State digest of the refolded copy.
     pub state_digest: [u8; 32],
+    /// Refolded node registry.
     pub nodes: BTreeMap<String, NodeRecord>,
+    /// Refolded origin seq per node.
     pub origins: BTreeMap<String, u64>,
+    /// FSRS retrievability per node in the refolded copy.
     pub retrievability: BTreeMap<String, f64>,
+    /// Gate verdicts the refold could not re-derive.
     pub gate_mismatches: Vec<String>,
+    /// Admission gaps the sweep found.
     pub gaps: Vec<String>,
 }
 

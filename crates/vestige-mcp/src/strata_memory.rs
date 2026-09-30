@@ -579,6 +579,19 @@ fn resolve_proof(
     store.latest_effect(receipt_or_node)
 }
 
+/// An edge receipt names both endpoints. When either was retired, the
+/// receipt stays hidden like the retired memory itself.
+fn edge_proof_hidden(store: &strata_store::StrataStore, proof: &strata_store::EffectProof) -> bool {
+    let Some((target, _)) = &proof.edge else {
+        return false;
+    };
+    [proof.node_id.as_str(), target.as_str()].iter().any(|id| {
+        store
+            .get_node(id)
+            .is_some_and(|record| !retrievable(&record))
+    })
+}
+
 fn mutation_kind(proof: &strata_store::EffectProof) -> &'static str {
     match (proof.action, proof.rating) {
         (strata_store::EffectAction::Create, _) => "created",
@@ -590,6 +603,7 @@ fn mutation_kind(proof: &strata_store::EffectProof) -> &'static str {
         (strata_store::EffectAction::Intention, _) => "intention_upserted",
         (strata_store::EffectAction::Anchor, _) => "anchor_recorded",
         (strata_store::EffectAction::AnchorVerdict, _) => "anchor_verified",
+        (strata_store::EffectAction::Edge, _) => "edge_recorded",
     }
 }
 
@@ -605,6 +619,9 @@ fn receipt_from_proof(proof: &strata_store::EffectProof, trust: f64) -> Receipt 
     }
     if proof.action == strata_store::EffectAction::Edit {
         note.push_str(" rule=edit");
+    }
+    if let Some((target, kind)) = &proof.edge {
+        note.push_str(&format!(" edge={kind} target={target}"));
     }
     Receipt {
         receipt_id: receipt_id_for(proof.effect_seq),
@@ -1582,6 +1599,9 @@ impl MemoryStoreSend for StrataMemory {
         let Some(proof) = resolve_proof(&store, receipt_id).map_err(map_store)? else {
             return Ok(None);
         };
+        if edge_proof_hidden(&store, &proof) {
+            return Ok(None);
+        }
         let trust = store
             .retrievability(&proof.node_id)
             .ok()
@@ -1609,6 +1629,7 @@ impl MemoryStoreSend for StrataMemory {
         // only means "no DSSE envelope"; the effect itself is checked in get_receipt.
         Ok(resolve_proof(&store, receipt_id)
             .map_err(map_store)?
+            .filter(|proof| !edge_proof_hidden(&store, proof))
             .map(|_| ReceiptAttestationStatus::LegacyUnsigned))
     }
 
@@ -1623,6 +1644,15 @@ impl MemoryStoreSend for StrataMemory {
     fn replay_receipt(&self, receipt_id: &str) -> Result<Value, StorageError> {
         let store = self.lock();
         let folded = store.refold().map_err(map_store)?;
+        if let Some(edge_proof) = parse_receipt_seq(receipt_id)
+            .map(|seq| store.effect_by_seq(seq))
+            .transpose()
+            .map_err(map_store)?
+            .flatten()
+            .filter(|proof| proof.action == strata_store::EffectAction::Edge)
+        {
+            return replay_edge_receipt(&store, &folded, &edge_proof);
+        }
         let Some((node_id, seq)) = lookup_origin(&store, receipt_id) else {
             return Err(StorageError::NotFound(format!(
                 "Receipt '{receipt_id}' was not found"
@@ -2804,6 +2834,51 @@ fn merge_operation(write: strata_store::NodeWrite) -> vestige_core::advanced::Me
         signals: None,
         reason,
     }
+}
+
+/// Replay an edge receipt: the refolded log must reach the live state, and
+/// the edge the receipt names must be in it.
+fn replay_edge_receipt(
+    store: &strata_store::StrataStore,
+    folded: &strata_store::Refold,
+    proof: &strata_store::EffectProof,
+) -> Result<Value, StorageError> {
+    let receipt_id = receipt_id_for(proof.effect_seq);
+    if edge_proof_hidden(store, proof) {
+        return Err(StorageError::NotFound(format!(
+            "Receipt '{receipt_id}' was not found"
+        )));
+    }
+    let (target, kind) = proof.edge.clone().unwrap_or_default();
+    let mut mismatches = Vec::new();
+    let live_digest = store.state_digest();
+    if live_digest != folded.state_digest {
+        mismatches.push("state_digest".to_string());
+    }
+    let present = store.edges().iter().any(|edge| {
+        edge.source_id == proof.node_id && edge.target_id == target && edge.link_type == kind
+    });
+    if !present {
+        mismatches.push(format!("edge:{}:{kind}:{target}:missing", proof.node_id));
+    }
+    mismatches.extend(folded.gate_mismatches.iter().cloned());
+    mismatches.extend(folded.gaps.iter().cloned());
+    mismatches.sort();
+    mismatches.dedup();
+    Ok(json!({
+        "action": "replay",
+        "kind": "strata",
+        "readOnly": true,
+        "receiptId": receipt_id,
+        "edge": { "source": proof.node_id, "target": target, "kind": kind },
+        "effectSeq": proof.effect_seq,
+        "matched": mismatches.is_empty(),
+        "mismatches": mismatches,
+        "stateDigest": hex32(&live_digest),
+        "replayedDigest": hex32(&folded.state_digest),
+        "frames": folded.frames,
+        "claimBoundary": STRATA_REPLAY_BOUNDARY,
+    }))
 }
 
 fn lookup_origin(
