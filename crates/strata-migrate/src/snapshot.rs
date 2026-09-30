@@ -27,18 +27,31 @@ pub struct Snapshot {
     /// The final signed MIGRATION_RECEIPT, when the log carries one.
     pub receipt: Option<MigrationReceipt>,
     /// Count of frames whose kind is not part of the migration family
-    /// (e.g. gate records sharing the log).
+    /// (e.g. gate records sharing the log), plus every frame after the
+    /// last receipt.
     pub other_frames: usize,
 }
 
 /// Read and decode a full migration snapshot from `log` (from seq 1).
+///
+/// Frames after the last MIGRATION_RECEIPT are store frames (carried
+/// intentions, later writes). Kinds `0x20` and `0x21` there are
+/// `STORE_WRITE` and `STORE_CHECKPOINT`, not nodes and edges, so they are
+/// counted in `other_frames` and never decoded as migration records.
 pub fn read_snapshot(log: &StrataLog) -> Result<Snapshot, MigrationError> {
     let frames = log
         .read_frames(1)
         .map_err(|e| MigrationError::Strata(e.to_string()))?;
+    let migration_end = frames
+        .iter()
+        .rposition(|frame| frame.kind == KIND_MIGRATION_RECEIPT)
+        .map_or(frames.len(), |index| index + 1);
 
-    let mut snapshot = Snapshot::default();
-    for frame in frames {
+    let mut snapshot = Snapshot {
+        other_frames: frames.len() - migration_end,
+        ..Snapshot::default()
+    };
+    for frame in frames.into_iter().take(migration_end) {
         let decode = |e: borsh::io::Error| {
             MigrationError::Corrupt(format!(
                 "frame seq {} kind {:#04x}: {e}",

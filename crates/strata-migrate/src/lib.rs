@@ -20,8 +20,23 @@
 //! | `fsrs_cards` rows                | `FSRS_REVIEW` frames (kernel `ReviewEvent`       |
 //! |                                  | plus `borsh(Option<i64>)` `reviewed_at_ms`)      |
 //! | `sync_tombstones` / `deletion_tombstones` | `TOMBSTONE` frames                     |
+//! | `intentions` rows                | no migration frame: decoded into [`Carryover`]  |
+//! |                                  | for [`MigrateOptions::carry_over`], which admits |
+//! |                                  | them as store writes after the receipt           |
 //! | everything else with rows        | counted in `MigrationReport::skipped_tables`    |
 //! | final frame                      | signed `MIGRATION_RECEIPT` (kind 46)            |
+//!
+//! Intentions are store state, not history: on Strata they only exist as
+//! gate-admitted `UpsertIntentions` writes, which is what gives each row a
+//! receipt. This crate cannot encode a store op (the store depends on it),
+//! so it reads the rows from the same snapshot the receipt hashes and hands
+//! them to the caller's `carry_over` hook, which runs on the staged log
+//! before the rename. Without a hook, `intentions` stays in `skipped_tables`.
+//!
+//! Only frames before the receipt are migration frames. `0x20` and `0x21`
+//! are shared with the store's `STORE_WRITE` and `STORE_CHECKPOINT`, so a
+//! frame after the receipt (a carried intention, or any later store write)
+//! is store data that the receipt never counted.
 //!
 //! The run re-hashes the source after the replay and refuses to seal if a
 //! single byte changed (the reader is read-only at the SQLite VFS level,
@@ -140,6 +155,55 @@ pub const LEGACY_INFERRED_KIND: &str = "legacy_inferred";
 /// before the rename. Only the lock holder runs it.
 pub type BeforePublish = Box<dyn FnOnce(&Path) -> Result<(), String>>;
 
+/// Source table whose rows ride in [`Carryover::intentions`].
+pub const INTENTIONS_TABLE: &str = "intentions";
+
+/// One v3 `intentions` row, decoded from the snapshot the receipt hashes.
+///
+/// Field for field this is `strata_store::IntentionRecord` (this crate does
+/// not depend on the store). Timestamps are unix milliseconds; v3 wrote
+/// microseconds, so sub-millisecond digits are dropped. Text is verbatim:
+/// statuses, trigger JSON, and scope are not normalized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentionRow {
+    pub id: String,
+    pub content: String,
+    pub trigger_type: String,
+    pub trigger_data: String,
+    /// v3 default when NULL or absent: 2 (normal).
+    pub priority: i32,
+    /// v3 default when NULL or absent: `active`.
+    pub status: String,
+    pub created_at_ms: i64,
+    pub deadline_ms: Option<i64>,
+    pub fulfilled_at_ms: Option<i64>,
+    pub reminder_count: i32,
+    pub last_reminded_at_ms: Option<i64>,
+    pub notes: Option<String>,
+    pub tags: Vec<String>,
+    pub related_memories: Vec<String>,
+    pub snoozed_until_ms: Option<i64>,
+    /// v3 default when NULL or absent: `api`.
+    pub source_type: String,
+    pub source_data: Option<String>,
+    /// `None` for rows written before v3 schema 37 added the column.
+    pub scope: Option<String>,
+}
+
+/// v3 rows the migration log has no frame kind for, in source row order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Carryover {
+    /// Every `intentions` row.
+    pub intentions: Vec<IntentionRow>,
+}
+
+/// Admits a [`Carryover`] into the staged log and returns how many
+/// intention rows the staged log now holds. Runs after
+/// [`MigrateOptions::before_publish`] passes and before the rename. A count
+/// short of `carryover.intentions.len()`, or an error, deletes staging and
+/// leaves the destination untouched.
+pub type CarryOverHook = Box<dyn FnOnce(&Path, &Carryover) -> Result<u64, String>>;
+
 /// Options for one migration run.
 #[derive(Default)]
 pub struct MigrateOptions {
@@ -161,6 +225,10 @@ pub struct MigrateOptions {
     /// the rename. Only the process holding the staging lock runs it. An
     /// error deletes staging and leaves the destination untouched.
     pub before_publish: Option<BeforePublish>,
+    /// Receives the source's `intentions` rows after `before_publish`
+    /// passes, on the same staging directory. See [`CarryOverHook`].
+    /// `None` leaves `intentions` in `skipped_tables`.
+    pub carry_over: Option<CarryOverHook>,
 }
 
 impl std::fmt::Debug for MigrateOptions {
@@ -177,6 +245,7 @@ impl std::fmt::Debug for MigrateOptions {
                 "before_publish",
                 &self.before_publish.as_ref().map(|_| "Some"),
             )
+            .field("carry_over", &self.carry_over.as_ref().map(|_| "Some"))
             .finish()
     }
 }
@@ -248,7 +317,11 @@ pub struct MigrationReport {
     pub edges: u64,
     /// FSRS_REVIEW frames appended.
     pub fsrs_events: u64,
+    /// `intentions` rows the `carry_over` hook admitted into the log (0 when
+    /// no hook ran).
+    pub intentions_carried: u64,
     /// Source tables that contained rows but have no STRATA mapping.
+    /// `intentions` is listed unless `carry_over` admitted every row.
     pub skipped_tables: Vec<String>,
     /// Whether kernel replay verification AND log tail verification both
     /// passed over the finished log.
@@ -315,8 +388,11 @@ pub fn migrate_with_options(
             snapshot,
             started,
             None,
-            options.before_import,
-            options.before_publish,
+            Hooks {
+                before_import: options.before_import,
+                before_publish: options.before_publish,
+                carry_over: options.carry_over,
+            },
         );
     }
 
@@ -341,9 +417,20 @@ pub fn migrate_with_options(
         snapshot,
         started,
         Some(files),
-        options.before_import,
-        options.before_publish,
+        Hooks {
+            before_import: options.before_import,
+            before_publish: options.before_publish,
+            carry_over: options.carry_over,
+        },
     )
+}
+
+/// The caller's staging hooks, moved into the lock holder.
+#[cfg(feature = "sqlite-reader")]
+struct Hooks {
+    before_import: Option<BeforePublish>,
+    before_publish: Option<BeforePublish>,
+    carry_over: Option<CarryOverHook>,
 }
 
 /// Appended to the destination directory's file name. The first-launch
@@ -451,13 +538,13 @@ fn stage_import(
     snapshot: source::SourceSnapshot,
     started: Instant,
     files: Option<source::SourceFiles>,
-    mut before_import: Option<BeforePublish>,
-    mut before_publish: Option<BeforePublish>,
+    hooks: Hooks,
 ) -> Result<MigrationReport, MigrationError> {
     let staging = staging_path(dest);
     if let Some(parent) = staging.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let mut hooks = Some(hooks);
     loop {
         if destination_occupied(dest)? {
             if allow_idempotent {
@@ -487,8 +574,11 @@ fn stage_import(
                     snapshot,
                     started,
                     files,
-                    before_import.take(),
-                    before_publish.take(),
+                    hooks.take().unwrap_or(Hooks {
+                        before_import: None,
+                        before_publish: None,
+                        carry_over: None,
+                    }),
                 );
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -510,9 +600,23 @@ fn import_holding_lock(
     snapshot: source::SourceSnapshot,
     started: Instant,
     files: Option<source::SourceFiles>,
-    before_import: Option<BeforePublish>,
-    before_publish: Option<BeforePublish>,
+    hooks: Hooks,
 ) -> Result<MigrationReport, MigrationError> {
+    let Hooks {
+        before_import,
+        before_publish,
+        carry_over,
+    } = hooks;
+    // Decoded before the backup and the import, so a corrupt row stops the
+    // run early. Nobody reads the rows without a hook.
+    let carryover = if carry_over.is_some() {
+        match extract_carryover(&snapshot.archive) {
+            Ok(carryover) => carryover,
+            Err(err) => return Err(discard_staging(lock, staging, err)),
+        }
+    } else {
+        Carryover::default()
+    };
     if let Some(hook) = before_import {
         if let Err(detail) = hook(staging) {
             return Err(discard_staging(
@@ -564,7 +668,7 @@ fn import_holding_lock(
         source_blake3.to_string()
     };
 
-    let report = match finish(log, staging, outcome, snapshot, &sealed_hash, started) {
+    let mut report = match finish(log, staging, outcome, snapshot, &sealed_hash, started) {
         Ok(report) => report,
         Err(err) => return Err(discard_staging(lock, staging, err)),
     };
@@ -582,6 +686,33 @@ fn import_holding_lock(
                 staging,
                 MigrationError::Strata(detail),
             ));
+        }
+    }
+    if let Some(hook) = carry_over {
+        let expected = carryover.intentions.len() as u64;
+        match hook(staging, &carryover) {
+            Ok(carried) if carried == expected => {
+                report.intentions_carried = carried;
+                report
+                    .skipped_tables
+                    .retain(|table| table != INTENTIONS_TABLE);
+            }
+            Ok(carried) => {
+                return Err(discard_staging(
+                    lock,
+                    staging,
+                    MigrationError::Strata(format!(
+                        "carry-over admitted {carried} of {expected} intentions"
+                    )),
+                ));
+            }
+            Err(detail) => {
+                return Err(discard_staging(
+                    lock,
+                    staging,
+                    MigrationError::Strata(detail),
+                ));
+            }
         }
     }
     if let Err(err) = publish(staging, dest) {
@@ -733,6 +864,7 @@ fn idempotent_report(
         nodes: table_rows(snapshot, "knowledge_nodes"),
         edges: table_rows(snapshot, "memory_connections"),
         fsrs_events: table_rows(snapshot, "fsrs_cards"),
+        intentions_carried: 0,
         skipped_tables: skipped_tables_for(snapshot),
         verify_passed: true,
         dropped_vectors: snapshot.dropped_vectors,
@@ -780,6 +912,7 @@ fn dry_run_report(
         nodes: table_rows(snapshot, "knowledge_nodes"),
         edges: table_rows(snapshot, "memory_connections"),
         fsrs_events: table_rows(snapshot, "fsrs_cards"),
+        intentions_carried: 0,
         skipped_tables: skipped_tables_for(snapshot),
         // A dry run writes nothing; the envelope chain is verified during
         // the read, so reaching this point means the chain held.
@@ -1025,6 +1158,7 @@ fn finish(
         nodes: outcome.nodes,
         edges: outcome.edges,
         fsrs_events: outcome.fsrs_events,
+        intentions_carried: 0,
         skipped_tables: skipped_tables_for(&snapshot),
         verify_passed,
         dropped_vectors: snapshot.dropped_vectors,
@@ -1511,6 +1645,69 @@ fn extract_tombstones(archive: &PortableArchive) -> Result<Vec<TombstoneRecord>,
         }
     }
     Ok(records)
+}
+
+/// Decode `intentions` into [`Carryover`] rows, source row order.
+///
+/// Mirrors v3's `row_to_intention`: a column older schemas lack reads as its
+/// v3 default, and `tags` / `related_memories` are tolerant JSON arrays.
+/// Unlike v3, a non-empty timestamp that does not parse is corrupt instead
+/// of becoming "now" or `None`, and the run stops.
+#[cfg(feature = "sqlite-reader")]
+fn extract_carryover(archive: &PortableArchive) -> Result<Carryover, MigrationError> {
+    let Some(table) = source::table(archive, INTENTIONS_TABLE) else {
+        return Ok(Carryover::default());
+    };
+    let has = |name: &str| table.columns.iter().any(|column| column == name);
+    let mut intentions = Vec::with_capacity(table.rows.len());
+    for index in 0..table.rows.len() {
+        let row = source::Row::new(table, index);
+        let opt_text = |name: &str| -> Result<Option<String>, MigrationError> {
+            if !has(name) {
+                return Ok(None);
+            }
+            Ok(row.opt_text(name)?.map(str::to_string))
+        };
+        let opt_ms = |name: &str| -> Result<Option<i64>, MigrationError> {
+            match opt_text(name)? {
+                Some(raw) if !raw.is_empty() => Ok(Some(source::timestamp_ms(&raw)?)),
+                _ => Ok(None),
+            }
+        };
+        let int32 = |name: &str, default: i64| -> Result<i32, MigrationError> {
+            let value = if has(name) {
+                row.integer_or(name, default)?
+            } else {
+                default
+            };
+            i32::try_from(value).map_err(|_| {
+                MigrationError::Corrupt(format!(
+                    "intentions row {index} column {name}: {value} is out of range"
+                ))
+            })
+        };
+        intentions.push(IntentionRow {
+            id: row.text("id")?.to_string(),
+            content: row.text("content")?.to_string(),
+            trigger_type: row.text("trigger_type")?.to_string(),
+            trigger_data: row.text("trigger_data")?.to_string(),
+            priority: int32("priority", 2)?,
+            status: opt_text("status")?.unwrap_or_else(|| "active".to_string()),
+            created_at_ms: source::timestamp_ms(row.text("created_at")?)?,
+            deadline_ms: opt_ms("deadline")?,
+            fulfilled_at_ms: opt_ms("fulfilled_at")?,
+            reminder_count: int32("reminder_count", 0)?,
+            last_reminded_at_ms: opt_ms("last_reminded_at")?,
+            notes: opt_text("notes")?,
+            tags: source::parse_tags(opt_text("tags")?.as_deref()),
+            related_memories: source::parse_tags(opt_text("related_memories")?.as_deref()),
+            snoozed_until_ms: opt_ms("snoozed_until")?,
+            source_type: opt_text("source_type")?.unwrap_or_else(|| "api".to_string()),
+            source_data: opt_text("source_data")?,
+            scope: opt_text("scope")?,
+        });
+    }
+    Ok(Carryover { intentions })
 }
 
 #[cfg(test)]

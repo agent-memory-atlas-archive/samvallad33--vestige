@@ -10,6 +10,9 @@
 //! 3. REPLAYS the frames against the receipt's per-table counts — a
 //!    dropped frame (possible only with the signing key, i.e. a lying
 //!    receipt) still fails here because the frame counts no longer match.
+//!    Only frames before the last receipt are the migration. Frames after
+//!    it are store writes (the upgrade's carried intentions, then normal
+//!    use) that share kind bytes 0x20/0x21 with NODE/EDGE.
 //!
 //! Every failure names what broke; the binary exits nonzero.
 
@@ -75,10 +78,12 @@ pub fn verify_migrated_log(dir: &Path) -> Result<MigrationVerifyReport, String> 
 
     let mut failures: Vec<String> = Vec::new();
 
-    // Pass 2: the receipt.
+    // Pass 2: the receipt. Frames after the last one are store frames
+    // (carried intentions, later writes): kinds 0x20 and 0x21 there are
+    // STORE_WRITE and STORE_CHECKPOINT, which the receipt never counted.
     let receipt_index = frames
         .iter()
-        .position(|f| f.kind == KIND_MIGRATION_RECEIPT)
+        .rposition(|f| f.kind == KIND_MIGRATION_RECEIPT)
         .ok_or_else(|| "no MIGRATION_RECEIPT (frame 46) in the log".to_string())?;
     let receipt_frame = &frames[receipt_index];
     let receipt =

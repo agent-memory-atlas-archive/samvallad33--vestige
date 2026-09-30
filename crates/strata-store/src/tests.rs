@@ -1063,6 +1063,46 @@ fn intention_upsert_replays_and_rejects_an_empty_id() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The upgrade admits into `<dir>/log.strata-staging`, then renames it onto
+/// `<dir>/log`. The plain open after the rename replays the same state and
+/// proves the same per-row receipts.
+#[test]
+fn staged_log_admits_then_replays_after_rename() {
+    let dir = temp_dir("staged-log");
+    let staged = dir.join("log.strata-staging");
+    let mut store =
+        StrataStore::open_log_with_policy(&dir, &staged, default_policy()).expect("open staged");
+    let effect = store
+        .upsert_intentions(vec![intention("int-s1", "one"), intention("int-s2", "two")])
+        .expect("admit");
+    let digest = store.state_digest();
+    drop(store);
+    assert!(
+        !dir.join("log").exists(),
+        "a staged open must not create <dir>/log"
+    );
+
+    std::fs::rename(&staged, dir.join("log")).expect("publish");
+    let reopened = StrataStore::open(&dir).expect("reopen published");
+    assert_eq!(reopened.state_digest(), digest);
+    assert_eq!(reopened.intentions().len(), 2);
+    let proved: Vec<_> = reopened
+        .prove_effects()
+        .expect("prove")
+        .into_iter()
+        .filter(|proof| proof.action == EffectAction::Intention)
+        .map(|proof| (proof.node_id, proof.effect_seq))
+        .collect();
+    assert_eq!(
+        proved,
+        vec![
+            ("int-s1".to_string(), effect),
+            ("int-s2".to_string(), effect)
+        ]
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn upsert_intentions_op_round_trips_through_borsh_and_replay() {
     let records = vec![intention("int-a", "one"), intention("int-b", "two")];

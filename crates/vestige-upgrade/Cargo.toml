@@ -16,6 +16,9 @@ libc = "0.2"
 directories = "6"
 # The only product binary that turns on the read-only SQLite reader.
 strata-migrate = { path = "../strata-migrate", features = ["sqlite-reader"] }
+# v3 intentions have no migration frame. They are admitted into the staged
+# log through the store's own UpsertIntentions path before the rename.
+strata-store = { path = "../strata-store" }
 strata-verify = { path = "../strata-verify" }
 vestige-core = { path = "../vestige-core", default-features = false }
 

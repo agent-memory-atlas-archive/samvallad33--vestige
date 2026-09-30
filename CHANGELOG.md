@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The v3 to Strata upgrade keeps intentions. The importer had no mapping for
+  the v3 `intentions` table, so after the first 4.0 launch `intention list`
+  returned nothing (54 of 54 rows lost on a real store). `vestige-upgrade`
+  now admits every row into the staged log through the store's normal
+  `UpsertIntentions` write (each row gets a receipt), reopens the staged log
+  to check every row replays, and only then publishes `log/`. A failure there
+  leaves no installed log and the v3 file untouched, so the next launch
+  retries. `upgrade.log` reports the count (`... N intentions imported`).
+  The CLI `migrate-to-strata` does not carry them and still lists
+  `intentions` in its skipped tables. `strata-verify` and
+  `strata_migrate::read_snapshot` now treat only frames before the
+  migration receipt as the migration, so a used store's log no longer fails
+  the receipt's frame counts.
+
 - Fresh reflections surface in recall (#232): an `Insight` written in the
   last 24 hours takes the lead slot when it is at least 30% as relevant as
   the top result. Raw term-score gaps between a terse reflection and a

@@ -373,6 +373,9 @@ struct AdmittedEffect {
 /// single-threaded single-writer (`!Send` through the gate-log cache).
 pub struct StrataStore {
     dir: PathBuf,
+    /// The log directory: `<dir>/log`, or the staged log the upgrade admits
+    /// into before renaming it there.
+    log_dir: PathBuf,
     log: StrataLog,
     gate_log: StrataEventLog,
     policy: Policy,
@@ -425,12 +428,30 @@ impl StrataStore {
     /// policy than the one that wrote the log is safe; it only affects new
     /// admissions (and `rederive_verdicts`).
     pub fn open_with_policy(dir: impl AsRef<Path>, policy: Policy) -> Result<Self, StoreError> {
+        let dir = dir.as_ref();
+        Self::open_log_with_policy(dir, dir.join(LOG_DIR), policy)
+    }
+
+    /// Open a store whose log lives at `log_dir` instead of `<dir>/log`.
+    /// `store.meta` is still read from and written to `dir`.
+    ///
+    /// The v3 upgrade admits carried-over rows into the staged log
+    /// (`<dir>/log.strata-staging`) with the normal write path, then renames
+    /// it onto `<dir>/log`. The frames do not name their directory, so
+    /// [`StrataStore::open`] on `dir` after the rename replays the same state.
+    pub fn open_log_with_policy(
+        dir: impl AsRef<Path>,
+        log_dir: impl AsRef<Path>,
+        policy: Policy,
+    ) -> Result<Self, StoreError> {
         let dir = dir.as_ref().to_path_buf();
+        let log_dir = log_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        let log = StrataLog::open(dir.join(LOG_DIR))?;
+        let log = StrataLog::open(&log_dir)?;
         let gate_log = StrataEventLog::new(log.clone())?;
         let mut store = Self {
             dir,
+            log_dir,
             log,
             gate_log,
             policy,
@@ -1674,7 +1695,7 @@ impl StrataStore {
         self.log.seal()?;
         let dest_log = dest.join(LOG_DIR);
         std::fs::create_dir_all(&dest_log)?;
-        for entry in std::fs::read_dir(self.dir.join(LOG_DIR))? {
+        for entry in std::fs::read_dir(&self.log_dir)? {
             let path = entry?.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
@@ -1742,6 +1763,7 @@ impl StrataStore {
         let gate_mismatches = gate_verdict_mismatches(self, &frames)?;
         let mut scratch = Self {
             dir: self.dir.clone(),
+            log_dir: self.log_dir.clone(),
             log: self.log.clone(),
             gate_log: self.gate_log.clone(),
             policy: self.policy.clone(),
@@ -1784,9 +1806,8 @@ impl StrataStore {
     /// chain is an error — unlike [`StrataLog::read_frames`], which stops at
     /// the first bad frame and returns the prefix.
     fn verify_segments(&self) -> Result<(), StoreError> {
-        let dir = self.dir.join(LOG_DIR);
         let mut paths = Vec::new();
-        for entry in std::fs::read_dir(&dir)? {
+        for entry in std::fs::read_dir(&self.log_dir)? {
             let path = entry?.path();
             if path.extension().and_then(|ext| ext.to_str()) == Some("seg") {
                 paths.push(path);

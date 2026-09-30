@@ -2995,6 +2995,7 @@ dependencies = [
  "sha2",
  "strata",
  "strata-migrate",
+ "strata-store",
  "strata-verify",
  "tempfile",
  "vestige-core",

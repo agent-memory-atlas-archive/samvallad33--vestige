@@ -167,3 +167,48 @@ fn migrated_log_wrong_receipt_key_fails() {
     );
     assert!(receipt.verify_checksum(), "checksum stays key-independent");
 }
+
+/// The upgrade admits carried intentions after the receipt, and every later
+/// store write lands there too. Kinds 0x20/0x21 after the receipt are
+/// STORE_WRITE/STORE_CHECKPOINT, so the receipt's counts still match.
+#[test]
+fn store_writes_after_the_receipt_keep_the_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_dir = dir.path().join("log");
+    build_log(&log_dir);
+    let mut store = strata_store::StrataStore::open(dir.path()).unwrap();
+    store
+        .upsert_intentions(vec![strata_store::IntentionRecord {
+            id: "int-after-receipt".into(),
+            content: "carried".into(),
+            trigger_type: "manual".into(),
+            trigger_data: "{}".into(),
+            priority: 2,
+            status: "active".into(),
+            created_at_ms: 1_700_000_000_000,
+            deadline_ms: None,
+            fulfilled_at_ms: None,
+            reminder_count: 0,
+            last_reminded_at_ms: None,
+            notes: None,
+            tags: Vec::new(),
+            related_memories: Vec::new(),
+            snoozed_until_ms: None,
+            source_type: "mcp".into(),
+            source_data: None,
+            scope: None,
+        }])
+        .unwrap();
+    store
+        .ingest(strata_store::IngestInput {
+            content: "written after the upgrade".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    drop(store);
+
+    let report = verify_migrated_log(&log_dir).expect("verification runs");
+    assert!(report.ok, "{report:?}");
+    assert!(report.counts_match);
+    assert!(strata_verify::verify_path(&log_dir).ok);
+}

@@ -8,13 +8,22 @@
 //! recovery is the same code. This crate decides that a v3 file needs that
 //! import, copies the sqlite family, and records progress on stderr.
 //! [`upgrade_with`] is the only path that calls `vestige_core::detect_v3`.
+//!
+//! v3 intentions have no migration frame. After the staged log verifies,
+//! `carry_intentions` admits them into it through the store's normal
+//! `UpsertIntentions` path (PROPOSE, GATE, EFFECT, so each row has a
+//! receipt), reopens it to check every row replays, and only then does the
+//! rename publish `log/`. A failure there discards staging like any other
+//! import failure, so an installed `log/` always carries them.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use strata_migrate::MigrateOptions;
+use strata_migrate::{Carryover, IntentionRow, MigrateOptions};
+use strata_store::{EffectAction, IntentionRecord, StrataStore};
 
 /// Installed strata log. Same relative path `StrataStore` opens.
 /// Staging for this destination is `log` plus [`strata_migrate::STAGING_SUFFIX`]:
@@ -27,6 +36,10 @@ pub const V311_RELEASE: &str = "https://github.com/samvallad33/vestige/releases/
 
 /// Backup plus staging log, relative to the sqlite family size.
 const SPACE_FACTOR: u64 = 3;
+
+/// Intention rows per admitted `UpsertIntentions` write. Bounds one data
+/// frame; every row still gets its own receipt.
+const INTENTION_BATCH: usize = 256;
 
 /// What the boot path should do after the upgrade attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +132,8 @@ pub fn upgrade_with(
     let backup_db = db_path.to_path_buf();
     let backup_dir = data_dir.clone();
     let backup_log = log_path.clone();
+    let carry_dir = data_dir.clone();
+    let carry_log = log_path.clone();
     let after_import = options.after_import.take();
     let report = match strata_migrate::migrate_with_options(
         db_path,
@@ -158,6 +173,20 @@ pub fn upgrade_with(
                     Err(err) => Err(format!("strata-verify failed: {err}")),
                 }
             })),
+            carry_over: Some(Box::new(move |staging, carryover: &Carryover| {
+                if !carryover.intentions.is_empty() {
+                    note(
+                        &carry_log,
+                        &format!(
+                            "vestige: admitting {} intentions into {}",
+                            carryover.intentions.len(),
+                            staging.display()
+                        ),
+                    );
+                }
+                carry_intentions(&carry_dir, staging, &carryover.intentions)
+                    .map_err(|err| format!("intention carry-over failed: {err}"))
+            })),
             ..MigrateOptions::default()
         },
     ) {
@@ -174,13 +203,93 @@ pub fn upgrade_with(
     note(
         &log_path,
         &format!(
-            "vestige: strata log ready at {} ({} memories, {} links imported)",
+            "vestige: strata log ready at {} ({} memories, {} links, {} intentions imported)",
             log_dir.display(),
             report.nodes,
-            report.edges
+            report.edges,
+            report.intentions_carried
         ),
     );
     Ok(UpgradeStatus::StrataReady { log_dir })
+}
+
+/// Admit v3 intentions into the staged log at `staging` and prove they
+/// replay. Returns how many rows the staged log holds.
+///
+/// Writes go through [`StrataStore::upsert_intentions`], the path the
+/// intention tool uses, under the default policy the server pins. The store
+/// is then reopened from the log alone: every row must come back
+/// field-for-field with an admitted effect behind it, and no other intention
+/// may be present. `data_dir` is where the published store keeps
+/// `store.meta`, so this open fails wherever the server's would.
+///
+/// Staging is fresh on every attempt and a published `log/` is never
+/// carried into again, so a relaunch cannot admit a row twice.
+fn carry_intentions(data_dir: &Path, staging: &Path, rows: &[IntentionRow]) -> Result<u64, String> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let records: Vec<IntentionRecord> = rows.iter().map(intention_record).collect();
+    let open = || {
+        StrataStore::open_log_with_policy(data_dir, staging, strata_store::default_policy())
+            .map_err(|err| format!("open staged store: {err}"))
+    };
+    {
+        let mut store = open()?;
+        for batch in records.chunks(INTENTION_BATCH) {
+            store
+                .upsert_intentions(batch.to_vec())
+                .map_err(|err| format!("admit intentions: {err}"))?;
+        }
+    }
+
+    let store = open()?;
+    let proved: BTreeSet<String> = store
+        .prove_effects()
+        .map_err(|err| format!("prove intentions: {err}"))?
+        .into_iter()
+        .filter(|proof| proof.action == EffectAction::Intention)
+        .map(|proof| proof.node_id)
+        .collect();
+    for record in &records {
+        if store.get_intention(&record.id).as_ref() != Some(record) {
+            return Err(format!("intention {} did not replay intact", record.id));
+        }
+        if !proved.contains(&record.id) {
+            return Err(format!("intention {} has no admitted effect", record.id));
+        }
+    }
+    let held = store.intentions().len();
+    if held != records.len() {
+        return Err(format!(
+            "staged log holds {held} intentions, v3 had {}",
+            records.len()
+        ));
+    }
+    Ok(held as u64)
+}
+
+fn intention_record(row: &IntentionRow) -> IntentionRecord {
+    IntentionRecord {
+        id: row.id.clone(),
+        content: row.content.clone(),
+        trigger_type: row.trigger_type.clone(),
+        trigger_data: row.trigger_data.clone(),
+        priority: row.priority,
+        status: row.status.clone(),
+        created_at_ms: row.created_at_ms,
+        deadline_ms: row.deadline_ms,
+        fulfilled_at_ms: row.fulfilled_at_ms,
+        reminder_count: row.reminder_count,
+        last_reminded_at_ms: row.last_reminded_at_ms,
+        notes: row.notes.clone(),
+        tags: row.tags.clone(),
+        related_memories: row.related_memories.clone(),
+        snoozed_until_ms: row.snoozed_until_ms,
+        source_type: row.source_type.clone(),
+        source_data: row.source_data.clone(),
+        scope: row.scope.clone(),
+    }
 }
 
 fn installed_log(log_dir: &Path, log_path: &Path) -> Option<UpgradeStatus> {
