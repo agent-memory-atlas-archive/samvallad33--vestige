@@ -1338,6 +1338,11 @@ pub fn record(
     event_tx: Option<&broadcast::Sender<VestigeEvent>>,
     event: MemoryTraceEvent,
 ) {
+    // A Strata log in 4.0 keeps no Black Box trace rows. Asking it on every
+    // tool call only produced a warning per call.
+    if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        return;
+    }
     let event = event.with_at(Utc::now().timestamp_millis());
     let seq = match storage.append_trace_event(&event) {
         Ok(seq) => seq,

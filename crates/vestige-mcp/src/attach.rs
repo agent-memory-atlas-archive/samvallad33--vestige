@@ -181,18 +181,11 @@ enum Addr {
     Tcp(u16),
 }
 
-/// The socket path, when this platform has Unix sockets and it fits.
+/// The socket path, when it fits in a socket address.
+#[cfg(unix)]
 fn socket_path(data_dir: &Path) -> Option<PathBuf> {
-    #[cfg(unix)]
-    {
-        let path = data_dir.join(SOCKET_FILE);
-        (path.as_os_str().len() <= SOCKET_PATH_MAX).then_some(path)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = data_dir;
-        None
-    }
+    let path = data_dir.join(SOCKET_FILE);
+    (path.as_os_str().len() <= SOCKET_PATH_MAX).then_some(path)
 }
 
 enum Listener {
@@ -214,6 +207,8 @@ impl Listener {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
             return Ok((Self::Unix(listener), Addr::Unix));
         }
+        #[cfg(not(unix))]
+        let _ = data_dir;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let port = listener.local_addr()?.port();
         Ok((Self::Tcp(listener), Addr::Tcp(port)))

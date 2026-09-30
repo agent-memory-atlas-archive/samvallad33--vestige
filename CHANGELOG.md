@@ -90,6 +90,8 @@ back), `maintain` `export` format `portable`, and `memory_status`
   on a 297 MB store, with two agents starting at once (the second waits for
   the import, then connects). A much larger store could exceed an MCP
   client's startup timeout on that first launch.
+- The Black Box trace recorder (`agent_traces`, `agent_runs`) records
+  nothing on a Strata log in 4.0. v3 trace rows are not imported.
 - When the agent whose process serves the store quits, a request another
   agent had in flight at that instant returns an error instead of being
   resent, because it may already have taken effect. The agent's session
@@ -109,7 +111,11 @@ back), `maintain` `export` format `portable`, and `memory_status`
 - Strata logs open on Windows. Every directory fsync opened the directory
   with `File::open`, which Windows refuses (os error 5), so no log could be
   created or opened there. Directory fsync is Unix-only now; CI runs the
-  log, store, upgrade and multi-agent suites on Windows.
+  log, store, upgrade and multi-agent suites on Windows. The log's stale-lock
+  check also treated every Windows process id as alive, so a process killed
+  while it held the log (a closed `vestige dashboard` window, say) locked the
+  store until `strata.lock` was deleted by hand; it now asks Windows whether
+  that process is still running.
 - `tools/list` advertises every field a call can send. A schema with a
   `oneOf` was compacted to a single invented `action` field, so
   `smart_ingest` went out without `content`, `items` or `tags`, `maintain`
