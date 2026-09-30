@@ -2872,10 +2872,12 @@ fn run_backup_through_server(data_dir: &Path, output: &Path) -> anyhow::Result<(
             fs::remove_dir(output)?;
         }
         if fs::rename(&made, output).is_err() {
-            copy_dir_all(&made, output)
-                .with_context(|| format!("failed to copy {} to {}", made.display(), output.display()))?;
-            fs::remove_dir_all(&made)
-                .with_context(|| format!("copied the backup, but could not remove {}", made.display()))?;
+            copy_dir_all(&made, output).with_context(|| {
+                format!("failed to copy {} to {}", made.display(), output.display())
+            })?;
+            fs::remove_dir_all(&made).with_context(|| {
+                format!("copied the backup, but could not remove {}", made.display())
+            })?;
         }
     }
     print_strata_backup_summary(data_dir, output);
@@ -5009,14 +5011,57 @@ fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
 
     println!("{}", "=== Vestige Dashboard ===".cyan().bold());
     println!();
+
+    let dir = cli_data_dir()?;
+    // Same check `vestige-mcp` runs before stdio. It runs before the lock:
+    // the upgrade helper takes that lock itself.
+    vestige_mcp::v3_launch::upgrade_or_refuse(&dir.join("vestige.db"))?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let mut open_browser = open_browser;
+
+    // Usually an agent's vestige-mcp holds the store. That process serves the
+    // dashboard on request, for as long as this command runs; if it exits,
+    // this process takes the store and serves the dashboard itself.
+    let wait = vestige_mcp::attach::election_wait();
+    let mut deadline = std::time::Instant::now() + wait;
+    while !take_cli_lock(&dir)? {
+        match rt.block_on(vestige_mcp::attach::request_dashboard(&dir, port)) {
+            Ok(lease) => {
+                println!("Dashboard: {}", lease.url.cyan());
+                println!(
+                    "  {} served by vestige-mcp (pid {}), the Vestige server your agents use",
+                    ">".cyan(),
+                    lease.owner_pid
+                );
+                if open_browser {
+                    let _ = open::that(&lease.url);
+                    open_browser = false;
+                }
+                println!("{}", "Press Ctrl+C to stop.".dimmed());
+                rt.block_on(lease.closed());
+                println!("That Vestige server exited; moving the dashboard here...");
+                deadline = std::time::Instant::now() + wait;
+            }
+            Err(err) => {
+                if std::time::Instant::now() >= deadline {
+                    let holder = vestige_mcp::attach::read_endpoint(&dir)
+                        .map(|endpoint| format!("vestige-mcp (pid {})", endpoint.pid))
+                        .unwrap_or_else(|| "another Vestige process".to_string());
+                    anyhow::bail!(
+                        "{holder} holds {} and did not start the dashboard: {err}",
+                        dir.display()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+
     println!(
         "Starting dashboard at {}...",
         format!("http://127.0.0.1:{}", port).cyan()
     );
-
     let storage = open_storage()?;
-
-    let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         // Initialize cognitive engine for dream and other cognitive features
         let cognitive = Arc::new(tokio::sync::Mutex::new(CognitiveEngine::new()));
@@ -5027,19 +5072,27 @@ fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
         let (event_tx, _) = tokio::sync::broadcast::channel::<
             vestige_mcp::dashboard::events::VestigeEvent,
         >(vestige_mcp::dashboard::state::EVENT_CHANNEL_CAPACITY);
+        let dashboard = vestige_mcp::dashboard::DashboardOnDemand::new(
+            Arc::clone(&storage),
+            Arc::clone(&cognitive),
+            event_tx.clone(),
+        );
+        let running = dashboard
+            .ensure(port)
+            .await
+            .map_err(|e| anyhow::anyhow!("Dashboard error: {}", e))?;
         // This process holds the store, so MCP clients started meanwhile
         // attach here instead of waiting for it to exit.
-        let _attach_point = open_cli_attach_point(&storage, &cognitive, &event_tx).await;
-
-        vestige_mcp::dashboard::start_dashboard_with_event_tx(
-            storage,
-            Some(cognitive),
-            event_tx,
-            port,
-            open_browser,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Dashboard error: {}", e))
+        let _attach_point =
+            open_cli_attach_point(&storage, &cognitive, &event_tx, Some(dashboard.starter())).await;
+        let url = format!("http://127.0.0.1:{running}");
+        println!("Dashboard: {}", url.cyan());
+        if open_browser {
+            let _ = open::that(&url);
+        }
+        println!("{}", "Press Ctrl+C to stop.".dimmed());
+        tokio::signal::ctrl_c().await.ok();
+        Ok(())
     })
 }
 
@@ -5064,25 +5117,17 @@ fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Re
             vestige_mcp::dashboard::events::VestigeEvent,
         >(vestige_mcp::dashboard::state::EVENT_CHANNEL_CAPACITY);
 
+        let dashboard = vestige_mcp::dashboard::DashboardOnDemand::new(
+            Arc::clone(&storage),
+            Arc::clone(&cognitive),
+            event_tx.clone(),
+        );
         // Optionally start dashboard
         if with_dashboard {
-            let ds = Arc::clone(&storage);
-            let dc = Arc::clone(&cognitive);
-            let dtx = event_tx.clone();
+            let dashboard = dashboard.clone();
             tokio::spawn(async move {
-                match vestige_mcp::dashboard::start_background_with_event_tx(
-                    ds,
-                    Some(dc),
-                    dtx,
-                    dashboard_port,
-                )
-                .await
-                {
-                    Ok(_) => println!(
-                        "  {} Dashboard: http://127.0.0.1:{}",
-                        ">".cyan(),
-                        dashboard_port
-                    ),
+                match dashboard.ensure(dashboard_port).await {
+                    Ok(port) => println!("  {} Dashboard: http://127.0.0.1:{}", ">".cyan(), port),
                     Err(e) => eprintln!("  {} Dashboard failed: {}", "!".yellow(), e),
                 }
             });
@@ -5090,7 +5135,8 @@ fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Re
 
         // This process holds the store, so MCP stdio clients started
         // meanwhile attach here instead of waiting for it to exit.
-        let _attach_point = open_cli_attach_point(&storage, &cognitive, &event_tx).await;
+        let _attach_point =
+            open_cli_attach_point(&storage, &cognitive, &event_tx, Some(dashboard.starter())).await;
 
         // Get auth token
         let token = vestige_mcp::protocol::auth::get_or_create_auth_token()
@@ -5135,18 +5181,23 @@ async fn open_cli_attach_point(
     storage: &Arc<Storage>,
     cognitive: &Arc<tokio::sync::Mutex<vestige_mcp::cognitive::CognitiveEngine>>,
     event_tx: &tokio::sync::broadcast::Sender<vestige_mcp::dashboard::events::VestigeEvent>,
+    dashboard: Option<vestige_mcp::attach::DashboardStarter>,
 ) -> Option<vestige_mcp::attach::AttachPoint> {
     let dir = cli_data_dir().ok()?;
     let storage = Arc::clone(storage);
     let cognitive = Arc::clone(cognitive);
     let event_tx = event_tx.clone();
-    match vestige_mcp::attach::AttachPoint::open(&dir, move || {
-        vestige_mcp::server::McpServer::new_with_events(
-            Arc::clone(&storage),
-            Arc::clone(&cognitive),
-            event_tx.clone(),
-        )
-    })
+    match vestige_mcp::attach::AttachPoint::open(
+        &dir,
+        move || {
+            vestige_mcp::server::McpServer::new_with_events(
+                Arc::clone(&storage),
+                Arc::clone(&cognitive),
+                event_tx.clone(),
+            )
+        },
+        dashboard,
+    )
     .await
     {
         Ok(point) => Some(point),

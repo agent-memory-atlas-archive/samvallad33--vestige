@@ -388,3 +388,89 @@ fn cli_backs_up_through_a_running_server_and_never_opens_a_served_log() {
     restored.initialize();
     assert!(restored.sees(&id), "the backup does not hold the memory");
 }
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Status line of a plain HTTP GET, or `None` when nothing answers.
+fn http_status(port: u16, path: &str) -> Option<String> {
+    use std::io::Read;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    response.lines().next().map(str::to_string)
+}
+
+#[test]
+fn dashboard_command_is_served_by_the_running_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = Client::spawn("server", dir.path());
+    server.initialize();
+    let id = server.remember("attach test: visible while the dashboard runs");
+
+    let port = free_port();
+    let mut dashboard = Command::new(env!("CARGO_BIN_EXE_vestige"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .args(["dashboard", "--port", &port.to_string(), "--no-open"])
+        .env_remove("VESTIGE_DATA_DIR")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run vestige dashboard");
+    let (tx, lines) = channel();
+    let stdout = dashboard.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let deadline = Instant::now() + RPC_TIMEOUT;
+    let mut seen = Vec::new();
+    loop {
+        let line = lines
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|_| panic!("vestige dashboard printed no URL:\n{}", seen.join("\n")));
+        seen.push(line.clone());
+        if line.contains("served by vestige-mcp") {
+            break;
+        }
+    }
+    assert!(
+        seen.iter()
+            .any(|line| line.contains(&format!("127.0.0.1:{port}"))),
+        "{}",
+        seen.join("\n")
+    );
+    let status = http_status(port, "/api/health").expect("the dashboard answers");
+    assert!(status.contains(" 200"), "GET /api/health: {status}");
+
+    // MCP keeps working beside the dashboard.
+    assert!(server.sees(&id));
+
+    // The agent's client leaves; the dashboard's lease keeps the store served.
+    server.close_stdin();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(server.running(), "the owner exited under an open dashboard");
+    let status = http_status(port, "/api/health").expect("still answering");
+    assert!(status.contains(" 200"), "GET /api/health: {status}");
+
+    // Closing the dashboard releases the owner.
+    dashboard.kill().unwrap();
+    dashboard.wait().unwrap();
+    assert!(server.wait_exit(Duration::from_secs(30)).success());
+}

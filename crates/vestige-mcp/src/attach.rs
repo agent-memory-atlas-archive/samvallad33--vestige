@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tokio::io::{
@@ -52,6 +53,7 @@ pub const ENDPOINT_FILE: &str = ".serve.endpoint";
 
 const HELLO: &str = "vestige-attach/1";
 const WELCOME: &str = "vestige-attached/1";
+const REFUSED: &str = "vestige-refused/1";
 /// Bound on each side of the attach handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A handshake line longer than this is not one.
@@ -307,7 +309,16 @@ impl Gate {
     }
 }
 
-type ServerFactory = Arc<dyn Fn() -> McpServer + Send + Sync>;
+/// Starts (or finds) the owner's dashboard on the asked-for port and returns
+/// its URL, or says why it cannot.
+pub type DashboardStarter =
+    Arc<dyn Fn(u16) -> BoxFuture<'static, Result<String, String>> + Send + Sync>;
+
+/// What an owner offers attached connections.
+struct Services {
+    make_server: Box<dyn Fn() -> McpServer + Send + Sync>,
+    dashboard: Option<DashboardStarter>,
+}
 
 /// The owner's side: a loopback listener plus the endpoint file naming it.
 pub struct AttachPoint {
@@ -319,9 +330,14 @@ pub struct AttachPoint {
 
 impl AttachPoint {
     /// Bind 127.0.0.1 on a free port, publish the endpoint, and start
-    /// accepting. `make_server` builds the MCP session for each attachment.
-    /// Call only while holding the serve lock.
-    pub async fn open<F>(data_dir: &Path, make_server: F) -> io::Result<Self>
+    /// accepting. `make_server` builds the MCP session for each attachment;
+    /// `dashboard`, when given, serves `vestige dashboard` requests. Call only
+    /// while holding the serve lock.
+    pub async fn open<F>(
+        data_dir: &Path,
+        make_server: F,
+        dashboard: Option<DashboardStarter>,
+    ) -> io::Result<Self>
     where
         F: Fn() -> McpServer + Send + Sync + 'static,
     {
@@ -337,7 +353,10 @@ impl AttachPoint {
             listener,
             Arc::from(endpoint.token.as_str()),
             Arc::clone(&gate),
-            Arc::new(make_server),
+            Arc::new(Services {
+                make_server: Box::new(make_server),
+                dashboard,
+            }),
         ));
         info!(
             port = endpoint.port,
@@ -378,7 +397,7 @@ async fn accept_loop(
     listener: TcpListener,
     token: Arc<str>,
     gate: Arc<Gate>,
-    make_server: ServerFactory,
+    services: Arc<Services>,
 ) {
     let handshakes = Arc::new(Semaphore::new(MAX_HANDSHAKES));
     loop {
@@ -396,44 +415,111 @@ async fn accept_loop(
         };
         let token = Arc::clone(&token);
         let gate = Arc::clone(&gate);
-        let make_server = Arc::clone(&make_server);
+        let services = Arc::clone(&services);
         tokio::spawn(async move {
-            let Some((reader, writer, guard)) = admit(stream, &token, &gate, permit).await else {
+            let Some(admitted) = admit(stream, &token, &gate, permit).await else {
                 return;
             };
-            if let Err(err) = run_io(make_server(), None, reader, writer).await {
-                debug!("attached session ended with an I/O error: {err}");
+            let pid = std::process::id();
+            let Admitted {
+                request,
+                mut reader,
+                mut writer,
+                guard,
+            } = admitted;
+            match request {
+                Request::Session => {
+                    let welcome = format!("{WELCOME} {pid}\n");
+                    if writer.write_all(welcome.as_bytes()).await.is_err()
+                        || writer.flush().await.is_err()
+                    {
+                        return;
+                    }
+                    if let Err(err) = run_io((services.make_server)(), None, reader, writer).await {
+                        debug!("attached session ended with an I/O error: {err}");
+                    }
+                }
+                Request::Dashboard { port } => {
+                    let started = match &services.dashboard {
+                        Some(start) => start(port).await,
+                        None => Err("this Vestige process does not serve a dashboard".to_string()),
+                    };
+                    let answer = match &started {
+                        Ok(url) => format!("{WELCOME} {pid} {url}\n"),
+                        Err(reason) => format!("{REFUSED} {}\n", reason.replace('\n', " ")),
+                    };
+                    if writer.write_all(answer.as_bytes()).await.is_err()
+                        || writer.flush().await.is_err()
+                        || started.is_err()
+                    {
+                        return;
+                    }
+                    // The lease stays open until `vestige dashboard` exits. It
+                    // counts as an attached session, so this owner keeps
+                    // serving the dashboard even after its own client leaves.
+                    let mut sink = [0u8; 256];
+                    while matches!(reader.read(&mut sink).await, Ok(n) if n > 0) {}
+                }
             }
             drop(guard);
         });
     }
 }
 
-/// Check the token, count the session, and answer the handshake.
+/// What an attaching connection asked for.
+enum Request {
+    /// An MCP session over this connection.
+    Session,
+    /// Start (or find) the dashboard, then hold the connection as a lease.
+    Dashboard { port: u16 },
+}
+
+struct Admitted {
+    request: Request,
+    reader: BufReader<OwnedReadHalf>,
+    writer: OwnedWriteHalf,
+    guard: SessionGuard,
+}
+
+/// Check the token, read what the connection wants, and count it.
 async fn admit(
     stream: TcpStream,
     token: &str,
     gate: &Arc<Gate>,
     permit: OwnedSemaphorePermit,
-) -> Option<(BufReader<OwnedReadHalf>, OwnedWriteHalf, SessionGuard)> {
+) -> Option<Admitted> {
     stream.set_nodelay(true).ok()?;
-    let (read, mut writer) = stream.into_split();
+    let (read, writer) = stream.into_split();
     let mut reader = BufReader::new(read);
     let hello = read_handshake_line(&mut reader).await?;
-    let presented = hello
+    let mut words = hello
         .strip_prefix(HELLO)
         .and_then(|rest| rest.strip_prefix(' '))
-        .unwrap_or("");
+        .unwrap_or("")
+        .split(' ');
+    let presented = words.next().unwrap_or("");
     if !bool::from(presented.as_bytes().ct_eq(token.as_bytes())) {
         debug!("attach refused: wrong or missing token");
         return None;
     }
+    let request = match (words.next(), words.next(), words.next()) {
+        (None, _, _) => Request::Session,
+        (Some("dashboard"), Some(port), None) => Request::Dashboard {
+            port: port.parse().ok()?,
+        },
+        _ => {
+            debug!("attach refused: unknown request {hello:?}");
+            return None;
+        }
+    };
     let guard = gate.try_enter()?;
     drop(permit);
-    let welcome = format!("{WELCOME} {}\n", std::process::id());
-    writer.write_all(welcome.as_bytes()).await.ok()?;
-    writer.flush().await.ok()?;
-    Some((reader, writer, guard))
+    Some(Admitted {
+        request,
+        reader,
+        writer,
+        guard,
+    })
 }
 
 // ============================================================================
@@ -448,7 +534,13 @@ pub struct Attachment {
     pub owner_pid: u32,
 }
 
-async fn attach(data_dir: &Path) -> Option<Attachment> {
+/// Connect to the published endpoint, send the token plus `request` (empty
+/// for an MCP session), and return the owner's one-line answer.
+async fn greet(
+    data_dir: &Path,
+    request: &str,
+    answer_within: Duration,
+) -> Option<(BufReader<OwnedReadHalf>, OwnedWriteHalf, String)> {
     let endpoint = read_endpoint(data_dir)?;
     let stream = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
@@ -459,11 +551,28 @@ async fn attach(data_dir: &Path) -> Option<Attachment> {
     .ok()?;
     stream.set_nodelay(true).ok()?;
     let (read, mut writer) = stream.into_split();
-    let hello = format!("{HELLO} {}\n", endpoint.token);
+    let hello = format!("{HELLO} {}{request}\n", endpoint.token);
     writer.write_all(hello.as_bytes()).await.ok()?;
     writer.flush().await.ok()?;
     let mut reader = BufReader::new(read);
-    let welcome = read_handshake_line(&mut reader).await?;
+    let mut answer = String::new();
+    let read = tokio::time::timeout(
+        answer_within,
+        (&mut reader)
+            .take(HANDSHAKE_LINE_MAX)
+            .read_line(&mut answer),
+    )
+    .await;
+    match read {
+        Ok(Ok(n)) if n > 0 && answer.ends_with('\n') => {
+            Some((reader, writer, answer.trim_end().to_string()))
+        }
+        _ => None,
+    }
+}
+
+async fn attach(data_dir: &Path) -> Option<Attachment> {
+    let (reader, writer, welcome) = greet(data_dir, "", HANDSHAKE_TIMEOUT).await?;
     let owner_pid = welcome
         .strip_prefix(WELCOME)?
         .strip_prefix(' ')?
@@ -766,14 +875,17 @@ async fn relay(
             drop(owner_tx);
             let drained = tokio::time::timeout(CLOSE_DRAIN, async {
                 while let Ok(Some(line)) = owner_lines.next_line().await {
-                    if session.owner_line(&line) && stdout.send(format!("{line}\n")).await.is_err() {
+                    if session.owner_line(&line) && stdout.send(format!("{line}\n")).await.is_err()
+                    {
                         break;
                     }
                 }
             })
             .await;
             if drained.is_err() {
-                warn!("the Vestige server did not finish answering within {CLOSE_DRAIN:?} of stdin EOF");
+                warn!(
+                    "the Vestige server did not finish answering within {CLOSE_DRAIN:?} of stdin EOF"
+                );
             }
             owner_writer.abort();
             Relayed::ClientClosed
@@ -828,6 +940,64 @@ fn answers(line: &str, id: &Value) -> bool {
 // ============================================================================
 // One-shot calls (CLI)
 // ============================================================================
+
+/// The owner's dashboard, held open for as long as this lease lives.
+pub struct DashboardLease {
+    /// Where the dashboard answers.
+    pub url: String,
+    /// The process serving it.
+    pub owner_pid: u32,
+    reader: BufReader<OwnedReadHalf>,
+    _writer: OwnedWriteHalf,
+}
+
+impl DashboardLease {
+    /// Wait until the owner goes away (the connection closes).
+    pub async fn closed(mut self) {
+        let mut sink = [0u8; 256];
+        while matches!(self.reader.read(&mut sink).await, Ok(n) if n > 0) {}
+    }
+}
+
+/// Ask the process serving `data_dir` to serve its dashboard on `port` (or
+/// to name the one it already runs). The lease keeps that process serving.
+pub async fn request_dashboard(data_dir: &Path, port: u16) -> io::Result<DashboardLease> {
+    let request = format!(" dashboard {port}");
+    let Some((reader, writer, answer)) = greet(data_dir, &request, Duration::from_secs(30)).await
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "no Vestige server accepted an attach for {}",
+                data_dir.display()
+            ),
+        ));
+    };
+    if let Some(reason) = answer
+        .strip_prefix(REFUSED)
+        .map(|rest| rest.trim().to_string())
+    {
+        return Err(io::Error::other(reason));
+    }
+    let mut words = answer
+        .strip_prefix(WELCOME)
+        .and_then(|rest| rest.strip_prefix(' '))
+        .unwrap_or("")
+        .split(' ');
+    let owner_pid = words.next().and_then(|pid| pid.parse().ok());
+    let url = words.next().map(str::to_string);
+    match (owner_pid, url) {
+        (Some(owner_pid), Some(url)) => Ok(DashboardLease {
+            url,
+            owner_pid,
+            reader,
+            _writer: writer,
+        }),
+        _ => Err(io::Error::other(format!(
+            "unexpected answer from the Vestige server: {answer}"
+        ))),
+    }
+}
 
 /// Call one MCP tool through the process serving `data_dir`, as a
 /// short-lived client. Returns the tool's structured result.
@@ -1037,9 +1207,9 @@ mod tests {
         session.client_line(r#"{"jsonrpc":"2.0","method":"notifications/cancelled"}"#);
         session.client_line(r#"{"jsonrpc":"2.0","id":9,"result":{}}"#);
         assert!(session.owner_line(r#"{"jsonrpc":"2.0","id":"x","result":{}}"#));
-        assert!(session.owner_line(
-            r#"{"jsonrpc":"2.0","method":"notifications/message","params":{}}"#
-        ));
+        assert!(
+            session.owner_line(r#"{"jsonrpc":"2.0","method":"notifications/message","params":{}}"#)
+        );
 
         let errors = session.abandon_in_flight();
         assert_eq!(errors.len(), 1);
@@ -1057,10 +1227,17 @@ mod tests {
             "isError": false
         }});
         assert_eq!(tool_result("t", ok).unwrap()["path"], "b");
-        let text_only = json!({"result": {"content": [{"type": "text", "text": "{\"path\":\"a\"}"}]}});
+        let text_only =
+            json!({"result": {"content": [{"type": "text", "text": "{\"path\":\"a\"}"}]}});
         assert_eq!(tool_result("t", text_only).unwrap()["path"], "a");
-        let failed = json!({"result": {"content": [{"type": "text", "text": "nope"}], "isError": true}});
-        assert!(tool_result("t", failed).unwrap_err().to_string().contains("nope"));
+        let failed =
+            json!({"result": {"content": [{"type": "text", "text": "nope"}], "isError": true}});
+        assert!(
+            tool_result("t", failed)
+                .unwrap_err()
+                .to_string()
+                .contains("nope")
+        );
         let rpc_error = json!({"error": {"code": -32601, "message": "missing"}});
         assert!(tool_result("t", rpc_error).is_err());
     }
@@ -1075,7 +1252,9 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!closer.is_finished(), "must wait for the attached session");
-        let second = gate.try_enter().expect("still open while a session is attached");
+        let second = gate
+            .try_enter()
+            .expect("still open while a session is attached");
         drop(first);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!closer.is_finished());

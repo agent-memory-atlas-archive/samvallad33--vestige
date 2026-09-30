@@ -512,7 +512,11 @@ async fn serve() {
             }
         }
         Err(e) => {
-            error!("Could not serve or attach to {}: {}", strata_dir.display(), e);
+            error!(
+                "Could not serve or attach to {}: {}",
+                strata_dir.display(),
+                e
+            );
             std::process::exit(1);
         }
     };
@@ -742,25 +746,23 @@ async fn serve() {
         event_tx.clone(),
     );
 
-    // Spawn dashboard HTTP server alongside MCP server (now with CognitiveEngine access)
+    // The dashboard starts here when VESTIGE_DASHBOARD_ENABLED is set, or
+    // later, when `vestige dashboard` asks this process through the attach
+    // endpoint (this process holds the store, so the CLI cannot open it).
+    let dashboard = vestige_mcp::dashboard::DashboardOnDemand::new(
+        Arc::clone(&storage),
+        Arc::clone(&cognitive),
+        event_tx.clone(),
+    );
     if config.dashboard_enabled {
         let dashboard_port = std::env::var("VESTIGE_DASHBOARD_PORT")
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(3927);
-        let dashboard_storage = Arc::clone(&storage);
-        let dashboard_cognitive = Arc::clone(&cognitive);
-        let dashboard_event_tx = event_tx.clone();
+        let dashboard = dashboard.clone();
         tokio::spawn(async move {
-            match vestige_mcp::dashboard::start_background_with_event_tx(
-                dashboard_storage,
-                Some(dashboard_cognitive),
-                dashboard_event_tx,
-                dashboard_port,
-            )
-            .await
-            {
-                Ok(_state) => {
+            match dashboard.ensure(dashboard_port).await {
+                Ok(_) => {
                     info!("Dashboard started with WebSocket + CognitiveEngine + shared event bus");
                 }
                 Err(e) => {
@@ -769,7 +771,9 @@ async fn serve() {
             }
         });
     } else {
-        info!("Dashboard disabled by VESTIGE_DASHBOARD_ENABLED=false");
+        info!(
+            "Dashboard not started (VESTIGE_DASHBOARD_ENABLED is off); `vestige dashboard` starts it on request"
+        );
     }
 
     // Start optional HTTP MCP transport for clients that need Streamable HTTP.
@@ -818,9 +822,17 @@ async fn serve() {
         let storage = Arc::clone(&storage);
         let cognitive = Arc::clone(&cognitive);
         let event_tx = event_tx.clone();
-        match attach::AttachPoint::open(&strata_dir, move || {
-            McpServer::new_with_events(Arc::clone(&storage), Arc::clone(&cognitive), event_tx.clone())
-        })
+        match attach::AttachPoint::open(
+            &strata_dir,
+            move || {
+                McpServer::new_with_events(
+                    Arc::clone(&storage),
+                    Arc::clone(&cognitive),
+                    event_tx.clone(),
+                )
+            },
+            Some(dashboard.starter()),
+        )
         .await
         {
             Ok(point) => Some(point),
