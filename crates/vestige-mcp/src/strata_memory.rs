@@ -2454,7 +2454,11 @@ impl MemoryStoreSend for StrataMemory {
         if store.get_node(id).is_none() {
             return Err(StorageError::NotFound(id.to_string()));
         }
-        store
+        // An edit admits a successor and retires this node, and a retired
+        // node has no anchors. Read them first so the code evidence moves
+        // with the memory (SQLite edits in place and keeps them).
+        let anchors = store.anchors_for(id);
+        let (successor, _) = store
             .edit(
                 id,
                 new_content,
@@ -2464,6 +2468,20 @@ impl MemoryStoreSend for StrataMemory {
                 },
             )
             .map_err(map_store)?;
+        if !anchors.is_empty() {
+            let moved = anchors
+                .into_iter()
+                .map(|anchor| strata_store::AnchorRecord {
+                    node_id: successor.clone(),
+                    ..anchor
+                })
+                .collect();
+            // Same anchor ids, so they move rather than duplicate. The edit
+            // already stands; a failure here is reported, not rolled back.
+            if let Err(err) = store.record_anchors(moved) {
+                tracing::warn!(memory_id = %successor, error = %err, "edit kept the memory but not its code anchors");
+            }
+        }
         Ok(())
     }
 }

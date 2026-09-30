@@ -1958,4 +1958,42 @@ pub fn load_config(path: &str) -> Config {
         assert_eq!(by_node.len(), 1);
         assert_eq!(by_node[&pattern.id].len(), 1);
     }
+
+    /// Editing a code memory on Strata admits a successor and retires the
+    /// old node. The anchors must move with it, or the edited memory would
+    /// lose its source evidence.
+    #[tokio::test]
+    async fn editing_a_code_memory_keeps_its_anchors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = strata(dir.path());
+        let cog = cognitive();
+        let repo = repo_with_source(SOURCE);
+        let saved = save_anchored(&storage, &cog, &repo).await;
+        let old_id = saved["nodeId"]
+            .as_str()
+            .or_else(|| saved["id"].as_str())
+            .expect("saved memory id")
+            .to_string();
+        let before = storage.code_anchors_for_node(&old_id).unwrap();
+        assert_eq!(before.len(), 1, "{saved}");
+
+        let edited = crate::tools::memory_unified::execute(
+            &storage,
+            &cog,
+            Some(serde_json::json!({
+                "action": "edit",
+                "id": old_id,
+                "content": "load_config still reads eagerly; cache the result"
+            })),
+        )
+        .await
+        .unwrap();
+        let successor = edited["nodeId"].as_str().expect("successor id").to_string();
+        assert_ne!(successor, old_id);
+        let moved = storage.code_anchors_for_node(&successor).unwrap();
+        assert_eq!(moved.len(), 1, "anchors must follow the edit: {edited}");
+        assert_eq!(moved[0].id, before[0].id);
+        assert_eq!(moved[0].content_hash, before[0].content_hash);
+        assert!(storage.code_anchors_for_node(&old_id).unwrap().is_empty());
+    }
 }
