@@ -1275,6 +1275,63 @@ fn remove_legacy_launchd_job(home: &Path) {
     }
 }
 
+/// Load the Claude Code settings file for a merge. A missing or blank file is an
+/// empty object; a file that is not a JSON object is an error and is never
+/// replaced.
+fn read_settings_for_update(settings_path: &Path) -> anyhow::Result<serde_json::Value> {
+    let raw = match fs::read_to_string(settings_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(serde_json::json!({}));
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", settings_path.display()));
+        }
+    };
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let settings: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "{} is not valid JSON; fix or move it and re-run (it was left unchanged)",
+            settings_path.display()
+        )
+    })?;
+    if !settings.is_object() {
+        anyhow::bail!(
+            "{} does not hold a JSON object; fix or move it and re-run (it was left unchanged)",
+            settings_path.display()
+        );
+    }
+    Ok(settings)
+}
+
+/// Copy the current settings file aside before it is rewritten. The first
+/// backup ever taken is kept as-is; a second backup is refreshed on every run.
+fn backup_settings_before_rewrite(claude_dir: &Path, settings_path: &Path) -> anyhow::Result<()> {
+    if !settings_path.exists() {
+        return Ok(());
+    }
+    let first = claude_dir.join("settings.json.bak.pre-sandwich");
+    let latest = claude_dir.join("settings.json.bak.last-sandwich");
+    let mut targets = vec![latest];
+    if !first.exists() {
+        targets.push(first);
+    }
+    for target in targets {
+        fs::copy(settings_path, &target)
+            .with_context(|| format!("failed to back up to {}", target.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&target)?.permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(&target, perms)?;
+        }
+    }
+    Ok(())
+}
+
 fn install_sandwich_from_source(
     source_root: &Path,
     options: &SandwichInstallOptions,
@@ -1308,6 +1365,10 @@ fn install_sandwich_from_source(
         with_launchd = false;
         enable_sanhedrin = true;
     }
+
+    // Read the settings first: an unreadable or unparseable file stops the
+    // install before anything on disk has changed.
+    let mut settings = read_settings_for_update(&settings_path)?;
 
     fs::create_dir_all(&claude_dir)?;
     let (hooks_copied, hooks_skipped) = copy_companion_files(
@@ -1387,24 +1448,7 @@ fn install_sandwich_from_source(
         install_launchd_job(&source_root, &home, &model)?;
     }
 
-    if !settings_path.exists() {
-        fs::write(&settings_path, "{}\n")?;
-    }
-    let backup_path = claude_dir.join("settings.json.bak.pre-sandwich");
-    if !backup_path.exists() {
-        fs::copy(&settings_path, &backup_path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&backup_path)?.permissions();
-            perms.set_mode(0o600);
-            fs::set_permissions(&backup_path, perms)?;
-        }
-    }
-
-    let settings_file = fs::File::open(&settings_path)?;
-    let mut settings: serde_json::Value =
-        serde_json::from_reader(settings_file).unwrap_or_else(|_| serde_json::json!({}));
+    backup_settings_before_rewrite(&claude_dir, &settings_path)?;
     scrub_vestige_hooks(&mut settings);
 
     if enable_preflight {
@@ -1424,9 +1468,10 @@ fn install_sandwich_from_source(
         )?;
     }
 
-    let mut settings_file = fs::File::create(&settings_path)?;
-    serde_json::to_writer_pretty(&mut settings_file, &settings)?;
-    writeln!(settings_file)?;
+    let mut rendered = serde_json::to_vec_pretty(&settings)?;
+    rendered.push(b'\n');
+    fs::write(&settings_path, rendered)
+        .with_context(|| format!("failed to write {}", settings_path.display()))?;
 
     if enable_preflight || enable_sanhedrin {
         let mut layers = Vec::new();
