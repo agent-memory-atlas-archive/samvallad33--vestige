@@ -77,16 +77,23 @@ fn happy_path_propose_gate_allow_effect_admitted() {
     let p_ack = rt.commit_propose(propose.clone());
     let g_ack = rt.commit_gate(p_ack.seq).expect("gate commits");
 
-    let stored_gate = rt.log().all()[g_ack.seq as usize].gate().expect("gate record");
+    let stored_gate = rt.log().all()[g_ack.seq as usize]
+        .gate()
+        .expect("gate record");
     assert_eq!(stored_gate.verdict, Verdict::Allow);
     assert_eq!(stored_gate.propose_seq, p_ack.seq);
     assert_eq!(stored_gate.policy_hash, rt.pinned().policy_hash());
 
     let effect = effect_for(&propose, p_ack.seq, g_ack.seq);
-    let ticket = rt.admit(&effect).expect("admission ticket projects the slot");
+    let ticket = rt
+        .admit(&effect)
+        .expect("admission ticket projects the slot");
     let e_ack = rt.commit_effect(effect).expect("admitted");
     assert_eq!(ticket.seq, e_ack.seq);
-    assert_eq!(rt.log().all().last().expect("tail").kind, RecordKind::Effect);
+    assert_eq!(
+        rt.log().all().last().expect("tail").kind,
+        RecordKind::Effect
+    );
     assert_eq!(rt.log().tip(), 3);
 }
 
@@ -110,7 +117,10 @@ fn gate_deny_rejects() {
     let propose = write_propose(vec![]);
     let p_ack = rt.commit_propose(propose.clone());
     let g_ack = rt.commit_gate(p_ack.seq).expect("gate commits");
-    assert_eq!(rt.log().all()[g_ack.seq as usize].gate().unwrap().verdict, Verdict::Deny);
+    assert_eq!(
+        rt.log().all()[g_ack.seq as usize].gate().unwrap().verdict,
+        Verdict::Deny
+    );
 
     let err = rt
         .commit_effect(effect_for(&propose, p_ack.seq, g_ack.seq))
@@ -179,7 +189,10 @@ fn forgotten_lesson_alarm_blocks_when_policy_forbids() {
     assert_eq!(inputs.forgotten_lessons, vec![(7, FORGET_FLOOR_MILLI - 1)]);
 
     let g_ack = rt.commit_gate(p_ack.seq).expect("gate commits");
-    assert_eq!(rt.log().all()[g_ack.seq as usize].gate().unwrap().verdict, Verdict::Deny);
+    assert_eq!(
+        rt.log().all()[g_ack.seq as usize].gate().unwrap().verdict,
+        Verdict::Deny
+    );
     assert_eq!(
         rt.commit_effect(effect_for(&propose, p_ack.seq, g_ack.seq)),
         Err(Rejected::GateDenied),
@@ -199,7 +212,11 @@ fn forbidden_by_alarm_reason_is_reachable() {
     append_raw(
         &mut log,
         RecordKind::LessonAlarm,
-        &LessonAlarmRecord { propose_seq: 1, lesson_id: 42, retention_milli: -1 },
+        &LessonAlarmRecord {
+            propose_seq: 1,
+            lesson_id: 42,
+            retention_milli: -1,
+        },
     );
     let propose = write_propose(vec![2]);
     let p0 = append_raw(&mut log, RecordKind::Propose, &propose); // seq 1, matches the alarm
@@ -223,7 +240,10 @@ fn forbidden_by_alarm_reason_is_reachable() {
     let mut rt = GateRuntime::new(MemLog::new(), policy);
     let p1 = rt.commit_propose(propose.clone());
     let g1 = rt.commit_gate(p1.seq).expect("gate");
-    assert_eq!(rt.log().all()[g1.seq as usize].gate().unwrap().verdict, Verdict::Allow);
+    assert_eq!(
+        rt.log().all()[g1.seq as usize].gate().unwrap().verdict,
+        Verdict::Allow
+    );
     rt.commit_lesson_alarm(LessonAlarmRecord {
         propose_seq: p1.seq,
         lesson_id: 43,
@@ -246,7 +266,11 @@ fn blast_radius_over_50_denies() {
     let ok_ack = rt.commit_propose(propose_ok.clone());
     rt.commit_gate(ok_ack.seq).expect("gate commits");
     assert_eq!(
-        rt.log().all().last().and_then(|e| e.gate()).map(|g| g.verdict),
+        rt.log()
+            .all()
+            .last()
+            .and_then(|e| e.gate())
+            .map(|g| g.verdict),
         Some(Verdict::Allow)
     );
 
@@ -255,7 +279,11 @@ fn blast_radius_over_50_denies() {
     let big_ack = rt.commit_propose(propose_big.clone());
     rt.commit_gate(big_ack.seq).expect("gate commits");
     assert_eq!(
-        rt.log().all().last().and_then(|e| e.gate()).map(|g| g.verdict),
+        rt.log()
+            .all()
+            .last()
+            .and_then(|e| e.gate())
+            .map(|g| g.verdict),
         Some(Verdict::Deny)
     );
 
@@ -268,11 +296,19 @@ fn blast_radius_over_50_denies() {
     let hub_propose = write_propose(vec![hub]);
     let h_ack = rt.commit_propose(hub_propose.clone());
     let inputs = compute_inputs(rt.log(), h_ack.seq).expect("inputs");
-    assert!(inputs.blast_radius.closure_size >= 61, "closure pulls spokes: {}", inputs.blast_radius.closure_size);
+    assert!(
+        inputs.blast_radius.closure_size >= 61,
+        "closure pulls spokes: {}",
+        inputs.blast_radius.closure_size
+    );
     assert!(inputs.blast_radius.tiers >= 1);
     rt.commit_gate(h_ack.seq).expect("gate commits");
     assert_eq!(
-        rt.log().all().last().and_then(|e| e.gate()).map(|g| g.verdict),
+        rt.log()
+            .all()
+            .last()
+            .and_then(|e| e.gate())
+            .map(|g| g.verdict),
         Some(Verdict::Deny)
     );
 }
@@ -299,7 +335,10 @@ fn canary_read_alerts_and_holds_descendants() {
     let inputs = compute_inputs(rt.log(), c_ack.seq).expect("inputs");
     assert_eq!(inputs.canary_hits, 1);
     let cg_ack = rt.commit_gate(c_ack.seq).expect("gate commits");
-    assert_eq!(rt.log().all()[cg_ack.seq as usize].gate().unwrap().verdict, Verdict::Hold);
+    assert_eq!(
+        rt.log().all()[cg_ack.seq as usize].gate().unwrap().verdict,
+        Verdict::Hold
+    );
     assert_eq!(
         rt.commit_effect(effect_for(&clean, c_ack.seq, cg_ack.seq)),
         Err(Rejected::GateDenied),
@@ -335,8 +374,12 @@ fn rederive_matches_stored_verdicts_over_1000_event_fixture() {
             0..=39 => {
                 let n = (rng.next() % 4) as usize;
                 let context: Vec<u64> = (0..n).map(|_| rng.next() % 32).collect();
-                let kind = [ActionKindCode::WRITE, ActionKindCode::RETIRE, ActionKindCode::GRANT, ActionKindCode::EFFECT]
-                    [(rng.next() % 4) as usize];
+                let kind = [
+                    ActionKindCode::WRITE,
+                    ActionKindCode::RETIRE,
+                    ActionKindCode::GRANT,
+                    ActionKindCode::EFFECT,
+                ][(rng.next() % 4) as usize];
                 let propose = Propose {
                     action_hash: h32(rng.next()),
                     action_kind: kind,
@@ -359,7 +402,9 @@ fn rederive_matches_stored_verdicts_over_1000_event_fixture() {
                     continue;
                 }
                 let seq = order[(rng.next() as usize) % order.len()];
-                let Some(propose) = proposes.get(&seq) else { continue };
+                let Some(propose) = proposes.get(&seq) else {
+                    continue;
+                };
                 // Cite the latest gate when there is one; sometimes cite a
                 // stale seq to exercise the rejection paths.
                 let gate_seq = rt
@@ -395,7 +440,10 @@ fn rederive_matches_stored_verdicts_over_1000_event_fixture() {
     assert!(stored.len() > 50, "fixture produced {} gates", stored.len());
 
     let rederived = rt.rederive_verdicts().expect("rederive succeeds");
-    assert_eq!(rederived, stored, "re-derived verdicts must match bit-for-bit");
+    assert_eq!(
+        rederived, stored,
+        "re-derived verdicts must match bit-for-bit"
+    );
 
     // Everything the runtime appended as an effect passed admission, so the
     // sweep must report no orphan effects (reads/duty gaps may exist).
@@ -416,7 +464,11 @@ struct HoleLog {
 
 impl EventLog for HoleLog {
     fn events_before(&self, bound: u64) -> Vec<GateEvent> {
-        self.events.iter().take_while(|e| e.seq < bound).cloned().collect()
+        self.events
+            .iter()
+            .take_while(|e| e.seq < bound)
+            .cloned()
+            .collect()
     }
     fn append(&mut self, kind: RecordKind, payload: Vec<u8>) -> SeqAck {
         let seq = self.next;
@@ -433,33 +485,51 @@ fn sweep_catches_orphan_effect_reads_and_duty_gaps() {
     let mut log = MemLog::new();
     let propose = write_propose(vec![999]); // 999 is also a dangling read
     let p_ack = append_raw(&mut log, RecordKind::Propose, &propose);
-    append_raw(&mut log, RecordKind::Effect, &effect_for(&propose, p_ack.seq, p_ack.seq + 1));
+    append_raw(
+        &mut log,
+        RecordKind::Effect,
+        &effect_for(&propose, p_ack.seq, p_ack.seq + 1),
+    );
 
     let gaps = sweep(&log);
     assert!(
         gaps.iter().any(|g| matches!(
             &g.detail,
-            GapDetail::OrphanEffect { effect_seq: 1, propose_seq: 0, reason: 2 } // NoGate
+            GapDetail::OrphanEffect {
+                effect_seq: 1,
+                propose_seq: 0,
+                reason: 2
+            } // NoGate
         )),
         "orphan effect flagged: {gaps:?}"
     );
     assert!(
         gaps.iter().any(|g| matches!(
             &g.detail,
-            GapDetail::ReadNoReceipt { reader_seq: 0, dangling_id: 999 }
+            GapDetail::ReadNoReceipt {
+                reader_seq: 0,
+                dangling_id: 999
+            }
         )),
         "dangling read flagged: {gaps:?}"
     );
 
     // Duty sequence hole.
-    let mut holey = HoleLog { events: Vec::new(), next: 0 };
+    let mut holey = HoleLog {
+        events: Vec::new(),
+        next: 0,
+    };
     holey.append(RecordKind::Canary, vec![]);
     holey.append(RecordKind::Canary, vec![]);
     let gaps = sweep(&holey);
     assert!(
         gaps.iter().any(|g| matches!(
             &g.detail,
-            GapDetail::DutySeqGap { source: 0, expected: 1, found: 2 }
+            GapDetail::DutySeqGap {
+                source: 0,
+                expected: 1,
+                found: 2
+            }
         )),
         "duty gap flagged: {gaps:?}"
     );
@@ -472,7 +542,10 @@ fn policy_vm_first_match_wins_default_deny() {
     let inputs = crate::GateInputs {
         live_facts_digest: [0; 32],
         retired_facts_digest: [0; 32],
-        blast_radius: crate::BlastRadius { closure_size: 10, tiers: 1 },
+        blast_radius: crate::BlastRadius {
+            closure_size: 10,
+            tiers: 1,
+        },
         forgotten_lessons: vec![],
         canary_hits: 0,
     };
@@ -521,23 +594,44 @@ fn wire_layouts_are_exact() {
         len(&effect_for(&write_propose(vec![]), 1, 2)),
         80 // 8+8+32+32
     );
-    assert_eq!(len(&LessonAlarmRecord { propose_seq: 1, lesson_id: 2, retention_milli: 3 }), 24);
+    assert_eq!(
+        len(&LessonAlarmRecord {
+            propose_seq: 1,
+            lesson_id: 2,
+            retention_milli: 3
+        }),
+        24
+    );
     assert_eq!(len(&crate::record::CanaryRecord { canary_id: 1 }), 8);
-    assert_eq!(len(&AlertRecord { canary_id: 1, reader_seq: 2 }), 16);
+    assert_eq!(
+        len(&AlertRecord {
+            canary_id: 1,
+            reader_seq: 2
+        }),
+        16
+    );
     assert_eq!(len(&allow_writes(50).rules[0]), 16); // 1+8+4+1+1+1
     assert_eq!(len(&allow_writes(50)), 4 + 16); // u32 len + 1 rule
     // GateInputs with no forgotten lessons: 32+32+(4+2)+4+4 = 78.
     let inputs = crate::GateInputs {
         live_facts_digest: [1; 32],
         retired_facts_digest: [2; 32],
-        blast_radius: crate::BlastRadius { closure_size: 7, tiers: 3 },
+        blast_radius: crate::BlastRadius {
+            closure_size: 7,
+            tiers: 3,
+        },
         forgotten_lessons: vec![],
         canary_hits: 9,
     };
     assert_eq!(len(&inputs), 78);
     // GateRecord with those inputs: 8+1+32+78 = 119.
     assert_eq!(
-        len(&GateRecord { propose_seq: 1, verdict: Verdict::Hold, policy_hash: [3; 32], inputs }),
+        len(&GateRecord {
+            propose_seq: 1,
+            verdict: Verdict::Hold,
+            policy_hash: [3; 32],
+            inputs
+        }),
         119
     );
 

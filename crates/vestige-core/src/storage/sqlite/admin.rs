@@ -34,10 +34,14 @@ impl SqliteMemoryStore {
 
     pub(super) fn prepare_data_dir(data_dir: PathBuf) -> Result<PathBuf> {
         let data_dir = Self::expand_tilde(data_dir);
+        // Owner-only 0700 applies ONLY to a directory this call created.
+        // Tightening a pre-existing data directory happened before the v3
+        // guard could refuse, narrowing the user's whole data dir as a side
+        // effect of a refused command (audit finding).
+        let existed = data_dir.exists();
         std::fs::create_dir_all(&data_dir)?;
-        // Restrict directory permissions to owner-only on Unix
         #[cfg(unix)]
-        {
+        if !existed {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o700);
             let _ = std::fs::set_permissions(&data_dir, perms);
@@ -649,10 +653,28 @@ impl SqliteMemoryStore {
             None => Self::default_db_path()?,
         };
 
+        // PR 0a: a v3 SQLite file is never opened read-write. Detect by
+        // magic bytes first — before the write handle, the chmod, and the
+        // migration pass can touch it — and refuse with the migration hint.
+        // The only escape is the `v3-engine` raw engine harness (restart /
+        // durability tests that reopen synthetic stores); test builds are
+        // NOT exempt (audit: a fresh install created a SQLite store and then
+        // refused to open it, invisible while the guard was test-disabled).
+        #[cfg(all(feature = "legacy-sqlite", not(feature = "v3-engine")))]
+        {
+            // A missing path is not a v3 store. Refusing to create it exits
+            // before the stdio handshake. Existing SQLite files stay refused.
+            crate::storage::v3_guard::ensure_not_v3(&path)?;
+        }
+
         // Open writer connection
         let writer_conn = Connection::open(&path)?;
 
-        // Restrict database file permissions to owner-only on Unix
+        // Restrict database file permissions to owner-only on Unix — the
+        // database FILE only. Chmodding a pre-existing data DIRECTORY here
+        // narrowed the user's whole data dir before the guard could refuse
+        // (audit finding); directories are only chmod'd when this call
+        // created them (see prepare_data_dir).
         #[cfg(unix)]
         if path.exists() {
             use std::os::unix::fs::PermissionsExt;
@@ -708,10 +730,10 @@ impl SqliteMemoryStore {
                 .to_string(),
         };
 
-        #[cfg(feature = "embeddings")]
+        #[cfg(vestige_embeddings_removed)]
         let embedding_service = EmbeddingService::new();
 
-        #[cfg(feature = "vector-search")]
+        #[cfg(vestige_embeddings_removed)]
         let vector_index = if Self::vector_search_enabled_by_cpu() {
             let vector_index = VectorIndex::new()
                 .map_err(|e| StorageError::Init(format!("Failed to create vector index: {}", e)))?;
@@ -724,7 +746,7 @@ impl SqliteMemoryStore {
             None
         };
 
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         let query_cache = if vector_index.is_some() {
             Some(Mutex::new(LruCache::new(
                 NonZeroUsize::new(100).expect("100 is non-zero"),
@@ -740,15 +762,15 @@ impl SqliteMemoryStore {
             writer: Mutex::new(writer_conn),
             reader: Mutex::new(reader_conn),
             scheduler: Mutex::new(FSRSScheduler::default()),
-            #[cfg(feature = "embeddings")]
+            #[cfg(vestige_embeddings_removed)]
             embedding_service,
-            #[cfg(feature = "vector-search")]
+            #[cfg(vestige_embeddings_removed)]
             vector_index,
-            #[cfg(feature = "vector-search")]
+            #[cfg(vestige_embeddings_removed)]
             vector_index_watermark: Mutex::new(VectorIndexWatermark::default()),
-            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+            #[cfg(vestige_embeddings_removed)]
             query_cache,
-            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+            #[cfg(vestige_embeddings_removed)]
             attached_profile_runtime: RwLock::new(None),
             registered_model: std::sync::RwLock::new(None),
         };
@@ -793,10 +815,6 @@ impl SqliteMemoryStore {
         self.data_dir().join(name)
     }
 
-    /// Return the profile-scoped HNSW sidecar location. The profile ID is
-    /// validated before being placed in a path, preventing traversal through a
-    /// manifest or CLI argument.
-
     /// Get memory statistics
     pub fn get_stats(&self) -> Result<MemoryStats> {
         let now = Utc::now().to_rfc3339();
@@ -804,7 +822,7 @@ impl SqliteMemoryStore {
         // Resolve the active pointer before taking the shared reader lock.
         // `active_embedding_profile` reads through that same mutex; calling it
         // below after acquiring `reader` would self-deadlock every stats read.
-        #[cfg(feature = "embeddings")]
+        #[cfg(vestige_embeddings_removed)]
         let active_profile = self.active_embedding_profile()?;
 
         let reader = self
@@ -869,7 +887,7 @@ impl SqliteMemoryStore {
             )
             .optional()?;
 
-        #[cfg(feature = "embeddings")]
+        #[cfg(vestige_embeddings_removed)]
         let active_embedding_model = active_profile.as_ref().and_then(|active| {
             reader
                 .query_row(
@@ -879,10 +897,10 @@ impl SqliteMemoryStore {
                 )
                 .ok()
         });
-        #[cfg(not(feature = "embeddings"))]
+        #[cfg(not(vestige_embeddings_removed))]
         let active_embedding_model: Option<String> = None;
 
-        #[cfg(feature = "embeddings")]
+        #[cfg(vestige_embeddings_removed)]
         let (nodes_with_active_embeddings, nodes_with_mismatched_embeddings) = {
             let active_profile_id = active_profile
                 .as_ref()
@@ -925,7 +943,7 @@ impl SqliteMemoryStore {
             )?;
             (active_count, mismatched_count)
         };
-        #[cfg(not(feature = "embeddings"))]
+        #[cfg(not(vestige_embeddings_removed))]
         let (nodes_with_active_embeddings, nodes_with_mismatched_embeddings) =
             (nodes_with_embeddings, 0);
 
@@ -1025,14 +1043,15 @@ impl SqliteMemoryStore {
                 FROM knowledge_nodes
              )",
         )?;
-        let (active, dormant, silent, unavailable): (i64, i64, i64, i64) = stmt.query_row([], |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-            ))
-        })?;
+        let (active, dormant, silent, unavailable): (i64, i64, i64, i64) =
+            stmt.query_row([], |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                ))
+            })?;
         Ok((active, dormant, silent, unavailable))
     }
 
@@ -1095,7 +1114,7 @@ impl SqliteMemoryStore {
         // vector coverage stats removed with the vector subsystem
         let embedding_null_count: i64 = 0;
 
-        #[cfg(feature = "embeddings")]
+        #[cfg(vestige_embeddings_removed)]
         let active_embedding_model = active_profile_id.as_deref().and_then(|profile_id| {
             reader
                 .query_row(
@@ -1105,10 +1124,10 @@ impl SqliteMemoryStore {
                 )
                 .ok()
         });
-        #[cfg(not(feature = "embeddings"))]
+        #[cfg(not(vestige_embeddings_removed))]
         let active_embedding_model: Option<String> = None;
 
-        #[cfg(feature = "embeddings")]
+        #[cfg(vestige_embeddings_removed)]
         let active_embedding_dimensions: Option<u32> =
             active_profile_id.as_deref().and_then(|profile_id| {
                 reader
@@ -1120,7 +1139,7 @@ impl SqliteMemoryStore {
                     .ok()
                     .and_then(|dimension| u32::try_from(dimension).ok())
             });
-        #[cfg(not(feature = "embeddings"))]
+        #[cfg(not(vestige_embeddings_removed))]
         let active_embedding_dimensions: Option<u32> = None;
 
         Ok(crate::SchemaIntrospection {

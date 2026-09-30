@@ -74,12 +74,15 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
         return Err("'id' must not be empty".to_string());
     }
     // Basic UUID sanity check — don't reject if missing, but warn
-    if uuid::Uuid::parse_str(&args.id).is_err() {
+    if !crate::tools::memory_unified::is_memory_id(&args.id) {
         return Err(format!("Invalid memory ID format: {}", args.id));
     }
 
     let sys = ActiveForgettingSystem::new();
 
+    if args.reverse && crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        return Err("unavailable_in_4_0: suppress reverse is not available on Strata in Vestige 4.0: a Strata suppression cannot be undone. The memory's bytes stay on the log; it is only hidden from reads.".to_string());
+    }
     if args.reverse {
         // Reverse path — only allowed within labile window.
         match storage.reverse_suppression(&args.id, sys.labile_hours) {
@@ -111,11 +114,16 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
         }
     } else {
         // Forward path — suppress + log reason + tell the user what will happen.
-        let before_count = storage
-            .get_node(&args.id)
-            .map_err(|e| format!("Failed to load memory: {}", e))?
-            .map(|n| n.suppression_count)
-            .unwrap_or(0);
+        let strata = crate::strata_memory::is_strata_backend(storage.as_ref());
+        let before_count = if strata {
+            0
+        } else {
+            storage
+                .get_node(&args.id)
+                .map_err(|e| format!("Failed to load memory: {}", e))?
+                .map(|n| n.suppression_count)
+                .unwrap_or(0)
+        };
 
         // Optional derived_from cascade: compute the exact blast set FIRST
         // (scope before effect — the traversal happens before ANY
@@ -134,6 +142,34 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
         let node = storage
             .suppress_memory(&args.id)
             .map_err(|e| format!("Suppress failed: {}", e))?;
+
+        if strata {
+            let receipt_id = node
+                .source
+                .clone()
+                .filter(|id| id.starts_with("eff-"))
+                .ok_or_else(|| "suppress admitted but the retire receipt is missing".to_string())?;
+            tracing::info!(
+                id = %node.id,
+                receipt_id = %receipt_id,
+                reason = args.reason.as_deref().unwrap_or(""),
+                "Memory suppressed"
+            );
+            let mut response = json!({
+                "success": true,
+                "action": "suppress",
+                "id": node.id,
+                "nodeId": node.id,
+                "receiptId": receipt_id,
+                "rule": "suppress",
+                "message": "Retired; can't be retrieved.",
+                "reason": args.reason,
+            });
+            if let Some(cascade) = cascade {
+                response["cascadeDerivedFrom"] = cascade;
+            }
+            return Ok(response);
+        }
 
         // Count how many neighbors will be cascaded over the coming 72h.
         // We don't run the cascade synchronously — it happens in the
@@ -192,11 +228,7 @@ async fn derive_and_gate_cascade(
     let report = storage
         .blast_radius_with_link_types(id, false, &["derived_from"])
         .map_err(|e| format!("cascade traversal failed: {}", e))?;
-    let targets: Vec<_> = report
-        .affected
-        .into_iter()
-        .filter(|a| a.id != id)
-        .collect();
+    let targets: Vec<_> = report.affected.into_iter().filter(|a| a.id != id).collect();
 
     let mode = crate::trace_recorder::read_review_mode(storage);
     let mut entries = Vec::with_capacity(targets.len());
@@ -276,7 +308,7 @@ async fn derive_and_gate_cascade(
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -495,7 +527,10 @@ mod tests {
             assert_eq!(node.suppression_count, 1, "{id} must be suppressed");
         }
         let stranger = storage.get_node(&unrelated).unwrap().unwrap();
-        assert_eq!(stranger.suppression_count, 0, "non-derived edges must not cascade");
+        assert_eq!(
+            stranger.suppression_count, 0,
+            "non-derived edges must not cascade"
+        );
     }
 
     #[tokio::test]
@@ -523,7 +558,8 @@ mod tests {
         // Cascade targets were NOT suppressed; each has a pending PR.
         for id in [&child, &grandchild] {
             assert_eq!(
-                storage.get_node(id).unwrap().unwrap().suppression_count, 0,
+                storage.get_node(id).unwrap().unwrap().suppression_count,
+                0,
                 "cascade target must wait for review"
             );
         }
@@ -531,7 +567,10 @@ mod tests {
             .list_memory_prs(Some(MemoryPrStatus::Pending), 10)
             .unwrap();
         assert_eq!(prs.len(), 2, "one PR per derived target");
-        assert!(prs.iter().all(|pr| pr.diff["pendingAction"] == json!("suppress")));
+        assert!(
+            prs.iter()
+                .all(|pr| pr.diff["pendingAction"] == json!("suppress"))
+        );
     }
 
     #[tokio::test]
@@ -545,7 +584,8 @@ mod tests {
             .unwrap();
         assert!(r["cascadeDerivedFrom"].is_null(), "no cascade unless asked");
         assert_eq!(
-            storage.get_node(&child).unwrap().unwrap().suppression_count, 0,
+            storage.get_node(&child).unwrap().unwrap().suppression_count,
+            0,
             "default suppress must not touch derived targets"
         );
     }

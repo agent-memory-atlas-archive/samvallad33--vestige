@@ -545,12 +545,17 @@ mod tests {
     use tempfile::tempdir;
 
     fn create_test_storage() -> std::sync::Arc<Storage> {
-        vestige_core::open_storage(None).expect("test storage")
+        // Private per-call store: the shared default store made these tests
+        // order-dependent (audit-adjacent isolation bug, same family as
+        // test_create_batch). The TempDir is leaked so it outlives the Arc.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path: &'static std::path::Path = Box::leak(dir.keep().into_boxed_path());
+        vestige_core::open_storage(Some(path.join("test.db"))).expect("private test storage")
     }
 
     #[test]
     fn test_create_memory() {
-        let mut storage = create_test_storage();
+        let storage = create_test_storage();
         let node = TestDataFactory::create_memory(&*storage, "test content");
 
         assert!(node.is_some());
@@ -559,7 +564,11 @@ mod tests {
 
     #[test]
     fn test_create_batch() {
-        let mut storage = create_test_storage();
+        // Count assertions need a private store: the shared default store is
+        // order-dependent across tests (pre-existing isolation bug).
+        let dir = tempdir().expect("tempdir");
+        let storage = vestige_core::open_storage(Some(dir.path().join("batch.db")))
+            .expect("private test storage");
         let ids = TestDataFactory::create_batch(&*storage, 10);
 
         assert_eq!(ids.len(), 10);
@@ -570,7 +579,7 @@ mod tests {
 
     #[test]
     fn test_create_decay_scenario() {
-        let mut storage = create_test_storage();
+        let storage = create_test_storage();
         let scenario = TestDataFactory::create_decay_scenario(&*storage);
 
         assert!(!scenario.node_ids.is_empty());
@@ -581,7 +590,7 @@ mod tests {
 
     #[test]
     fn test_create_scheduling_scenario() {
-        let mut storage = create_test_storage();
+        let storage = create_test_storage();
         let scenario = TestDataFactory::create_scheduling_scenario(&*storage);
 
         assert!(!scenario.node_ids.is_empty());

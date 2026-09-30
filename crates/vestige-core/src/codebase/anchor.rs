@@ -52,14 +52,17 @@
 //! "we cannot check this", never "this is wrong". Telling someone their
 //! correct memory is stale would be a worse bug than the one being fixed.
 
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(unused_imports))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+#[cfg(feature = "legacy-sqlite")]
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(feature = "legacy-sqlite")]
 use crate::storage::{Result as StorageResult, SqliteMemoryStore};
 
 /// Domain separator so an anchor hash can never collide with another blake3
@@ -838,9 +841,11 @@ pub fn verify_anchor(anchor: &CodeAnchor, repo_root: &Path) -> AnchorVerificatio
 // STORAGE
 // ============================================================================
 
+#[cfg(feature = "legacy-sqlite")]
 const ANCHOR_COLUMNS: &str = "id, node_id, file_path, symbol, symbol_kind, start_line, end_line, \
      span_lines, content_hash, captured_at, last_verified_at, last_status";
 
+#[cfg(feature = "legacy-sqlite")]
 fn row_to_anchor(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeAnchor> {
     let captured_at: String = row.get(9)?;
     let last_verified_at: Option<String> = row.get(10)?;
@@ -865,6 +870,7 @@ fn row_to_anchor(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeAnchor> {
     })
 }
 
+#[cfg(feature = "legacy-sqlite")]
 impl SqliteMemoryStore {
     /// Persist source anchors for a memory.
     ///
@@ -1018,7 +1024,7 @@ impl SqliteMemoryStore {
 // TESTS
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use std::io::Write;

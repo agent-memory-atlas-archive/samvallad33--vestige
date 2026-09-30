@@ -5,9 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::admit::admission_check;
 use crate::log::EventLog;
-use crate::record::{
-    ActionKindCode, DutyKind, GapDetail, GapRecord, Propose, RecordKind,
-};
+use crate::record::{ActionKindCode, DutyKind, GapDetail, GapRecord, Propose, RecordKind};
 
 /// Sweep the log for structural violations:
 ///
@@ -32,7 +30,11 @@ pub fn sweep(log: &dyn EventLog) -> Vec<GapRecord> {
         if ev.seq != expected {
             gaps.push(GapRecord {
                 duty: DutyKind::DutySeqGap,
-                detail: GapDetail::DutySeqGap { source: 0, expected, found: ev.seq },
+                detail: GapDetail::DutySeqGap {
+                    source: 0,
+                    expected,
+                    found: ev.seq,
+                },
             });
         }
         expected = ev.seq.saturating_add(1);

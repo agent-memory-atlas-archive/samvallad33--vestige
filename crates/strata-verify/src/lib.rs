@@ -32,6 +32,10 @@
 #![warn(missing_docs)]
 
 pub mod layout;
+mod live;
+pub mod migration;
+mod pin;
+mod readonly;
 
 use std::fmt;
 use std::path::Path;
@@ -661,3 +665,194 @@ pub use layout::{
     FRAME_LEN_BYTES as VERIFY_FRAME_LEN_BYTES, GateFrame, KernelRecord,
     MAGIC_BYTES as VERIFY_STORE_MAGIC, StoreFiles, StorePaths,
 };
+
+/// One verification of a directory. `json` is the pretty-printed report.
+/// The check never creates or modifies a file under `dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathReport {
+    /// True when every check for the detected layout passed.
+    pub ok: bool,
+    /// Pretty JSON of the layout-specific report.
+    pub json: String,
+    /// Human-readable failures. Empty when `ok` is true.
+    pub failures: Vec<String>,
+    /// blake3 hex of the ed25519 verifying key this check trusted.
+    /// Empty when no key was trusted.
+    pub key_fingerprint: String,
+}
+
+/// Verify `dir` without writing.
+///
+/// Layout detection, in order:
+/// * segment files in `dir` — a migrated log when a receipt frame is
+///   present, otherwise a raw strata log (chain only);
+/// * `log/*.seg` — a data directory: its `log/` is checked exactly as if it
+///   had been passed itself (so an upgraded store's migration receipt is
+///   verified), plus `store.meta` when sealed;
+/// * otherwise the kernel.log / gate.log layout.
+///
+/// A successful migrated-log check does not continue into the kernel
+/// layout. A missing path is a failure and is not created.
+pub fn verify_path(dir: &Path) -> PathReport {
+    if !dir.exists() {
+        return path_failure(format!("path does not exist: {}", dir.display()));
+    }
+    if readonly::dir_has_segments(dir) {
+        return verify_segment_dir(dir);
+    }
+    if live::is_live_store(dir) {
+        // `strata-verify <data-dir>` is the documented form. It has to check
+        // as much as `strata-verify <data-dir>/log`: before this, a data
+        // directory only had its chain scanned and an upgraded store's
+        // migration receipt went unverified.
+        let mut report = verify_segment_dir(&dir.join("log"));
+        let meta_failures = live::store_meta_failures(dir);
+        if !meta_failures.is_empty() {
+            report.ok = false;
+            if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&report.json)
+                && let Some(obj) = value.as_object_mut()
+            {
+                obj.insert("ok".into(), serde_json::Value::Bool(false));
+                let listed = obj
+                    .entry("failures")
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                if let Some(listed) = listed.as_array_mut() {
+                    listed.extend(meta_failures.iter().cloned().map(serde_json::Value::String));
+                }
+                report.json =
+                    serde_json::to_string_pretty(&value).expect("verify report serializes");
+            }
+            report.failures.extend(meta_failures);
+        }
+        return report;
+    }
+    // Fresh strata-store: `log/*.seg` exists before the first checkpoint
+    // writes `store.meta`. Check that log; do not fall through to kernel.log.
+    let nested_log = dir.join("log");
+    if readonly::dir_has_segments(&nested_log) {
+        return verify_segment_dir(&nested_log);
+    }
+    let report = verify_store(dir);
+    let failures = report.failures.iter().map(|f| f.to_string()).collect();
+    let key = pin::KeyUse {
+        fingerprint: String::new(),
+        pin: "none",
+        note: "kernel/gate layout has no strata receipt key".into(),
+    };
+    path_from(report.ok(), &report, failures, key)
+}
+
+fn verify_segment_dir(dir: &Path) -> PathReport {
+    let scan = match readonly::scan_log(dir) {
+        Ok(scan) => scan,
+        Err(err) => return path_failure(err),
+    };
+    let has_receipt = scan
+        .frames
+        .iter()
+        .any(|frame| frame.kind == strata_migrate::records::KIND_MIGRATION_RECEIPT);
+    if has_receipt {
+        return match migration::verify_migrated_log(dir) {
+            Ok(report) => {
+                let failures = report.failures.clone();
+                let ok = report.ok;
+                let key = receipt_key(dir, &scan);
+                path_from(ok, &report, failures, key)
+            }
+            Err(err) => path_failure(err),
+        };
+    }
+    let report = live::LiveVerifyReport {
+        ok: true,
+        frames_total: scan.frames.len() as u64,
+        segments: scan.segments,
+        failures: Vec::new(),
+    };
+    path_from(
+        true,
+        &report,
+        Vec::new(),
+        pin::segment_only(&scan.segment_key),
+    )
+}
+
+/// Pin decision for a log that carries a receipt. A mismatch still reports
+/// the pin file's fingerprint. A missing pin file reports `strata.key`.
+fn receipt_key(dir: &Path, scan: &readonly::Scan) -> pin::KeyUse {
+    let embedded = embedded_receipt_key(&scan.frames);
+    let Some(embedded) = embedded else {
+        return pin::segment_only(&scan.segment_key);
+    };
+    match pin::require_receipt_pin(dir, &embedded) {
+        Ok(key) => key,
+        Err(err) => {
+            let pinned = pin::pinned_fingerprint(dir);
+            pin::KeyUse {
+                fingerprint: pinned
+                    .clone()
+                    .unwrap_or_else(|| pin::fingerprint(&scan.segment_key)),
+                pin: if pinned.is_some() {
+                    "receipt-signing.key"
+                } else {
+                    "none"
+                },
+                note: err,
+            }
+        }
+    }
+}
+
+fn embedded_receipt_key(frames: &[readonly::ScannedFrame]) -> Option<[u8; 32]> {
+    use strata_migrate::records::{KIND_MIGRATION_RECEIPT, decode_receipt};
+    let frame = frames
+        .iter()
+        .find(|frame| frame.kind == KIND_MIGRATION_RECEIPT)?;
+    decode_receipt(&frame.payload)
+        .ok()
+        .map(|receipt| receipt.verifying_key)
+}
+
+fn path_failure(err: String) -> PathReport {
+    let body = serde_json::json!({
+        "ok": false,
+        "failures": [err.clone()],
+        "key_fingerprint": "",
+        "key_pin": "none",
+        "key_pin_note": err,
+    });
+    PathReport {
+        ok: false,
+        json: serde_json::to_string_pretty(&body).expect("failure report serializes"),
+        failures: vec![err],
+        key_fingerprint: String::new(),
+    }
+}
+
+fn path_from(
+    ok: bool,
+    body: &impl serde::Serialize,
+    failures: Vec<String>,
+    key: pin::KeyUse,
+) -> PathReport {
+    let mut value = serde_json::to_value(body).expect("verify report serializes");
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "key_fingerprint".to_string(),
+            serde_json::Value::String(key.fingerprint.clone()),
+        );
+        obj.insert(
+            "key_pin".to_string(),
+            serde_json::Value::String(key.pin.to_string()),
+        );
+        obj.insert(
+            "key_pin_note".to_string(),
+            serde_json::Value::String(key.note),
+        );
+    }
+    PathReport {
+        ok,
+        json: serde_json::to_string_pretty(&value).expect("verify report serializes"),
+        failures,
+        key_fingerprint: key.fingerprint,
+    }
+}

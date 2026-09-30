@@ -197,9 +197,13 @@ fn build_temp_chain_builder(
         all_conns.extend(conns);
     }
 
-    // Deduplicate edges and load referenced memory nodes
+    // Deduplicate edges and load referenced memory nodes.
+    // `legacy_inferred` is loaded in the store but is not a causal hop.
     let mut seen_edges = std::collections::HashSet::new();
-    all_conns.retain(|c| seen_edges.insert((c.source_id.clone(), c.target_id.clone())));
+    all_conns.retain(|c| {
+        c.link_type != "legacy_inferred"
+            && seen_edges.insert((c.source_id.clone(), c.target_id.clone()))
+    });
 
     let mut seen_ids = std::collections::HashSet::new();
     for conn in &all_conns {
@@ -251,7 +255,7 @@ fn link_type_to_connection_type(link_type: &str) -> ConnectionType {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use crate::cognitive::CognitiveEngine;

@@ -14,7 +14,7 @@
 //! bytes and therefore identical digests and receipt ids.
 
 use chrono::Utc;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
 use super::sqlite::{Result, SqliteMemoryStore, StorageError};
@@ -22,69 +22,11 @@ use super::sqlite::{Result, SqliteMemoryStore, StorageError};
 /// Stable schema URI for walk receipts.
 pub const WALK_RECEIPT_SCHEMA_V1: &str = "https://vestige.dev/schemas/receipt/walk/v1";
 
-/// Handle returned when a walk receipt is saved. Deterministic: the same
-/// canonical parameters always yield the same pair.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WalkReceiptHandle {
-    pub receipt_id: String,
-    pub digest: String,
-    /// True when the row already existed (idempotent re-save of the same
-    /// canonical envelope) rather than being written by this call.
-    pub reused_existing: bool,
-}
+// `WalkReceiptHandle`, `StoredWalkReceipt`, and `CoverageSnapshot` are
+// defined in (and re-exported from) `crate::storage::types`.
+pub use crate::storage::types::{CoverageSnapshot, StoredWalkReceipt, WalkReceiptHandle};
 
-/// One persisted walk receipt row.
-#[derive(Debug, Clone)]
-pub struct StoredWalkReceipt {
-    pub receipt_id: String,
-    pub digest: String,
-    /// The exact canonical JSON bytes that were digested.
-    pub canonical_json: String,
-    /// The canonical envelope parsed back into a JSON value.
-    pub params: Value,
-    /// vestige-core version that canonicalized and digested the envelope.
-    pub engine_version: String,
-    pub created_at: String,
-}
-
-/// Store-wide coverage aggregates for `memory_status(view="coverage")`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CoverageSnapshot {
-    /// Total knowledge nodes in the store.
-    pub total_nodes: u64,
-    /// Distinct nodes carrying at least one code memory anchor.
-    pub anchored_nodes: u64,
-    /// `anchored_nodes / total_nodes * 100`, rounded to 2 decimals. 0.0 when
-    /// the store is empty (no division by zero, no NaN).
-    pub anchor_coverage_pct: f64,
-    /// `memory_connections` counts grouped by `link_type`, ordered by type
-    /// ascending so serialization is byte-stable.
-    pub edge_counts_by_type: Vec<(String, u64)>,
-    /// RFC 3339 `created_at` of the newest git-commit-tagged node, if any.
-    pub newest_git_commit_record: Option<String>,
-    /// Whole days since that record was created (floor of exact days).
-    pub newest_git_commit_record_age_days: Option<i64>,
-    /// Wall-clock millis of the newest Black Box trace event, if any.
-    pub newest_agent_trace_at: Option<i64>,
-    /// Hours since that event (rounded to 1 decimal).
-    pub newest_agent_trace_age_hours: Option<f64>,
-}
-
-/// Canonicalize a walk parameter envelope with the codebase's canonical JSON
-/// helper (RFC 8785 JCS via `serde_json_canonicalizer`, the same encoder the
-/// receipt DSSE chain uses). Key order and whitespace of the input never
-/// affect the output.
-pub fn canonical_walk_json(params: &Value) -> Result<String> {
-    if !params.is_object() {
-        return Err(StorageError::Init(
-            "walk receipt params must be a JSON object".into(),
-        ));
-    }
-    let bytes = serde_json_canonicalizer::to_vec(params)
-        .map_err(|error| StorageError::Init(format!("walk params canonicalization: {error}")))?;
-    String::from_utf8(bytes)
-        .map_err(|error| StorageError::Init(format!("canonical walk params not UTF-8: {error}")))
-}
+pub use super::contracts::canonical_walk_json;
 
 /// blake3 hex digest of canonical bytes — same primitive the anchor store
 /// and the replay policy digests use.
@@ -118,8 +60,9 @@ impl SqliteMemoryStore {
         }
         // The parsed envelope must round-trip to the same bytes; this also
         // rejects a canonical_json that is not valid JSON.
-        let parsed: Value = serde_json::from_str(canonical_json)
-            .map_err(|error| StorageError::Init(format!("canonical_json is not valid JSON: {error}")))?;
+        let parsed: Value = serde_json::from_str(canonical_json).map_err(|error| {
+            StorageError::Init(format!("canonical_json is not valid JSON: {error}"))
+        })?;
         if parsed != *params {
             return Err(StorageError::Init(
                 "canonical_json and params must encode the same value".into(),
@@ -212,9 +155,8 @@ impl SqliteMemoryStore {
             .reader
             .lock()
             .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
-        let total_nodes: i64 = reader.query_row("SELECT COUNT(*) FROM knowledge_nodes", [], |row| {
-            row.get(0)
-        })?;
+        let total_nodes: i64 =
+            reader.query_row("SELECT COUNT(*) FROM knowledge_nodes", [], |row| row.get(0))?;
         let anchored_nodes: i64 = reader.query_row(
             "SELECT COUNT(DISTINCT node_id) FROM code_memory_anchors",
             [],
@@ -226,7 +168,9 @@ impl SqliteMemoryStore {
              GROUP BY link_type ORDER BY link_type ASC",
         )?;
         let edge_counts: Vec<(String, u64)> = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
 
@@ -311,12 +255,18 @@ mod tests {
             "scope": "user"
         });
         let third = canonical_walk_json(&shuffled).unwrap();
-        assert_eq!(first, third, "key-order shuffle must not change the digest input");
+        assert_eq!(
+            first, third,
+            "key-order shuffle must not change the digest input"
+        );
         assert_eq!(walk_digest(&first), walk_digest(&third));
 
         // A genuinely different envelope must digest differently.
         let changed = json!({"scope": "user", "lookback_days": 31});
-        assert_ne!(walk_digest(&first), walk_digest(&canonical_walk_json(&changed).unwrap()));
+        assert_ne!(
+            walk_digest(&first),
+            walk_digest(&canonical_walk_json(&changed).unwrap())
+        );
 
         // Non-object envelopes are refused.
         assert!(canonical_walk_json(&json!([1, 2])).is_err());
@@ -345,9 +295,7 @@ mod tests {
 
         // A mismatched (canonical_json, params) pair is rejected.
         let other = json!({"scope": "other"});
-        assert!(store
-            .save_walk_receipt(&canonical, &other)
-            .is_err());
+        assert!(store.save_walk_receipt(&canonical, &other).is_err());
         // Non-canonical bytes are rejected even when they encode params.
         let pretty = serde_json::to_string_pretty(&params).unwrap();
         assert!(store.save_walk_receipt(&pretty, &params).is_err());
@@ -464,10 +412,16 @@ mod tests {
         let age_days = snapshot
             .newest_git_commit_record_age_days
             .expect("git-commit record exists");
-        assert!(age_days <= 1, "seeded commit is seconds old, got {age_days}");
+        assert!(
+            age_days <= 1,
+            "seeded commit is seconds old, got {age_days}"
+        );
         let age_hours = snapshot
             .newest_agent_trace_age_hours
             .expect("ingest traces exist");
-        assert!(age_hours < 1.0, "seeded traces are seconds old, got {age_hours}");
+        assert!(
+            age_hours < 1.0,
+            "seeded traces are seconds old, got {age_hours}"
+        );
     }
 }

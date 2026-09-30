@@ -27,8 +27,10 @@
 //!
 //! ## Determinism
 //!
-//! * No clocks: `created_at_ms` is caller-supplied data (default 0), never a
-//!   hidden `SystemTime::now()` read. Time-as-seq is the ordering authority.
+//! * Ordering stays sequence-based. `created_at_ms` is caller-supplied
+//!   (default 0). An explicit [`StoreOp::ReviewNode`] always carries
+//!   `reviewed_at_ms` (`borsh` `Option`, tag present). Live admits use the
+//!   admission clock. Retrievability reads that clock; `None` uses seq distance.
 //! * No floats in persisted state: edge strength is `strength_milli` (i64);
 //!   FSRS stability/difficulty live quantized inside the kernel's Q32.32
 //!   `CardState`. Retrievability is derived on read and never stored.
@@ -41,15 +43,23 @@
 //! `32` = `STORE_WRITE` (payload `borsh(StoreOp)`), `33` = `STORE_CHECKPOINT`
 //! (payload `borsh(strata_kernel::Checkpoint)`).
 //!
+//! An upgraded store also replays the v3 importer's frames: nodes and edges
+//! (sharing `32`/`33`), `0x24` supersessions, and FSRS state. `0x22`
+//! `FSRS_REVIEW` folds a v3 `fsrs_cards` rating series and `0x27`
+//! `FSRS_STATE` folds a v3 card carried from `knowledge_nodes`, both onto
+//! the node's card handle and into the checkpointed fold.
+//!
 //! ## v1 scope (documented deviations in SCOPE-HANDOFF.md)
 //!
-//! Single-threaded single-writer (`!Send` gate-log cache); reads append
+//! Single-writer (`Send` via the gate-log mutex); reads append
 //! nothing (reads-as-writes is a later wave); one FSRS kernel version
 //! (`ALGO_V2`) per store, recorded per record as `kernel_id`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod anchor;
+mod card;
 mod error;
 mod gate_log;
 mod op;
@@ -57,13 +67,19 @@ mod store;
 mod types;
 
 #[cfg(test)]
+mod import_tests;
+#[cfg(test)]
 mod tests;
 
 pub use error::StoreError;
 pub use gate_log::StrataEventLog;
 pub use op::{StoreOp, KIND_STORE_CHECKPOINT, KIND_STORE_WRITE};
-pub use store::{default_policy, StrataStore};
+pub use store::{
+    default_policy, effect_receipt_id, permissive_policy, retire_rule_id, AdmissionContext,
+    EffectAction, EffectProof, NodeWrite, RecordedOrigin, RetireReceipt, StrataStore, SupersedeHop,
+    RULE_EDIT, RULE_INTENTIONS, RULE_PURGE, RULE_SUPPRESS,
+};
 pub use types::{
-    looks_like_failure, ConnectionRecord, EdgeDirection, EdgeKind, IngestInput, NodeRecord,
-    TYPED_EDGE_VOCABULARY, VALID_FOREVER_MS,
+    looks_like_failure, AnchorRecord, ConnectionRecord, EdgeDirection, EdgeKind, IngestInput,
+    IntentionRecord, NodeRecord, SourceKey, TYPED_EDGE_VOCABULARY, VALID_FOREVER_MS,
 };

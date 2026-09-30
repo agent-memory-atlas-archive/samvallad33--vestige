@@ -299,7 +299,7 @@ impl SqliteMemoryStore {
             tx.commit()?;
         }
 
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         self.load_embeddings_into_index()?;
 
         Ok(report)

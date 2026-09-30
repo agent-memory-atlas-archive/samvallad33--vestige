@@ -18,8 +18,14 @@ pub enum RederiveError {
 impl core::fmt::Display for RederiveError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            RederiveError::UnknownProposal { gate_seq, propose_seq } => {
-                write!(f, "GATE at seq {gate_seq} cites missing proposal {propose_seq}")
+            RederiveError::UnknownProposal {
+                gate_seq,
+                propose_seq,
+            } => {
+                write!(
+                    f,
+                    "GATE at seq {gate_seq} cites missing proposal {propose_seq}"
+                )
             }
             RederiveError::Malformed(e) => write!(f, "malformed record: {e}"),
         }
@@ -48,9 +54,11 @@ pub fn rederive_verdicts(
     let all = log.events_before(u64::MAX);
     let mut out = Vec::new();
     for ev in all.iter().filter(|e| e.kind == RecordKind::Gate) {
-        let gate = ev.gate().ok_or(RederiveError::Malformed(GateError::MalformedRecord {
-            seq: ev.seq,
-        }))?;
+        let gate = ev
+            .gate()
+            .ok_or(RederiveError::Malformed(GateError::MalformedRecord {
+                seq: ev.seq,
+            }))?;
         let propose_ev = all
             .iter()
             .find(|e| e.seq == gate.propose_seq && e.kind == RecordKind::Propose)
@@ -58,9 +66,12 @@ pub fn rederive_verdicts(
                 gate_seq: ev.seq,
                 propose_seq: gate.propose_seq,
             })?;
-        let propose = propose_ev
-            .propose()
-            .ok_or(RederiveError::Malformed(GateError::MalformedRecord { seq: propose_ev.seq }))?;
+        let propose =
+            propose_ev
+                .propose()
+                .ok_or(RederiveError::Malformed(GateError::MalformedRecord {
+                    seq: propose_ev.seq,
+                }))?;
         let inputs = compute_inputs(log, gate.propose_seq).map_err(RederiveError::Malformed)?;
         out.push((ev.seq, gate_verdict(pinned, &propose, &inputs)));
     }

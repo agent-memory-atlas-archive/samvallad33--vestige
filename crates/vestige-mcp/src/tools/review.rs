@@ -42,8 +42,10 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
         None => return Err("Missing arguments".to_string()),
     };
 
-    // Validate UUID
-    uuid::Uuid::parse_str(&args.id).map_err(|_| "Invalid node ID format".to_string())?;
+    // SQLite ids are UUIDs. Strata ids are `mem-` + 16 hex chars.
+    if uuid::Uuid::parse_str(&args.id).is_err() && !is_strata_memory_id(&args.id) {
+        return Err("Invalid node ID format".to_string());
+    }
 
     let rating_value = args.rating.unwrap_or(3);
     if !(1..=4).contains(&rating_value) {
@@ -89,11 +91,18 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
     }))
 }
 
+fn is_strata_memory_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("mem-") else {
+        return false;
+    };
+    rest.len() == 16 && rest.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 // ============================================================================
 // TESTS
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;

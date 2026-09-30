@@ -77,8 +77,14 @@ Every payload starts with `u16 record_version = 1`. `kernel_id` is dense,
 - **Re-running into the same dir is append-only**: records duplicate, the
   checkpoint chain extends (strictly increasing log_seq; zero-append re-runs
   skip the duplicate checkpoint). Tested.
-- **Unmapped tables** (node_embeddings, memory_access_log, intentions,
-  sessions, composition_*, …) are reported in `skipped_tables`, not migrated.
+- **Unmapped tables** (node_embeddings, memory_access_log, sessions,
+  composition_*, …) are reported in `skipped_tables`, not migrated.
+- **Intentions** have no migration frame. `MigrateOptions::carry_over`
+  receives them as `Carryover` rows and admits them into the staged log as
+  store `UpsertIntentions` writes after the receipt (`vestige-upgrade` does
+  this). Without that hook, `intentions` is listed in `skipped_tables`.
+  Frames after the receipt are store frames; `read_snapshot` and
+  `verify_migrated_log` only treat frames before it as the migration.
 - **Path B side effects:** opening a live store with `Storage::new` may
   create `-wal`/`-shm` siblings and runs idempotent migrations; logical
   contents are never modified.

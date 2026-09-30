@@ -20,48 +20,9 @@ use crate::actor::{ActorPolicySnapshot, RoleResolution, endorsement_event_id, re
 use crate::trace::{ActorProvenance, Receipt, ReceiptMutation};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// One recorded actor endorsement, bound to the exact content revision it
-/// supported. Mirrors a row of `actor_endorsement_events` (migration V38).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct EndorsementEventRecord {
-    pub event_id: String,
-    pub memory_id: String,
-    pub actor_did: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub claimed_role: Option<String>,
-    pub effective_role: String,
-    pub resolved_weight: f64,
-    pub resolution_disposition: String,
-    pub policy_version: u64,
-    /// `support`, `oppose`, or `self_support`.
-    pub endorsement_kind: String,
-    /// SHA-256 hex of the exact content revision this stance binds to.
-    pub revision_digest: String,
-    /// The prior this event contributes to Phase B aggregation. Exactly 0.0
-    /// for self-support; same-actor retries do not add rows.
-    pub independent_prior: f64,
-    pub tool: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub receipt_id: Option<String>,
-    pub created_at: String,
-}
-
-/// Outcome of one actor-attributed mutation: the mutated node, its receipt
-/// (persisted in the same transaction), and the endorsement event.
-#[derive(Debug, Clone)]
-pub struct ActorMutationOutcome {
-    /// The node state before the mutation.
-    pub before: KnowledgeNode,
-    /// The node state after the mutation committed.
-    pub node: KnowledgeNode,
-    /// The receipt persisted inside the same transaction.
-    pub receipt: Receipt,
-    /// The endorsement event recorded inside the same transaction.
-    pub endorsement: EndorsementEventRecord,
-    /// True when this actor had already recorded the same stance on the same
-    /// revision: the mutation applies, but no second vote was created.
-    pub already_recorded: bool,
-}
+// `EndorsementEventRecord` and `ActorMutationOutcome` are defined in (and
+// re-exported from) `crate::storage::types`.
+pub use crate::storage::types::{ActorMutationOutcome, EndorsementEventRecord};
 
 const ACTOR_FEEDBACK_OPERATION: &str = "actor_feedback_mutation";
 
@@ -76,7 +37,9 @@ impl SqliteMemoryStore {
     /// `<data_dir>/actor.key`.
     pub fn set_process_actor(&self, did: &str) -> Result<()> {
         crate::actor::ed25519_public_key_from_did_key(did).map_err(|error| {
-            StorageError::Init(format!("process actor is not a valid Ed25519 did:key: {error}"))
+            StorageError::Init(format!(
+                "process actor is not a valid Ed25519 did:key: {error}"
+            ))
         })?;
         *self
             .process_actor_did
@@ -110,8 +73,7 @@ impl SqliteMemoryStore {
 
         let mut weights = BTreeMap::new();
         {
-            let mut stmt =
-                conn.prepare("SELECT role, weight_prior FROM actor_role_weights")?;
+            let mut stmt = conn.prepare("SELECT role, weight_prior FROM actor_role_weights")?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
             })?;
@@ -123,8 +85,7 @@ impl SqliteMemoryStore {
 
         let mut memberships: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         {
-            let mut stmt =
-                conn.prepare("SELECT actor_did, role FROM actor_role_membership")?;
+            let mut stmt = conn.prepare("SELECT actor_did, role FROM actor_role_membership")?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
@@ -243,10 +204,13 @@ impl SqliteMemoryStore {
     /// Resolve the process actor's claimed role against the frozen policy.
     /// Returns the actor did plus the resolution. Fails when no process
     /// actor is bound — endorsement paths never guess an identity.
-    pub fn resolve_actor_role(&self, claimed_role: Option<&str>) -> Result<(String, RoleResolution)> {
-        let actor_did = self.process_actor_did().ok_or_else(|| {
-            StorageError::Init("no process actor is bound to this store".into())
-        })?;
+    pub fn resolve_actor_role(
+        &self,
+        claimed_role: Option<&str>,
+    ) -> Result<(String, RoleResolution)> {
+        let actor_did = self
+            .process_actor_did()
+            .ok_or_else(|| StorageError::Init("no process actor is bound to this store".into()))?;
         let snapshot = self.actor_policy_snapshot()?;
         let resolution = snapshot.resolve(&actor_did, claimed_role);
         Ok((actor_did, resolution))
@@ -350,7 +314,7 @@ impl SqliteMemoryStore {
             (None, None) => stmt.query_map([], map_row)?,
         };
         rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| e.into())
+            .map_err(Into::into)
     }
 
     /// The bounded aggregate independent prior for one memory revision:
@@ -383,9 +347,9 @@ impl SqliteMemoryStore {
         kind: FeedbackKind,
         tool: &str,
     ) -> Result<ActorMutationOutcome> {
-        let actor_did = self.process_actor_did().ok_or_else(|| {
-            StorageError::Init("no process actor is bound to this store".into())
-        })?;
+        let actor_did = self
+            .process_actor_did()
+            .ok_or_else(|| StorageError::Init("no process actor is bound to this store".into()))?;
         let now = Utc::now();
         let writer = self
             .writer
@@ -476,7 +440,11 @@ impl SqliteMemoryStore {
             (_, false) => "support",
         };
         // Self-support contributes exactly zero independent prior (gate 2).
-        let independent_prior = if is_self_support { 0.0 } else { resolution.resolved_weight };
+        let independent_prior = if is_self_support {
+            0.0
+        } else {
+            resolution.resolved_weight
+        };
 
         let event_id = endorsement_event_id(&actor_did, id, &digest, endorsement_kind);
         let existing: Option<(String, String)> = tx
@@ -489,8 +457,8 @@ impl SqliteMemoryStore {
             .optional()?;
         let mut already_recorded = false;
         match existing {
-            Some((existing_digest, existing_kind)) if existing_digest == digest
-                && existing_kind == endorsement_kind =>
+            Some((existing_digest, existing_kind))
+                if existing_digest == digest && existing_kind == endorsement_kind =>
             {
                 // The same stance on the same revision from the same actor:
                 // one actor, one vote. The mutation still applies (matching
@@ -533,7 +501,11 @@ impl SqliteMemoryStore {
                     resolution.disposition.as_str(),
                     resolution.resolved_weight,
                     resolution.policy_version,
-                    if already_recorded { "; stance already recorded" } else { "" }
+                    if already_recorded {
+                        "; stance already recorded"
+                    } else {
+                        ""
+                    }
                 )),
             }],
         )
@@ -614,9 +586,11 @@ impl SqliteMemoryStore {
     /// Read one node through an open write transaction (the writer's own
     /// uncommitted view — the reader connection cannot see it).
     fn read_node_in_tx(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<KnowledgeNode> {
-        tx.query_row("SELECT * FROM knowledge_nodes WHERE id = ?1", params![id], |row| {
-            Self::row_to_node(row)
-        })
+        tx.query_row(
+            "SELECT * FROM knowledge_nodes WHERE id = ?1",
+            params![id],
+            Self::row_to_node,
+        )
         .map_err(|error| match error {
             rusqlite::Error::QueryReturnedNoRows => StorageError::NotFound(id.to_string()),
             other => other.into(),
@@ -650,8 +624,8 @@ fn normalize_role(role: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actor::{ProcessActor, ResolutionDisposition};
     use crate::IngestInput;
+    use crate::actor::{ProcessActor, ResolutionDisposition};
 
     fn test_storage() -> (SqliteMemoryStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -710,7 +684,10 @@ mod tests {
         // The event records the same neutral resolution.
         assert_eq!(outcome.endorsement.effective_role, "unattributed");
         assert_eq!(outcome.endorsement.resolved_weight, 1.0);
-        assert_eq!(outcome.endorsement.resolution_disposition, "unregistered_claim");
+        assert_eq!(
+            outcome.endorsement.resolution_disposition,
+            "unregistered_claim"
+        );
     }
 
     #[test]
@@ -742,7 +719,10 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(author.as_deref(), Some(storage.process_actor_did().unwrap().as_str()));
+        assert_eq!(
+            author.as_deref(),
+            Some(storage.process_actor_did().unwrap().as_str())
+        );
     }
 
     // ========================================================================
@@ -810,7 +790,10 @@ mod tests {
         let first = storage
             .promote_memory_as_actor(&node.id, None, "promote_memory")
             .expect("support revision one");
-        assert_eq!(first.endorsement.revision_digest, crate::actor::revision_digest("revision one content"));
+        assert_eq!(
+            first.endorsement.revision_digest,
+            crate::actor::revision_digest("revision one content")
+        );
 
         // The content is edited: the old verification must NOT inherit.
         storage
@@ -827,7 +810,11 @@ mod tests {
         let events = storage
             .list_endorsement_events(Some(&node.id), None, 50)
             .expect("list");
-        assert_eq!(events.len(), 2, "different revisions bind different stances");
+        assert_eq!(
+            events.len(),
+            2,
+            "different revisions bind different stances"
+        );
     }
 
     // ========================================================================
@@ -846,7 +833,12 @@ mod tests {
         // binds a DIFFERENT revision. The endorsement write must detect the
         // mismatch and undo the promote entirely.
         let tampered_digest = crate::actor::revision_digest("different revision entirely");
-        let event_id = crate::actor::endorsement_event_id(&did, &node.id, &crate::actor::revision_digest("rollback target content"), "support");
+        let event_id = crate::actor::endorsement_event_id(
+            &did,
+            &node.id,
+            &crate::actor::revision_digest("rollback target content"),
+            "support",
+        );
         {
             let writer = storage.writer.lock().unwrap();
             writer
@@ -914,7 +906,13 @@ mod tests {
             after.retrieval_strength > weakened.retrieval_strength,
             "the strength mutation committed with its evidence"
         );
-        assert_eq!(storage.list_endorsement_events(Some(&node.id), None, 10).unwrap().len(), 1);
+        assert_eq!(
+            storage
+                .list_endorsement_events(Some(&node.id), None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     // ========================================================================
@@ -969,10 +967,16 @@ mod tests {
         let (storage, _dir) = test_storage();
         let _did = bind_actor(&storage);
         // Unregistered role name.
-        let resolution = storage.resolve_actor_role(Some("shadow-emperor")).unwrap().1;
+        let resolution = storage
+            .resolve_actor_role(Some("shadow-emperor"))
+            .unwrap()
+            .1;
         assert_eq!(resolution.effective_role, "unattributed");
         assert_eq!(resolution.resolved_weight, 1.0);
-        assert_eq!(resolution.disposition, ResolutionDisposition::UnregisteredClaim);
+        assert_eq!(
+            resolution.disposition,
+            ResolutionDisposition::UnregisteredClaim
+        );
         // No claim at all.
         let unclaimed = storage.resolve_actor_role(None).unwrap().1;
         assert_eq!(unclaimed.effective_role, "unattributed");
@@ -1070,6 +1074,8 @@ mod tests {
         assert_eq!(outcome.endorsement.tool, "smart_ingest");
         assert_eq!(outcome.receipt.mutations[0].kind, "reinforced");
         // +0.05 retrieval matches strengthen_on_access, not the +0.20 promote.
-        assert!((outcome.node.retrieval_strength - weakened.retrieval_strength - 0.05).abs() < 1e-9);
+        assert!(
+            (outcome.node.retrieval_strength - weakened.retrieval_strength - 0.05).abs() < 1e-9
+        );
     }
 }

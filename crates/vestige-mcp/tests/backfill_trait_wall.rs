@@ -2,7 +2,8 @@
 //!
 //! The backfill MCP tool runs end-to-end against `WallMockStore`, a pure
 //! in-memory mock that implements the storage trait (`MemoryStoreSend`) and
-//! overrides ONLY the seven methods backfill needs. Every other trait method
+//! overrides only the methods backfill needs, plus `db_path` so the Strata
+//! probe can tell this mock is not a log. Every other trait method
 //! resolves to the wall's loud defaults (`Err(StorageError::Init("... not
 //! implemented by this backend"))` / `unimplemented!`), and the async seam is
 //! stubbed with `MemoryStoreError::Backend`. There is no SQLite anywhere in
@@ -12,15 +13,16 @@
 //! tools layer is engine-agnostic: a second backend (STRATA) that implements
 //! the same trait can serve the same tool.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde_json::json;
-use vestige_core::storage::{
-    Domain, HealthStatus, MemoryEdge, MemoryStoreError, MemoryStoreResult, MemoryStoreSend,
-    MemoryRecord, ModelSignature, SchedulingState, SearchQuery, StorageError, StoreStats,
-};
-use vestige_core::storage::{ConnectionRecord, Storage};
 use vestige_core::KnowledgeNode;
+use vestige_core::storage::{ConnectionRecord, Storage};
+use vestige_core::storage::{
+    Domain, HealthStatus, MemoryEdge, MemoryRecord, MemoryStoreError, MemoryStoreResult,
+    MemoryStoreSend, ModelSignature, SchedulingState, SearchQuery, StorageError, StoreStats,
+};
 use vestige_mcp::tools::backfill;
 
 type MockResult<T> = std::result::Result<T, StorageError>;
@@ -31,6 +33,7 @@ struct WallMockStore {
     connections: Mutex<Vec<ConnectionRecord>>,
     promoted: Mutex<Vec<String>>,
     saved_edges: Mutex<Vec<String>>,
+    path: PathBuf,
 }
 
 impl WallMockStore {
@@ -40,6 +43,7 @@ impl WallMockStore {
             connections: Mutex::new(Vec::new()),
             promoted: Mutex::new(Vec::new()),
             saved_edges: Mutex::new(Vec::new()),
+            path: PathBuf::from("wall-mock.db"),
         }
     }
 
@@ -61,7 +65,12 @@ fn node(id: &str, content: &str, tags: &[&str], days_ago: i64) -> KnowledgeNode 
 }
 
 impl MemoryStoreSend for WallMockStore {
-    // ---- the seven methods the backfill tool actually touches ----
+    // Filename is not `log`, so `is_strata_backend` stays false.
+    fn db_path(&self) -> &Path {
+        &self.path
+    }
+
+    // ---- the methods the backfill tool actually touches ----
 
     fn get_node(&self, id: &str) -> MockResult<Option<KnowledgeNode>> {
         Ok(self
@@ -77,10 +86,15 @@ impl MemoryStoreSend for WallMockStore {
         Ok(self.nodes.lock().unwrap().iter().any(|n| n.id == id))
     }
 
-    fn get_all_nodes_in_scope(&self, _scope: &str, limit: i32, _offset: i32) -> MockResult<Vec<KnowledgeNode>> {
+    fn get_all_nodes_in_scope(
+        &self,
+        _scope: &str,
+        limit: i32,
+        _offset: i32,
+    ) -> MockResult<Vec<KnowledgeNode>> {
         let mut nodes = self.nodes.lock().unwrap().clone();
         // newest first, mirroring the reference backend's ordering contract
-        nodes.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        nodes.sort_by_key(|n| std::cmp::Reverse(n.created_at));
         nodes.truncate(limit.max(0) as usize);
         Ok(nodes)
     }
@@ -101,10 +115,10 @@ impl MemoryStoreSend for WallMockStore {
     }
 
     fn save_connection(&self, connection: &ConnectionRecord) -> MockResult<()> {
-        self.saved_edges
-            .lock()
-            .unwrap()
-            .push(format!("{}->{}", connection.source_id, connection.target_id));
+        self.saved_edges.lock().unwrap().push(format!(
+            "{}->{}",
+            connection.source_id, connection.target_id
+        ));
         self.connections.lock().unwrap().push(connection.clone());
         Ok(())
     }
@@ -143,7 +157,10 @@ impl MemoryStoreSend for WallMockStore {
     async fn delete(&self, _id: uuid::Uuid) -> MemoryStoreResult<()> {
         Err(unsup("delete"))
     }
-    async fn search_records(&self, _query: &SearchQuery) -> MemoryStoreResult<Vec<vestige_core::storage::SearchResult>> {
+    async fn search_records(
+        &self,
+        _query: &SearchQuery,
+    ) -> MemoryStoreResult<Vec<vestige_core::storage::SearchResult>> {
         Err(unsup("search_records"))
     }
     async fn fts_search(
@@ -281,9 +298,10 @@ async fn backfill_tool_runs_purely_against_the_trait_wall() {
 
     // The wall held: writes landed in the mock, via trait methods only.
     assert!(mock.promoted.lock().unwrap().contains(&"cause".to_string()));
-    assert!(mock
-        .saved_edges
-        .lock()
-        .unwrap()
-        .contains(&"cause->failure".to_string()));
+    assert!(
+        mock.saved_edges
+            .lock()
+            .unwrap()
+            .contains(&"cause->failure".to_string())
+    );
 }

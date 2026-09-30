@@ -92,9 +92,9 @@ pub mod fsrs;
 /// behind `legacy-sqlite` (build/t5-legacy-isolation).
 #[cfg(feature = "legacy-sqlite")]
 pub mod fts;
-pub mod memory;
 /// Evidence-aware future intentions with deterministic local evaluation.
 pub mod intention_graph;
+pub mod memory;
 pub mod security;
 pub mod storage;
 
@@ -173,59 +173,73 @@ pub use config::{CONFIG_FILE, OutputConfig, OutputDefaults, OutputProfile, Vesti
 
 // Actor provenance (#252 Phase A)
 pub use actor::{
-    ActorIdentityError, ActorPolicySnapshot, ProcessActor, ResolutionDisposition, RoleResolution,
-    ACTOR_KEY_FILE, ED25519_MULTICODEC_PREFIX, FLAT_POLICY_V1, INITIAL_POLICY_VERSION,
-    MAX_AGGREGATE_ENDORSEMENT_WEIGHT, MAX_ROLE_WEIGHT, NEUTRAL_WEIGHT, UNATTRIBUTED_ROLE,
+    ACTOR_KEY_FILE, ActorIdentityError, ActorPolicySnapshot, ED25519_MULTICODEC_PREFIX,
+    FLAT_POLICY_V1, INITIAL_POLICY_VERSION, MAX_AGGREGATE_ENDORSEMENT_WEIGHT, MAX_ROLE_WEIGHT,
+    NEUTRAL_WEIGHT, ProcessActor, ResolutionDisposition, RoleResolution, UNATTRIBUTED_ROLE,
     actor_key_path_for_data_dir, base58btc_decode, base58btc_encode, bounded_aggregate,
     did_key_from_ed25519_public_key, ed25519_public_key_from_did_key, endorsement_event_id,
     revision_digest,
 };
 
 // Agent Black Box / Receipts / Memory PRs (the cognitive flight recorder)
-pub use trace::{
-    BACKFILL_RECEIPT_CLAIM_BOUNDARY, BACKFILL_RECEIPT_SCHEMA_V1, WALK_RECEIPT_CLAIM_BOUNDARY,
-    WALK_RECEIPT_SCHEMA_V1, BackfillCandidateEvidence, DecayRisk, HIGH_TRUST_FLOOR,
-    LOW_CONFIDENCE_FLOOR, MemoryPr, MemoryPrAction, MemoryPrKind, MemoryPrStatus,
-    MemoryTraceEvent, Receipt, ReceiptEvidence, ReceiptMutation, ReviewMode, RiskClass,
-    RiskSignal, StrengthDelta, SuppressReason, SuppressedReceiptEntry, SynapticCaptureCandidate,
-    SynapticCaptureDisposition, SynapticCaptureEvidence, SynapticCaptureTrigger,
-    SynapticCaptureWindow, SynapticStrengthChange, WriteContext, WriteSource, classify_write,
-};
 pub use trace::ActorProvenance;
+pub use trace::{
+    BACKFILL_RECEIPT_CLAIM_BOUNDARY, BACKFILL_RECEIPT_SCHEMA_V1, BackfillCandidateEvidence,
+    DecayRisk, HIGH_TRUST_FLOOR, LOW_CONFIDENCE_FLOOR, MemoryPr, MemoryPrAction, MemoryPrKind,
+    MemoryPrStatus, MemoryTraceEvent, Receipt, ReceiptEvidence, ReceiptMutation, ReviewMode,
+    RiskClass, RiskSignal, StrengthDelta, SuppressReason, SuppressedReceiptEntry,
+    SynapticCaptureCandidate, SynapticCaptureDisposition, SynapticCaptureEvidence,
+    SynapticCaptureTrigger, SynapticCaptureWindow, SynapticStrengthChange,
+    WALK_RECEIPT_CLAIM_BOUNDARY, WALK_RECEIPT_SCHEMA_V1, WriteContext, WriteSource, classify_write,
+};
 
 // Storage layer
 // Storage: backend-agnostic surface (always available).
+pub use storage::LegacySqliteDisabled;
+#[cfg(not(feature = "legacy-sqlite"))]
+pub use storage::install_open_storage_hook;
+
+/// Install the protocol-test Strata opener when this crate was built without
+/// `legacy-sqlite`. Workspace feature unification can turn that feature on
+/// for `vestige-core` while `vestige-mcp`'s own feature stays off; the
+/// `legacy-sqlite` expansion drops the hook so the caller still compiles and
+/// `open_storage` stays the SQLite constructor.
+#[cfg(not(feature = "legacy-sqlite"))]
+#[macro_export]
+macro_rules! install_strata_open_hook {
+    ($hook:expr) => {
+        $crate::install_open_storage_hook($hook)
+    };
+}
+
+#[cfg(feature = "legacy-sqlite")]
+#[macro_export]
+macro_rules! install_strata_open_hook {
+    ($hook:expr) => {{
+        let _ = $hook;
+    }};
+}
 pub use storage::{
-    ClassificationResult,
-    Domain,
-    HealthStatus,
-    LocalMemoryStore,
-    MemoryEdge,
-    MemoryRecord,
-    MemoryStore,
-    MemoryStoreError,
-    MemoryStoreResult,
-    ModelSignature,
-    SchedulingState,
-    SearchQuery,
-    StoreStats,
-    LegacySqliteDisabled,
-    open_storage,
+    ACCESS_LOG_RETENTION_DAYS, ClassificationResult, DEFAULT_MEMORY_SCOPE, Domain, HealthStatus,
+    LocalMemoryStore, MemoryEdge, MemoryRecord, MemoryStore, MemoryStoreError, MemoryStoreResult,
+    MemoryStoreSend, ModelSignature, SchedulingState, SearchQuery, Storage, StorageError,
+    StoreStats, default_db_path, open_storage,
+};
+// v3 SQLite guard: refuses the legacy engine at every 4.0 entry point
+// (ungated — the refusal must fire in Strata-only builds too).
+pub use storage::v3_guard::{
+    MIGRATION_HINT, SQLITE_MAGIC, V3Info, detect_v3, ensure_not_v3, v3_rw_guard_armed,
 };
 
-// Storage: legacy SQLite surface (quarantined behind `legacy-sqlite`,
-// build/t5-legacy-isolation; default ON, flips off when STRATA lands).
-#[cfg(feature = "legacy-sqlite")]
+// Storage types live in the ungated `storage::types` module. Names that only
+// exist in the legacy engine stay behind `legacy-sqlite` further down.
 pub use storage::{
-    ACCESS_LOG_RETENTION_DAYS,
     AgentRunSummary,
     BLAST_LINK_TYPES,
     BLAST_MAX_DEPTH,
     BLAST_SCAN_NODE_CAP,
     BlastAffected,
     BlastReport,
-    RetireOutcome,
-    commit_sha_of,
     CompositionEventRecord,
     CompositionMemberRecord,
     CompositionNeighborRecord,
@@ -234,17 +248,11 @@ pub use storage::{
     ConnectorCursor,
     ConsolidationHistoryRecord,
     CounterfactualReplayResult,
-    DEFAULT_MEMORY_SCOPE,
     DreamHistoryRecord,
     DurableCounterfactualReplay,
     DurableRetrievalReplayCapsule,
     DurableSynapticCapture,
     DurableSynapticPairReceipt,
-    EmbeddingProfileIntegrityManifest,
-    EmbeddingProfileMigrationNodeCheckpoint,
-    EmbeddingProfileMigrationRecord,
-    EmbeddingProfileVector,
-    FrozenReplayItem,
     HygieneNodeSummary,
     HygieneSnapshot,
     InsightRecord,
@@ -262,16 +270,13 @@ pub use storage::{
     REPLAY_SCHEMA_VERSION,
     REPLAY_SELECTION_BOUNDARY,
     ReconcileReport,
-    ReplayBuildError,
     ReplayDecayRisk,
     ReplayEvidenceItemSummary,
     ReplayEvidenceSetSummary,
     ReplayInfluence,
-    ReplayInvalidationReason,
-    ReplayMaterializationCheck,
-    ReplayPrivacyInvalidation,
     ReplayPrivacyState,
     Result,
+    RetireOutcome,
     RetrievalReplayCapsuleDraft,
     RetrievalReplayCapsuleSummary,
     RetrievalReplayItemDraft,
@@ -287,12 +292,7 @@ pub use storage::{
     SmartIngestResult,
     SourceUpsertOutcome,
     SourceUpsertResult,
-    SqliteMemoryStore,
     StateTransitionRecord,
-    Storage,
-    StorageError,
-    db_path_for_data_dir,
-    default_db_path,
     StoredCounterfactualReplay,
     SynapticCapturePolicy,
     SynapticCaptureRequest,
@@ -301,11 +301,20 @@ pub use storage::{
     SynapticIngestRequest,
     SynapticSignalSnapshot,
     TagVocabulary,
-    ablate_frozen_context,
+    commit_sha_of,
+    db_path_for_data_dir,
     private_evidence_digest,
     replay_evidence_slot,
     replay_idempotency_key,
     replay_policy_digest,
+};
+
+#[cfg(feature = "legacy-sqlite")]
+pub use storage::{
+    EmbeddingProfileIntegrityManifest, EmbeddingProfileMigrationNodeCheckpoint,
+    EmbeddingProfileMigrationRecord, EmbeddingProfileVector, FrozenReplayItem, ReplayBuildError,
+    ReplayInvalidationReason, ReplayMaterializationCheck, ReplayPrivacyInvalidation,
+    SqliteMemoryStore, ablate_frozen_context,
 };
 
 // Embedding profile contracts are feature-independent so profile discovery,
@@ -318,8 +327,6 @@ pub use consolidation::{
     CreativeConnection, CreativeConnectionType, DreamEngine, DreamInsight, DreamPhase,
     FourPhaseDreamResult, PhaseResult, TriageCategory, TriagedMemory,
 };
-// Dream compile is wired to the legacy SQLite store (`build/t5-legacy-isolation`).
-#[cfg(feature = "legacy-sqlite")]
 pub use consolidation::{
     DreamCompileConfig, DreamCompilePhase, DreamCompilePr, DreamCompileReport, run_dream_compile,
 };
@@ -366,6 +373,8 @@ pub use advanced::{
     ImportanceTracker,
     // Intent detection
     IntentDetector,
+    // Reconsolidation (memories become modifiable on retrieval)
+    LabileCandidate,
     LabileState,
     MaintenanceType,
     // Merge / Supersede controls (Phase 3)
@@ -397,8 +406,6 @@ pub use advanced::{
     ProjectContext,
     ReasoningChain,
     ReconsolidatedMemory,
-    // Reconsolidation (memories become modifiable on retrieval)
-    LabileCandidate,
     ReconsolidationManager,
     ReconsolidationMeta,
     ReconsolidationStats,
@@ -561,9 +568,7 @@ pub use neuroscience::{
 };
 
 // Search fusion (RRF + linear combination over ranked result lists)
-pub use search::{
-    HybridSearchConfig, HybridSearcher, linear_combination, reciprocal_rank_fusion,
-};
+pub use search::{HybridSearchConfig, HybridSearcher, linear_combination, reciprocal_rank_fusion};
 
 // ============================================================================
 // VERSION INFO
@@ -670,25 +675,4 @@ pub mod prelude {
         TemporalContext,
         TopicalContext,
     };
-}
-
-/// Wave-S UX: the latest published version of `vestige-mcp-server` on the
-/// npm registry, or None on any failure (offline, timeout, parse). Used by
-/// the server's start-time check-and-hint — never a self-update. Two-second
-/// budget so a slow registry cannot delay anything.
-#[cfg(feature = "cloud-sync")]
-pub async fn latest_npm_version() -> Option<String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-        .ok()?;
-    let resp: serde_json::Value = client
-        .get("https://registry.npmjs.org/vestige-mcp-server/latest")
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    resp.get("version")?.as_str().map(String::from)
 }

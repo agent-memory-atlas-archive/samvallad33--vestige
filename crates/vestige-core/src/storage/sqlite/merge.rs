@@ -177,7 +177,9 @@ impl SqliteMemoryStore {
         let nodes: Vec<KnowledgeNode> = nodes
             .into_iter()
             .filter(|node| !superseded.contains(&node.id))
-            .filter(|node| tag_filter.is_empty() || tag_filter.iter().any(|t| node.tags.contains(t)))
+            .filter(|node| {
+                tag_filter.is_empty() || tag_filter.iter().any(|t| node.tags.contains(t))
+            })
             .collect();
         if nodes.len() < 2 {
             return Ok(vec![]);
@@ -398,8 +400,9 @@ impl SqliteMemoryStore {
             .reader
             .lock()
             .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
-        let mut stmt = reader
-            .prepare("SELECT id, superseded_by FROM knowledge_nodes WHERE superseded_by IS NOT NULL")?;
+        let mut stmt = reader.prepare(
+            "SELECT id, superseded_by FROM knowledge_nodes WHERE superseded_by IS NOT NULL",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -430,7 +433,7 @@ impl SqliteMemoryStore {
     /// The survivor is the first id (or highest retention if unspecified). The
     /// plan is persisted to `merge_plans` with status `pending` and returned for
     /// inspection. Nothing about the nodes changes until `apply_plan`.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn plan_merge(
         &self,
         member_ids: &[String],
@@ -575,7 +578,7 @@ impl SqliteMemoryStore {
 
     /// Build a previewable SUPERSEDE plan: invalidate `old_id` in favour of
     /// `new_id` (bitemporal, audit-preserving) WITHOUT applying it.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn plan_supersede(
         &self,
         old_id: &str,
@@ -645,7 +648,7 @@ impl SqliteMemoryStore {
     /// Classification is always `Possible`: a conflict with a live memory is
     /// a review case by construction, never an auto-apply, regardless of
     /// match score. See [`super::reconsolidation`] for the neuroscience.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn plan_reconsolidation(
         &self,
         target_id: &str,
@@ -726,7 +729,7 @@ impl SqliteMemoryStore {
     }
 
     /// Persist a plan row (status pending). Idempotent on plan id.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub(super) fn persist_plan(&self, plan: &crate::advanced::MergePlan) -> Result<()> {
         let writer = self
             .writer
@@ -950,7 +953,7 @@ impl SqliteMemoryStore {
     ///
     /// Expired plans are refused and auto-closed. Verdict on anything that is
     /// not a pending reconsolidation plan is an error.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn verdict_reconsolidation_plan(
         &self,
         plan_id: &str,
@@ -1015,8 +1018,7 @@ impl SqliteMemoryStore {
                     .writer
                     .lock()
                     .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
-                let tx =
-                    Self::begin_write_transaction(&writer, "quarantine_reconsolidation_plan")?;
+                let tx = Self::begin_write_transaction(&writer, "quarantine_reconsolidation_plan")?;
                 let op = self.record_reconsolidation_verdict_op(
                     &tx,
                     &plan,
@@ -1043,7 +1045,7 @@ impl SqliteMemoryStore {
     ///
     /// `auto_apply` must be true in the policy to apply a `Match` plan without an
     /// explicit `confirm`; non-`Match` plans always require `confirm=true`.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn apply_plan(
         &self,
         plan_id: &str,
@@ -1311,7 +1313,7 @@ impl SqliteMemoryStore {
                             plan.survivor_id
                         ],
                     )?;
-                    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+                    #[cfg(vestige_embeddings_removed)]
                     if content_changed {
                         // Flag for rebuild before COMMIT, so a crash between
                         // here and the regeneration below is self-healing.
@@ -1361,7 +1363,7 @@ impl SqliteMemoryStore {
         // Committed. Regenerate the survivor's embedding outside the write
         // lock; `has_embedding = 0` is already persisted, so failure here is
         // recoverable by the next consolidation cycle rather than silent.
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         if content_changed {
             if let Some(index) = self.vector_index.as_ref()
                 && let Ok(mut index) = index.lock()
@@ -1388,7 +1390,7 @@ impl SqliteMemoryStore {
     /// Reverse a prior merge/supersede operation by id (the "memory reflog").
     /// Restores survivor content/tags and clears the bitemporal invalidation on
     /// every node the operation touched, then records a compensating `undo` op.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub fn merge_undo(&self, op_id: &str) -> Result<crate::advanced::MergeOperation> {
         let op = self
             .read_operation(op_id)?
@@ -1622,7 +1624,7 @@ impl SqliteMemoryStore {
     /// now snapshots inside the apply transaction instead (see
     /// [`Self::read_bitemporal_in_transaction`]); this remains as the assertion
     /// helper the merge/supersede tests read state through.
-    #[cfg(all(test, feature = "embeddings", feature = "vector-search"))]
+    #[cfg(all(test, vestige_embeddings_removed, vestige_embeddings_removed))]
     pub(super) fn read_bitemporal(&self, id: &str) -> Result<(Option<String>, Option<String>)> {
         let reader = self
             .reader
@@ -1645,7 +1647,7 @@ impl SqliteMemoryStore {
 
     /// `read_bitemporal` against an open transaction, so a snapshot and the
     /// mutation it protects observe the same database state.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub(super) fn read_bitemporal_in_transaction(
         tx: &rusqlite::Transaction<'_>,
         id: &str,
@@ -1668,7 +1670,7 @@ impl SqliteMemoryStore {
     /// `invalidate_node` against an open transaction. The helper that takes the
     /// writer lock itself cannot be called from inside a transaction: the lock
     /// is not reentrant, so it would deadlock.
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     pub(super) fn invalidate_node_in_transaction(
         tx: &rusqlite::Transaction<'_>,
         id: &str,
@@ -1739,9 +1741,7 @@ mod exact_nomination_tests {
         }
     }
 
-    fn candidate_members(
-        storage: &Storage,
-    ) -> Vec<Vec<String>> {
+    fn candidate_members(storage: &Storage) -> Vec<Vec<String>> {
         storage
             .merge_candidates(crate::advanced::MergePolicy::default(), 20, &[])
             .unwrap()
@@ -1793,7 +1793,9 @@ mod exact_nomination_tests {
         // dropping the index for the duration of the test.
         {
             let writer = storage.writer.lock().unwrap();
-            writer.execute_batch("DROP INDEX idx_nodes_source_key").unwrap();
+            writer
+                .execute_batch("DROP INDEX idx_nodes_source_key")
+                .unwrap();
         }
         let a = ingest_with_envelope(
             &storage,
@@ -1826,7 +1828,11 @@ mod exact_nomination_tests {
         // sets differ (services vs service), so exact-equality nomination
         // must NOT offer it.
         ingest(&storage, "Use tokio runtime for async Rust services", &[]);
-        ingest(&storage, "Use the tokio runtime for async Rust service", &[]);
+        ingest(
+            &storage,
+            "Use the tokio runtime for async Rust service",
+            &[],
+        );
 
         let clusters = candidate_members(&storage);
         assert!(

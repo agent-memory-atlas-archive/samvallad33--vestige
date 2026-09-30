@@ -58,7 +58,11 @@ impl MemLog {
 
 impl EventLog for MemLog {
     fn events_before(&self, bound: u64) -> Vec<GateEvent> {
-        self.events.iter().take_while(|e| e.seq < bound).cloned().collect()
+        self.events
+            .iter()
+            .take_while(|e| e.seq < bound)
+            .cloned()
+            .collect()
     }
 
     fn append(&mut self, kind: RecordKind, payload: Vec<u8>) -> SeqAck {

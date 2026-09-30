@@ -176,7 +176,7 @@ pub async fn execute_stats(storage: &Arc<Storage>) -> Result<Value, String> {
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use vestige_core::IngestInput;
@@ -185,7 +185,8 @@ mod tests {
     async fn legacy_trigger_fails_closed_without_mutating_memory_state() {
         let directory = tempfile::tempdir().expect("temporary database directory");
         let storage = Arc::new(
-            vestige_core::open_storage(Some(directory.path().join("tagging.db"))).expect("test storage"),
+            vestige_core::open_storage(Some(directory.path().join("tagging.db")))
+                .expect("test storage"),
         );
         let node = storage
             .ingest(IngestInput {

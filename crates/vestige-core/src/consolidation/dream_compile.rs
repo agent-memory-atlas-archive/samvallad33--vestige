@@ -169,8 +169,10 @@ pub fn run_dream_compile(
         })
         .collect();
 
-    let content_by_id: std::collections::HashMap<&str, &str> =
-        nodes.iter().map(|n| (n.id.as_str(), n.content.as_str())).collect();
+    let content_by_id: std::collections::HashMap<&str, &str> = nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.content.as_str()))
+        .collect();
 
     // 3. Replay over memory_connections. Each unordered pair is visited once
     // even though get_connections_for_memory returns it from both endpoints.
@@ -244,7 +246,12 @@ pub fn run_dream_compile(
                 continue;
             }
             prs.push(contradiction_pr(
-                &run_id, nodes.len(), a_id, b_id, a_text, b_text,
+                &run_id,
+                nodes.len(),
+                a_id,
+                b_id,
+                a_text,
+                b_text,
             ));
         }
     }
@@ -432,7 +439,9 @@ fn insight_pr(run_id: &str, scope: &str, memories: usize, insight: &DreamInsight
                 code: "pattern_evidence".to_string(),
                 detail: format!(
                     "Cross-memory pattern at confidence {:.2} and novelty {:.2}, sourced from {} memory ids.",
-                    insight.confidence, insight.novelty, insight.source_memory_ids.len()
+                    insight.confidence,
+                    insight.novelty,
+                    insight.source_memory_ids.len()
                 ),
             },
         ],
@@ -468,15 +477,20 @@ fn pr_source_ids(pr: &MemoryPr) -> Vec<String> {
 // TESTS
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use crate::storage::ConnectionRecord;
     use chrono::Duration;
 
-    fn test_storage() -> (std::sync::Arc<crate::storage::SqliteMemoryStore>, tempfile::TempDir) {
+    fn test_storage() -> (
+        std::sync::Arc<crate::storage::SqliteMemoryStore>,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = std::sync::Arc::new(crate::storage::SqliteMemoryStore::new(Some(dir.path().join("test.db"))).unwrap());
+        let storage = std::sync::Arc::new(
+            crate::storage::SqliteMemoryStore::new(Some(dir.path().join("test.db"))).unwrap(),
+        );
         (storage, dir)
     }
 
@@ -498,7 +512,12 @@ mod tests {
             .id
     }
 
-    fn seed_connection(storage: &crate::storage::SqliteMemoryStore, a: &str, b: &str, strength: f64) {
+    fn seed_connection(
+        storage: &crate::storage::SqliteMemoryStore,
+        a: &str,
+        b: &str,
+        strength: f64,
+    ) {
         let now = Utc::now();
         storage
             .save_connection(&ConnectionRecord {
@@ -513,7 +532,11 @@ mod tests {
             .unwrap();
     }
 
-    fn edge(storage: &crate::storage::SqliteMemoryStore, a: &str, b: &str) -> Option<ConnectionRecord> {
+    fn edge(
+        storage: &crate::storage::SqliteMemoryStore,
+        a: &str,
+        b: &str,
+    ) -> Option<ConnectionRecord> {
         storage
             .get_connections_for_memory(a)
             .unwrap()
@@ -529,12 +552,16 @@ mod tests {
     }
 
     /// Ten related memories: a replay-able corpus.
-    fn store_with_corpus() -> (std::sync::Arc<crate::storage::SqliteMemoryStore>, tempfile::TempDir, Vec<String>) {
+    fn store_with_corpus() -> (
+        std::sync::Arc<crate::storage::SqliteMemoryStore>,
+        tempfile::TempDir,
+        Vec<String>,
+    ) {
         let (storage, dir) = test_storage();
         let mut ids = Vec::new();
         for i in 0..10 {
             ids.push(ingest(
-                &*storage,
+                &storage,
                 &format!("Dream compile test memory number {i} about the deploy pipeline"),
                 &["dream-compile-test"],
             ));
@@ -605,7 +632,10 @@ mod tests {
         let report = run_dream_compile(&*storage, &config("user")).unwrap();
         assert_eq!(report.edges_strengthened, 1);
         let after = edge(&storage, &ids[0], &ids[1]).unwrap().strength;
-        assert!(after > before, "co-replayed edge must strengthen: {before} -> {after}");
+        assert!(
+            after > before,
+            "co-replayed edge must strengthen: {before} -> {after}"
+        );
         assert!(after <= 1.0, "strengthening must stay capped at 1.0");
     }
 
@@ -625,7 +655,10 @@ mod tests {
         let weak = edge(&storage, &ids[2], &outside).unwrap();
         assert!((weak.strength - 0.40 * 0.95).abs() < 1e-9);
         let strong = edge(&storage, &ids[3], &outside_2).unwrap();
-        assert!((strong.strength - 0.90).abs() < 1e-9, "strong edge untouched");
+        assert!(
+            (strong.strength - 0.90).abs() < 1e-9,
+            "strong edge untouched"
+        );
     }
 
     #[test]
@@ -633,19 +666,19 @@ mod tests {
         let (storage, _dir) = test_storage();
         // Shared substantive vocabulary + a ("never", "always") polarity flip.
         let _a = ingest(
-            &*storage,
+            &storage,
             "Deployments to production always use the blue pipeline on friday",
             &["deploys"],
         );
         let _b = ingest(
-            &*storage,
+            &storage,
             "Deployments to production never use the blue pipeline on friday",
             &["deploys"],
         );
         // Corpus padding so the 5-memory floor passes.
         for i in 0..4 {
             ingest(
-                &*storage,
+                &storage,
                 &format!("Deployment pipeline note {i} about staging checks"),
                 &["deploys"],
             );
@@ -663,7 +696,12 @@ mod tests {
         let report = run_dream_compile(&*storage, &config("user")).unwrap();
         assert_eq!(report.status, "compiled");
         assert!(report.contradictions_found >= 1, "{report:?}");
-        assert!(report.prs_filed.iter().any(|p| p.kind == "dream_consolidation"));
+        assert!(
+            report
+                .prs_filed
+                .iter()
+                .any(|p| p.kind == "dream_consolidation")
+        );
 
         // The PR is queryable, pending, and evidence-signed.
         let pending = storage
@@ -676,11 +714,29 @@ mod tests {
         assert!(!dream_prs.is_empty());
         let contradiction_pr = dream_prs
             .iter()
-            .find(|p| p.diff.get("change").and_then(|c| c.as_str()) == Some("contradiction_resolution"))
+            .find(|p| {
+                p.diff.get("change").and_then(|c| c.as_str()) == Some("contradiction_resolution")
+            })
             .expect("a contradiction PR must be stored");
-        assert!(contradiction_pr.signals.iter().any(|s| s.code == "dream_consolidation"));
-        assert!(contradiction_pr.signals.iter().any(|s| s.code == "contradiction_detected"));
-        assert!(contradiction_pr.run_id.as_deref().unwrap_or("").starts_with("dream_"));
+        assert!(
+            contradiction_pr
+                .signals
+                .iter()
+                .any(|s| s.code == "dream_consolidation")
+        );
+        assert!(
+            contradiction_pr
+                .signals
+                .iter()
+                .any(|s| s.code == "contradiction_detected")
+        );
+        assert!(
+            contradiction_pr
+                .run_id
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("dream_")
+        );
     }
 
     #[test]
@@ -690,12 +746,24 @@ mod tests {
         // pattern extractor (bigrams shared by 3-10 memories) something to
         // find; varied first tags give cross-domain pairing room.
         let topics = [
-            ("Rust error handling with Result types", vec!["rust", "safety"]),
-            ("TypeScript error handling with try catch blocks", vec!["typescript"]),
-            ("Python error handling with exception classes", vec!["python"]),
+            (
+                "Rust error handling with Result types",
+                vec!["rust", "safety"],
+            ),
+            (
+                "TypeScript error handling with try catch blocks",
+                vec!["typescript"],
+            ),
+            (
+                "Python error handling with exception classes",
+                vec!["python"],
+            ),
             ("Go error handling with error values everywhere", vec!["go"]),
             ("Java error handling with checked exceptions", vec!["java"]),
-            ("A cooking recipe for sourdough bread at home", vec!["cooking"]),
+            (
+                "A cooking recipe for sourdough bread at home",
+                vec!["cooking"],
+            ),
         ];
         for (content, tags) in &topics {
             ingest(&storage, content, tags);
@@ -704,7 +772,10 @@ mod tests {
         let report = run_dream_compile(&*storage, &config("user")).unwrap();
         assert_eq!(report.status, "compiled");
         assert!(
-            report.prs_filed.iter().any(|p| p.kind == "dream_consolidation"),
+            report
+                .prs_filed
+                .iter()
+                .any(|p| p.kind == "dream_consolidation"),
             "REM patterns must land as PRs, got: {report:?}"
         );
         // Insight PRs carry a structured proposed change, not a memory write.
@@ -767,7 +838,9 @@ mod tests {
             .list_memory_prs(Some(MemoryPrStatus::Pending), 100)
             .unwrap();
         assert!(
-            pending.iter().all(|p| p.kind == MemoryPrKind::DreamConsolidation),
+            pending
+                .iter()
+                .all(|p| p.kind == MemoryPrKind::DreamConsolidation),
             "every filed PR must be a DreamConsolidation proposal"
         );
         let strengthened = edge(&storage, &ids[0], &ids[1]).unwrap();
@@ -780,18 +853,18 @@ mod tests {
     fn max_prs_budget_is_respected() {
         let (storage, _dir) = test_storage();
         let _a = ingest(
-            &*storage,
+            &storage,
             "Deployments to production always use the blue pipeline on friday",
             &["deploys"],
         );
         let _b = ingest(
-            &*storage,
+            &storage,
             "Deployments to production never use the blue pipeline on friday",
             &["deploys"],
         );
         for i in 0..4 {
             ingest(
-                &*storage,
+                &storage,
                 &format!("Deployment pipeline note {i} about staging checks"),
                 &["deploys"],
             );
@@ -824,7 +897,11 @@ mod tests {
     fn report_names_the_dreamed_namespace() {
         let (storage, _dir) = test_storage();
         for i in 0..10 {
-            ingest(&storage, &format!("Scoped item {i} about the deploy pipeline"), &["work"]);
+            ingest(
+                &storage,
+                &format!("Scoped item {i} about the deploy pipeline"),
+                &["work"],
+            );
         }
         let report = run_dream_compile(&*storage, &config("user")).unwrap();
         assert_eq!(report.scope, "user");
@@ -851,7 +928,7 @@ mod tests {
             .unwrap();
         for i in 0..10 {
             ingest(
-                &*storage,
+                &storage,
                 &format!("Current dream note {i} about the deploy pipeline"),
                 &["current"],
             );

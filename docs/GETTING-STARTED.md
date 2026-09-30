@@ -1,5 +1,7 @@
 # Getting Started with Vestige
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../README.md) and the [4.0.0 changelog](../CHANGELOG.md).
+
 Your first 30 minutes, start to finish. By the end you'll have Vestige installed,
 connected to your agent, storing memories, and you'll know how to look at exactly
 what it kept.

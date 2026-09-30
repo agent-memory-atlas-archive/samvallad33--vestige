@@ -34,6 +34,7 @@
 #[path = "glibc_compat.rs"]
 mod glibc_compat;
 
+use vestige_mcp::attach;
 use vestige_mcp::cognitive;
 use vestige_mcp::protocol;
 use vestige_mcp::server;
@@ -244,6 +245,23 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
     }
 }
 
+fn default_strata_dir() -> io::Result<PathBuf> {
+    if let Some(data_dir) = data_dir_from_env() {
+        let data_dir = expand_tilde(data_dir);
+        fs::create_dir_all(&data_dir)?;
+        return Ok(data_dir);
+    }
+    let proj = directories::ProjectDirs::from("com", "vestige", "core").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Could not determine project directories",
+        )
+    })?;
+    let dir = proj.data_dir().to_path_buf();
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 fn prepare_storage_path(data_dir: Option<PathBuf>) -> io::Result<Option<PathBuf>> {
     let Some(data_dir) = data_dir else {
         return Ok(None);
@@ -430,11 +448,87 @@ async fn serve() {
         }
     };
 
-    // Initialize storage with optional custom data directory.
-    // vestige_core::open_storage(Some(...)) expects a DB file path, so map data dirs to vestige.db here.
-    let storage = match vestige_core::open_storage(storage_path) {
+    // The probed path is `<data-dir>/vestige.db`. The Strata log lives in the
+    // data directory (`log/`) and the open below never creates that sqlite file.
+    let (strata_dir, db_path) = match storage_path.as_deref() {
+        Some(db_path) => {
+            let dir = db_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| db_path.to_path_buf());
+            (dir, db_path.to_path_buf())
+        }
+        None => match default_strata_dir() {
+            Ok(dir) => {
+                let db_path = dir.join(DATABASE_FILE);
+                (dir, db_path)
+            }
+            Err(e) => {
+                error!("Failed to resolve the Strata data directory: {}", e);
+                std::process::exit(1);
+            }
+        },
+    };
+
+    // Presence of vestige.db is the whole v3 check. The file is not opened.
+    // `vestige-upgrade` does the import when it sits beside this binary or on PATH.
+    if let Err(err) = vestige_mcp::v3_launch::upgrade_or_refuse(&db_path) {
+        if !err.to_string().is_empty() {
+            eprintln!("{err}");
+            let _ = std::io::Write::flush(&mut io::stderr());
+        }
+        std::process::exit(err.code());
+    }
+
+    // Two servers must not open the same log, and every agent on the machine
+    // must still get the store. `.serve.lock` elects one owner (the kernel
+    // drops it with its holder, SIGKILL included); every other process
+    // attaches to the owner and relays its stdio there. See `attach`.
+    let wait = attach::election_wait();
+    let (serve_lock, promoted) = match attach::elect(&strata_dir, wait).await {
+        Ok(attach::Role::Owner(lock)) => (lock, None),
+        Ok(attach::Role::Attached(attachment)) => {
+            info!(
+                owner_pid = attachment.owner_pid,
+                "{} is served by another vestige-mcp; relaying this client to it",
+                strata_dir.display()
+            );
+            match attach::proxy_stdio(attachment, &strata_dir, wait).await {
+                Ok(attach::ProxyEnd::Closed) => {
+                    info!("attached client closed");
+                    return;
+                }
+                Ok(attach::ProxyEnd::Promoted { lock, client }) => {
+                    info!(
+                        "the owner went away; this process now serves {}",
+                        strata_dir.display()
+                    );
+                    (lock, Some(client))
+                }
+                Err(e) => {
+                    error!("Lost the Vestige server and could not elect another: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            error!(
+                "Could not serve or attach to {}: {}",
+                strata_dir.display(),
+                e
+            );
+            std::process::exit(1);
+        }
+    };
+    // Held for the life of `serve`. `log/strata.lock` is a pid file: while
+    // this process is alive it also stops a reader (`dump-migration` opens
+    // that same directory with `StrataLog::open`). The serve lock is taken
+    // first, then the pid file is dropped so the reader can reopen the log
+    // this process is serving.
+    let _serve_lock = serve_lock;
+    let storage = match vestige_mcp::strata_memory::open(&strata_dir) {
         Ok(s) => {
-            info!("Storage initialized successfully");
+            info!("Strata log initialized at {}", strata_dir.display());
             s
         }
         Err(e) => {
@@ -442,6 +536,7 @@ async fn serve() {
             std::process::exit(1);
         }
     };
+    let _ = fs::remove_file(strata_dir.join("log").join("strata.lock"));
 
     // Preserve the released Nomic default in the background so MCP clients can
     // finish their stdio handshake before a first-run model download. Optional
@@ -453,44 +548,16 @@ async fn serve() {
     // stderr, which stdio clients hide.
     let (transport, notifier) = StdioTransport::with_notifications();
 
-    // Wave-S UX: start-time version hint (canonical pattern per the Sep 2026
-    // ecosystem scan — check-and-hint, never self-update). One stderr line,
-    // spawned off the critical path so the handshake budget is untouched.
-    // Compare against npm's registry metadata for vestige-mcp-server; any
-    // network failure or timeout is silently skipped.
-    #[cfg(feature = "cloud-sync")]
-    {
-        let notifier = notifier.clone();
-        tokio::spawn(async move {
-            // reqwest reaches vestige-mcp only through vestige-core's
-            // cloud-sync/connectors feature; the guard above keeps builds
-            // without it compiling.
-            // Offline / rate-limited / parse failure: None, silently skipped.
-            if let Some(latest_version) = vestige_core::latest_npm_version().await {
-                let current = env!("CARGO_PKG_VERSION");
-                if latest_version != current {
-                    notifier.log(
-                        "info",
-                        "vestige.update",
-                        serde_json::json!({
-                            "event": "newer_version_available",
-                            "current": current,
-                            "latest": latest_version,
-                            "hint": "npm install -g vestige-mcp-server@latest  (or brew upgrade vestige)",
-                        }),
-                    );
-                }
-            }
-        });
-    }
     // Nothing warms up at startup anymore (the embedding runtime was removed),
     // so the notifier has no sender beyond this scope; dropping it parks the channel.
-    let _notifier: Notifier = notifier.clone();
+    let _notifier: Notifier = notifier;
 
     // Startup hygiene: sweep Black Box traces past VESTIGE_TRACE_RETENTION_DAYS
     // now, not only when the consolidation cycle next runs. Best-effort.
     match storage.prune_agent_traces() {
-        Ok(deleted) if deleted > 0 => info!(deleted, "Pruned expired agent trace events at startup"),
+        Ok(deleted) if deleted > 0 => {
+            info!(deleted, "Pruned expired agent trace events at startup")
+        }
         Ok(_) => {}
         Err(e) => warn!("Startup trace retention sweep failed: {}", e),
     }
@@ -661,10 +728,9 @@ async fn serve() {
     info!("CognitiveEngine initialized and hydrated");
 
     // Create shared event broadcast channel for dashboard <-> MCP tool events
-    let (event_tx, _) =
-        tokio::sync::broadcast::channel::<vestige_mcp::dashboard::events::VestigeEvent>(
-            vestige_mcp::dashboard::state::EVENT_CHANNEL_CAPACITY,
-        );
+    let (event_tx, _) = tokio::sync::broadcast::channel::<
+        vestige_mcp::dashboard::events::VestigeEvent,
+    >(vestige_mcp::dashboard::state::EVENT_CHANNEL_CAPACITY);
 
     // v2.0.9 "Autopilot" — spawn the backend event-subscriber that routes
     // every live WebSocket event into the cognitive modules that already
@@ -680,25 +746,23 @@ async fn serve() {
         event_tx.clone(),
     );
 
-    // Spawn dashboard HTTP server alongside MCP server (now with CognitiveEngine access)
+    // The dashboard starts here when VESTIGE_DASHBOARD_ENABLED is set, or
+    // later, when `vestige dashboard` asks this process through the attach
+    // endpoint (this process holds the store, so the CLI cannot open it).
+    let dashboard = vestige_mcp::dashboard::DashboardOnDemand::new(
+        Arc::clone(&storage),
+        Arc::clone(&cognitive),
+        event_tx.clone(),
+    );
     if config.dashboard_enabled {
         let dashboard_port = std::env::var("VESTIGE_DASHBOARD_PORT")
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(3927);
-        let dashboard_storage = Arc::clone(&storage);
-        let dashboard_cognitive = Arc::clone(&cognitive);
-        let dashboard_event_tx = event_tx.clone();
+        let dashboard = dashboard.clone();
         tokio::spawn(async move {
-            match vestige_mcp::dashboard::start_background_with_event_tx(
-                dashboard_storage,
-                Some(dashboard_cognitive),
-                dashboard_event_tx,
-                dashboard_port,
-            )
-            .await
-            {
-                Ok(_state) => {
+            match dashboard.ensure(dashboard_port).await {
+                Ok(_) => {
                     info!("Dashboard started with WebSocket + CognitiveEngine + shared event bus");
                 }
                 Err(e) => {
@@ -707,7 +771,9 @@ async fn serve() {
             }
         });
     } else {
-        info!("Dashboard disabled by VESTIGE_DASHBOARD_ENABLED=false");
+        info!(
+            "Dashboard not started (VESTIGE_DASHBOARD_ENABLED is off); `vestige dashboard` starts it on request"
+        );
     }
 
     // Start optional HTTP MCP transport for clients that need Streamable HTTP.
@@ -750,14 +816,53 @@ async fn serve() {
         info!("HTTP MCP transport disabled; set VESTIGE_HTTP_ENABLED=1 or pass --http to enable");
     }
 
+    // Other local clients attach here: one MCP session each, same storage,
+    // same cognitive engine, same event bus.
+    let attach_point = {
+        let storage = Arc::clone(&storage);
+        let cognitive = Arc::clone(&cognitive);
+        let event_tx = event_tx.clone();
+        match attach::AttachPoint::open(
+            &strata_dir,
+            move || {
+                McpServer::new_with_events(
+                    Arc::clone(&storage),
+                    Arc::clone(&cognitive),
+                    event_tx.clone(),
+                )
+            },
+            Some(dashboard.starter()),
+        )
+        .await
+        {
+            Ok(point) => Some(point),
+            Err(e) => {
+                warn!(
+                    "Other Vestige clients cannot attach to this server ({}); they will wait for it to exit",
+                    e
+                );
+                None
+            }
+        }
+    };
 
     // Create MCP server with shared event channel for dashboard broadcasts
     let server = McpServer::new_with_events(storage, cognitive, event_tx);
 
     info!("Starting MCP server on stdio...");
 
-    // Run the server
-    if let Err(e) = transport.run(server).await {
+    // Run the server: this process's own client, or the attached client this
+    // process took over when its owner went away.
+    let result = match promoted {
+        None => transport.run(server).await,
+        Some(client) => client.serve(server).await,
+    };
+    // Attached sessions outlive this process's own client: keep serving them,
+    // then stop accepting and retire the endpoint while still holding the lock.
+    if let Some(point) = attach_point {
+        point.close().await;
+    }
+    if let Err(e) = result {
         error!("Server error: {}", e);
         // Not `std::process::exit`: this runs on a runtime thread with the
         // warm-up tasks possibly still inside ONNX Runtime, which is the state

@@ -1,5 +1,7 @@
 # Android (Termux) Installation
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../README.md) and the [4.0.0 changelog](../CHANGELOG.md).
+
 Vestige runs on Android inside [Termux](https://termux.dev). Today that means
 building from source in a configuration without embeddings; a prebuilt
 `aarch64-linux-android` release asset and `npm install -g` support are the next
@@ -35,14 +37,15 @@ compiler is needed.
 pkg install rust clang cmake make pkg-config git
 git clone https://github.com/samvallad33/vestige.git
 cd vestige
-cargo build --release -p vestige-mcp --no-default-features --features connectors,cloud-sync
+cargo build --release -p vestige-mcp --no-default-features
+cargo build --release -p vestige-upgrade
 ```
 
-The binaries land in `target/release/`: `vestige-mcp`, `vestige` and
-`vestige-restore`. Put them on your `PATH`:
+The binaries land in `target/release/`: `vestige-mcp`, `vestige`,
+`vestige-restore`, and `vestige-upgrade`. Put them on your `PATH`:
 
 ```bash
-install -m 755 target/release/vestige-mcp target/release/vestige target/release/vestige-restore "$PREFIX/bin/"
+install -m 755 target/release/vestige-mcp target/release/vestige target/release/vestige-restore target/release/vestige-upgrade "$PREFIX/bin/"
 ```
 
 ## Verify
@@ -66,8 +69,8 @@ Then connect an MCP client with the usual config:
 
 | Feature | State | Why |
 | --- | --- | --- |
-| `connectors` | on | GitHub Issues and Redmine connectors; the HTTP client is rustls, no OpenSSL |
-| `cloud-sync` | on | Vestige Pro sync client, same HTTP client |
+| `connectors` | off | Not a 4.0 default. Add `--features connectors` to opt in |
+| `cloud-sync` | off | Not a 4.0 default. Add `--features cloud-sync` to opt in |
 | `embeddings`, `vector-search` | off | this build leaves them out on purpose; the pinned `ort-sys` does ship an `aarch64-linux-android` ONNX Runtime prebuilt (NDK-built), and whether it links in a native Termux build is untested, so the embeddings build is the next step rather than part of this one |
 | `codebase-git` | off | libgit2 needs OpenSSL and libssh2 |
 

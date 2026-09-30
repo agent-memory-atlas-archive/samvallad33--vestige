@@ -17,38 +17,25 @@ use std::fmt;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::sqlite::SqliteMemoryStore;
 use super::{Result, StorageError};
 use crate::trace::Receipt;
 
-/// The only selection boundary implemented by replay v1.
-pub const REPLAY_SELECTION_BOUNDARY: &str = "post_retrieval_context_ablation";
-/// Stable algorithm identifier included in every capsule, digest, and replay.
-pub const REPLAY_ALGORITHM_VERSION: &str = "vestige.post_retrieval_context_ablation.v1";
-/// Schema version for persisted capsule and replay payloads.
-pub const REPLAY_SCHEMA_VERSION: u32 = 1;
-/// Public claim boundary. Product surfaces must show this verbatim.
-pub const REPLAY_CLAIM_BOUNDARY: &str = "Controlled replay shows how the recorded memory context changes when specified evidence is withheld. It does not establish that a memory caused an agent answer or any real-world outcome.";
+pub use super::contracts::{
+    REPLAY_ALGORITHM_VERSION, REPLAY_CLAIM_BOUNDARY, REPLAY_SCHEMA_VERSION,
+    REPLAY_SELECTION_BOUNDARY, replay_evidence_slot, replay_idempotency_key,
+};
 
-const PRIVATE_DIGEST_DOMAIN: &[u8] = b"vestige.replay.private-item.v1";
-const POLICY_DIGEST_DOMAIN: &[u8] = b"vestige.replay.policy.v1";
 const ITEM_LEAF_DOMAIN: &[u8] = b"vestige.replay.item-leaf.v1";
 const SET_DIGEST_DOMAIN: &[u8] = b"vestige.replay.ordered-set.v1";
 const EMPTY_MERKLE_DOMAIN: &[u8] = b"vestige.replay.merkle-empty.v1";
 const MERKLE_PARENT_DOMAIN: &[u8] = b"vestige.replay.merkle-parent.v1";
-const IDEMPOTENCY_DOMAIN: &[u8] = b"vestige.replay.idempotency.v1";
 
-/// Privacy state of a frozen capsule or replay record.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReplayPrivacyState {
-    Active,
-    Redacted,
-    Purged,
-}
+// `ReplayPrivacyState` and `ReplayDecayRisk` are defined in (and re-exported
+// from) `crate::storage::types`.
+pub use crate::storage::types::{ReplayDecayRisk, ReplayPrivacyState};
 
 impl ReplayPrivacyState {
     fn as_str(self) -> &'static str {
@@ -69,15 +56,6 @@ impl ReplayPrivacyState {
             ))),
         }
     }
-}
-
-/// Coarse decay signal frozen with one evidence item.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum ReplayDecayRisk {
-    Low,
-    Medium,
-    High,
 }
 
 impl ReplayDecayRisk {
@@ -218,44 +196,9 @@ impl fmt::Display for ReplayBuildError {
 
 impl std::error::Error for ReplayBuildError {}
 
-/// One item in the exact evidence pack supplied by the retrieval boundary.
-///
-/// `memory_id` is only an internal dependency locator. It is never copied into
-/// replay result JSON. `private_digest` must be a keyed digest, not a public
-/// hash of memory content.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RetrievalReplayItemDraft {
-    pub evidence_slot: String,
-    pub memory_id: String,
-    pub private_digest: String,
-    pub token_estimate: u64,
-    pub trust_score: f64,
-    pub decay_risk: ReplayDecayRisk,
-}
-
-/// Draft frozen alongside one retrieval receipt.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RetrievalReplayCapsuleDraft {
-    pub source_receipt_id: String,
-    pub policy_digest: String,
-    pub items: Vec<RetrievalReplayItemDraft>,
-    pub created_at: DateTime<Utc>,
-}
-
-impl RetrievalReplayCapsuleDraft {
-    pub fn new(
-        source_receipt_id: impl Into<String>,
-        policy_digest: impl Into<String>,
-        items: Vec<RetrievalReplayItemDraft>,
-    ) -> Self {
-        Self {
-            source_receipt_id: source_receipt_id.into(),
-            policy_digest: policy_digest.into(),
-            items,
-            created_at: Utc::now(),
-        }
-    }
-}
+// `RetrievalReplayItemDraft` and `RetrievalReplayCapsuleDraft` are defined
+// in (and re-exported from) `crate::storage::types`.
+pub use crate::storage::types::RetrievalReplayCapsuleDraft;
 
 /// Persisted frozen item. Suppression nulls evidence and size-derived fields;
 /// the memory locator remains private until purge deletes the item row.
@@ -294,42 +237,9 @@ struct RetrievalReplayCapsule {
     pub created_at: DateTime<Utc>,
 }
 
-/// Public capsule projection. Stable memory ids and private item digests never
-/// enter this type; non-active capsules expose no item rows at all.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct RetrievalReplayCapsuleSummary {
-    pub capsule_id: String,
-    pub source_receipt_id: String,
-    pub schema_version: u32,
-    pub algorithm_version: String,
-    pub selection_boundary: String,
-    pub redaction_generation: u64,
-    pub privacy_state: ReplayPrivacyState,
-    pub replayable: bool,
-    pub policy_digest: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub baseline_evidence_digest: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub baseline_merkle_root: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub item_count: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_token_estimate: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trust_floor: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub decay_risk: Option<ReplayDecayRisk>,
-    pub items: Vec<ReplayEvidenceItemSummary>,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Result of durable capsule creation.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DurableRetrievalReplayCapsule {
-    pub capsule: RetrievalReplayCapsuleSummary,
-    pub reused_existing: bool,
-}
+// `RetrievalReplayCapsuleSummary` and `DurableRetrievalReplayCapsule` are
+// defined in (and re-exported from) `crate::storage::types`.
+pub use crate::storage::types::{DurableRetrievalReplayCapsule, RetrievalReplayCapsuleSummary};
 
 /// Privacy-safe item consumed by the pure ablation engine.
 #[derive(Debug, Clone, PartialEq)]
@@ -342,87 +252,14 @@ pub struct FrozenReplayItem {
     pub decay_risk: ReplayDecayRisk,
 }
 
-/// Exact aggregate of one ordered evidence set.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ReplayEvidenceItemSummary {
-    pub evidence_slot: String,
-    /// One-based rank in the exact final evidence order.
-    pub rank: u32,
-    pub token_estimate: u64,
-    pub trust_score: f64,
-    pub decay_risk: ReplayDecayRisk,
-}
-
-/// Exact aggregate of one ordered evidence set.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ReplayEvidenceSetSummary {
-    pub items: Vec<ReplayEvidenceItemSummary>,
-    pub ordered_slots: Vec<String>,
-    pub item_count: u64,
-    pub token_estimate: u64,
-    pub trust_floor: f64,
-    pub decay_risk: ReplayDecayRisk,
-    pub ordered_evidence_digest: String,
-    pub merkle_root: String,
-}
-
-/// Measured structural difference between baseline and ablated context.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ReplayInfluence {
-    pub removed_item_count: u64,
-    pub removed_token_estimate: u64,
-    pub trust_floor_delta: f64,
-    pub decay_risk_changed: bool,
-    pub ordered_evidence_digest_changed: bool,
-    pub merkle_root_changed: bool,
-}
-
-/// Privacy-safe evidence payload for one controlled replay.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct CounterfactualReplayResult {
-    pub source_receipt_id: String,
-    pub schema_version: u32,
-    pub algorithm_version: String,
-    pub selection_boundary: String,
-    pub policy_digest: String,
-    pub redaction_generation: u64,
-    pub withheld_slots: Vec<String>,
-    pub baseline: ReplayEvidenceSetSummary,
-    pub counterfactual: ReplayEvidenceSetSummary,
-    pub replay_influence: ReplayInfluence,
-    /// Replay persisted an audit record but did not mutate cognitive state.
-    pub memory_state_was_read_only: bool,
-    pub claim_boundary: String,
-}
-
-/// Stored counterfactual replay. `result` becomes `None` after privacy
-/// invalidation; structural audit linkage may remain.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct StoredCounterfactualReplay {
-    pub replay_id: String,
-    pub idempotency_key: String,
-    pub capsule_id: String,
-    pub source_receipt_id: String,
-    pub receipt_id: Option<String>,
-    pub algorithm_version: String,
-    pub redaction_generation: u64,
-    pub withheld_slots: Vec<String>,
-    pub privacy_state: ReplayPrivacyState,
-    pub result: Option<CounterfactualReplayResult>,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Result of replay creation or an idempotent retry.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DurableCounterfactualReplay {
-    pub replay: StoredCounterfactualReplay,
-    pub reused_existing: bool,
-}
+// `ReplayEvidenceItemSummary`, `ReplayEvidenceSetSummary`, `ReplayInfluence`,
+// `CounterfactualReplayResult`, `StoredCounterfactualReplay`, and
+// `DurableCounterfactualReplay` are defined in (and re-exported from)
+// `crate::storage::types`.
+pub use crate::storage::types::{
+    CounterfactualReplayResult, DurableCounterfactualReplay, ReplayEvidenceItemSummary,
+    ReplayEvidenceSetSummary, ReplayInfluence, StoredCounterfactualReplay,
+};
 
 /// Count of privacy records affected by one invalidation operation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -437,57 +274,6 @@ pub enum ReplayMaterializationCheck {
     Match,
     ContentChanged,
     Unavailable,
-}
-
-/// Build a non-public, keyed digest of one exact evidence fragment.
-///
-/// The key must come from a local secret and must not be persisted next to the
-/// digest. Including the receipt-local slot prevents cross-slot equality leaks.
-pub fn private_evidence_digest(
-    private_key: &[u8; 32],
-    evidence_slot: &str,
-    evidence_bytes: &[u8],
-) -> String {
-    let mut hasher = blake3::Hasher::new_keyed(private_key);
-    put_field(&mut hasher, PRIVATE_DIGEST_DOMAIN);
-    put_field(&mut hasher, evidence_slot.as_bytes());
-    put_field(&mut hasher, evidence_bytes);
-    format!("b3k:{}", hasher.finalize().to_hex())
-}
-
-/// Digest a canonical, non-content selection-policy representation.
-pub fn replay_policy_digest(canonical_policy: &[u8]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    put_field(&mut hasher, POLICY_DIGEST_DOMAIN);
-    put_field(&mut hasher, canonical_policy);
-    format!("b3:{}", hasher.finalize().to_hex())
-}
-
-/// Generate the only accepted receipt-local slot format for a one-based rank.
-pub fn replay_evidence_slot(rank: usize) -> String {
-    format!("evidence_{rank}")
-}
-
-/// Canonical idempotency key for a replay request.
-///
-/// Withheld slots are sorted and deduplicated, so retry order and accidental
-/// duplicate arguments do not mint a second replay.
-pub fn replay_idempotency_key(
-    algorithm_version: &str,
-    source_receipt_id: &str,
-    redaction_generation: u64,
-    withheld_slots: &[String],
-) -> String {
-    let normalized = normalize_withheld_slots(withheld_slots);
-    let mut hasher = blake3::Hasher::new();
-    put_field(&mut hasher, IDEMPOTENCY_DOMAIN);
-    put_field(&mut hasher, algorithm_version.as_bytes());
-    put_field(&mut hasher, source_receipt_id.as_bytes());
-    put_field(&mut hasher, &redaction_generation.to_be_bytes());
-    for slot in normalized {
-        put_field(&mut hasher, slot.as_bytes());
-    }
-    format!("b3:{}", hasher.finalize().to_hex())
 }
 
 /// Pure post-retrieval context ablation.
@@ -2002,8 +1788,12 @@ fn scrub_dependent_replay_receipts(tx: &Transaction<'_>, capsule_id: &str) -> Re
 }
 
 #[cfg(test)]
+// Reopen-style durability tests: the v3-engine harness feature disables
+// the read-write guard for these synthetic-store round trips.
+#[cfg(all(test, feature = "v3-engine"))]
 mod tests {
     use super::*;
+    use crate::storage::{RetrievalReplayItemDraft, private_evidence_digest, replay_policy_digest};
     // Only the rollback fixture drives a transaction by hand; production
     // writers go through SqliteMemoryStore::begin_write_transaction.
     use rusqlite::TransactionBehavior;

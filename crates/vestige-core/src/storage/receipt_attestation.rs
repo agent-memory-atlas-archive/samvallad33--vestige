@@ -265,7 +265,6 @@ impl RedactionSafeReceiptBindingV1 {
             Some(ReceiptEvidence::SynapticCapture(_)) => {
                 Some(ReceiptBindingEvidenceKind::SynapticCapture)
             }
-            #[cfg(feature = "legacy-sqlite")]
             Some(ReceiptEvidence::CounterfactualReplay { .. }) => {
                 Some(ReceiptBindingEvidenceKind::CounterfactualReplay)
             }
@@ -766,10 +765,12 @@ impl DisclosureMapping {
         &self.evidence_slot
     }
 
+    #[allow(dead_code)] // consumer sits in the legacy-sqlite-gated surface; dead only in the no-embeddings profile
     pub(crate) fn memory_id(&self) -> &str {
         &self.memory_id
     }
 
+    #[allow(dead_code)] // consumer sits in the legacy-sqlite-gated surface; dead only in the no-embeddings profile
     pub(crate) fn nonce(&self) -> &[u8; 32] {
         &self.nonce
     }
@@ -1765,6 +1766,7 @@ impl ChainEntry {
     /// This is crate-visible so the durable store can reconstruct the exact
     /// predecessor selected from its append-only chain state; callers outside
     /// Vestige cannot mint arbitrary predecessor metadata.
+    #[allow(dead_code)] // consumer sits in the legacy-sqlite-gated surface; dead only in the no-embeddings profile
     pub(crate) fn from_verified_parts(
         receipt_id: String,
         chain_id: String,
@@ -2174,10 +2176,13 @@ fn receipt_memory_ids(receipt: &Receipt) -> HashSet<&str> {
         }) => {
             ids.insert(failure_id.as_str());
             ids.extend(path_ids.iter().map(String::as_str));
-            ids.extend(candidates.iter().map(|candidate| candidate.memory_id.as_str()));
+            ids.extend(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.memory_id.as_str()),
+            );
         }
         None => {}
-        #[cfg(feature = "legacy-sqlite")]
         Some(ReceiptEvidence::CounterfactualReplay { .. }) => {}
     }
     ids

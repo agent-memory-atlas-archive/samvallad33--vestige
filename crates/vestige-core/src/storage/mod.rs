@@ -8,24 +8,35 @@
 //! with the STRATA backend. Builders must open stores through
 //! [`open_storage`] so a `legacy-sqlite`-free build fails with the clear
 //! [`LegacySqliteDisabled`] error instead of a compile error.
+//!
+//! Type definitions shared by the trait surface and every backend live in
+//! [`types`] UNGATED, so the workspace compiles with AND without
+//! `legacy-sqlite` (dual-mode rule, strata/fix-00a).
 
 #[cfg(feature = "legacy-sqlite")]
 mod attestation_store;
-#[cfg(feature = "cloud-sync")]
+#[cfg(feature = "legacy-sqlite")]
+mod blast;
+// cloud_crypto's only consumer is cloud_sync, which needs the legacy
+// engine; ungating it made the whole module dead code in the
+// no-embeddings profile.
+#[cfg(all(feature = "cloud-sync", feature = "legacy-sqlite"))]
 mod cloud_crypto;
 #[cfg(all(feature = "cloud-sync", feature = "legacy-sqlite"))]
 mod cloud_sync;
+/// Feature-independent type definitions shared by every backend and the
+/// `LocalMemoryStore` trait surface. Available with AND without
+/// `legacy-sqlite` — dual-mode compilation (strata/fix-00a).
+mod contracts;
 #[cfg(feature = "legacy-sqlite")]
 mod edges;
-#[cfg(feature = "legacy-sqlite")]
-mod blast;
 #[cfg(feature = "legacy-sqlite")]
 mod intention_claim;
 #[cfg(feature = "legacy-sqlite")]
 mod intention_graph_store;
-mod memory_store;
 #[cfg(feature = "legacy-sqlite")]
 mod maintenance_batches;
+mod memory_store;
 #[cfg(feature = "legacy-sqlite")]
 mod migrations;
 #[cfg(feature = "legacy-sqlite")]
@@ -37,32 +48,50 @@ mod replay_store;
 mod resolver;
 #[cfg(feature = "legacy-sqlite")]
 mod session_queries;
+mod signing_seed;
 #[cfg(feature = "legacy-sqlite")]
 mod sqlite;
 #[cfg(feature = "legacy-sqlite")]
 mod synaptic_store;
 #[cfg(feature = "legacy-sqlite")]
 mod trace_store;
-#[cfg(feature = "legacy-sqlite")]
-mod walk_receipts;
+pub mod types;
 pub mod unlearning;
 #[cfg(feature = "legacy-sqlite")]
 mod unlearning_store;
+/// Feature-independent v3 SQLite guard: detects the legacy engine by magic
+/// bytes and refuses read-write opens (PR 0a). Available with AND without
+/// `legacy-sqlite`.
+pub mod v3_guard;
+#[cfg(feature = "legacy-sqlite")]
+mod walk_receipts;
+
+// Every type the backend-agnostic `LocalMemoryStore` trait names is defined
+// in `types` and re-exported here UNGATED so the trait (and its callers)
+// compile with or without `legacy-sqlite`.
+pub use contracts::{
+    BLAST_LINK_TYPES, BLAST_MAX_DEPTH, BLAST_SCAN_NODE_CAP, PORTABLE_ARCHIVE_FORMAT,
+    REPLAY_ALGORITHM_VERSION, REPLAY_CLAIM_BOUNDARY, REPLAY_SCHEMA_VERSION,
+    REPLAY_SELECTION_BOUNDARY, SYNAPTIC_CAPTURE_ALGORITHM_V1, SYNAPTIC_CAPTURE_ALGORITHM_V2,
+    SYNAPTIC_CAPTURE_CLAIM_BOUNDARY, SYNAPTIC_CAPTURE_SCHEMA_V1, SYNAPTIC_CAPTURE_SCHEMA_V2,
+    SYNAPTIC_CONTEXT_ALGORITHM_V1, SYNAPTIC_CONTEXT_THRESHOLD_V1, canonical_walk_json,
+    commit_sha_of, private_evidence_digest, replay_evidence_slot, replay_idempotency_key,
+    replay_policy_digest,
+};
+pub use signing_seed::load_receipt_signing_seed;
+pub use types::*;
 
 #[cfg(all(feature = "cloud-sync", feature = "legacy-sqlite"))]
 pub use cloud_sync::HttpPortableSyncBackend;
 
 #[cfg(feature = "legacy-sqlite")]
 pub use attestation_store::{
-    DurableSignedReceipt, DurableSignedRetrievalReceipt, ProvisionedReceiptSigningKey,
-    ReceiptAttestationStatus, ReceiptSigningKeyTransition, SignedReceiptWrite,
-    StoredReceiptAttestationVerification, load_receipt_signing_seed,
+    ProvisionedReceiptSigningKey, ReceiptSigningKeyTransition,
     provision_receipt_signing_key_sidecar,
 };
 #[cfg(feature = "legacy-sqlite")]
-pub use blast::{
-    BLAST_LINK_TYPES, BLAST_MAX_DEPTH, BLAST_SCAN_NODE_CAP, BlastAffected, BlastReport,
-    RetireOutcome, commit_sha_of,
+pub use edges::{
+    EdgeDirection, EdgeKind, EdgeMeta, PurgeTombstone, TYPED_EDGE_VOCABULARY, TypedEdge,
 };
 pub use memory_store::{
     ClassificationResult, Domain, HealthStatus, LocalMemoryStore, MemoryEdge, MemoryRecord,
@@ -70,65 +99,19 @@ pub use memory_store::{
     SchedulingState, SearchQuery, SearchResult, StoreStats,
 };
 #[cfg(feature = "legacy-sqlite")]
-pub use edges::{
-    EdgeDirection, EdgeKind, EdgeMeta, PurgeTombstone, TYPED_EDGE_VOCABULARY, TypedEdge,
-};
-#[cfg(feature = "legacy-sqlite")]
 pub use migrations::MIGRATIONS;
 #[cfg(feature = "legacy-sqlite")]
-pub use portable::{
-    PORTABLE_ARCHIVE_FORMAT, PortableArchive, PortableImportMode, PortableImportReport,
-    PortableTable, PortableValue,
-};
-#[cfg(feature = "legacy-sqlite")]
-pub use resolver::{HANDLE_REQUIRED_DETAIL, HandleKind, HandleResolution, MAX_CANDIDATES};
-#[cfg(feature = "legacy-sqlite")]
 pub use replay_store::{
-    CounterfactualReplayResult, DurableCounterfactualReplay, DurableRetrievalReplayCapsule,
-    FrozenReplayItem, REPLAY_ALGORITHM_VERSION, REPLAY_CLAIM_BOUNDARY, REPLAY_SCHEMA_VERSION,
-    REPLAY_SELECTION_BOUNDARY, ReplayBuildError, ReplayDecayRisk, ReplayEvidenceItemSummary,
-    ReplayEvidenceSetSummary, ReplayInfluence, ReplayInvalidationReason,
-    ReplayMaterializationCheck, ReplayPrivacyInvalidation, ReplayPrivacyState,
-    RetrievalReplayCapsuleDraft, RetrievalReplayCapsuleSummary, RetrievalReplayItemDraft,
-    StoredCounterfactualReplay, ablate_frozen_context, private_evidence_digest,
-    replay_evidence_slot, replay_idempotency_key, replay_policy_digest,
+    FrozenReplayItem, ReplayBuildError, ReplayInvalidationReason, ReplayMaterializationCheck,
+    ReplayPrivacyInvalidation, ablate_frozen_context,
 };
 #[cfg(feature = "legacy-sqlite")]
-pub use sqlite::{WalCheckpointMode, WalCheckpointStatus};
+pub use session_queries::FAILED_CALLS_MAX;
 #[cfg(feature = "legacy-sqlite")]
 pub use sqlite::{
-    ACCESS_LOG_RETENTION_DAYS, ActorMutationOutcome, CompositionEventRecord,
-    CompositionMemberRecord, CompositionNeighborRecord, CompositionOutcomeRecord,
-    ConnectionRecord, ConnectorCursor, ConsolidationHistoryRecord, DEFAULT_MEMORY_SCOPE,
-    DreamHistoryRecord, EmbeddingProfileIntegrityManifest,
-    EmbeddingProfileMigrationNodeCheckpoint, EmbeddingProfileMigrationRecord,
-    EmbeddingProfileVector, EndorsementEventRecord, FilePortableSyncBackend, HygieneNodeSummary,
-    HygieneSnapshot, InsightRecord, IntentionRecord, NeverComposedCandidate,
-    PortableSyncBackend, PortableSyncReport, PurgeReport, ReconcileReport, Result,
-    SmartIngestResult,
-    SourceUpsertOutcome, SourceUpsertResult, SqliteMemoryStore, StateTransitionRecord,
-    StorageError, TagVocabulary,
-};
-#[cfg(feature = "legacy-sqlite")]
-pub use synaptic_store::{
-    DurableSynapticCapture, DurableSynapticPairReceipt, SYNAPTIC_CAPTURE_ALGORITHM_V1,
-    SYNAPTIC_CAPTURE_ALGORITHM_V2, SYNAPTIC_CAPTURE_CLAIM_BOUNDARY, SYNAPTIC_CAPTURE_SCHEMA_V1,
-    SYNAPTIC_CAPTURE_SCHEMA_V2, SYNAPTIC_CONTEXT_ALGORITHM_V1, SYNAPTIC_CONTEXT_THRESHOLD_V1,
-    SynapticCapturePolicy, SynapticCaptureRequest, SynapticImportanceEvent, SynapticIngestOutcome,
-    SynapticIngestRequest, SynapticSignalSnapshot,
-};
-#[cfg(feature = "legacy-sqlite")]
-pub use session_queries::{
-    ClosedIssueNode, FailedToolCall, GitCommitNode, OpenFailureTouching, FAILED_CALLS_MAX,
-};
-#[cfg(feature = "legacy-sqlite")]
-pub use trace_store::{
-    AgentRunSummary, PendingMemoryMutationDecision, PendingMemoryMutationEffect,
-};
-#[cfg(feature = "legacy-sqlite")]
-pub use walk_receipts::{
-    CoverageSnapshot, StoredWalkReceipt, WalkReceiptHandle, WALK_RECEIPT_SCHEMA_V1,
-    canonical_walk_json,
+    EmbeddingProfileIntegrityManifest, EmbeddingProfileMigrationNodeCheckpoint,
+    EmbeddingProfileMigrationRecord, EmbeddingProfileVector, FilePortableSyncBackend,
+    PortableSyncBackend, SqliteMemoryStore,
 };
 pub use unlearning::{
     AntiResurrectionCommitments, ArtifactKind, ArtifactRef, CheckStatus, Commitment, CommitmentKey,
@@ -146,11 +129,8 @@ pub use unlearning_store::{
     V25_REQUIRED_LOCAL_CANARY_TABLES, V25_UNLEARNING_STORAGE_SCHEMA_EXPECTATION,
     V25_UNLEARNING_STORAGE_SCHEMA_VERSION,
 };
-
-/// Backwards-compatibility alias. Retained until Phase 4 completes so every
-/// existing `Arc<Storage>` call site keeps compiling. Scheduled for removal
-/// once no downstream source file references it.
 #[cfg(feature = "legacy-sqlite")]
+pub use walk_receipts::WALK_RECEIPT_SCHEMA_V1;
 
 /// Error returned by [`open_storage`] when the binary was built without the
 /// `legacy-sqlite` feature. Exists in every build so callers can name it
@@ -176,14 +156,42 @@ pub struct LegacySqliteDisabled;
 /// engine implements `MemoryStoreSend` and drops in behind the same alias.
 pub type Storage = dyn MemoryStore;
 
+/// Default scope for memories the caller did not place in a project namespace.
+///
+/// Lives here (not in the SQLite module) so Strata builds share the same
+/// constant the tools already pass.
+pub const DEFAULT_MEMORY_SCOPE: &str = "user";
+
+/// How long access-log rows are eligible to be trimmed. Strata has no access
+/// log; the constant stays so maintenance previews can name the same window.
+pub const ACCESS_LOG_RETENTION_DAYS: i64 = 90;
+
 /// Default database artifact path for the SQLite backend.
+#[cfg(feature = "legacy-sqlite")]
 pub fn default_db_path() -> Result<std::path::PathBuf> {
     SqliteMemoryStore::default_db_path()
 }
 
+/// Feature-off twin: the shipped server does not create a SQLite file.
+#[cfg(not(feature = "legacy-sqlite"))]
+pub fn default_db_path() -> Result<std::path::PathBuf> {
+    Err(StorageError::Init(
+        "SQLite store creation is disabled: SQLite is a read-only migration source in 4.0. hint: the Strata backend owns new stores (run: vestige migrate-to-strata --from <path> for existing v3 stores)".into(),
+    ))
+}
+
 /// Database artifact path for a given data directory (SQLite backend).
+#[cfg(feature = "legacy-sqlite")]
 pub fn db_path_for_data_dir(data_dir: std::path::PathBuf) -> Result<std::path::PathBuf> {
     SqliteMemoryStore::db_path_for_data_dir(data_dir)
+}
+
+/// Feature-off twin: 4.0 does not create a SQLite file beside a data dir.
+#[cfg(not(feature = "legacy-sqlite"))]
+pub fn db_path_for_data_dir(_data_dir: std::path::PathBuf) -> Result<std::path::PathBuf> {
+    Err(StorageError::Init(
+        "SQLite store creation is disabled: SQLite is a read-only migration source in 4.0. hint: the Strata backend owns new stores (run: vestige migrate-to-strata --from <path> for existing v3 stores)".into(),
+    ))
 }
 
 /// Construct the default local backend (SQLite reference implementation)
@@ -195,11 +203,32 @@ pub fn open_storage(path: Option<std::path::PathBuf>) -> Result<std::sync::Arc<d
     Ok(std::sync::Arc::new(SqliteMemoryStore::new(path)?))
 }
 
-/// Feature-off twin of [`open_storage`]: always fails because no legacy
-/// backend exists in this build; the STRATA backend constructs directly.
+#[cfg(not(feature = "legacy-sqlite"))]
+type OpenStorageHook =
+    fn(
+        Option<std::path::PathBuf>,
+    ) -> std::result::Result<std::sync::Arc<dyn MemoryStore>, LegacySqliteDisabled>;
+
+#[cfg(not(feature = "legacy-sqlite"))]
+static OPEN_STORAGE_HOOK: std::sync::OnceLock<OpenStorageHook> = std::sync::OnceLock::new();
+
+/// Test seam so protocol tests can open Strata without editing `stdio.rs`.
+/// The shipped binaries never call this; with the hook unset, [`open_storage`]
+/// still returns [`LegacySqliteDisabled`].
+#[doc(hidden)]
+#[cfg(not(feature = "legacy-sqlite"))]
+pub fn install_open_storage_hook(hook: OpenStorageHook) {
+    let _ = OPEN_STORAGE_HOOK.set(hook);
+}
+
+/// Feature-off twin of [`open_storage`]: fails unless a test hook was
+/// installed. The shipped server constructs Strata directly.
 #[cfg(not(feature = "legacy-sqlite"))]
 pub fn open_storage(
-    _path: Option<std::path::PathBuf>,
+    path: Option<std::path::PathBuf>,
 ) -> std::result::Result<std::sync::Arc<dyn MemoryStore>, LegacySqliteDisabled> {
+    if let Some(hook) = OPEN_STORAGE_HOOK.get() {
+        return hook(path);
+    }
     Err(LegacySqliteDisabled)
 }

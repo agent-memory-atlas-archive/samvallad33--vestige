@@ -216,7 +216,6 @@ impl Receipt {
                 }
             }
             None => {}
-            #[cfg(feature = "legacy-sqlite")]
             Some(ReceiptEvidence::CounterfactualReplay { .. }) => {}
         }
     }
@@ -309,13 +308,12 @@ pub struct BackfillCandidateEvidence {
 /// Typed predicate carried by a persisted receipt.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "predicate", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // box the large variant when the no-embeddings profile is a first-class target
 pub enum ReceiptEvidence {
     /// A synaptic-tag capture decision and its measured state transition.
     SynapticCapture(SynapticCaptureEvidence),
     /// One controlled post-retrieval context-ablation replay. The nested
     /// result is identity-free and carries the exact non-causal claim boundary.
-    /// Variant type is quarantined with the SQLite store (build/t5-legacy-isolation).
-    #[cfg(feature = "legacy-sqlite")]
     CounterfactualReplay {
         schema: String,
         schema_version: u32,
@@ -653,7 +651,10 @@ mod tests {
         assert_eq!(json["actor"]["claimed_role"], "operator");
         assert_eq!(json["actor"]["effective_role"], "unattributed");
         assert_eq!(json["actor"]["resolved_weight"], 1.0);
-        assert_eq!(json["actor"]["resolution_disposition"], "unregistered_claim");
+        assert_eq!(
+            json["actor"]["resolution_disposition"],
+            "unregistered_claim"
+        );
         assert_eq!(json["actor"]["policy_version"], 1);
         let decoded: Receipt = serde_json::from_value(json).expect("decode with actor");
         assert_eq!(decoded.actor, with_actor.actor);

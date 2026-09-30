@@ -890,6 +890,14 @@ fn validate_inputs(args: &UnifiedIntentionArgs) -> Result<(), String> {
 // ACTION IMPLEMENTATIONS
 // ============================================================================
 
+fn attach_write_receipt(storage: &Arc<Storage>, body: &mut Value, id: &str) {
+    let Ok(Some(receipt)) = storage.get_receipt(id) else {
+        return;
+    };
+    body["receiptId"] = Value::String(receipt.receipt_id.clone());
+    body["receipt"] = serde_json::to_value(receipt).unwrap_or(Value::Null);
+}
+
 /// Execute "set" action - create a new intention
 async fn execute_set(
     storage: &Arc<Storage>,
@@ -1045,7 +1053,7 @@ async fn execute_set(
 
     storage.save_intention(&record).map_err(|e| e.to_string())?;
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "success": true,
         "action": "set",
         "intentionId": id,
@@ -1058,7 +1066,9 @@ async fn execute_set(
         "deadline": deadline.map(|dt| dt.to_rfc3339()),
         "nlpParsed": nlp_parsed,
         "scope": record.effective_scope(),
-    }))
+    });
+    attach_write_receipt(storage, &mut response, &id);
+    Ok(response)
 }
 
 /// Execute "check" action - find triggered intentions
@@ -1296,12 +1306,16 @@ async fn execute_check(
         storage.commit_intention_check(&changes)?;
     }
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "action": "check",
         "triggered": triggered,
         "pending": pending,
         "checkedAt": now.to_rfc3339(),
-    }))
+    });
+    if let Some((_, updated)) = changes.first() {
+        attach_write_receipt(storage, &mut response, &updated.id);
+    }
+    Ok(response)
 }
 
 /// Execute "update" action - complete, snooze, or cancel an intention
@@ -1323,13 +1337,15 @@ async fn execute_update(
                 .map_err(|e| e.to_string())?;
 
             if updated {
-                Ok(serde_json::json!({
+                let mut response = serde_json::json!({
                     "success": true,
                     "action": "update",
                     "status": "complete",
                     "message": "Intention marked as complete",
                     "intentionId": intention_id,
-                }))
+                });
+                attach_write_receipt(storage, &mut response, intention_id);
+                Ok(response)
             } else {
                 Err(format!("Intention not found: {}", intention_id))
             }
@@ -1348,14 +1364,16 @@ async fn execute_update(
                 .map_err(|e| e.to_string())?;
 
             if updated {
-                Ok(serde_json::json!({
+                let mut response = serde_json::json!({
                     "success": true,
                     "action": "update",
                     "status": "snooze",
                     "message": format!("Intention snoozed for {} minutes", minutes),
                     "intentionId": intention_id,
                     "snoozedUntil": snooze_until.to_rfc3339(),
-                }))
+                });
+                attach_write_receipt(storage, &mut response, intention_id);
+                Ok(response)
             } else {
                 Err(format!("Intention not found: {}", intention_id))
             }
@@ -1366,13 +1384,15 @@ async fn execute_update(
                 .map_err(|e| e.to_string())?;
 
             if updated {
-                Ok(serde_json::json!({
+                let mut response = serde_json::json!({
                     "success": true,
                     "action": "update",
                     "status": "cancel",
                     "message": "Intention cancelled",
                     "intentionId": intention_id,
-                }))
+                });
+                attach_write_receipt(storage, &mut response, intention_id);
+                Ok(response)
             } else {
                 Err(format!("Intention not found: {}", intention_id))
             }
@@ -1553,7 +1573,10 @@ fn trigger_cue_evidence(
             }
             Some((
                 "time",
-                format!("scheduled time reached ({})", at.format("%Y-%m-%d %H:%M UTC")),
+                format!(
+                    "scheduled time reached ({})",
+                    at.format("%Y-%m-%d %H:%M UTC")
+                ),
                 1.0,
             ))
         }
@@ -1570,7 +1593,11 @@ fn trigger_cue_evidence(
                 return None;
             }
             let confidence = text_cue_confidence(condition)?;
-            Some(("event", format!("query matches event condition '{condition}'"), confidence))
+            Some((
+                "event",
+                format!("query matches event condition '{condition}'"),
+                confidence,
+            ))
         }
         ProspectiveTrigger::ActivityBased {
             activity,
@@ -1599,7 +1626,11 @@ fn trigger_cue_evidence(
                 return None;
             }
             let (_, inner, confidence) = trigger_cue_evidence(base, cue, scope)?;
-            Some(("recurring", format!("recurring schedule due; {inner}"), confidence))
+            Some((
+                "recurring",
+                format!("recurring schedule due; {inner}"),
+                confidence,
+            ))
         }
         ProspectiveTrigger::Compound { all_of, any_of } => {
             let mut cues: Vec<(&'static str, String, f64)> = Vec::new();
@@ -1611,7 +1642,10 @@ fn trigger_cue_evidence(
             if cues.is_empty() {
                 return None;
             }
-            let confidence = cues.iter().map(|(_, _, c)| *c).fold(f64::INFINITY, f64::min);
+            let confidence = cues
+                .iter()
+                .map(|(_, _, c)| *c)
+                .fold(f64::INFINITY, f64::min);
             let explanation = cues
                 .into_iter()
                 .map(|(_, text, _)| text)
@@ -1638,7 +1672,11 @@ fn context_cue_evidence(
                 return None;
             }
             let confidence = text_cue_confidence(name)?;
-            Some(("context", format!("query scope matches codebase '{name}'"), confidence))
+            Some((
+                "context",
+                format!("query scope matches codebase '{name}'"),
+                confidence,
+            ))
         }
         ContextPattern::FilePattern(file_pattern) => {
             let matched = cue
@@ -1649,7 +1687,11 @@ fn context_cue_evidence(
                 return None;
             }
             let confidence = text_cue_confidence(file_pattern)?;
-            Some(("context", format!("query matches file pattern '{file_pattern}'"), confidence))
+            Some((
+                "context",
+                format!("query matches file pattern '{file_pattern}'"),
+                confidence,
+            ))
         }
         ContextPattern::TopicActive(topic) => {
             let matched = cue
@@ -1660,7 +1702,11 @@ fn context_cue_evidence(
                 return None;
             }
             let confidence = text_cue_confidence(topic)?;
-            Some(("context", format!("query mentions topic '{topic}'"), confidence))
+            Some((
+                "context",
+                format!("query mentions topic '{topic}'"),
+                confidence,
+            ))
         }
         // Recall cues carry no user mode; the verdict matcher can never fire
         // this arm against a ProspectiveCue, so it never cites one either.
@@ -1772,7 +1818,9 @@ pub(crate) fn surface_prospective(
         let within_one_shot_limits = intention.reminder_count < MAX_ONE_SHOT_REMINDERS
             && intention
                 .last_reminded_at
-                .map(|last| cue.now - last >= Duration::minutes(MIN_ONE_SHOT_REMINDER_INTERVAL_MINUTES))
+                .map(|last| {
+                    cue.now - last >= Duration::minutes(MIN_ONE_SHOT_REMINDER_INTERVAL_MINUTES)
+                })
                 .unwrap_or(true);
         if !(scheduled_recurrence || within_one_shot_limits) {
             continue;
@@ -1851,7 +1899,7 @@ pub(crate) fn surface_prospective(
 // TESTS
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use crate::cognitive::CognitiveEngine;
@@ -3201,7 +3249,11 @@ mod tests {
         }
     }
 
-    async fn set_event_intention(storage: &Arc<Storage>, condition: &str, scope: Option<&str>) -> String {
+    async fn set_event_intention(
+        storage: &Arc<Storage>,
+        condition: &str,
+        scope: Option<&str>,
+    ) -> String {
         let mut args = serde_json::json!({
             "action": "set",
             "description": format!("Act on: {condition}"),
@@ -3232,7 +3284,10 @@ mod tests {
         assert_eq!(items[0]["id"], serde_json::json!(id));
         assert_eq!(items[0]["cueType"], "event");
         assert!(
-            items[0]["why"].as_str().unwrap().contains("payments migration finished"),
+            items[0]["why"]
+                .as_str()
+                .unwrap()
+                .contains("payments migration finished"),
             "the citation must name the matched cue: {:?}",
             items[0]["why"]
         );
@@ -3249,8 +3304,12 @@ mod tests {
         let (storage, _dir) = test_storage().await;
         set_event_intention(&storage, "payments migration finished", None).await;
 
-        let section = surface_prospective(&storage, &cue("favorite hiking trails near oslo"), "user");
-        assert!(section.is_none(), "no-match must produce no section: {section:?}");
+        let section =
+            surface_prospective(&storage, &cue("favorite hiking trails near oslo"), "user");
+        assert!(
+            section.is_none(),
+            "no-match must produce no section: {section:?}"
+        );
     }
 
     #[tokio::test]
@@ -3294,13 +3353,19 @@ mod tests {
         }
         let section = surface_prospective(
             &storage,
-            &cue("alpha review finished, beta review finished, gamma review finished, \
-                  delta review finished, epsilon review finished"),
+            &cue(
+                "alpha review finished, beta review finished, gamma review finished, \
+                  delta review finished, epsilon review finished",
+            ),
             "user",
         )
         .expect("matches exist");
         let items = section["intentions"].as_array().unwrap();
-        assert_eq!(items.len(), 3, "never crowd out the actual results: {items:?}");
+        assert_eq!(
+            items.len(),
+            3,
+            "never crowd out the actual results: {items:?}"
+        );
     }
 
     #[tokio::test]
@@ -3338,12 +3403,324 @@ mod tests {
             "description": "namespaced intention",
             "scope": "  alpha  "
         });
-        let result = execute(&storage, &test_cognitive(), Some(args)).await.unwrap();
+        let result = execute(&storage, &test_cognitive(), Some(args))
+            .await
+            .unwrap();
         assert_eq!(result["scope"], "alpha");
         let id = result["intentionId"].as_str().unwrap().to_string();
         let record = storage.get_intention(&id).unwrap().unwrap();
         assert_eq!(record.effective_scope(), "alpha");
         // And it is invisible to a user-scope surfacing scan.
         assert!(surface_prospective(&storage, &cue("namespaced intention"), "user").is_none());
+    }
+}
+
+#[cfg(test)]
+mod strata_log_tests {
+    use super::*;
+    use crate::cognitive::CognitiveEngine;
+    use std::path::Path;
+
+    fn cognitive() -> Arc<Mutex<CognitiveEngine>> {
+        Arc::new(Mutex::new(CognitiveEngine::new()))
+    }
+
+    fn open_dir(dir: &Path) -> Arc<Storage> {
+        crate::strata_memory::open(dir).expect("strata log")
+    }
+
+    fn no_sqlite(dir: &Path) -> bool {
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if name.ends_with(".sqlite")
+                    || name.ends_with(".sqlite3")
+                    || name.ends_with(".db")
+                    || name.ends_with(".db-wal")
+                    || name.ends_with(".db-shm")
+                {
+                    return false;
+                }
+                if path.is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+        true
+    }
+
+    #[tokio::test]
+    async fn set_check_update_and_list_round_trip_on_the_log() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_dir(dir.path());
+        let set = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({
+                "action": "set",
+                "description": "Act when the build finishes",
+                "trigger": {"type": "event", "condition": "build_finished"},
+                "priority": "high",
+                "scope": "user"
+            })),
+        )
+        .await
+        .expect("set");
+        assert_eq!(set["success"], true);
+        assert_eq!(set["action"], "set");
+        let id = set["intentionId"].as_str().unwrap().to_string();
+        let receipt_id = set["receiptId"].as_str().unwrap();
+        assert!(receipt_id.starts_with("eff-"), "{receipt_id}");
+        assert_eq!(set["receipt"]["retrieved"][0], id);
+        assert_eq!(set["triggerType"], "event");
+
+        let miss = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({
+                "action": "check",
+                "context": {"events": ["build"], "current_time": "2026-01-02T00:00:00Z"}
+            })),
+        )
+        .await
+        .expect("non-matching check");
+        assert!(
+            !miss["triggered"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == id),
+            "a prefix is not an exact event condition: {miss}"
+        );
+
+        let hit = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({
+                "action": "check",
+                "context": {"events": ["build_finished"], "current_time": "2026-01-02T00:00:00Z"}
+            })),
+        )
+        .await
+        .expect("exact check");
+        assert!(
+            hit["triggered"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == id),
+            "exact condition must fire: {hit}"
+        );
+        assert!(hit["receiptId"].as_str().unwrap().starts_with("eff-"));
+
+        let listed = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({"action": "list"})),
+        )
+        .await
+        .expect("list");
+        assert!(
+            listed["intentions"].as_array().unwrap().iter().any(|row| {
+                row["id"] == id && row["description"] == "Act when the build finishes"
+            })
+        );
+
+        let missing = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({
+                "action": "update",
+                "id": "intention-does-not-exist",
+                "status": "complete"
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert!(missing.contains("not found"), "{missing}");
+
+        let done = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({
+                "action": "update",
+                "id": id,
+                "status": "complete"
+            })),
+        )
+        .await
+        .expect("complete");
+        assert_eq!(done["success"], true);
+        assert!(done["receiptId"].as_str().unwrap().starts_with("eff-"));
+        assert_ne!(done["receiptId"], set["receiptId"]);
+
+        let fulfilled = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({"action": "list", "filter_status": "fulfilled"})),
+        )
+        .await
+        .expect("fulfilled list");
+        assert!(
+            fulfilled["intentions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == id)
+        );
+
+        let snooze_set = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({
+                "action": "set",
+                "description": "Snooze me",
+                "trigger": {"type": "time", "at": "2030-01-01T00:00:00Z"}
+            })),
+        )
+        .await
+        .expect("second set");
+        let snooze_id = snooze_set["intentionId"].as_str().unwrap();
+        let snoozed = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({
+                "action": "update",
+                "id": snooze_id,
+                "status": "snooze",
+                "snooze_minutes": 30
+            })),
+        )
+        .await
+        .expect("snooze");
+        assert_eq!(snoozed["status"], "snooze");
+        assert!(snoozed["receiptId"].as_str().unwrap().starts_with("eff-"));
+        let snoozed_list = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({"action": "list", "filter_status": "snoozed"})),
+        )
+        .await
+        .expect("snoozed list");
+        assert!(
+            snoozed_list["intentions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == snooze_id)
+        );
+        assert!(no_sqlite(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn set_rejects_an_empty_description_and_a_malformed_trigger() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_dir(dir.path());
+        let empty = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({"action": "set", "description": "   "})),
+        )
+        .await
+        .unwrap_err();
+        assert!(empty.to_lowercase().contains("empty"), "{empty}");
+
+        let missing = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({"action": "set"})),
+        )
+        .await
+        .unwrap_err();
+        assert!(missing.contains("description"), "{missing}");
+
+        let bad_shape = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({
+                "action": "set",
+                "description": "x",
+                "trigger": "deploy"
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert!(bad_shape.to_lowercase().contains("invalid"), "{bad_shape}");
+
+        let bad_time = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({
+                "action": "set",
+                "description": "x",
+                "trigger": {"type": "time", "at": "not-a-timestamp"}
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert!(bad_time.contains("RFC3339"), "{bad_time}");
+
+        let listed = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({"action": "list", "filter_status": "all"})),
+        )
+        .await
+        .expect("list after rejected writes");
+        assert_eq!(listed["total"], 0);
+        assert!(no_sqlite(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn set_intention_is_readable_after_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_dir(dir.path());
+        let set = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({
+                "action": "set",
+                "description": "Synthetic reminder",
+                "trigger": {"type": "time", "at": "2020-01-01T00:00:00Z"},
+                "scope": "user"
+            })),
+        )
+        .await
+        .expect("set");
+        let id = set["intentionId"].as_str().unwrap().to_string();
+        let receipt_id = set["receiptId"].as_str().unwrap().to_string();
+        drop(storage);
+
+        let storage = open_dir(dir.path());
+        let listed = execute(
+            &storage,
+            &cognitive(),
+            Some(serde_json::json!({"action": "list"})),
+        )
+        .await
+        .expect("list after restart");
+        let row = listed["intentions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .expect("intention survived restart");
+        assert_eq!(row["description"], "Synthetic reminder");
+        assert_eq!(row["triggerType"], "time");
+        assert_eq!(row["status"], "active");
+        let stored = storage.get_intention(&id).unwrap().unwrap();
+        assert_eq!(stored.content, "Synthetic reminder");
+        assert_eq!(stored.effective_scope(), "user");
+        let receipt = storage
+            .get_receipt(&receipt_id)
+            .unwrap()
+            .expect("receipt survived");
+        assert_eq!(receipt.retrieved, vec![id]);
+        assert!(no_sqlite(dir.path()));
     }
 }

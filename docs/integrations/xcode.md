@@ -1,5 +1,7 @@
 # Xcode 26.3
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../../README.md) and the [4.0.0 changelog](../../CHANGELOG.md).
+
 > Give Xcode's AI agent a brain that remembers.
 
 Xcode 26.3 supports [agentic coding](https://developer.apple.com/documentation/xcode/giving-agentic-coding-tools-access-to-xcode) with full MCP (Model Context Protocol) integration. Vestige plugs directly into Xcode's Claude Agent, giving it persistent memory across every coding session.

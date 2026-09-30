@@ -1,5 +1,7 @@
 # Codex
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../../README.md) and the [4.0.0 changelog](../../CHANGELOG.md).
+
 > Give Codex a brain that remembers between sessions.
 
 Codex has native MCP support through the `codex mcp` CLI. Add Vestige once and Codex can carry project preferences, architecture decisions, and past fixes across sessions.

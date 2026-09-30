@@ -213,7 +213,7 @@ impl RelationshipTracker {
                     self.finalize_session()?;
                     self.current_session = Some(CoEditSession {
                         files: files.iter().cloned().collect(),
-                                                last_updated: now,
+                        last_updated: now,
                     });
                 } else {
                     // Add files to current session
@@ -225,7 +225,7 @@ impl RelationshipTracker {
                 // Start new session
                 self.current_session = Some(CoEditSession {
                     files: files.iter().cloned().collect(),
-                                        last_updated: now,
+                    last_updated: now,
                 });
             }
         }

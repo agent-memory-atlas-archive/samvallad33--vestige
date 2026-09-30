@@ -17,5 +17,14 @@ publish = false
 strata = { path = "../strata" }
 strata-kernel = { path = "../strata-kernel" }
 strata-gate = { path = "../strata-gate" }
+# Migration frames share kind bytes 0x20/0x21 with store writes. Replay
+# decodes the existing migration records; it does not invent a StoreOp.
+# Record types only: without default-features the SQLite reader (rusqlite)
+# stays out of every binary that links the store.
+strata-migrate = { path = "../strata-migrate", default-features = false }
 borsh = { version = "1", features = ["derive"] }
 blake3 = "1"
+
+[dev-dependencies]
+# The replay tests import a v3 fixture through the real importer.
+strata-migrate = { path = "../strata-migrate", features = ["sqlite-reader"] }

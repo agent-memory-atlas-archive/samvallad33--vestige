@@ -1,7 +1,7 @@
 use super::*;
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 use crate::advanced::{MatchClass, MergePolicy};
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 #[cfg(unix)]
 use std::process::{Command, Stdio};
@@ -1137,7 +1137,7 @@ fn upsert_by_source_matches_legacy_null_project_row_with_empty_string() {
     assert_eq!(res2.node_id, created.node_id);
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn pinning_auto_merge_in_one_test_does_not_leak_to_other_threads() {
     let real = std::env::var("VESTIGE_AUTO_CONSOLIDATE_MERGE").ok();
@@ -2742,7 +2742,6 @@ fn purging_empty_content_does_not_scrub_unrelated_evidence() {
     assert_eq!(remaining_reviews, 1);
 }
 
-
 /// GhostLink contract (2026-09-28): never-composed pairs are admitted ONLY
 /// via recorded typed-edge hops.
 fn seed_typed_edge(storage: &crate::storage::Storage, a: &str, b: &str) {
@@ -2782,7 +2781,10 @@ fn never_composed_tags_only_returns_empty() {
         })
         .unwrap();
     let out = storage.get_never_composed_candidates(5, None).unwrap();
-    assert!(out.is_empty(), "shared words must never admit a pair: {out:?}");
+    assert!(
+        out.is_empty(),
+        "shared words must never admit a pair: {out:?}"
+    );
 }
 
 /// A typed-edge hop admits the pair even with zero shared vocabulary.
@@ -2808,7 +2810,11 @@ fn never_composed_admits_via_typed_edge_hop() {
     seed_typed_edge(&storage, &a.id, &b.id);
     let out = storage.get_never_composed_candidates(5, None).unwrap();
     assert_eq!(out.len(), 1, "edge hop must admit: {out:?}");
-    assert!(out[0].reason.contains("typed-edge hop"), "{}", out[0].reason);
+    assert!(
+        out[0].reason.contains("typed-edge hop"),
+        "{}",
+        out[0].reason
+    );
 }
 
 #[test]
@@ -2832,16 +2838,26 @@ fn test_composition_save_query_outcome_and_never_composed() {
         .unwrap();
 
     // GhostLink contract: without a typed edge, shared tags admit nothing.
-    assert!(storage.get_never_composed_candidates(10, None).unwrap().is_empty());
+    assert!(
+        storage
+            .get_never_composed_candidates(10, None)
+            .unwrap()
+            .is_empty()
+    );
 
     seed_typed_edge(&storage, &first.id, &second.id);
     let before = storage.get_never_composed_candidates(10, None).unwrap();
     assert_eq!(before.len(), 1, "edge hop must admit: {before:?}");
     assert!(
-        { before[0].first_id == first.id && before[0].second_id == second.id }
-            || { before[0].first_id == second.id && before[0].second_id == first.id }
+        { before[0].first_id == first.id && before[0].second_id == second.id } || {
+            before[0].first_id == second.id && before[0].second_id == first.id
+        }
     );
-    assert!(before[0].reason.contains("typed-edge hop"), "{}", before[0].reason);
+    assert!(
+        before[0].reason.contains("typed-edge hop"),
+        "{}",
+        before[0].reason
+    );
 
     let event = CompositionEventRecord {
         id: "composition-test-1".to_string(),
@@ -3144,7 +3160,10 @@ fn test_never_composed_carries_prior_outcome_signal() {
         .unwrap();
 
     let candidates = storage.get_never_composed_candidates(10, None).unwrap();
-    assert!(candidates.is_empty(), "composed pair excluded: {candidates:?}");
+    assert!(
+        candidates.is_empty(),
+        "composed pair excluded: {candidates:?}"
+    );
 }
 
 #[test]
@@ -3169,9 +3188,12 @@ fn test_never_composed_marks_mixed_prior_outcomes() {
     seed_typed_edge(&storage, &successful.id, &closed.id);
     let out = storage.get_never_composed_candidates(10, None).unwrap();
     assert_eq!(out.len(), 1);
-    assert!(out[0].reason.contains("typed-edge hop"), "{}", out[0].reason);
+    assert!(
+        out[0].reason.contains("typed-edge hop"),
+        "{}",
+        out[0].reason
+    );
 }
-
 
 #[test]
 fn test_dream_history_save_and_get_last() {
@@ -4613,8 +4635,13 @@ fn purge_fails_closed_when_a_referencing_row_cannot_be_read() {
 
 /// Ingest a node and seed it with a controllable embedding under the active
 /// model so similarity is deterministic in tests.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
-fn seed_node(storage: &SqliteMemoryStore, content: &str, tags: &[&str], vector: Vec<f32>) -> String {
+#[cfg(vestige_embeddings_removed)]
+fn seed_node(
+    storage: &SqliteMemoryStore,
+    content: &str,
+    tags: &[&str],
+    vector: Vec<f32>,
+) -> String {
     let node = storage
         .ingest(IngestInput {
             content: content.to_string(),
@@ -4651,7 +4678,7 @@ fn seed_node(storage: &SqliteMemoryStore, content: &str, tags: &[&str], vector: 
 
 /// A near-unit vector pointing mostly along `axis`, so two nodes sharing an
 /// axis are highly similar and nodes on different axes are not.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 fn axis_vector(axis: usize, jitter: f32) -> Vec<f32> {
     let mut v = vec![0.0f32; EMBEDDING_DIMENSIONS];
     v[axis % EMBEDDING_DIMENSIONS] = 1.0;
@@ -4840,7 +4867,7 @@ fn trait_fts_search_returns_tokens_match() {
     });
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_merge_candidates_threshold_classification() {
     let storage = create_test_storage();
@@ -4879,7 +4906,7 @@ fn test_merge_candidates_threshold_classification() {
     assert!(!cluster.has_protected_member);
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_plan_merge_is_preview_only_no_mutation() {
     let storage = create_test_storage();
@@ -4930,7 +4957,7 @@ fn test_plan_merge_is_preview_only_no_mutation() {
 /// survivor overwritten with no way back. The whole apply is one IMMEDIATE
 /// transaction now, so the plan applies exactly once no matter how many
 /// callers race it, and every mutation is covered by an undo row.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn concurrent_apply_of_one_plan_applies_it_exactly_once() {
     let storage = std::sync::Arc::new(create_test_storage());
@@ -5009,7 +5036,7 @@ fn concurrent_apply_of_one_plan_applies_it_exactly_once() {
     );
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_merge_state_rejects_changed_and_legacy_plans() {
     for mutation in [
@@ -5069,7 +5096,7 @@ fn test_merge_state_rejects_changed_and_legacy_plans() {
     );
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_merge_undo_conflict_and_transaction_rollback() {
     let storage = create_test_storage();
@@ -5133,7 +5160,7 @@ fn test_merge_undo_conflict_and_transaction_rollback() {
     );
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_merge_undo_concurrent_has_one_winner() {
     let storage = std::sync::Arc::new(create_test_storage());
@@ -5169,7 +5196,7 @@ fn test_merge_undo_concurrent_has_one_winner() {
     assert!(storage.apply_plan(&plan.id, true).is_ok());
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_apply_then_undo_merge_is_reversible() {
     let storage = create_test_storage();
@@ -5229,7 +5256,7 @@ fn test_apply_then_undo_merge_is_reversible() {
     assert!(storage.merge_undo(&op.id).is_err());
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_supersede_invalidates_old_but_keeps_it_queryable() {
     let storage = create_test_storage();
@@ -5267,7 +5294,7 @@ fn test_supersede_invalidates_old_but_keeps_it_queryable() {
     assert!(vu_r.is_none() && sb_r.is_none());
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_protect_blocks_merge_away() {
     let storage = create_test_storage();
@@ -5328,7 +5355,7 @@ fn test_protect_blocks_merge_away() {
 
 /// Force a node's retention_strength so the keeper tiebreak in
 /// `auto_dedup_consolidation` is deterministic regardless of insertion order.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 fn set_retention(storage: &SqliteMemoryStore, id: &str, value: f64) {
     let writer = storage.writer.lock().unwrap();
     writer
@@ -5344,7 +5371,7 @@ fn set_retention(storage: &SqliteMemoryStore, id: &str, value: f64) {
 /// Sibling of `with_vector_search_disabled`; like it, this no longer
 /// touches the process environment, so consolidation tests on other
 /// threads keep reading the real one.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 fn with_auto_merge_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
     AUTO_CONSOLIDATE_MERGE_FOR_TEST
         .with(|cell| *cell.borrow_mut() = Some(value.map(str::to_string)));
@@ -5359,7 +5386,7 @@ fn with_auto_merge_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
 // --- A. Default (flag unset): NOTHING merges, nothing is deleted ---------
 // v2.6.0 flipped the #142 opt-out into an opt-in: unattended destruction
 // of user memories must be asked for, never inherited.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_auto_dedup_default_off_preserves_near_duplicates() {
     with_auto_merge_env(None, || {
@@ -5434,7 +5461,7 @@ fn test_auto_dedup_default_off_preserves_near_duplicates() {
 }
 
 // --- B. Flag off suppresses the merge (parametrized) ---------------------
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_auto_dedup_env_off_suppresses_merge() {
     // trimmed + case-insensitive false/off/no/0 all disable.
@@ -5470,7 +5497,7 @@ fn test_auto_dedup_env_off_suppresses_merge() {
 }
 
 // --- B (cont). A malformed value fails CLOSED: no destruction on a typo --
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_auto_dedup_env_garbage_fails_closed_and_preserves() {
     with_auto_merge_env(Some("banana"), || {
@@ -5503,7 +5530,7 @@ fn test_auto_dedup_env_garbage_fails_closed_and_preserves() {
 }
 
 // --- C(a). Protected would-be keeper: untouched; others merge -----------
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_auto_dedup_protected_would_be_keeper_untouched_others_merge() {
     with_auto_merge_env(Some("1"), || {
@@ -5553,7 +5580,7 @@ fn test_auto_dedup_protected_would_be_keeper_untouched_others_merge() {
 }
 
 // --- C(b) / Regression (#142): protected weak member is never absorbed --
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn auto_dedup_regression_142_protected_weak_member_not_absorbed() {
     with_auto_merge_env(Some("1"), || {
@@ -5614,7 +5641,7 @@ fn auto_dedup_regression_142_protected_weak_member_not_absorbed() {
 }
 
 // --- C(c). Two protected near-dups: neither merges ----------------------
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_auto_dedup_two_protected_near_dups_neither_merges() {
     with_auto_merge_env(Some("1"), || {
@@ -5646,7 +5673,7 @@ fn test_auto_dedup_two_protected_near_dups_neither_merges() {
 }
 
 // --- C(d). Protected + a single unprotected near-dup: no merge ----------
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_auto_dedup_protected_plus_single_unprotected_no_merge() {
     with_auto_merge_env(Some("1"), || {
@@ -5677,7 +5704,7 @@ fn test_auto_dedup_protected_plus_single_unprotected_no_merge() {
 }
 
 // --- D. Liveness: protected + two unprotected → the two merge -----------
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_auto_dedup_protected_plus_two_unprotected_liveness() {
     with_auto_merge_env(Some("1"), || {
@@ -5721,7 +5748,7 @@ fn test_auto_dedup_protected_plus_two_unprotected_liveness() {
     });
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_apply_requires_confirm_for_low_confidence() {
     let storage = create_test_storage();
@@ -5744,7 +5771,7 @@ fn test_apply_requires_confirm_for_low_confidence() {
     assert!(storage.apply_plan(&plan.id, true).is_err());
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn apply_match_obeys_current_policy_and_project_boundary() {
     let storage = create_test_storage();
@@ -5809,7 +5836,7 @@ fn apply_match_obeys_current_policy_and_project_boundary() {
     assert!(storage.apply_plan(&plan.id, true).is_ok());
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn apply_match_can_use_explicit_auto_apply_policy() {
     let storage = create_test_storage();
@@ -5832,7 +5859,7 @@ fn apply_match_can_use_explicit_auto_apply_policy() {
     assert!(storage.apply_plan(&plan.id, false).is_ok());
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn test_merge_policy_roundtrip_persists() {
     let storage = create_test_storage();
@@ -6524,10 +6551,10 @@ fn backfill_autofire_gate_defaults_on_and_reads_opt_out() {
 /// Marker-keyed test embedder: contents sharing the "alpha" marker embed
 /// to the same axis (cosine similarity 1.0) and everything else lands on
 /// the orthogonal axis, so gate decisions are fully controlled by content.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 struct MarkerEmbedder;
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 impl crate::embedder::EmbedderSend for MarkerEmbedder {
     async fn embed(&self, text: &str) -> crate::embedder::EmbedderResult<Vec<f32>> {
         Ok(if text.contains("alpha") {
@@ -6559,7 +6586,7 @@ impl crate::embedder::EmbedderSend for MarkerEmbedder {
 }
 
 /// the process-local registry is private to the lifecycle module.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 fn storage_with_marker_gate_runtime(dir: &tempfile::TempDir) -> Storage {
     use crate::embedding::{
         ChunkingStrategy, EmbeddingDevice, EmbeddingEvaluationSummary, EmbeddingNormalization,
@@ -6639,7 +6666,7 @@ fn storage_with_marker_gate_runtime(dir: &tempfile::TempDir) -> Storage {
     storage
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn inferred_as_of_validity_never_mutates_an_existing_nodes_window() {
     let dir = tempdir().unwrap();
@@ -6682,7 +6709,7 @@ fn inferred_as_of_validity_never_mutates_an_existing_nodes_window() {
     );
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn inferred_as_of_must_not_resurrect_an_expired_similar_node() {
     let dir = tempdir().unwrap();
@@ -6733,7 +6760,7 @@ fn inferred_as_of_must_not_resurrect_an_expired_similar_node() {
     assert!(!node.is_currently_valid());
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn explicit_valid_from_on_reinforce_updates_without_clearing_valid_until() {
     let dir = tempdir().unwrap();
@@ -6775,7 +6802,7 @@ fn explicit_valid_from_on_reinforce_updates_without_clearing_valid_until() {
     );
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn create_path_still_stamps_inferred_validity_on_the_new_node() {
     let dir = tempdir().unwrap();
@@ -6800,7 +6827,7 @@ fn create_path_still_stamps_inferred_validity_on_the_new_node() {
     assert!(node.valid_until.is_none());
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn older_dated_claim_after_newer_fact_is_created_with_a_closed_window() {
     let dir = tempdir().unwrap();
@@ -6966,10 +6993,10 @@ fn narrative_seed(store: &Storage, n: usize) -> Vec<String> {
         .map(|i| {
             store
                 .ingest(IngestInput {
-                        content: format!("narrative fixture {i}: co-retrieval check"),
-                        node_type: "fact".to_string(),
-                        ..Default::default()
-                    })
+                    content: format!("narrative fixture {i}: co-retrieval check"),
+                    node_type: "fact".to_string(),
+                    ..Default::default()
+                })
                 .unwrap()
                 .id
                 .to_string()
@@ -7011,7 +7038,10 @@ fn one_retrieval_links_the_top_pairs_only() {
         edges.len()
     );
     for (_, _, strength, count) in &edges {
-        assert!(*strength <= 0.2 + 1e-9, "first co-retrieval is a hairline, got {strength}");
+        assert!(
+            *strength <= 0.2 + 1e-9,
+            "first co-retrieval is a hairline, got {strength}"
+        );
         assert_eq!(*count, 1);
     }
 }
@@ -7028,7 +7058,10 @@ fn repeated_co_retrieval_grows_strength_to_a_cap() {
     assert_eq!(edges.len(), 1);
     let (_, _, strength, count) = &edges[0];
     assert_eq!(*count, 10);
-    assert!((*strength - 0.6).abs() < 1e-9, "capped at 0.6, got {strength}");
+    assert!(
+        (*strength - 0.6).abs() < 1e-9,
+        "capped at 0.6, got {strength}"
+    );
 }
 
 #[test]
@@ -7046,7 +7079,7 @@ fn single_memory_retrievals_link_nothing() {
 // crate::advanced::reconsolidation for the neuroscience).
 // ========================================================================
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 fn reconsolidation_candidate(
     storage: &SqliteMemoryStore,
     node_id: &str,
@@ -7071,7 +7104,7 @@ fn reconsolidation_candidate(
 /// labile window is live → the conflict is routed through a reconsolidation
 /// merge plan that carries the mark_labile snapshot. Both memories exist; the
 /// target is untouched pending the verdict.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn contradiction_during_live_window_creates_reconsolidation_plan_with_snapshot() {
     let dir = tempdir().unwrap();
@@ -7133,12 +7166,22 @@ fn contradiction_during_live_window_creates_reconsolidation_plan_with_snapshot()
 
 /// Scenario 2: approve → the plan applies (bitemporal supersede of the labile
 /// target), and the existing merge_undo reflog reverses it.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn approve_verdict_applies_the_plan_and_undo_reverses_it() {
     let storage = create_test_storage();
-    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
-    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    let target = seed_node(
+        &storage,
+        "Fact A about caching",
+        &["perf"],
+        axis_vector(5, 0.02),
+    );
+    let incoming = seed_node(
+        &storage,
+        "Fact B about caching fresh",
+        &["perf"],
+        axis_vector(9, 0.01),
+    );
     let candidate = reconsolidation_candidate(&storage, &target, 300);
 
     let plan = storage
@@ -7156,24 +7199,46 @@ fn approve_verdict_applies_the_plan_and_undo_reverses_it() {
     let node = storage.get_node(&target).unwrap().unwrap();
     assert!(!node.is_currently_valid());
     assert_eq!(node.suppression_count, 0);
-    assert_eq!(storage.plan_status(&plan.id).unwrap().as_deref(), Some("applied"));
+    assert_eq!(
+        storage.plan_status(&plan.id).unwrap().as_deref(),
+        Some("applied")
+    );
 
     // Snapshot-based rollback through the existing undo path.
     let undone = storage.merge_undo(&op.id).unwrap();
     assert_eq!(undone.op_type, "undo");
     let (vu2, sb2) = storage.read_bitemporal(&target).unwrap();
-    assert!(vu2.is_none() && sb2.is_none(), "undo restores the validity window");
-    assert!(storage.get_node(&target).unwrap().unwrap().is_currently_valid());
+    assert!(
+        vu2.is_none() && sb2.is_none(),
+        "undo restores the validity window"
+    );
+    assert!(
+        storage
+            .get_node(&target)
+            .unwrap()
+            .unwrap()
+            .is_currently_valid()
+    );
 }
 
 /// Scenario 3: reject → the plan is discarded and the target memory stays
 /// byte-identical to its mark_labile snapshot.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn reject_verdict_leaves_the_memory_byte_identical_to_its_snapshot() {
     let storage = create_test_storage();
-    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
-    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    let target = seed_node(
+        &storage,
+        "Fact A about caching",
+        &["perf"],
+        axis_vector(5, 0.02),
+    );
+    let incoming = seed_node(
+        &storage,
+        "Fact B about caching fresh",
+        &["perf"],
+        axis_vector(9, 0.01),
+    );
     let candidate = reconsolidation_candidate(&storage, &target, 300);
     let plan = storage
         .plan_reconsolidation(&target, &incoming, &candidate, "supersede_deferred")
@@ -7195,9 +7260,15 @@ fn reject_verdict_leaves_the_memory_byte_identical_to_its_snapshot() {
     assert_eq!(after.content, candidate.snapshot.content);
     assert_eq!(after.content, before.content);
     assert_eq!(after.tags, candidate.snapshot.tags);
-    assert_eq!(after.retention_strength, candidate.snapshot.retention_strength);
+    assert_eq!(
+        after.retention_strength,
+        candidate.snapshot.retention_strength
+    );
     assert_eq!(after.storage_strength, candidate.snapshot.storage_strength);
-    assert_eq!(after.retrieval_strength, candidate.snapshot.retrieval_strength);
+    assert_eq!(
+        after.retrieval_strength,
+        candidate.snapshot.retrieval_strength
+    );
     let (vu, sb) = storage.read_bitemporal(&target).unwrap();
     assert!(vu.is_none() && sb.is_none());
     assert_eq!(after.suppression_count, 0);
@@ -7206,12 +7277,22 @@ fn reject_verdict_leaves_the_memory_byte_identical_to_its_snapshot() {
 
 /// Scenario 4: quarantine → the target memory is suppressed through the
 /// existing top-down suppression path and the plan closes.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn quarantine_verdict_suppresses_the_target_and_closes_the_plan() {
     let storage = create_test_storage();
-    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
-    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    let target = seed_node(
+        &storage,
+        "Fact A about caching",
+        &["perf"],
+        axis_vector(5, 0.02),
+    );
+    let incoming = seed_node(
+        &storage,
+        "Fact B about caching fresh",
+        &["perf"],
+        axis_vector(9, 0.01),
+    );
     let candidate = reconsolidation_candidate(&storage, &target, 300);
     let plan = storage
         .plan_reconsolidation(&target, &incoming, &candidate, "contradiction")
@@ -7237,12 +7318,22 @@ fn quarantine_verdict_suppresses_the_target_and_closes_the_plan() {
 
 /// Scenario 5: a reconsolidation plan whose labile window expires unacted is
 /// auto-closed (recorded), never applied, and never left pending as a zombie.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn expired_window_auto_closes_the_plan() {
     let storage = create_test_storage();
-    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
-    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    let target = seed_node(
+        &storage,
+        "Fact A about caching",
+        &["perf"],
+        axis_vector(5, 0.02),
+    );
+    let incoming = seed_node(
+        &storage,
+        "Fact B about caching fresh",
+        &["perf"],
+        axis_vector(9, 0.01),
+    );
     // One plan left to expire by the sweep, one fed straight to apply_plan.
     let candidate = reconsolidation_candidate(&storage, &target, 1);
     let plan_swept = storage
@@ -7255,16 +7346,20 @@ fn expired_window_auto_closes_the_plan() {
 
     // The sweep auto-closes the stale plan and records it in the reflog.
     let closed = storage.expire_stale_reconsolidation_plans().unwrap();
-    assert!(closed.contains(&plan_swept.id), "sweep must close the stale plan");
+    assert!(
+        closed.contains(&plan_swept.id),
+        "sweep must close the stale plan"
+    );
     assert_eq!(
         storage.plan_status(&plan_swept.id).unwrap().as_deref(),
         Some("expired")
     );
     let ops = storage.list_merge_operations(10).unwrap();
     assert!(
-        ops.iter().any(|op| op.plan_id.as_deref() == Some(plan_swept.id.as_str())
-            && op.op_type == "reconsolidation"
-            && op.status == "expired"),
+        ops.iter()
+            .any(|op| op.plan_id.as_deref() == Some(plan_swept.id.as_str())
+                && op.op_type == "reconsolidation"
+                && op.status == "expired"),
         "the auto-close must be recorded, got {ops:?}"
     );
 
@@ -7297,12 +7392,22 @@ fn expired_window_auto_closes_the_plan() {
 
 /// A pending reconsolidation plan is discoverable through the listing that
 /// backs the dedup scan surface.
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 #[test]
 fn pending_reconsolidation_plans_are_listed_for_the_verdict_surface() {
     let storage = create_test_storage();
-    let target = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
-    let incoming = seed_node(&storage, "Fact B about caching fresh", &["perf"], axis_vector(9, 0.01));
+    let target = seed_node(
+        &storage,
+        "Fact A about caching",
+        &["perf"],
+        axis_vector(5, 0.02),
+    );
+    let incoming = seed_node(
+        &storage,
+        "Fact B about caching fresh",
+        &["perf"],
+        axis_vector(9, 0.01),
+    );
     let candidate = reconsolidation_candidate(&storage, &target, 300);
     let plan = storage
         .plan_reconsolidation(&target, &incoming, &candidate, "supersede_deferred")
@@ -7451,7 +7556,11 @@ fn retention_distribution_reports_out_of_range_values_explicitly() {
             .map(|(_, count)| *count)
             .unwrap_or(0)
     };
-    assert_eq!(bucket_of("unknown"), 1, "NULL retention gets its own bucket");
+    assert_eq!(
+        bucket_of("unknown"),
+        1,
+        "NULL retention gets its own bucket"
+    );
     assert_eq!(bucket_of("below0"), 1);
     assert_eq!(bucket_of("above100%"), 1);
     assert_eq!(bucket_of("40-60%"), 1);

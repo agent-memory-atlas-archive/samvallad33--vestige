@@ -119,7 +119,7 @@ fn execute_graph(storage: &Arc<Storage>, args: &Value) -> Result<Value, String> 
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
 

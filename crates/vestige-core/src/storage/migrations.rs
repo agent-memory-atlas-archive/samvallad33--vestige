@@ -1037,7 +1037,10 @@ pub fn get_current_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32>
         // The ledger is one row updated in place. More than one row means an
         // older runner or a hand edit left extras; MAX() still picks the
         // highest, which is the right answer, but say so instead of hiding it.
-        tracing::warn!(rows, "schema_version holds more than one row; using the highest version");
+        tracing::warn!(
+            rows,
+            "schema_version holds more than one row; using the highest version"
+        );
     }
     let raw: rusqlite::types::Value = conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -1131,7 +1134,12 @@ pub(crate) fn split_add_column_statements(up: &str) -> (Vec<String>, String) {
         let trimmed = line.trim();
         if trimmed.to_ascii_uppercase().starts_with("ALTER TABLE") {
             if trimmed.ends_with(';') {
-                finish(trimmed.to_string(), vec![line], &mut statements, &mut remaining);
+                finish(
+                    trimmed.to_string(),
+                    vec![line],
+                    &mut statements,
+                    &mut remaining,
+                );
             } else {
                 pending = Some((trimmed.to_string(), vec![line]));
             }
@@ -2285,7 +2293,6 @@ fn apply_migrations_once(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
     Ok(applied)
 }
 
-
 /// V30: FTS5 tokenizer fix.
 ///
 /// V7 built `knowledge_fts` with `tokenize='porter ascii'`. The `ascii`
@@ -2780,9 +2787,19 @@ mod tests {
         let before = schema_dump(&conn);
 
         let second = apply_migrations(&conn).expect("replay on a migrated database");
-        assert_eq!(second, 0, "replaying a fully migrated database must apply nothing");
-        assert_eq!(get_current_version(&conn).expect("version after replay"), version);
-        assert_eq!(schema_dump(&conn), before, "replay must not alter the schema");
+        assert_eq!(
+            second, 0,
+            "replaying a fully migrated database must apply nothing"
+        );
+        assert_eq!(
+            get_current_version(&conn).expect("version after replay"),
+            version
+        );
+        assert_eq!(
+            schema_dump(&conn),
+            before,
+            "replay must not alter the schema"
+        );
     }
 
     #[test]
@@ -2792,7 +2809,8 @@ mod tests {
         conn.execute("DELETE FROM schema_version", [])
             .expect("empty the version ledger");
 
-        let error = apply_migrations(&conn).expect_err("must not replay migrations over live tables");
+        let error =
+            apply_migrations(&conn).expect_err("must not replay migrations over live tables");
         let message = error.to_string();
         assert!(
             message.contains("schema_version") && message.contains("positive"),
@@ -2822,10 +2840,13 @@ mod tests {
             ("-7", "positive integer"),
             ("9223372036854775807", "out of range"),
         ] {
-            conn.execute(&format!("UPDATE schema_version SET version = {corrupt}"), [])
-                .expect("corrupt the version");
-            let error = get_current_version(&conn)
-                .expect_err("a corrupted version must fail closed");
+            conn.execute(
+                &format!("UPDATE schema_version SET version = {corrupt}"),
+                [],
+            )
+            .expect("corrupt the version");
+            let error =
+                get_current_version(&conn).expect_err("a corrupted version must fail closed");
             assert!(
                 error.to_string().contains(expected),
                 "version {corrupt}: unexpected error: {error}"
@@ -2854,8 +2875,14 @@ UPDATE schema_version SET version = 99;\n";
         assert!(rest.contains("CREATE TABLE IF NOT EXISTS t"));
         assert!(rest.contains("CREATE INDEX IF NOT EXISTS idx_t_a"));
         assert!(rest.contains("UPDATE schema_version SET version = 99;"));
-        assert!(rest.contains("ALTER TABLE t RENAME COLUMN a TO a2;"), "non-ADD ALTERs stay: {rest}");
-        assert!(!rest.contains("ADD COLUMN"), "ALTERs must leave the batch: {rest}");
+        assert!(
+            rest.contains("ALTER TABLE t RENAME COLUMN a TO a2;"),
+            "non-ADD ALTERs stay: {rest}"
+        );
+        assert!(
+            !rest.contains("ADD COLUMN"),
+            "ALTERs must leave the batch: {rest}"
+        );
     }
 
     #[test]
@@ -2874,8 +2901,9 @@ UPDATE schema_version SET version = 99;\n";
             let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
             apply_migrations_through(&conn, migration.version - 1);
             for stmt in &alters {
-                conn.execute(stmt, [])
-                    .unwrap_or_else(|error| panic!("v{} half-apply {stmt}: {error}", migration.version));
+                conn.execute(stmt, []).unwrap_or_else(|error| {
+                    panic!("v{} half-apply {stmt}: {error}", migration.version)
+                });
             }
             apply_migrations(&conn).unwrap_or_else(|error| {
                 panic!(
@@ -2888,7 +2916,10 @@ UPDATE schema_version SET version = 99;\n";
                 MIGRATIONS.last().expect("migrations").version
             );
         }
-        assert!(exercised >= 5, "expected the ADD COLUMN migrations to be exercised, got {exercised}");
+        assert!(
+            exercised >= 5,
+            "expected the ADD COLUMN migrations to be exercised, got {exercised}"
+        );
     }
 
     #[test]
@@ -2960,7 +2991,10 @@ UPDATE schema_version SET version = 99;\n";
                 |row| row.get(0),
             )
             .expect("manifest count");
-        assert_eq!(count, 2, "manifest count must equal the real vector count after replay");
+        assert_eq!(
+            count, 2,
+            "manifest count must equal the real vector count after replay"
+        );
 
         // And the on-open reconciliation catches drift that appears later.
         conn.execute(
@@ -2968,7 +3002,10 @@ UPDATE schema_version SET version = 99;\n";
             [],
         )
         .expect("drift");
-        assert!(reconcile_profile_manifest_vector_count(&conn, "nomic-v1.5-legacy-raw-256").expect("reconcile"));
+        assert!(
+            reconcile_profile_manifest_vector_count(&conn, "nomic-v1.5-legacy-raw-256")
+                .expect("reconcile")
+        );
         let count: i64 = conn
             .query_row(
                 "SELECT vector_count FROM embedding_profile_manifests WHERE profile_id = 'nomic-v1.5-legacy-raw-256'",
@@ -2977,7 +3014,10 @@ UPDATE schema_version SET version = 99;\n";
             )
             .expect("manifest count");
         assert_eq!(count, 2);
-        assert!(!reconcile_profile_manifest_vector_count(&conn, "nomic-v1.5-legacy-raw-256").expect("no-op"));
+        assert!(
+            !reconcile_profile_manifest_vector_count(&conn, "nomic-v1.5-legacy-raw-256")
+                .expect("no-op")
+        );
     }
 
     #[test]

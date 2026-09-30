@@ -105,12 +105,13 @@ pub fn weights_for(version: u32) -> Result<&'static [u32; 21], UnknownAlgoVersio
 }
 
 /// Upper bound for stability (days). Matches FSRS ecosystem conventions.
-const S_MAX: f64 = 36500.0;
+pub const S_MAX: f64 = 36500.0;
 /// Lower bound for stability (days).
-const S_MIN: f64 = 0.01;
-/// Difficulty domain bounds (FSRS convention: 1 = easiest, 10 = hardest).
-const D_MIN: f64 = 1.0;
-const D_MAX: f64 = 10.0;
+pub const S_MIN: f64 = 0.01;
+/// Lower difficulty bound (FSRS convention: 1 = easiest).
+pub const D_MIN: f64 = 1.0;
+/// Upper difficulty bound (FSRS convention: 10 = hardest).
+pub const D_MAX: f64 = 10.0;
 
 /// Learning phase of a card. Fieldless enum: borsh-encodes as a `u8`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -195,6 +196,70 @@ impl FsrsFold {
         let w = weights_for(version)?;
         let elapsed = current_seq.saturating_sub(card.last_seq);
         Ok(Self::r(Self::dequantized_stability(card), elapsed, w))
+    }
+
+    /// Whole days from `reviewed_at_ms` to `as_of_ms` (0 if `as_of` is earlier).
+    ///
+    /// The fold still uses sequence numbers. This only turns a caller-supplied
+    /// review clock into the `t` that [`Self::retrievability`] already takes.
+    /// Not a new algorithm version.
+    pub fn elapsed_review_days(reviewed_at_ms: i64, as_of_ms: i64) -> u64 {
+        let delta = as_of_ms.saturating_sub(reviewed_at_ms);
+        if delta <= 0 {
+            0
+        } else {
+            delta as u64 / 86_400_000
+        }
+    }
+
+    /// Derived retrievability at `as_of_ms`.
+    ///
+    /// `Some(reviewed_at_ms)` measures `t` in whole days since that review.
+    /// `None` (no last-review time) keeps `t = fallback_seq - last_seq`.
+    pub fn retrievability_at_review(
+        card: &CardState,
+        reviewed_at_ms: Option<i64>,
+        as_of_ms: i64,
+        fallback_seq: u64,
+        version: u32,
+    ) -> Result<f64, UnknownAlgoVersion> {
+        let current = match reviewed_at_ms {
+            Some(at) => card
+                .last_seq
+                .saturating_add(Self::elapsed_review_days(at, as_of_ms)),
+            None => fallback_seq,
+        };
+        Self::retrievability(card, current, version)
+    }
+
+    /// Stability (days) whose retrievability after `elapsed_days` whole days
+    /// equals `target`, under the constants of `version`: the inverse of
+    /// [`Self::retrievability`] in `S`. Derived-only, like retrievability;
+    /// no fold calls it.
+    ///
+    /// Solves `(1 + FACTOR * t / S)^decay = target` for `S` and clamps the
+    /// result to `[S_MIN, S_MAX]`. `target <= 0` (or NaN) gives `S_MIN`.
+    /// `target >= 1`, or `elapsed_days == 0` (where every `S` recalls with
+    /// certainty), gives `S_MAX`.
+    pub fn stability_for_retrievability(
+        target: f64,
+        elapsed_days: u64,
+        version: u32,
+    ) -> Result<f64, UnknownAlgoVersion> {
+        let w = weights_for(version)?;
+        if target.is_nan() || target <= 0.0 {
+            return Ok(S_MIN);
+        }
+        if target >= 1.0 || elapsed_days == 0 {
+            return Ok(S_MAX);
+        }
+        let factor = milli(w, 19);
+        let decay = -(0.5 + milli(w, 20));
+        let base = libm::pow(target, 1.0 / decay) - 1.0;
+        if base.is_nan() || base <= 0.0 {
+            return Ok(S_MAX);
+        }
+        Ok((factor * (elapsed_days as f64) / base).clamp(S_MIN, S_MAX))
     }
 
     fn dequantized_stability(card: &CardState) -> f64 {
@@ -355,6 +420,48 @@ mod tests {
             let far = FsrsFold::retrievability(&card, 500, v).unwrap();
             assert!(near > far, "version {v}: {near} !> {far}");
         }
+    }
+
+    #[test]
+    fn stability_for_retrievability_inverts_the_curve() {
+        for version in [ALGO_V1, ALGO_V2] {
+            for s in [0.05, 0.4, 2.3065, 6.3, 41.0, 900.0] {
+                for days in [1u64, 3, 16, 120] {
+                    let card = CardState {
+                        stability_q: to_q32_32(s),
+                        difficulty_q: to_q32_32(5.0),
+                        last_seq: 10,
+                        review_count: 0,
+                        lapse_count: 0,
+                        phase: CardPhase::Learning,
+                    };
+                    let r = FsrsFold::retrievability(&card, 10 + days, version).unwrap();
+                    let back = FsrsFold::stability_for_retrievability(r, days, version).unwrap();
+                    assert!(
+                        ((back - s) / s).abs() < 1e-6,
+                        "v{version} S={s} t={days}: R={r} inverts to {back}"
+                    );
+                }
+            }
+        }
+        let v = ALGO_V2;
+        assert_eq!(
+            FsrsFold::stability_for_retrievability(0.0, 5, v).unwrap(),
+            S_MIN
+        );
+        assert_eq!(
+            FsrsFold::stability_for_retrievability(f64::NAN, 5, v).unwrap(),
+            S_MIN
+        );
+        assert_eq!(
+            FsrsFold::stability_for_retrievability(1.0, 5, v).unwrap(),
+            S_MAX
+        );
+        assert_eq!(
+            FsrsFold::stability_for_retrievability(0.5, 0, v).unwrap(),
+            S_MAX
+        );
+        assert!(FsrsFold::stability_for_retrievability(0.5, 1, 99).is_err());
     }
 
     #[test]

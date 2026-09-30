@@ -27,7 +27,9 @@ pub mod search_unified;
 pub mod recall;
 pub mod receipt;
 pub mod smart_ingest;
-// #57: external-source connectors (GitHub Issues / Redmine retrieval layer)
+// #57: external-source connectors (GitHub Issues / Redmine retrieval layer).
+// The tool is absent from tools/list and dispatch unless this feature is on.
+#[cfg(feature = "connectors")]
 pub mod source_sync;
 
 // v1.2: Temporal query tools
@@ -97,8 +99,8 @@ pub mod causal_walk;
 
 // w3d: planted-cause self-calibration + decayed-lesson detection, both
 // built on the backfill surface above.
-pub mod selftest;
 pub mod forgotten_lesson;
+pub mod selftest;
 
 // Internal/backwards-compat tools still dispatched by server.rs for specific
 // tool names. Each module below has live callers via string dispatch in

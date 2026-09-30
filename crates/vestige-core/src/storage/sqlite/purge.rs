@@ -41,7 +41,7 @@ impl SqliteMemoryStore {
         // purge and a concurrent profile activation.
         drop(writer);
 
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         if cleanup.is_some()
             && let Some(index) = self.vector_index.as_ref()
             && let Ok(mut index) = index.lock()
@@ -61,6 +61,7 @@ impl SqliteMemoryStore {
                 unlearning_scope: crate::storage::UnlearningScope::LegacyAuditedPurge,
                 unlearning_verdict: crate::storage::UnlearningVerdict::Incomplete,
                 unlearning_claim_boundary: "No purge ran because the requested memory was not found; no unlearning audit or verified-local erasure claim was produced.",
+                receipt_id: None,
             });
         };
 
@@ -75,18 +76,19 @@ impl SqliteMemoryStore {
             unlearning_scope: crate::storage::UnlearningScope::LegacyAuditedPurge,
             unlearning_verdict: crate::storage::UnlearningVerdict::Incomplete,
             unlearning_claim_boundary: "Legacy cleanup completed, but this operation has no V25 lineage-completeness proof, full required-surface audit, or anti-resurrection ingress gate. It does not establish complete machine unlearning, erasure of unmanaged copies, media forensics, provider backups, external model weights, or re-ingest prevention.",
+            receipt_id: None,
         })
     }
 
     /// Remove a committed purge from the optional in-process vector index.
     pub(crate) fn remove_purged_node_from_vector_index(&self, id: &str) {
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        #[cfg(vestige_embeddings_removed)]
         if let Some(index) = self.vector_index.as_ref()
             && let Ok(mut index) = index.lock()
         {
             let _ = index.remove(id);
         }
-        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+        #[cfg(not(vestige_embeddings_removed))]
         let _ = id;
     }
 

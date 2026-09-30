@@ -34,7 +34,7 @@ use vestige_core::storage::{
     },
 };
 use vestige_core::{
-    BACKFILL_RECEIPT_CLAIM_BOUNDARY, BACKFILL_RECEIPT_SCHEMA_V1, ActorProvenance,
+    ActorProvenance, BACKFILL_RECEIPT_CLAIM_BOUNDARY, BACKFILL_RECEIPT_SCHEMA_V1,
     BackfillCandidateEvidence, MemoryTraceEvent, REPLAY_SELECTION_BOUNDARY, Receipt,
     ReceiptEvidence, ReplayDecayRisk, RetrievalReplayCapsuleDraft, RetrievalReplayItemDraft,
     Storage, SuppressReason, SuppressedReceiptEntry, WriteSource, private_evidence_digest,
@@ -109,6 +109,28 @@ fn is_write_decision(label: &str) -> bool {
 /// This is the single source of truth: the dashboard handler delegates here so
 /// the MCP write path and the dashboard can never disagree about the mode.
 pub fn read_review_mode(storage: &Arc<Storage>) -> vestige_core::ReviewMode {
+    let mode = read_review_mode_setting(storage);
+    // A Strata log has no Memory PR store in 4.0. A gated mode would hold a
+    // risky write out of retrieval and then fail to save the PR that could
+    // release it, so the write would vanish. Strata runs every write through
+    // its own gate with a receipt instead; the review modes fall back to fast.
+    if !matches!(mode, vestige_core::ReviewMode::Fast)
+        && crate::strata_memory::is_strata_backend(storage.as_ref())
+    {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                requested = mode.as_str(),
+                "review_mode.json asks for a Memory PR review mode, which is not available on a Strata log in 4.0; using fast"
+            );
+        });
+        return vestige_core::ReviewMode::Fast;
+    }
+    mode
+}
+
+/// The review mode `review_mode.json` asks for, before any backend limit.
+fn read_review_mode_setting(storage: &Arc<Storage>) -> vestige_core::ReviewMode {
     let path = storage.data_dir().join("review_mode.json");
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -129,7 +151,10 @@ pub fn read_review_mode(storage: &Arc<Storage>) -> vestige_core::ReviewMode {
         .ok()
         .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(str::to_owned));
     // Report malformed settings so the operator can repair their opt-in choice.
-    match label.as_deref().map(vestige_core::ReviewMode::try_from_label) {
+    match label
+        .as_deref()
+        .map(vestige_core::ReviewMode::try_from_label)
+    {
         Some(Some(mode)) => mode,
         Some(None) => {
             tracing::warn!(
@@ -610,7 +635,10 @@ fn pr_kind_phrase(kind: vestige_core::MemoryPrKind) -> &'static str {
 
 /// Tools whose output warrants a retrieval receipt.
 fn is_retrieval_tool(tool: &str) -> bool {
-    matches!(tool, "recall" | "deep_reference" | "cross_reference" | "search")
+    matches!(
+        tool,
+        "recall" | "deep_reference" | "cross_reference" | "search"
+    )
 }
 
 /// Process-private key used to prevent replay item digests from becoming a
@@ -1310,6 +1338,11 @@ pub fn record(
     event_tx: Option<&broadcast::Sender<VestigeEvent>>,
     event: MemoryTraceEvent,
 ) {
+    // A Strata log in 4.0 keeps no Black Box trace rows. Asking it on every
+    // tool call only produced a warning per call.
+    if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        return;
+    }
     let event = event.with_at(Utc::now().timestamp_millis());
     let seq = match storage.append_trace_event(&event) {
         Ok(seq) => seq,
@@ -2270,7 +2303,8 @@ mod tests {
         let _lock = receipt_signing_env_lock().lock().unwrap();
         let _reset = ReceiptSigningEnvReset::capture();
         let dir = tempfile::tempdir().unwrap();
-        let storage = vestige_core::open_storage(Some(dir.path().join("signed-receipt.db"))).unwrap();
+        let storage =
+            vestige_core::open_storage(Some(dir.path().join("signed-receipt.db"))).unwrap();
         let provisioned = vestige_core::storage::provision_receipt_signing_key_sidecar(
             &dir.path().join("receipt-keys"),
             "test-receipt-key",
@@ -2696,5 +2730,28 @@ mod tests {
         assert!(is_write_tool("memory"));
         assert!(!is_write_tool("search"));
         assert!(!is_write_tool("deep_reference"));
+    }
+}
+
+#[cfg(test)]
+mod strata_review_mode_tests {
+    /// A gated review mode on a Strata store would hide a write behind a
+    /// Memory PR the log cannot save; it falls back to fast instead.
+    #[test]
+    fn a_gated_review_mode_is_fast_on_strata() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("review_mode.json"),
+            r#"{"mode":"paranoid"}"#,
+        )
+        .unwrap();
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        assert!(matches!(
+            super::read_review_mode(&storage),
+            vestige_core::ReviewMode::Fast
+        ));
+        // The operator's setting is left as written.
+        let kept = std::fs::read_to_string(dir.path().join("review_mode.json")).unwrap();
+        assert!(kept.contains("paranoid"));
     }
 }

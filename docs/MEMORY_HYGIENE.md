@@ -1,5 +1,7 @@
 # Memory hygiene and tag maintenance
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../README.md) and the [4.0.0 changelog](../CHANGELOG.md).
+
 Vestige exposes project-isolated, agent-facing hygiene workflows without requiring direct SQLite edits. Ordinary operations default to the legacy-compatible `user` scope. Cross-scope maintenance is always explicit.
 
 ## Dated facts at ingest

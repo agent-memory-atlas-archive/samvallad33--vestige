@@ -525,6 +525,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctor"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec09e802f5081de6157da9a75701d6c713d8dc3ba52571fd4bd25f412644e8a6"
+dependencies = [
+ "ctor-proc-macro",
+ "dtor",
+]
+
+[[package]]
+name = "ctor-proc-macro"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2931af7e13dc045d8e9d26afccc6fa115d64e115c9c84b1166288b46f6782c2"
+
+[[package]]
 name = "ctutils"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -544,6 +560,7 @@ dependencies = [
  "curve25519-dalek-derive",
  "digest 0.11.3",
  "fiat-crypto",
+ "rand_core 0.10.1",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -621,6 +638,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtor"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97cbdf2ad6846025e8e25df05171abfb30e3ababa12ee0a0e44b9bbe570633a8"
+dependencies = [
+ "dtor-proc-macro",
+]
+
+[[package]]
+name = "dtor-proc-macro"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7454e41ff9012c00d53cf7f475c5e3afa3b91b7c90568495495e8d9bf47a1055"
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -643,7 +675,9 @@ checksum = "6ebaa1a2bf1290ab3bfe5a7b771d050ebffab2711c19a81691c683a5144a25de"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.10.1",
  "sha2",
+ "signature",
  "subtle",
  "zeroize",
 ]
@@ -2224,6 +2258,9 @@ name = "signature"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
+dependencies = [
+ "rand_core 0.10.1",
+]
 
 [[package]]
 name = "simd_cesu8"
@@ -2288,6 +2325,7 @@ dependencies = [
  "blake3",
  "borsh",
  "ed25519-dalek",
+ "getrandom 0.4.3",
  "libc",
 ]
 
@@ -2312,15 +2350,33 @@ dependencies = [
 name = "strata-migrate"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "base64 0.22.1",
  "blake3",
  "borsh",
  "chrono",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
+ "rusqlite",
  "serde",
  "serde_json",
  "strata",
  "strata-kernel",
+ "tempfile",
  "thiserror",
  "vestige-core",
+]
+
+[[package]]
+name = "strata-store"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "borsh",
+ "strata",
+ "strata-gate",
+ "strata-kernel",
+ "strata-migrate",
 ]
 
 [[package]]
@@ -2329,10 +2385,13 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "borsh",
+ "ed25519-dalek",
  "serde",
  "serde_json",
+ "strata",
  "strata-gate",
  "strata-kernel",
+ "strata-migrate",
 ]
 
 [[package]]
@@ -2808,7 +2867,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vestige-core"
-version = "3.1.1"
+version = "4.0.0"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -2865,24 +2924,30 @@ dependencies = [
 
 [[package]]
 name = "vestige-mcp"
-version = "3.1.1"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "blake3",
  "chrono",
  "clap",
  "colored",
+ "ctor",
  "directories",
  "ed25519-dalek",
  "futures-util",
+ "getrandom 0.4.3",
  "include_dir",
+ "libc",
  "mime_guess",
  "open",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
+ "strata-gate",
  "strata-migrate",
+ "strata-store",
  "strata-verify",
  "subtle",
  "tempfile",
@@ -2919,6 +2984,22 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "vestige-upgrade"
+version = "4.0.0"
+dependencies = [
+ "directories",
+ "libc",
+ "rusqlite",
+ "sha2",
+ "strata",
+ "strata-migrate",
+ "strata-store",
+ "strata-verify",
+ "tempfile",
+ "vestige-core",
 ]
 
 [[package]]

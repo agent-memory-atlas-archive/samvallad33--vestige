@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use vestige_core::neuroscience::predictive_retrieval::PredictiveMemory;
 use vestige_core::neuroscience::prospective_memory::{IntentionParser, ProspectiveMemory};
-#[cfg(feature = "vector-search")]
+#[cfg(vestige_embeddings_removed)]
 use vestige_core::search::TemporalSearcher;
 use vestige_core::{
     AccessibilityCalculator,
@@ -45,9 +45,9 @@ use vestige_core::{
 /// health view reports this as the compiled-in module count, not a runtime
 /// probe. When you add a module field, update the matching arm here and
 /// `cognitive_module_count_is_maintained`.
-#[cfg(feature = "vector-search")]
+#[cfg(vestige_embeddings_removed)]
 pub const COGNITIVE_MODULE_COUNT: usize = 16 + 10 + 1;
-#[cfg(not(feature = "vector-search"))]
+#[cfg(not(vestige_embeddings_removed))]
 pub const COGNITIVE_MODULE_COUNT: usize = 16 + 10;
 
 /// Stateful cognitive engine holding all neuroscience modules.
@@ -87,7 +87,7 @@ pub struct CognitiveEngine {
     pub consolidation_scheduler: ConsolidationScheduler,
 
     // -- Search --
-    #[cfg(feature = "vector-search")]
+    #[cfg(vestige_embeddings_removed)]
     pub temporal_searcher: TemporalSearcher,
 }
 
@@ -180,13 +180,13 @@ impl CognitiveEngine {
             consolidation_scheduler: ConsolidationScheduler::new(),
 
             // Search
-            #[cfg(feature = "vector-search")]
+            #[cfg(vestige_embeddings_removed)]
             temporal_searcher: TemporalSearcher::new(),
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use chrono::Utc;
@@ -200,7 +200,13 @@ mod tests {
     /// arms and this expression together.
     #[test]
     fn cognitive_module_count_is_maintained() {
-        let expected = 16 + 10 + if cfg!(feature = "vector-search") { 1 } else { 0 };
+        let expected = 16
+            + 10
+            + if cfg!(vestige_embeddings_removed) {
+                1
+            } else {
+                0
+            };
         assert_eq!(COGNITIVE_MODULE_COUNT, expected);
     }
 

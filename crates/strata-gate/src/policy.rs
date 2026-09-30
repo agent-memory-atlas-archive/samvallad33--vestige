@@ -81,7 +81,12 @@ fn effective(rule: &Rule, inputs: &GateInputs) -> (Verdict, Option<Veto>) {
     (rule.verdict, None)
 }
 
-fn matches(rule: &Rule, kind: Option<u8>, params_hash: Option<&[u8; 32]>, inputs: &GateInputs) -> bool {
+fn matches(
+    rule: &Rule,
+    kind: Option<u8>,
+    params_hash: Option<&[u8; 32]>,
+    inputs: &GateInputs,
+) -> bool {
     if let Some(k) = kind
         && rule.match_kind != ANY_KIND
         && rule.match_kind != k
@@ -118,17 +123,30 @@ pub fn first_matching_rule<'a>(
     propose: &Propose,
     inputs: &GateInputs,
 ) -> Option<&'a Rule> {
-    policy
-        .rules
-        .iter()
-        .find(|r| matches(r, Some(propose.action_kind), Some(&propose.params_hash), inputs))
+    policy.rules.iter().find(|r| {
+        matches(
+            r,
+            Some(propose.action_kind),
+            Some(&propose.params_hash),
+            inputs,
+        )
+    })
 }
 
 /// Subject-aware evaluation without the canary clamp. Returns the verdict and
 /// the veto cause when a modifier fired.
-pub fn evaluate_detailed(policy: &Policy, propose: &Propose, inputs: &GateInputs) -> (Verdict, Option<Veto>) {
+pub fn evaluate_detailed(
+    policy: &Policy,
+    propose: &Propose,
+    inputs: &GateInputs,
+) -> (Verdict, Option<Veto>) {
     for rule in &policy.rules {
-        if matches(rule, Some(propose.action_kind), Some(&propose.params_hash), inputs) {
+        if matches(
+            rule,
+            Some(propose.action_kind),
+            Some(&propose.params_hash),
+            inputs,
+        ) {
             return effective(rule, inputs);
         }
     }

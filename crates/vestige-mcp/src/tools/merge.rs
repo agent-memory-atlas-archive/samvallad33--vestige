@@ -180,7 +180,7 @@ fn obj(args: &Option<Value>) -> serde_json::Map<String, Value> {
 // ============================================================================
 
 fn merge_candidates(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     {
         let a = obj(&args);
         let limit = a.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
@@ -239,7 +239,7 @@ fn merge_candidates(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value
             "note": "Nothing was changed. These are review candidates only."
         }))
     }
-    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+    #[cfg(not(vestige_embeddings_removed))]
     {
         let _ = (storage, args);
         Ok(json!({ "error": "Embeddings feature not enabled.", "candidates": [] }))
@@ -251,7 +251,7 @@ fn merge_candidates(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value
 // ============================================================================
 
 fn plan_merge(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     {
         let a = obj(&args);
         let member_ids: Vec<String> = a
@@ -273,7 +273,7 @@ fn plan_merge(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, Stri
             .map_err(|e| e.to_string())?;
         Ok(plan_to_json(&plan, &policy))
     }
-    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+    #[cfg(not(vestige_embeddings_removed))]
     {
         let _ = (storage, args);
         Err("Embeddings feature not enabled.".into())
@@ -285,7 +285,7 @@ fn plan_merge(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, Stri
 // ============================================================================
 
 fn plan_supersede(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     {
         let a = obj(&args);
         let old_id = a
@@ -302,14 +302,14 @@ fn plan_supersede(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, 
             .map_err(|e| e.to_string())?;
         Ok(plan_to_json(&plan, &policy))
     }
-    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+    #[cfg(not(vestige_embeddings_removed))]
     {
         let _ = (storage, args);
         Err("Embeddings feature not enabled.".into())
     }
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+#[cfg(vestige_embeddings_removed)]
 fn plan_to_json(plan: &vestige_core::MergePlan, policy: &vestige_core::MergePolicy) -> Value {
     let requires_confirm =
         plan.classification != vestige_core::MatchClass::Match || !policy.auto_apply;
@@ -347,7 +347,7 @@ fn plan_to_json(plan: &vestige_core::MergePlan, policy: &vestige_core::MergePoli
 // ============================================================================
 
 fn apply_plan(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
-    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[cfg(vestige_embeddings_removed)]
     {
         let a = obj(&args);
         let plan_id = a
@@ -371,7 +371,7 @@ fn apply_plan(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, Stri
             "note": "Old memories were bitemporally invalidated (valid_until stamped), NOT deleted. They remain queryable for audit."
         }))
     }
-    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+    #[cfg(not(vestige_embeddings_removed))]
     {
         let _ = (storage, args);
         Err("Embeddings feature not enabled.".into())
@@ -404,7 +404,21 @@ fn merge_undo(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, Stri
                 }));
             }
 
-            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+            // Strata has no embedding runtime. Undo appends a compensating
+            // UpsertNode; it does not take the SQLite merge_undo path.
+            if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+                let op = storage.merge_undo(op_id).map_err(|e| e.to_string())?;
+                return Ok(json!({
+                    "undoOperationId": op.id,
+                    "revertedOperationId": op.reverts_op_id,
+                    "status": "reverted",
+                    "affectedIds": op.affected_ids,
+                    "reason": op.reason,
+                    "note": "The append-only log gained a compensating record. The undone change is no longer visible to reads."
+                }));
+            }
+
+            #[cfg(vestige_embeddings_removed)]
             {
                 let op = storage.merge_undo(op_id).map_err(|e| e.to_string())?;
                 Ok(json!({
@@ -417,7 +431,7 @@ fn merge_undo(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, Stri
                 }))
             }
 
-            #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+            #[cfg(not(vestige_embeddings_removed))]
             {
                 Err("Undoing merge/supersede operations requires embeddings and vector-search features; tag operation undo is available in this build.".into())
             }
@@ -546,7 +560,7 @@ fn merge_policy(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, St
 // TESTS — see tests/merge_supersede_test.rs for full integration coverage.
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
 

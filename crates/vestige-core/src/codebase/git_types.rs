@@ -9,7 +9,6 @@ use std::path::PathBuf;
 
 use super::types::{BugFix, FileRelationship};
 
-
 /// Current git context for a repository
 #[derive(Debug, Clone)]
 pub struct GitContext {

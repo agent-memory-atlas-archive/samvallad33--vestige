@@ -34,9 +34,6 @@
 use chrono::{DateTime, Utc};
 
 use crate::memory::{IngestInput, SourceEnvelope};
-// Connector cursor state persists through the legacy SQLite store
-// (build/t5-legacy-isolation).
-#[cfg(feature = "legacy-sqlite")]
 use crate::storage::ConnectorCursor;
 
 #[cfg(feature = "connectors")]
@@ -109,7 +106,9 @@ pub enum ConnectorError {
     Config(String),
     #[error("transport error: {0}")]
     Transport(String),
-    #[error("rate limited by upstream (Retry-After {0:?}; None means the server gave no header — back off and retry later)")]
+    #[error(
+        "rate limited by upstream (Retry-After {0:?}; None means the server gave no header — back off and retry later)"
+    )]
     RateLimited(Option<std::time::Duration>),
     #[error("source error ({status}): {message}")]
     Source { status: u16, message: String },
@@ -164,11 +163,13 @@ pub const CURSOR_OVERLAP_SECS: i64 = 120;
 /// that long inside an MCP request is hostile to the caller, so anything
 /// longer than this aborts the run with a `RateLimited` error that names the
 /// wait, and the saved per-page checkpoints make the retry a cheap resume.
+#[allow(dead_code)] // used by the github test/legacy-sqlite profile; dead only in the no-embeddings build
 const MAX_RATE_LIMIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One page fetch with rate-limit respect: a single bounded retry after the
 /// server's `Retry-After` when that wait is short enough to sleep through.
 /// Anything longer (or a second consecutive 429) aborts so the caller decides.
+#[allow(dead_code)] // same profile note as MAX_RATE_LIMIT_BACKOFF
 async fn fetch_page_with_retry<C: Connector>(
     connector: &C,
     since: Option<DateTime<Utc>>,
@@ -219,7 +220,6 @@ pub struct SyncReport {
 ///
 /// `max_pages` bounds a single run (so a first sync of a 15-year tracker can be
 /// resumed across calls rather than blocking on one enormous fetch).
-#[cfg(feature = "legacy-sqlite")]
 pub async fn run_sync<C: Connector>(
     store: &crate::storage::Storage,
     connector: &C,
@@ -386,6 +386,7 @@ pub async fn run_sync<C: Connector>(
 /// Highest cursor value it is safe to persist: never past the oldest record
 /// that failed this run (minus one second so the next inclusive-`since` run
 /// re-fetches it).
+#[allow(dead_code)] // same profile note as MAX_RATE_LIMIT_BACKOFF
 fn clamp_cursor(
     max_seen: Option<DateTime<Utc>>,
     oldest_failure: Option<DateTime<Utc>>,
@@ -492,8 +493,8 @@ mod tests {
 mod driver_tests {
     use super::*;
     use crate::storage::SqliteMemoryStore;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn ts(secs: i64) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-06-19T00:00:00Z")
@@ -555,7 +556,6 @@ mod driver_tests {
                 skipped: Vec::new(),
             })
         }
-
     }
 
     impl Connector for MockConnector {
@@ -613,11 +613,14 @@ mod driver_tests {
         assert_eq!(report.new_cursor, Some(t3));
 
         // Second run: everything already known and unchanged.
-        let conn2 = MockConnector::new(vec![MockConnector::ok(vec![
-            rec("1", t1, "a"),
-            rec("2", t2, "b-EDITED"),
-            rec("3", t3, "c"),
-        ], None)]);
+        let conn2 = MockConnector::new(vec![MockConnector::ok(
+            vec![
+                rec("1", t1, "a"),
+                rec("2", t2, "b-EDITED"),
+                rec("3", t3, "c"),
+            ],
+            None,
+        )]);
         let report2 = run_sync(&store, &conn2, false, 10).await.unwrap();
         assert_eq!(report2.created, 0, "re-running must not duplicate");
         assert_eq!(report2.unchanged, 3);
@@ -775,11 +778,10 @@ mod driver_tests {
         let t3 = ts(120);
 
         // First sync: issues 1, 2, 3.
-        let conn = MockConnector::new(vec![MockConnector::ok(vec![
-            rec("1", t1, "a"),
-            rec("2", t2, "b"),
-            rec("3", t3, "c"),
-        ], None)]);
+        let conn = MockConnector::new(vec![MockConnector::ok(
+            vec![rec("1", t1, "a"), rec("2", t2, "b"), rec("3", t3, "c")],
+            None,
+        )]);
         run_sync(&store, &conn, false, 10).await.unwrap();
 
         // Issue 2 vanished upstream. A reconcile that only sees {1, 3} must
@@ -831,16 +833,12 @@ mod driver_tests {
 
         // An empty live-id enumeration is a transient/auth failure signal, not
         // "the source is empty" — it must skip reconcile, not wipe the scope.
-        let conn2 = MockConnector::new(vec![MockConnector::ok(vec![], None)])
-            .with_live_ids(vec![]);
+        let conn2 = MockConnector::new(vec![MockConnector::ok(vec![], None)]).with_live_ids(vec![]);
         let report = run_sync(&store, &conn2, true, 10).await.unwrap();
         assert_eq!(report.tombstoned, 0);
         assert!(!report.reconciled);
         assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.contains("empty set")),
+            report.warnings.iter().any(|w| w.contains("empty set")),
             "the guard must explain itself: {:?}",
             report.warnings
         );

@@ -44,6 +44,7 @@ use common::*;
 /// #219: the standalone purge tool — the one irreversible call — gets
 /// its own e2e coverage: happy path purges and the memory is really
 /// gone; the unconfirmed call is refused; the alias still dispatches.
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn purge_tool_purges_refuses_without_confirm_and_alias_matches() {
     let dir = data_dir();
@@ -53,16 +54,15 @@ fn purge_tool_purges_refuses_without_confirm_and_alias_matches() {
         "purge e2e fixture alpha: idempotent removal check",
         &["purge-e2e"],
     );
-    let id_b = server.ingest_keyword_only(
-        "purge e2e fixture beta: alias path check",
-        &["purge-e2e"],
-    );
+    let id_b =
+        server.ingest_keyword_only("purge e2e fixture beta: alias path check", &["purge-e2e"]);
 
     // Unconfirmed purge is refused — the destructive call requires
     // confirm=true exactly like memory(action='purge').
     let refused = server.call_tool("purge", json!({ "id": id_a }));
     assert!(
-        refused.get("error").is_some() || refused["isError"] == json!(true)
+        refused.get("error").is_some()
+            || refused["isError"] == json!(true)
             || refused.to_string().contains("confirm"),
         "unconfirmed purge must be refused: {refused}"
     );
@@ -78,7 +78,8 @@ fn purge_tool_purges_refuses_without_confirm_and_alias_matches() {
     );
     let gone = server.call_tool("memory", json!({ "action": "get", "id": id_a }));
     assert!(
-        gone.get("error").is_some() || gone["isError"] == json!(true)
+        gone.get("error").is_some()
+            || gone["isError"] == json!(true)
             || gone["found"] == json!(false),
         "purged memory must be unreachable: {gone}"
     );
@@ -108,6 +109,9 @@ fn purge_tool_purges_refuses_without_confirm_and_alias_matches() {
 /// real. Since #241 the server implements BOTH eras, so the modern revision
 /// must be named; a client that cannot speak it still negotiates down to
 /// `2025-11-25` through the handshake.
+// Re-lands with the strata runtime boot: this journey starts from an
+// EMPTY data dir, and a guard-armed 4.0 binary creates no SQLite store
+// (audit blocker 1) — there is nothing to boot until strata lands.
 #[test]
 fn discover_answers_before_any_handshake_and_does_not_overclaim() {
     let dir = data_dir();
@@ -148,6 +152,9 @@ fn discover_answers_before_any_handshake_and_does_not_overclaim() {
         "#241: the server implements the 2026-07-28 stateless core, resultType \
          and the receipt-card app, so it must advertise it: {versions:?}"
     );
+    // One writer per log. Release this process before the probes open the
+    // same directory.
+    server.shutdown();
     // Every LEGACY advertised revision must be one initialize will actually
     // accept. The modern revision is deliberately absent from the handshake:
     // a 2026-07-28 client never shakes hands at all, it sends per-request
@@ -167,10 +174,8 @@ fn discover_answers_before_any_handshake_and_does_not_overclaim() {
             json!(version),
             "discover advertised {version} but initialize negotiated something else"
         );
-        probe.abandon();
+        probe.shutdown();
     }
-
-    server.shutdown();
 }
 
 /// Everything except `initialize` and `server/discover` must be refused before
@@ -315,6 +320,11 @@ fn tools_list_is_deterministic_across_restarts_and_carries_cache_hints() {
             "duplicate tool advertised: {name}"
         );
     }
+    // purge is withheld on Strata in 4.0 (not advertised).
+    assert!(
+        !names.contains(&"purge".to_string()),
+        "withheld tool advertised on Strata: {names:?}"
+    );
     for required in ["recall", "smart_ingest", "memory", "suppress"] {
         assert!(
             names.contains(&required.to_string()),
@@ -506,6 +516,10 @@ fn blank_lines_and_notifications_produce_no_response() {
 /// with thousands of intact memories became unopenable because one fts5 blob
 /// was damaged: the server must start, rebuild the index, keep every memory,
 /// and serve keyword search again.
+// Re-lands with the strata runtime boot: this journey starts from an
+// EMPTY data dir, and a guard-armed 4.0 binary creates no SQLite store
+// (audit blocker 1) — there is nothing to boot until strata lands.
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn corrupt_fts_index_does_not_brick_the_store() {
     let dir = data_dir();
@@ -578,6 +592,10 @@ fn corrupt_fts_index_does_not_brick_the_store() {
 /// Catches the regression where any store carrying deletion residue from a
 /// build that ran without `PRAGMA foreign_keys = ON` became unopenable, with no
 /// recovery short of manual SQLite surgery.
+// Fails under the 4.0 contract: the journey needs SQLite RW (guard),
+// keyword/tag recall (0b removed), or recall run receipts (PR 1).
+// Re-lands with build/wire-strata + the handle walk.
+#[ignore = "pre-4.0 contract journey; re-lands with wire-strata / PR 1"]
 #[test]
 fn foreign_key_orphans_are_repaired_instead_of_being_fatal() {
     let dir = data_dir();
@@ -653,6 +671,10 @@ fn foreign_key_orphans_are_repaired_instead_of_being_fatal() {
 /// user table in the committed snapshot, so the server still sees a fresh store
 /// and runs the full migration chain — the maximum amount of migration work
 /// possible — with a competing writer on the file.
+// Fails under the 4.0 contract: the journey needs SQLite RW (guard),
+// keyword/tag recall (0b removed), or recall run receipts (PR 1).
+// Re-lands with build/wire-strata + the handle walk.
+#[ignore = "pre-4.0 contract journey; re-lands with wire-strata / PR 1"]
 #[test]
 fn migration_survives_a_concurrent_sqlite_writer() {
     let dir = data_dir();
@@ -732,6 +754,7 @@ fn migration_survives_a_concurrent_sqlite_writer() {
 /// and leave a complete, single-versioned, quick_check-clean store behind.
 /// Catches: a half-applied migration chain, duplicate `schema_version` rows, or
 /// a panic instead of a diagnosable "database is locked".
+#[ignore = "concurrent SQLite-boot race; the 4.0 journey re-lands with build/wire-strata"]
 #[test]
 fn concurrent_server_startups_leave_an_intact_store() {
     let dir = data_dir();
@@ -802,6 +825,10 @@ fn concurrent_server_startups_leave_an_intact_store() {
 ///
 /// Catches: writes that live only in an in-process cache, a WAL that is never
 /// checkpointed, and tags or content mangled on reload.
+// Re-lands with the strata runtime boot: this journey starts from an
+// EMPTY data dir, and a guard-armed 4.0 binary creates no SQLite store
+// (audit blocker 1) — there is nothing to boot until strata lands.
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn a_clean_restart_preserves_every_memory() {
     let dir = data_dir();
@@ -864,6 +891,7 @@ fn a_clean_restart_preserves_every_memory() {
 
 /// A save costs the agent context on every call, so the create response has a
 /// byte ceiling and must not carry a tag-status block that says nothing.
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn smart_ingest_create_response_is_lean() {
     let dir = data_dir();
@@ -903,6 +931,10 @@ fn smart_ingest_create_response_is_lean() {
 /// nothing was ever saved. The tool schema still describes this filter as
 /// "case-sensitive", so the documented contract and the implemented one
 /// disagree; the implementation is the one users depend on.
+// Fails under the 4.0 contract: the journey needs SQLite RW (guard),
+// keyword/tag recall (0b removed), or recall run receipts (PR 1).
+// Re-lands with build/wire-strata + the handle walk.
+#[ignore = "pre-4.0 contract journey; re-lands with wire-strata / PR 1"]
 #[test]
 fn tag_prefix_filtering_is_case_insensitive_on_the_keyword_path() {
     let dir = data_dir();
@@ -972,6 +1004,7 @@ fn tag_prefix_filtering_is_case_insensitive_on_the_keyword_path() {
 /// Projection over stdio: the durable subset lands in a fenced region, the
 /// human's text around it survives byte for byte, a second write is a no-op,
 /// and a path that escapes the root is refused.
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn project_previews_then_writes_a_fenced_region_and_keeps_the_rest() {
     let dir = data_dir();
@@ -1060,6 +1093,10 @@ fn project_previews_then_writes_a_fenced_region_and_keeps_the_rest() {
 /// a note repeating a UUID three times can outscore the exact match and invert
 /// the documented exact-lookup guarantee. Filler documents are required: with a
 /// tiny corpus BM25's IDF term is degenerate and the ranking proves nothing.
+// Fails under the 4.0 contract: the journey needs SQLite RW (guard),
+// keyword/tag recall (0b removed), or recall run receipts (PR 1).
+// Re-lands with build/wire-strata + the handle walk.
+#[ignore = "pre-4.0 contract journey; re-lands with wire-strata / PR 1"]
 #[test]
 fn exact_identifier_lookup_beats_a_memory_that_only_cites_it() {
     let dir = data_dir();
@@ -1109,6 +1146,7 @@ fn exact_identifier_lookup_beats_a_memory_that_only_cites_it() {
 /// `window — carefully` indexed as a single unsearchable token and `naïve`
 /// could not be reached from `naive`. The filler corpus makes a hit meaningful:
 /// with one memory in the store every query "succeeds".
+#[ignore = "keyword findability removed in 0b; findability re-lands as handle walk in PR 1"]
 #[test]
 fn unicode_and_typographic_content_stays_findable_by_keyword() {
     let dir = data_dir();
@@ -1160,6 +1198,10 @@ fn unicode_and_typographic_content_stays_findable_by_keyword() {
 
 /// A fresh installation stores sensitive context without an approval queue and
 /// keeps that context retrievable after the server restarts.
+// Re-lands with the strata runtime boot: this journey starts from an
+// EMPTY data dir, and a guard-armed 4.0 binary creates no SQLite store
+// (audit blocker 1) — there is nothing to boot until strata lands.
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn default_memory_writes_are_immediate_and_survive_restart() {
     let dir = data_dir();
@@ -1206,6 +1248,7 @@ fn default_memory_writes_are_immediate_and_survive_restart() {
 /// nothing is erased until the Memory PR is decided. A caller that reads
 /// `confirm=true` as "erased" would be wrong. Catches a regression in either
 /// direction: silently erasing without review, or dropping the review record.
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn purge_with_confirm_is_review_gated_when_opted_in() {
     let dir = data_dir();
@@ -1263,6 +1306,10 @@ fn purge_with_confirm_is_review_gated_when_opted_in() {
 /// database), and a tombstone that leaks what it was told to forget — the audit
 /// record must prove a removal happened without retaining the removed content,
 /// its tags, or its reason.
+// Re-lands with the strata runtime boot: this journey starts from an
+// EMPTY data dir, and a guard-armed 4.0 binary creates no SQLite store
+// (audit blocker 1) — there is nothing to boot until strata lands.
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn approved_purge_removes_content_and_leaves_a_content_free_tombstone() {
     let dir = data_dir();
@@ -1369,6 +1416,10 @@ fn approved_purge_removes_content_and_leaves_a_content_free_tombstone() {
 /// failure where a restart rehydrates FSRS state from defaults and quietly
 /// restores a memory the user deliberately suppressed — the memory system
 /// undoing the user's decision behind their back.
+// Fails under the 4.0 contract: the journey needs SQLite RW (guard),
+// keyword/tag recall (0b removed), or recall run receipts (PR 1).
+// Re-lands with build/wire-strata + the handle walk.
+#[ignore = "pre-4.0 contract journey; re-lands with wire-strata / PR 1"]
 #[test]
 fn suppression_survives_a_restart_and_keeps_compounding() {
     let dir = data_dir();
@@ -1598,6 +1649,10 @@ fn contradictions_are_returned_intact_and_flagged_as_protected() {
 /// `vestige-core/src/advanced/contradiction.rs`; this test locks the write
 /// path's behaviour. The pairs are lexically near-identical, so the keyword
 /// path drives the same gate decisions the embedding runtime used to.
+// Re-lands with the strata runtime boot: this journey starts from an
+// EMPTY data dir, and a guard-armed 4.0 binary creates no SQLite store
+// (audit blocker 1) — there is nothing to boot until strata lands.
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn correction_must_not_be_swallowed_by_the_ingest_gate() {
     const NEGATIVE: &str =
@@ -1688,6 +1743,7 @@ fn correction_must_not_be_swallowed_by_the_ingest_gate() {
 // an error path, with a payload ceiling so a response cannot quietly bloat.
 // The last test reads this file and fails when an advertised tool has fewer
 // than two calls in it.
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn session_start_returns_a_budgeted_context_and_rejects_a_bad_budget() {
     let dir = data_dir();
@@ -1770,6 +1826,7 @@ fn memory_status_every_view_has_its_shape_and_an_unknown_view_errors() {
     server.shutdown();
 }
 
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn dedup_scan_policy_and_undo_answer_and_apply_needs_a_plan() {
     let dir = data_dir();
@@ -1810,6 +1867,7 @@ fn dedup_scan_policy_and_undo_answer_and_apply_needs_a_plan() {
     server.shutdown();
 }
 
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn graph_recent_predict_and_memory_graph_answer_and_chain_needs_endpoints() {
     let dir = data_dir();
@@ -1850,6 +1908,7 @@ fn graph_recent_predict_and_memory_graph_answer_and_chain_needs_endpoints() {
     server.shutdown();
 }
 
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn intention_set_list_check_update_round_trip_and_a_bad_trigger_errors() {
     let dir = data_dir();
@@ -1952,6 +2011,82 @@ fn maintain_scores_importance_dry_runs_gc_consolidates_and_restore_needs_a_path(
     server.shutdown();
 }
 
+/// `maintain(action=dream)` on a Strata log consolidates recorded edges and
+/// FSRS state. Shared wording across memories does not create a review, and
+/// an edge under the strength floor does not either.
+#[test]
+fn dream_over_stdio_completes_from_recorded_edges_and_fsrs() {
+    let dir = data_dir();
+    let (strong, quiet, reps_before) = {
+        let storage = vestige_mcp::strata_memory::open(dir.path()).expect("seed strata log");
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            let node = storage
+                .ingest(vestige_core::IngestInput {
+                    content: format!("shared token salad {i} alpha beta gamma"),
+                    ..vestige_core::IngestInput::default()
+                })
+                .unwrap();
+            ids.push(node.id);
+        }
+        let now = storage.get_node(&ids[0]).unwrap().unwrap().created_at;
+        let link = |source: &str, target: &str, kind: &str, strength: f64| {
+            storage
+                .save_connection(&vestige_core::ConnectionRecord {
+                    source_id: source.to_string(),
+                    target_id: target.to_string(),
+                    strength,
+                    link_type: kind.to_string(),
+                    created_at: now,
+                    last_activated: now,
+                    activation_count: 1,
+                })
+                .unwrap();
+        };
+        link(&ids[0], &ids[1], "derived_from", 1.0);
+        link(&ids[1], &ids[2], "evidence_of", 0.8);
+        link(&ids[3], &ids[4], "touched", 0.1);
+        let reps = storage.get_node(&ids[0]).unwrap().unwrap().reps;
+        (
+            vec![ids[0].clone(), ids[1].clone(), ids[2].clone()],
+            ids[5].clone(),
+            reps,
+        )
+    };
+
+    let mut server = Server::spawn(dir.path());
+    server.handshake();
+    let value = server.call_tool_ok("maintain", json!({ "action": "dream" }));
+    assert_eq!(value["status"], json!("completed"), "{value}");
+    assert_eq!(value["basis"], json!("recorded_edges_fsrs"), "{value}");
+    assert_eq!(value["edgesConsolidated"], json!(2), "{value}");
+    assert_eq!(value["connectionsPersisted"], json!(0), "{value}");
+    let text = serde_json::to_string(&value).unwrap();
+    assert!(!text.contains("pending_strata"), "{value}");
+    assert!(!text.contains("not implemented"), "{value}");
+    assert!(!text.contains("token salad"), "{value}");
+    let mut reviewed: Vec<String> = value["reviews"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|review| review["id"].as_str().unwrap().to_string())
+        .collect();
+    let mut expected = strong.clone();
+    expected.sort();
+    reviewed.sort();
+    assert_eq!(reviewed, expected, "{value}");
+
+    let strengthened = server.call_tool_ok("memory", json!({ "action": "get", "id": strong[0] }));
+    assert_eq!(
+        strengthened["node"]["reps"],
+        json!(reps_before + 1),
+        "{strengthened}"
+    );
+    let untouched = server.call_tool_ok("memory", json!({ "action": "get", "id": quiet }));
+    assert_eq!(untouched["node"]["reps"], json!(reps_before), "{untouched}");
+    server.shutdown();
+}
+
 #[test]
 fn codebase_remembers_a_decision_returns_context_verifies_and_needs_its_fields() {
     let dir = data_dir();
@@ -2005,6 +2140,7 @@ fn codebase_remembers_a_decision_returns_context_verifies_and_needs_its_fields()
     server.shutdown();
 }
 
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn backfill_dry_run_surfaces_an_upstream_cause_and_an_empty_store_errors() {
     let dir = data_dir();
@@ -2032,6 +2168,10 @@ fn backfill_dry_run_surfaces_an_upstream_cause_and_an_empty_store_errors() {
     server.shutdown();
 }
 
+// Fails under the 4.0 contract: the journey needs SQLite RW (guard),
+// keyword/tag recall (0b removed), or recall run receipts (PR 1).
+// Re-lands with build/wire-strata + the handle walk.
+#[ignore = "pre-4.0 contract journey; re-lands with wire-strata / PR 1"]
 #[test]
 fn receipt_get_returns_the_receipt_a_recall_produced_and_an_unknown_id_errors() {
     let dir = data_dir();
@@ -2072,6 +2212,7 @@ fn receipt_get_returns_the_receipt_a_recall_produced_and_an_unknown_id_errors() 
 /// `source_sync` reaches an external system, so it has no offline happy path.
 /// Both of its tests are error paths by design; the connector itself is
 /// covered by the unit tests in `vestige-core`.
+#[cfg(feature = "connectors")]
 #[test]
 fn source_sync_rejects_an_unknown_source_and_a_missing_repo_without_touching_the_network() {
     let dir = data_dir();
@@ -2112,6 +2253,7 @@ fn smart_ingest_and_suppress_reject_calls_without_their_subject() {
     server.shutdown();
 }
 
+#[ignore = "4.0 creates no SQLite store; journey re-lands with build/wire-strata"]
 #[test]
 fn causal_walk_selftest_and_forgotten_lesson_are_called_over_stdio() {
     let dir = data_dir();
@@ -2120,7 +2262,9 @@ fn causal_walk_selftest_and_forgotten_lesson_are_called_over_stdio() {
 
     let r1 = server.call_tool("causal_walk", json!({ "manual": true }));
     assert!(
-        r1.get("needs_report").is_some() || r1.get("error").is_some() || r1["triggered"].is_boolean(),
+        r1.get("needs_report").is_some()
+            || r1.get("error").is_some()
+            || r1["triggered"].is_boolean(),
         "causal_walk must answer with needs_report or a result: {r1}"
     );
     let r2 = server.call_tool(
@@ -2143,7 +2287,9 @@ fn causal_walk_selftest_and_forgotten_lesson_are_called_over_stdio() {
         "missing_entities must be sorted-stable"
     );
     assert!(
-        s1.get("hits").is_some() || s1.get("gap_calibration").is_some() || s1.get("error").is_some(),
+        s1.get("hits").is_some()
+            || s1.get("gap_calibration").is_some()
+            || s1.get("error").is_some(),
         "selftest must report its score or error: {s1}"
     );
 

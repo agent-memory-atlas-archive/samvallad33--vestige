@@ -1,5 +1,7 @@
 # Configuration Reference
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../README.md) and the [4.0.0 changelog](../CHANGELOG.md).
+
 > Environment variables, CLI commands, and setup options
 
 ---
@@ -396,7 +398,7 @@ See [Storage Modes](STORAGE.md) for more options.
 vestige update
 ```
 
-This updates `vestige`, `vestige-mcp`, and `vestige-restore`. It does not mutate
+This updates `vestige`, `vestige-mcp`, `vestige-restore`, and `vestige-upgrade`. It does not mutate
 Claude Code Cognitive Sandwich companion files unless you explicitly request it.
 
 **Also refresh optional Claude Code companion files:**

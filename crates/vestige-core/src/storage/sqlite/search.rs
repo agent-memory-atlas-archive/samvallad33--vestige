@@ -817,11 +817,11 @@ mod w1b_search_collapse_tests {
     use super::*;
 
     fn fresh_store(dir: &tempfile::TempDir, tag: &str) -> SqliteMemoryStore {
-        SqliteMemoryStore::new(Some(dir.path().join(format!("w1b-{tag}.db"))))
-            .expect("store opens")
+        SqliteMemoryStore::new(Some(dir.path().join(format!("w1b-{tag}.db")))).expect("store opens")
     }
 
-    fn summary(results: &[SearchResult]) -> Vec<(String, Option<f32>, Option<f32>, f32, MatchType)> {
+    type Row = (String, Option<f32>, Option<f32>, f32, MatchType);
+    fn summary(results: &[SearchResult]) -> Vec<Row> {
         results
             .iter()
             .map(|r| {

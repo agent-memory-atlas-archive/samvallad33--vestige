@@ -483,7 +483,7 @@ async fn run_prospective_poller(cognitive: Arc<Mutex<CognitiveEngine>>) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use chrono::Utc;
@@ -492,7 +492,8 @@ mod tests {
     async fn memory_created_preserves_predictive_learning_without_legacy_capture() {
         let directory = tempfile::tempdir().expect("temporary database directory");
         let storage = Arc::new(
-            vestige_core::open_storage(Some(directory.path().join("autopilot.db"))).expect("test storage"),
+            vestige_core::open_storage(Some(directory.path().join("autopilot.db")))
+                .expect("test storage"),
         );
         let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
         let (event_tx, _) = broadcast::channel(1);

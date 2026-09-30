@@ -68,9 +68,9 @@
 //! # }
 //! ```
 
-// `anchor` persists/verifies code anchors through the legacy SQLite store:
-// quarantined behind `legacy-sqlite` (build/t5-legacy-isolation).
-#[cfg(feature = "legacy-sqlite")]
+// `anchor` types and pure capture/verify logic are always available; only
+// the SQLite persistence half is gated on `legacy-sqlite` inside the module
+// (dual-mode rule, strata/fix-00a).
 pub mod anchor;
 pub mod context;
 #[cfg(feature = "codebase-git")]
@@ -85,8 +85,7 @@ pub mod staleness;
 pub mod types;
 pub mod watcher;
 
-// Re-export main types
-#[cfg(feature = "legacy-sqlite")]
+// Re-export main types. Anchor capture/verify is pure and always available.
 pub use anchor::{
     AnchorDraft, AnchorStatus, AnchorVerification, CodeAnchor, MAX_ANCHORED_FILE_BYTES,
     MAX_SPAN_LINES, capture_anchor, find_symbol_definition, hash_span, verify_anchor,

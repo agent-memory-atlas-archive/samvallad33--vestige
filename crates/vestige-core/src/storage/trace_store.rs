@@ -18,25 +18,12 @@ use super::sqlite::SqliteMemoryStore;
 use super::{Result, StorageError};
 use crate::trace::{MemoryPr, MemoryPrAction, MemoryPrStatus, MemoryTraceEvent, Receipt};
 
-/// Side effect applied while atomically deciding a pre-execution mutation PR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PendingMemoryMutationEffect {
-    /// The reviewer kept the memory unchanged.
-    Kept,
-    /// The reviewer approved the pending purge/delete.
-    Purged,
-    /// The reviewer held the memory under active suppression.
-    Suppressed,
-}
-
-/// Result of deciding a PR created before a destructive mutation.
-#[derive(Debug, Clone)]
-pub struct PendingMemoryMutationDecision {
-    /// Final PR state returned even when an approved purge removed its row.
-    pub pr: MemoryPr,
-    /// Mutation side effect committed with the decision.
-    pub effect: PendingMemoryMutationEffect,
-}
+// `PendingMemoryMutationEffect`, `PendingMemoryMutationDecision`, and
+// `AgentRunSummary` are defined in (and re-exported from)
+// `crate::storage::types`.
+pub use crate::storage::types::{
+    AgentRunSummary, PendingMemoryMutationDecision, PendingMemoryMutationEffect,
+};
 
 /// Trace retention window used when `VESTIGE_TRACE_RETENTION_DAYS` is unset or
 /// unusable.
@@ -74,28 +61,8 @@ fn resolve_trace_retention_days(raw: Option<&str>) -> i64 {
         .unwrap_or(DEFAULT_TRACE_RETENTION_DAYS)
 }
 
-/// A roll-up summary of one agent run, for the Black Box run list.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct AgentRunSummary {
-    /// The run id.
-    pub run_id: String,
-    /// The first tool invoked in the run (the run's "entry point").
-    pub first_tool: Option<String>,
-    /// Total events recorded.
-    pub event_count: i64,
-    /// Memories retrieved across the run.
-    pub retrieved_count: i64,
-    /// Memories suppressed across the run.
-    pub suppressed_count: i64,
-    /// Memory writes across the run.
-    pub write_count: i64,
-    /// Sanhedrin vetoes across the run.
-    pub veto_count: i64,
-    /// Millis of the first event.
-    pub started_at: i64,
-    /// Millis of the most recent event.
-    pub last_at: i64,
-}
+// `AgentRunSummary` definition lives in `crate::storage::types` (see the
+// re-export above).
 
 impl SqliteMemoryStore {
     // ========================================================================

@@ -180,7 +180,11 @@ pub struct TypedEdge {
 impl TypedEdge {
     /// A typed edge with default bookkeeping (strength 1.0, timestamps now,
     /// empty payload). Set `meta` / `created_by_run` on the returned value.
-    pub fn new(source_id: impl Into<String>, target_id: impl Into<String>, link_type: &str) -> Self {
+    pub fn new(
+        source_id: impl Into<String>,
+        target_id: impl Into<String>,
+        link_type: &str,
+    ) -> Self {
         let now = Utc::now();
         Self {
             source_id: source_id.into(),
@@ -235,8 +239,9 @@ impl SqliteMemoryStore {
                 TYPED_EDGE_VOCABULARY.join(", ")
             )));
         }
-        let edge_meta_json = serde_json::to_string(&edge.meta)
-            .map_err(|error| StorageError::Init(format!("edge_meta serialization failed: {error}")))?;
+        let edge_meta_json = serde_json::to_string(&edge.meta).map_err(|error| {
+            StorageError::Init(format!("edge_meta serialization failed: {error}"))
+        })?;
         let writer = self
             .writer
             .lock()
@@ -335,8 +340,8 @@ impl SqliteMemoryStore {
             if depth >= max_depth {
                 continue;
             }
-            let mut targets = stmt.query_map(params![node], |row| row.get::<_, String>(0))?;
-            while let Some(row) = targets.next() {
+            let targets = stmt.query_map(params![node], |row| row.get::<_, String>(0))?;
+            for row in targets {
                 let target = row?;
                 if !visited.contains(&target) {
                     queue.push_back((target, depth + 1));
@@ -396,7 +401,12 @@ impl SqliteMemoryStore {
             "INSERT OR REPLACE INTO purge_tombstones
                 (purged_id, purged_at, reason, prior_content_hash)
              VALUES (?1, ?2, ?3, ?4)",
-            params![purged_id, Utc::now().to_rfc3339(), reason, prior_content_hash],
+            params![
+                purged_id,
+                Utc::now().to_rfc3339(),
+                reason,
+                prior_content_hash
+            ],
         )?;
         Ok(())
     }
@@ -515,7 +525,9 @@ mod tests {
                 run_id: None,
             };
             edge.created_by_run = Some("run-42".to_string());
-            store.save_typed_edge(&edge).expect("vocabulary member saves");
+            store
+                .save_typed_edge(&edge)
+                .expect("vocabulary member saves");
 
             let outgoing = store
                 .edges_for(&edge.source_id, EdgeDirection::Outgoing)
@@ -601,12 +613,19 @@ mod tests {
             store
                 .edge_reachability("a", &[EdgeKind::DerivedFrom, EdgeKind::Touched], usize::MAX)
                 .expect("multi-type reachability"),
-            vec!["b".to_string(), "c".to_string(), "d".to_string(), "x".to_string()]
+            vec![
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "x".to_string()
+            ]
         );
-        assert!(store
-            .edge_reachability("a", &[], usize::MAX)
-            .expect("empty type set")
-            .is_empty());
+        assert!(
+            store
+                .edge_reachability("a", &[], usize::MAX)
+                .expect("empty type set")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -640,7 +659,9 @@ mod tests {
         }
         let reader = store.reader.lock().expect("reader");
         let edge_count: i64 = reader
-            .query_row("SELECT COUNT(*) FROM memory_connections", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM memory_connections", [], |row| {
+                row.get(0)
+            })
             .expect("count edges");
         drop(reader);
         assert_eq!(edge_count, 3, "no edge may be removed by retire_subgraph");
@@ -660,7 +681,9 @@ mod tests {
         let store = test_store();
         seed_node(&store, "victim", "content that will be purged");
         assert!(
-            store.get_purge_tombstone("victim").expect("lookup")
+            store
+                .get_purge_tombstone("victim")
+                .expect("lookup")
                 .is_none(),
             "no tombstone before the purge"
         );
@@ -681,7 +704,10 @@ mod tests {
             Some(crate::actor::revision_digest("content that will be purged").as_str()),
             "hash is taken from the still-present content"
         );
-        assert!(node_exists(&store, "victim"), "simulated purge deletes nothing");
+        assert!(
+            node_exists(&store, "victim"),
+            "simulated purge deletes nothing"
+        );
 
         // After the real delete, re-recording keeps exactly one row and the
         // original hash is gone (content no longer readable).

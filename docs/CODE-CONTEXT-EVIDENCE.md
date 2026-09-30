@@ -1,5 +1,7 @@
 # Code context evidence
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../README.md) and the [4.0.0 changelog](../CHANGELOG.md).
+
 `codebase.get_context` and `session_start` share current-memory selection and
 source-anchor evaluation. Startup retains each code memory's ID, actionable
 summary and evidence state, including code advice found through search or

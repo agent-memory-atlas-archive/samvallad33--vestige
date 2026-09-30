@@ -106,7 +106,11 @@ fn parse_iso_bound(raw: Option<&str>, field: &str) -> Result<Option<DateTime<Utc
 }
 
 /// Per-memory changelog: state transition audit trail
-fn execute_per_memory(storage: &Arc<Storage>, memory_id: &str, limit: i32) -> Result<Value, String> {
+fn execute_per_memory(
+    storage: &Arc<Storage>,
+    memory_id: &str,
+    limit: i32,
+) -> Result<Value, String> {
     // Validate UUID format
     Uuid::parse_str(memory_id)
         .map_err(|_| format!("Invalid memory_id '{}'. Must be a valid UUID.", memory_id))?;
@@ -296,7 +300,7 @@ fn execute_system_wide(
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;

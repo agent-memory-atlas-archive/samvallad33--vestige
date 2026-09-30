@@ -14,12 +14,11 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-
-#[cfg(feature = "legacy-sqlite")]
-use crate::Storage;
-#[cfg(feature = "legacy-sqlite")]
-use crate::storage::Result;
+#[cfg_attr(not(feature = "legacy-sqlite"), allow(unused_imports))]
 use std::sync::Arc;
+
+use crate::Storage;
+use crate::storage::Result;
 
 /// Which client file shape to render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,17 +95,22 @@ pub const BEGIN_MARKER: &str = "<!-- vestige:projection:begin";
 pub const END_MARKER: &str = "<!-- vestige:projection:end -->";
 
 /// Node types projected regardless of tags, in output order.
+#[allow(dead_code)] // callers sit in the legacy-sqlite-gated surface; dead only in the no-embeddings profile
 const DURABLE_TYPES: [&str; 2] = ["decision", "pattern"];
 /// Tags that make a fact or note durable enough to project.
+#[allow(dead_code)] // callers sit in the legacy-sqlite-gated surface; dead only in the no-embeddings profile
 const DURABLE_TAGS: [&str; 3] = ["rule", "preference", "convention"];
 /// How many candidates to pull per query before filtering.
+#[allow(dead_code)] // callers sit in the legacy-sqlite-gated surface; dead only in the no-embeddings profile
 const CANDIDATE_LIMIT: i32 = 500;
 /// Longest single projected line before it is cut.
 const MAX_LINE_CHARS: usize = 400;
 
-#[cfg(feature = "legacy-sqlite")]
 /// Pick the durable subset of `opts.scope`.
-pub fn select_durable(storage: &Arc<Storage>, opts: &ProjectionOptions) -> Result<Vec<ProjectedItem>> {
+pub fn select_durable(
+    storage: &Arc<Storage>,
+    opts: &ProjectionOptions,
+) -> Result<Vec<ProjectedItem>> {
     let now = Utc::now();
     let candidates =
         storage.projection_candidates(&opts.scope, opts.min_retention, CANDIDATE_LIMIT)?;
@@ -192,7 +196,12 @@ fn render_line(item: &ProjectedItem) -> String {
 /// no timestamps inside the fence, so an unchanged store projects to an
 /// unchanged file.
 pub fn render(format: ProjectionFormat, scope: &str, items: &[ProjectedItem]) -> String {
-    let scope = scope.trim().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('`', "&#96;");
+    let scope = scope
+        .trim()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('`', "&#96;");
     let mut out = String::new();
     out.push_str(&format!(
         "{BEGIN_MARKER} scope={scope} format={} -->\n",
@@ -234,7 +243,6 @@ pub fn render(format: ProjectionFormat, scope: &str, items: &[ProjectedItem]) ->
     out
 }
 
-#[cfg(feature = "legacy-sqlite")]
 /// Build the full projection for a scope.
 pub fn project(storage: &Arc<Storage>, opts: &ProjectionOptions) -> Result<Projection> {
     let mut items = select_durable(storage, opts)?;

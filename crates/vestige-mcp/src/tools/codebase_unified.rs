@@ -753,7 +753,7 @@ async fn execute_verify(storage: &Arc<Storage>, args: &CodebaseArgs) -> Result<V
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
 
@@ -1458,7 +1458,10 @@ pub fn load_config(path: &str) -> Config {
         super::code_context::verify_nodes(&storage, repo.path(), std::slice::from_ref(&id))
             .unwrap();
         let anchors = storage.code_anchors_for_node(&id).unwrap();
-        assert_eq!(anchors[0].last_status, Some(vestige_core::codebase::AnchorStatus::Verified));
+        assert_eq!(
+            anchors[0].last_status,
+            Some(vestige_core::codebase::AnchorStatus::Verified)
+        );
         assert!(anchors[0].last_verified_at.is_some());
 
         // The code changes; the next check persists the accusation.
@@ -1469,7 +1472,10 @@ pub fn load_config(path: &str) -> Config {
         super::code_context::verify_nodes(&storage, repo.path(), std::slice::from_ref(&id))
             .unwrap();
         let anchors = storage.code_anchors_for_node(&id).unwrap();
-        assert_eq!(anchors[0].last_status, Some(vestige_core::codebase::AnchorStatus::Drifted));
+        assert_eq!(
+            anchors[0].last_status,
+            Some(vestige_core::codebase::AnchorStatus::Drifted)
+        );
 
         // Reanchor resets the evidence: a fresh capture has not been checked yet.
         execute(
@@ -1534,5 +1540,465 @@ pub fn load_config(path: &str) -> Config {
         // The five actions themselves survive as the enum.
         let actions = compact["properties"]["action"]["enum"].as_array().unwrap();
         assert_eq!(actions.len(), 5);
+    }
+}
+
+/// The anchor contract on a Strata log, the backend the shipped binary boots.
+/// Anchors are admitted through the gate and replayed from the log, so every
+/// verdict here must also survive a reopen.
+#[cfg(all(test, not(feature = "legacy-sqlite")))]
+mod strata_tests {
+    use super::*;
+    use vestige_core::codebase::AnchorStatus;
+
+    const SOURCE: &str = "\
+use std::fs;
+
+pub fn load_config(path: &str) -> Config {
+    let raw = fs::read_to_string(path).unwrap();
+    parse(&raw)
+}
+";
+
+    const DRIFTED: &str = "pub fn load_config(path: &str) -> Config {\n    Config::from_env()\n}\n";
+
+    fn cognitive() -> Arc<Mutex<CognitiveEngine>> {
+        Arc::new(Mutex::new(CognitiveEngine::new()))
+    }
+
+    fn strata(dir: &std::path::Path) -> Arc<Storage> {
+        let storage = crate::strata_memory::open(dir).unwrap();
+        assert!(crate::strata_memory::is_strata_backend(storage.as_ref()));
+        storage
+    }
+
+    fn repo_with_source(body: &str) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/state.rs"), body).unwrap();
+        dir
+    }
+
+    fn rewrite_source(repo: &tempfile::TempDir, body: &str) {
+        std::fs::write(repo.path().join("src/state.rs"), body).unwrap();
+    }
+
+    fn repo_path(repo: &tempfile::TempDir) -> &str {
+        repo.path().to_str().unwrap()
+    }
+
+    async fn call(storage: &Arc<Storage>, cog: &Arc<Mutex<CognitiveEngine>>, args: Value) -> Value {
+        execute(storage, cog, &OutputConfig::default(), Some(args))
+            .await
+            .unwrap()
+    }
+
+    async fn save_anchored(
+        storage: &Arc<Storage>,
+        cog: &Arc<Mutex<CognitiveEngine>>,
+        repo: &tempfile::TempDir,
+    ) -> Value {
+        call(
+            storage,
+            cog,
+            serde_json::json!({
+                "action": "remember_pattern",
+                "name": "Eager config read",
+                "description": "load_config reads the whole file eagerly; do not call it in a loop",
+                "files": ["src/state.rs#load_config"],
+                "repoPath": repo_path(repo),
+                "codebase": "anchored"
+            }),
+        )
+        .await
+    }
+
+    async fn verify(
+        storage: &Arc<Storage>,
+        cog: &Arc<Mutex<CognitiveEngine>>,
+        repo: &tempfile::TempDir,
+    ) -> Value {
+        call(
+            storage,
+            cog,
+            serde_json::json!({"action": "verify", "codebase": "anchored", "repoPath": repo_path(repo)}),
+        )
+        .await
+    }
+
+    async fn get_context(
+        storage: &Arc<Storage>,
+        cog: &Arc<Mutex<CognitiveEngine>>,
+        repo: &tempfile::TempDir,
+    ) -> Value {
+        call(
+            storage,
+            cog,
+            serde_json::json!({"action": "get_context", "codebase": "anchored", "repoPath": repo_path(repo)}),
+        )
+        .await
+    }
+
+    async fn reanchor(
+        storage: &Arc<Storage>,
+        cog: &Arc<Mutex<CognitiveEngine>>,
+        repo: &tempfile::TempDir,
+        id: &str,
+    ) -> Result<Value, String> {
+        execute(
+            storage,
+            cog,
+            &OutputConfig::default(),
+            Some(serde_json::json!({
+                "action": "reanchor", "memoryId": id,
+                "repoPath": repo_path(repo),
+                "files": ["src/state.rs#load_config"]
+            })),
+        )
+        .await
+    }
+
+    fn status_of(storage: &Arc<Storage>, id: &str) -> Option<AnchorStatus> {
+        let anchors = storage.code_anchors_for_node(id).unwrap();
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        anchors[0].last_status
+    }
+
+    /// remember -> verify (fresh) -> the code changes -> verify and
+    /// get_context (stale) -> reanchor -> verify (fresh), then the whole
+    /// state replays from the log after a reopen.
+    #[tokio::test]
+    async fn remember_verify_drift_reanchor_on_a_strata_log() {
+        let data = tempfile::TempDir::new().unwrap();
+        let storage = strata(data.path());
+        let cog = cognitive();
+        let repo = repo_with_source(SOURCE);
+
+        let saved = save_anchored(&storage, &cog, &repo).await;
+        let anchors = &saved["anchors"];
+        assert_eq!(anchors["count"], 1, "{saved}");
+        assert_eq!(anchors["verifiable"], 1, "{saved}");
+        assert_eq!(anchors["recorded"], 1, "{saved}");
+        assert!(anchors["error"].is_null(), "{saved}");
+        let id = saved["nodeId"].as_str().unwrap().to_string();
+        let captured = storage.code_anchors_for_node(&id).unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].node_id, id);
+        assert_eq!(captured[0].symbol.as_deref(), Some("load_config"));
+        assert!(
+            captured[0]
+                .content_hash
+                .as_deref()
+                .unwrap()
+                .starts_with("v2:")
+        );
+        assert!(captured[0].last_status.is_none());
+
+        let report = verify(&storage, &cog, &repo).await;
+        assert_eq!(report["checked"], 1, "{report}");
+        assert_eq!(report["fresh"], 1, "{report}");
+        assert_eq!(report["stale"], 0, "{report}");
+        assert_eq!(report["unverifiable"], 0, "{report}");
+        assert!(
+            report["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("1 of 1 code memories still match"),
+            "{report}"
+        );
+        assert_eq!(status_of(&storage, &id), Some(AnchorStatus::Verified));
+
+        let ctx = get_context(&storage, &cog, &repo).await;
+        assert_eq!(ctx["patterns"]["items"][0]["id"], id.as_str());
+        assert_eq!(
+            ctx["patterns"]["items"][0]["anchorStatus"], "verified",
+            "{ctx}"
+        );
+        assert_eq!(ctx["verification"]["fresh"], 1);
+        assert!(ctx["staleMemories"].as_array().unwrap().is_empty());
+
+        rewrite_source(&repo, DRIFTED);
+        let report = verify(&storage, &cog, &repo).await;
+        assert_eq!(report["stale"], 1, "{report}");
+        assert_eq!(report["fresh"], 0, "{report}");
+        assert_eq!(report["staleMemories"][0]["id"], id.as_str());
+        assert_eq!(report["staleMemories"][0]["status"], "drifted");
+        assert_eq!(status_of(&storage, &id), Some(AnchorStatus::Drifted));
+        let ctx = get_context(&storage, &cog, &repo).await;
+        let item = &ctx["patterns"]["items"][0];
+        assert_eq!(item["anchorStatus"], "drifted", "{ctx}");
+        assert_eq!(item["stale"], true, "{ctx}");
+        assert_eq!(ctx["staleMemories"], serde_json::json!([id.clone()]));
+        assert!(
+            item["content"]
+                .as_str()
+                .unwrap()
+                .contains("do not call it in a loop"),
+            "the memory is returned untouched"
+        );
+
+        let before = storage.get_node(&id).unwrap().unwrap();
+        let rea = reanchor(&storage, &cog, &repo, &id).await.unwrap();
+        assert_eq!(rea["anchorsReplaced"], 1, "{rea}");
+        assert_eq!(rea["memoryContentChanged"], false);
+        let replaced = storage.code_anchors_for_node(&id).unwrap();
+        assert_eq!(replaced.len(), 1);
+        assert_ne!(replaced[0].id, captured[0].id, "old evidence was replaced");
+        assert_ne!(replaced[0].content_hash, captured[0].content_hash);
+        assert!(replaced[0].last_status.is_none() && replaced[0].last_verified_at.is_none());
+        let after = storage.get_node(&id).unwrap().unwrap();
+        assert_eq!(
+            (&before.content, before.reps, before.lapses),
+            (&after.content, after.reps, after.lapses),
+            "reanchor must not touch the memory"
+        );
+        let report = verify(&storage, &cog, &repo).await;
+        assert_eq!(report["fresh"], 1, "{report}");
+        assert_eq!(report["stale"], 0, "{report}");
+
+        // The memory's own receipt still proves, and replay still matches.
+        let receipt = storage.get_receipt(&id).unwrap().expect("write receipt");
+        assert_eq!(receipt.mutations[0].kind, "created");
+        let replay = storage.replay_receipt(&id).unwrap();
+        assert_eq!(replay["matched"], true, "{replay}");
+        drop(storage);
+
+        let reopened = strata(data.path());
+        let replayed = reopened.code_anchors_for_node(&id).unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].id, replaced[0].id);
+        assert_eq!(replayed[0].content_hash, replaced[0].content_hash);
+        assert_eq!(replayed[0].last_status, Some(AnchorStatus::Verified));
+        let report = verify(&reopened, &cog, &repo).await;
+        assert_eq!(report["fresh"], 1, "{report}");
+        rewrite_source(&repo, SOURCE);
+        let report = verify(&reopened, &cog, &repo).await;
+        assert_eq!(
+            report["stale"], 1,
+            "the reanchored hash is the drifted body: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_decision_records_anchors_and_an_unresolved_symbol_is_unverifiable() {
+        let data = tempfile::TempDir::new().unwrap();
+        let storage = strata(data.path());
+        let cog = cognitive();
+        let repo = repo_with_source(SOURCE);
+        let saved = call(
+            &storage,
+            &cog,
+            serde_json::json!({
+                "action": "remember_decision",
+                "decision": "Config loading lives in state.rs",
+                "rationale": "Keeps IO in one place",
+                "files": ["src/state.rs#load_config", "src/state.rs#no_such_symbol"],
+                "repoPath": repo_path(&repo),
+                "codebase": "anchored"
+            }),
+        )
+        .await;
+        assert_eq!(saved["anchors"]["count"], 2, "{saved}");
+        assert_eq!(saved["anchors"]["verifiable"], 1, "{saved}");
+        assert_eq!(saved["anchors"]["recorded"], 2, "{saved}");
+        assert!(saved["anchors"]["error"].is_null(), "{saved}");
+        let id = saved["nodeId"].as_str().unwrap();
+        assert_eq!(storage.code_anchors_for_node(id).unwrap().len(), 2);
+
+        let ctx = get_context(&storage, &cog, &repo).await;
+        let item = &ctx["decisions"]["items"][0];
+        assert_eq!(item["anchorStatus"], "unverifiable", "{ctx}");
+        assert!(item.get("stale").is_none(), "{ctx}");
+
+        rewrite_source(&repo, DRIFTED);
+        let ctx = get_context(&storage, &cog, &repo).await;
+        assert_eq!(
+            ctx["decisions"]["items"][0]["anchorStatus"], "drifted",
+            "{ctx}"
+        );
+    }
+
+    /// An edit retires the memory on Strata. The retired node's anchors stop
+    /// being returned, and it can no longer be reanchored.
+    #[tokio::test]
+    async fn anchors_of_a_retired_memory_are_not_returned() {
+        let data = tempfile::TempDir::new().unwrap();
+        let storage = strata(data.path());
+        let cog = cognitive();
+        let repo = repo_with_source(SOURCE);
+        let saved = save_anchored(&storage, &cog, &repo).await;
+        let id = saved["nodeId"].as_str().unwrap().to_string();
+        let anchor_id = storage.code_anchors_for_node(&id).unwrap()[0].id.clone();
+
+        storage
+            .update_node_content(&id, "# Code Pattern: edited\n\nrewritten advice")
+            .unwrap();
+        assert!(storage.code_anchors_for_node(&id).unwrap().is_empty());
+        assert!(
+            storage
+                .code_anchors_for_nodes(std::slice::from_ref(&id))
+                .unwrap()
+                .is_empty()
+        );
+        // The edit moved the anchor to the successor, so a verdict for that
+        // anchor id lands there, never on the retired memory.
+        storage
+            .record_anchor_verification(&anchor_id, AnchorStatus::Drifted, chrono::Utc::now())
+            .unwrap();
+        assert!(storage.code_anchors_for_node(&id).unwrap().is_empty());
+        let refused = reanchor(&storage, &cog, &repo, &id).await.unwrap_err();
+        assert!(refused.contains("not found"), "{refused}");
+        // The live successor still matches its source.
+        let report = verify(&storage, &cog, &repo).await;
+        assert_eq!(report["fresh"], 1, "{report}");
+        assert_eq!(report["stale"], 0, "{report}");
+    }
+
+    #[test]
+    fn store_methods_mirror_the_sqlite_contract() {
+        let data = tempfile::TempDir::new().unwrap();
+        let storage = strata(data.path());
+        let repo = repo_with_source(SOURCE);
+        let fact = storage
+            .ingest_in_scope(
+                IngestInput {
+                    content: "a plain fact".into(),
+                    node_type: "fact".into(),
+                    ..IngestInput::default()
+                },
+                "user",
+            )
+            .unwrap();
+        let pattern = storage
+            .ingest_in_scope(
+                IngestInput {
+                    content: "# Code Pattern: x".into(),
+                    node_type: "pattern".into(),
+                    tags: vec!["codebase".into()],
+                    ..IngestInput::default()
+                },
+                "proj",
+            )
+            .unwrap();
+        let draft = AnchorDraft::parse("src/state.rs#load_config");
+        let first = capture_anchor(&pattern.id, repo.path(), &draft);
+        let mut again = capture_anchor(&pattern.id, repo.path(), &draft);
+        again.id = first.id.clone();
+        again.symbol_kind = Some("fn".into());
+        // Same capture instant: two captures can straddle a millisecond, and
+        // this test is about replacement by id, not about the clock.
+        again.captured_at = first.captured_at;
+
+        assert_eq!(storage.record_code_anchors(&[]).unwrap(), 0);
+        // A repeated id keeps the last row, as SQLite's INSERT OR REPLACE does.
+        assert_eq!(
+            storage
+                .record_code_anchors(&[first.clone(), again.clone()])
+                .unwrap(),
+            2
+        );
+        let rows = storage.code_anchors_for_node(&pattern.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol_kind.as_deref(), Some("fn"));
+        assert_eq!(
+            rows[0].captured_at.timestamp_millis(),
+            first.captured_at.timestamp_millis()
+        );
+        let unknown = capture_anchor("mem-ffffffffffffffff", repo.path(), &draft);
+        assert!(storage.record_code_anchors(&[unknown]).is_err());
+
+        let unverifiable = capture_anchor(
+            &pattern.id,
+            repo.path(),
+            &AnchorDraft::parse("src/state.rs#missing_symbol"),
+        );
+        let err = storage
+            .replace_code_anchors(&pattern.id, "proj", &[unverifiable])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("complete verifiable anchors"), "{err}");
+        let fresh = capture_anchor(&pattern.id, repo.path(), &draft);
+        let err = storage
+            .replace_code_anchors(&pattern.id, "user", std::slice::from_ref(&fresh))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found in requested scope"), "{err}");
+        let fact_anchor = capture_anchor(&fact.id, repo.path(), &draft);
+        let err = storage
+            .replace_code_anchors(&fact.id, "user", &[fact_anchor])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found in requested scope"), "{err}");
+        assert_eq!(
+            storage
+                .replace_code_anchors(&pattern.id, " proj ", std::slice::from_ref(&fresh))
+                .unwrap(),
+            1
+        );
+        let rows = storage.code_anchors_for_node(&pattern.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, fresh.id);
+
+        // An unknown anchor id is a no-op, as an UPDATE of zero rows is.
+        storage
+            .record_anchor_verification(
+                "anchor-unknown",
+                AnchorStatus::Verified,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let checked_at = chrono::Utc::now();
+        storage
+            .record_anchor_verification(&fresh.id, AnchorStatus::Moved, checked_at)
+            .unwrap();
+        let rows = storage.code_anchors_for_node(&pattern.id).unwrap();
+        assert_eq!(rows[0].last_status, Some(AnchorStatus::Moved));
+        assert_eq!(
+            rows[0].last_verified_at.map(|at| at.timestamp_millis()),
+            Some(checked_at.timestamp_millis())
+        );
+        let by_node = storage
+            .code_anchors_for_nodes(&[pattern.id.clone(), fact.id.clone()])
+            .unwrap();
+        assert_eq!(by_node.len(), 1);
+        assert_eq!(by_node[&pattern.id].len(), 1);
+    }
+
+    /// Editing a code memory on Strata admits a successor and retires the
+    /// old node. The anchors must move with it, or the edited memory would
+    /// lose its source evidence.
+    #[tokio::test]
+    async fn editing_a_code_memory_keeps_its_anchors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = strata(dir.path());
+        let cog = cognitive();
+        let repo = repo_with_source(SOURCE);
+        let saved = save_anchored(&storage, &cog, &repo).await;
+        let old_id = saved["nodeId"]
+            .as_str()
+            .or_else(|| saved["id"].as_str())
+            .expect("saved memory id")
+            .to_string();
+        let before = storage.code_anchors_for_node(&old_id).unwrap();
+        assert_eq!(before.len(), 1, "{saved}");
+
+        let edited = crate::tools::memory_unified::execute(
+            &storage,
+            &cog,
+            Some(serde_json::json!({
+                "action": "edit",
+                "id": old_id,
+                "content": "load_config still reads eagerly; cache the result"
+            })),
+        )
+        .await
+        .unwrap();
+        let successor = edited["nodeId"].as_str().expect("successor id").to_string();
+        assert_ne!(successor, old_id);
+        let moved = storage.code_anchors_for_node(&successor).unwrap();
+        assert_eq!(moved.len(), 1, "anchors must follow the edit: {edited}");
+        assert_eq!(moved[0].id, before[0].id);
+        assert_eq!(moved[0].content_hash, before[0].content_hash);
+        assert!(storage.code_anchors_for_node(&old_id).unwrap().is_empty());
     }
 }

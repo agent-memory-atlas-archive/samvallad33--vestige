@@ -1,5 +1,7 @@
 # Frequently Asked Questions
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../README.md) and the [4.0.0 changelog](../CHANGELOG.md).
+
 > 30+ answers from the Vestige community
 
 ---
@@ -160,7 +162,7 @@ Accessibility is calculated as: `0.5 × retention + 0.3 × retrieval_strength + 
 
 Memories are never deleted automatically. They fade from relevance but can be revived if accessed again (like human memory—"oh, I forgot about that!").
 
-If you explicitly want content gone, use `memory(action="purge", confirm=true)`. Purge permanently removes the memory content and embeddings, scrubs internal references, and keeps only a non-content tombstone so sync/audit can prove the deletion happened.
+If you explicitly want a memory retired, use `memory(action="purge", confirm=true)`. Purge retires it so it can't be retrieved and returns an `eff-` receipt naming `purge`. The log keeps the bytes.
 
 **To configure decay**: The FSRS-6 algorithm auto-tunes based on your usage patterns. Memories you access stay strong; memories you ignore fade. No manual tuning needed.
 </details>

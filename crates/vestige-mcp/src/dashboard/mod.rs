@@ -281,6 +281,64 @@ pub async fn start_background(
     start_background_inner(app, state, port).await
 }
 
+/// This process's dashboard, started at most once and on demand: by
+/// `VESTIGE_DASHBOARD_ENABLED` at startup, by `vestige dashboard`, or by a
+/// `vestige dashboard` run elsewhere that asks through the attach endpoint.
+#[derive(Clone)]
+pub struct DashboardOnDemand {
+    running: Arc<Mutex<Option<u16>>>,
+    storage: Arc<Storage>,
+    cognitive: Arc<Mutex<CognitiveEngine>>,
+    event_tx: tokio::sync::broadcast::Sender<events::VestigeEvent>,
+}
+
+impl DashboardOnDemand {
+    pub fn new(
+        storage: Arc<Storage>,
+        cognitive: Arc<Mutex<CognitiveEngine>>,
+        event_tx: tokio::sync::broadcast::Sender<events::VestigeEvent>,
+    ) -> Self {
+        Self {
+            running: Arc::new(Mutex::new(None)),
+            storage,
+            cognitive,
+            event_tx,
+        }
+    }
+
+    /// Serve the dashboard on `port`. When it already runs, that port.
+    pub async fn ensure(&self, port: u16) -> Result<u16, String> {
+        let mut running = self.running.lock().await;
+        if let Some(port) = *running {
+            return Ok(port);
+        }
+        let started = start_background_with_event_tx(
+            Arc::clone(&self.storage),
+            Some(Arc::clone(&self.cognitive)),
+            self.event_tx.clone(),
+            port,
+        )
+        .await
+        .map_err(|err| format!("the dashboard could not bind 127.0.0.1:{port}: {err}"));
+        started?;
+        *running = Some(port);
+        Ok(port)
+    }
+
+    /// For the attach endpoint: start (or find) the dashboard, as a URL.
+    pub fn starter(&self) -> crate::attach::DashboardStarter {
+        let this = self.clone();
+        Arc::new(move |port| {
+            let this = this.clone();
+            Box::pin(async move {
+                this.ensure(port)
+                    .await
+                    .map(|port| format!("http://127.0.0.1:{port}"))
+            })
+        })
+    }
+}
+
 /// Start the dashboard sharing an external event broadcast channel.
 pub async fn start_background_with_event_tx(
     storage: Arc<Storage>,

@@ -129,7 +129,7 @@ pub extern "C" fn __cxa_call_terminate(_exception: *mut c_void) -> ! {
     std::process::abort()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use std::ptr;

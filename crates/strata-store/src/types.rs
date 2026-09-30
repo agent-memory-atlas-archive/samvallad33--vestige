@@ -126,6 +126,10 @@ pub struct NodeRecord {
     pub valid_until_ms: i64,
     /// Set when a later record superseded this one: the superseder's id.
     pub superseded_by: Option<String>,
+    /// Source provenance key, when the memory came from a connector or a v3 row.
+    pub source: Option<SourceKey>,
+    /// Source row's last-updated timestamp (unix ms).
+    pub source_updated_at_ms: Option<i64>,
 }
 
 impl NodeRecord {
@@ -135,6 +139,23 @@ impl NodeRecord {
     }
 }
 
+/// Provenance key for re-derivation: `(source_system, source_project,
+/// source_id)`. Re-deriving the same key with a later `source_updated_at`
+/// is a sanctioned supersede path — same source, same fact slot.
+///
+/// A v3 row that only has the free-form `source` text (no
+/// `source_system` / `source_id`) is stored as `system = <that text>` with
+/// empty `project` and `id`. `None` means the row had no source.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct SourceKey {
+    /// Connector/system name (exact bytes; never case-folded).
+    pub system: String,
+    /// Project namespace within the system.
+    pub project: String,
+    /// The source row id.
+    pub id: String,
+}
+
 /// Input for creating a new memory (store-local mirror of the vestige-core
 /// ingest input; float sentiment fields are dropped — no floats in persisted
 /// state).
@@ -142,6 +163,10 @@ impl NodeRecord {
 pub struct IngestInput {
     /// The content to memorize.
     pub content: String,
+    /// Source provenance key, when the memory came from a connector or a v3 row.
+    pub source: Option<SourceKey>,
+    /// Source row's last-updated timestamp (unix ms) for re-derivation.
+    pub source_updated_at_ms: Option<i64>,
     /// Knowledge type; empty string defaults to "fact".
     pub node_type: String,
     /// Tags (sorted + deduplicated on ingest).
@@ -194,6 +219,104 @@ impl ConnectionRecord {
     pub fn strength(&self) -> f64 {
         self.strength_milli as f64 / 1000.0
     }
+}
+
+/// One prospective intention. Timestamps are unix milliseconds supplied by
+/// the caller; this store does not read a clock. Trigger text is stored
+/// verbatim — matching stays in the tool, and it is exact or structural.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct IntentionRecord {
+    /// Caller-supplied id (the tool's uuid). The registry key.
+    pub id: String,
+    /// What to remember to do.
+    pub content: String,
+    /// `time`, `context`, `event`, `activity`, `recurring`, `compound`, or `manual`.
+    pub trigger_type: String,
+    /// Canonical trigger JSON produced by the tool.
+    pub trigger_data: String,
+    /// 1=low, 2=normal, 3=high, 4=critical.
+    pub priority: i32,
+    /// `active`, `fulfilled`, `cancelled`, or `snoozed`.
+    pub status: String,
+    /// Creation time (unix ms).
+    pub created_at_ms: i64,
+    /// Optional deadline (unix ms).
+    pub deadline_ms: Option<i64>,
+    /// Set when status becomes `fulfilled`.
+    pub fulfilled_at_ms: Option<i64>,
+    /// How many times a check has delivered this intention.
+    pub reminder_count: i32,
+    /// Last delivery time (unix ms).
+    pub last_reminded_at_ms: Option<i64>,
+    /// Free-form notes. Unused by `set`.
+    pub notes: Option<String>,
+    /// Tags, in caller order.
+    pub tags: Vec<String>,
+    /// Related memory ids, in caller order.
+    pub related_memories: Vec<String>,
+    /// Snooze deadline (unix ms).
+    pub snoozed_until_ms: Option<i64>,
+    /// `mcp` or `nlp`.
+    pub source_type: String,
+    /// Optional source payload.
+    pub source_data: Option<String>,
+    /// Project namespace. Blank resolves to `user` on read.
+    pub scope: Option<String>,
+}
+
+impl IntentionRecord {
+    /// The columns a check compares before it claims a delivery.
+    ///
+    /// Same predicate as the SQLite `UPDATE ... WHERE` in
+    /// `commit_intention_check`: identity, notes, tags, and scope are not
+    /// part of the claim.
+    pub fn same_claim(&self, other: &Self) -> bool {
+        self.trigger_type == other.trigger_type
+            && self.trigger_data == other.trigger_data
+            && self.status == other.status
+            && self.reminder_count == other.reminder_count
+            && self.last_reminded_at_ms == other.last_reminded_at_ms
+            && self.snoozed_until_ms == other.snoozed_until_ms
+            && self.content == other.content
+            && self.priority == other.priority
+            && self.deadline_ms == other.deadline_ms
+            && self.fulfilled_at_ms == other.fulfilled_at_ms
+    }
+}
+
+/// One code anchor: a pointer from a memory into source, plus the
+/// fingerprint a later check compares against the working tree.
+///
+/// Mirror of vestige-core's `CodeAnchor` with integer times (unix ms). The
+/// store never hashes source and never reads a clock: every field is the
+/// caller's. `last_status` is the persisted verdict string (`verified`,
+/// `moved`, `drifted`, `missing`, `unverifiable`); `None` means never checked.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct AnchorRecord {
+    /// Anchor id (the registry key). Unique across nodes.
+    pub id: String,
+    /// The memory this anchor belongs to.
+    pub node_id: String,
+    /// Repository-relative (or absolute) path of the anchored file.
+    pub file_path: String,
+    /// Symbol the memory is about, if any.
+    pub symbol: Option<String>,
+    /// Display kind of the symbol (`fn`, `class`, ...).
+    pub symbol_kind: Option<String>,
+    /// Capture-time first line of the span (1-based). A reporting hint.
+    pub start_line: Option<u32>,
+    /// Capture-time last line of the span (1-based, inclusive).
+    pub end_line: Option<u32>,
+    /// Lines the hash covers. `None` means the anchor cannot be checked.
+    pub span_lines: Option<u32>,
+    /// Versioned content fingerprint. `None` means the anchor cannot be checked.
+    pub content_hash: Option<String>,
+    /// Capture time (unix ms).
+    pub captured_at_ms: i64,
+    /// Time of the latest recorded verification (unix ms).
+    pub last_verified_at_ms: Option<i64>,
+    /// Latest recorded verdict.
+    pub last_status: Option<String>,
 }
 
 /// Whole-word failure markers, ported from vestige-core's

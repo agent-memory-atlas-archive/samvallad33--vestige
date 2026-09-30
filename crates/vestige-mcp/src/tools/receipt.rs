@@ -32,7 +32,7 @@ pub fn schema() -> Value {
             "action": {
                 "type": "string",
                 "enum": ["get", "replay", "save_walk"],
-                "description": "'get': one receipt with its replay-capsule summary. 'replay': withhold named evidence slots from the frozen context without rerunning retrieval, OR re-execute a saved walk receipt (id 'wr_…') against the current store. 'save_walk': freeze a backfill parameter envelope as a digest-addressed walk receipt."
+                "description": "'get': one receipt with its replay-capsule summary. 'replay': on a Strata log, re-derive state from the log and the receipt and report any mismatch (read-only). Otherwise withhold named evidence slots from a frozen capsule, or re-execute a saved walk receipt (id 'wr_…'). 'save_walk': freeze a backfill parameter envelope as a digest-addressed walk receipt."
             },
             "receipt_id": {
                 "type": "string",
@@ -111,6 +111,19 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
         "get" => execute_get(storage, args.receipt_id.as_deref().unwrap_or_default()),
         "replay" => {
             let receipt_id = args.receipt_id.as_deref().unwrap_or_default();
+            if crate::strata_memory::is_strata_backend(storage.as_ref())
+                && !receipt_id.starts_with("wr_")
+                && args.remove_edge.is_none()
+            {
+                if args
+                    .withheld_slots
+                    .as_ref()
+                    .is_some_and(|slots| !slots.is_empty())
+                {
+                    return Err("withheld_slots do not apply to a Strata log replay".into());
+                }
+                return execute_strata_replay(storage, receipt_id);
+            }
             if storage
                 .get_walk_receipt(receipt_id)
                 .map_err(|error| safe_storage_error("walk receipt lookup", &error))?
@@ -147,7 +160,9 @@ fn validate_args(args: &ReceiptArgs) -> Result<(), String> {
                 return Err("withheld_slots is only valid for action='replay'".into());
             }
             if args.remove_edge.is_some() {
-                return Err("remove_edge is only valid for action='replay' on a walk receipt".into());
+                return Err(
+                    "remove_edge is only valid for action='replay' on a walk receipt".into(),
+                );
             }
             if args.params.is_some() {
                 return Err("params is only valid for action='save_walk'".into());
@@ -172,7 +187,9 @@ fn validate_args(args: &ReceiptArgs) -> Result<(), String> {
                 return Err("receipt_id is not valid for action='save_walk'".into());
             }
             if args.withheld_slots.is_some() || args.remove_edge.is_some() {
-                return Err("withheld_slots and remove_edge are not valid for action='save_walk'".into());
+                return Err(
+                    "withheld_slots and remove_edge are not valid for action='save_walk'".into(),
+                );
             }
             let Some(params) = &args.params else {
                 return Err("save_walk requires a params object".into());
@@ -196,6 +213,15 @@ fn claim_boundary_for_receipt(receipt: &Receipt) -> &'static str {
 }
 
 fn safe_storage_error(operation: &str, error: &impl std::fmt::Display) -> String {
+    let text = error.to_string();
+    if text.contains("pending_strata")
+        || text.contains("similarity_disabled")
+        || text.contains("verification failed")
+        || text.contains("gate_denied")
+        || text.contains("gate_held")
+    {
+        return text;
+    }
     tracing::warn!(%error, "receipt storage operation failed: {operation}");
     format!("Receipt {operation} is temporarily unavailable")
 }
@@ -219,9 +245,45 @@ fn execute_get(storage: &Arc<Storage>, receipt_id: &str) -> Result<Value, String
     }))
 }
 
+/// Strata effect receipt: recomputed from the log by `get_receipt` (Allow gate,
+/// payload digest, hash chain). Not a DSSE envelope and not an external timestamp.
+fn strata_effect_attestation(storage: &Arc<Storage>, receipt_id: &str) -> Result<Value, String> {
+    let receipt = storage
+        .get_receipt(receipt_id)
+        .map_err(|error| safe_storage_error("attestation lookup", &error))?
+        .ok_or_else(|| format!("Receipt '{receipt_id}' was not found"))?;
+    let note = receipt
+        .mutations
+        .first()
+        .and_then(|mutation| mutation.note.as_deref())
+        .unwrap_or("");
+    let digest = note
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("digest="))
+        .unwrap_or("");
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "Receipt '{receipt_id}' has no proved payload digest"
+        ));
+    }
+    Ok(json!({
+        "status": "strata_effect",
+        "verification": {
+            "locallyVerified": true,
+            "chainValid": true,
+            "gateAllowed": true,
+            "payloadDigest": digest,
+            "claimBoundary": "Recomputed from the hash-chained log: the effect cites an Allow gate and its payload digest matches the admitted frame. A sealed segment trailer signature is checked when one is present. This is not an external timestamp or a truth claim."
+        }
+    }))
+}
+
 /// Present cryptographic receipt state without treating local database row
 /// checks as an external timestamp or non-equivocation proof.
 fn receipt_attestation_view(storage: &Arc<Storage>, receipt_id: &str) -> Result<Value, String> {
+    if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        return strata_effect_attestation(storage, receipt_id);
+    }
     let status = storage
         .receipt_attestation_status(receipt_id)
         .map_err(|error| safe_storage_error("attestation lookup", &error))?
@@ -284,6 +346,40 @@ fn linked_replay_receipt(
         .map_err(|error| safe_storage_error("recovery", &error))?
         .ok_or_else(|| "Replay receipt link is incomplete; retry the replay".to_string())
         .map(Some)
+}
+
+fn execute_strata_replay(storage: &Arc<Storage>, receipt_id: &str) -> Result<Value, String> {
+    match storage.replay_receipt(receipt_id) {
+        Ok(report) => Ok(report),
+        // A memory imported by the v3 upgrade exists but has no admitted
+        // write on this log to replay; say so instead of "not found".
+        Err(vestige_core::StorageError::NotFound(_))
+            if storage.get_node(receipt_id).ok().flatten().is_some() =>
+        {
+            Err(format!(
+                "imported_from_v3: memory '{receipt_id}' was imported by the upgrade and has no admitted write on this log to replay. The signed migration receipt covers it; `vestige strata-verify` checks that receipt."
+            ))
+        }
+        Err(vestige_core::StorageError::NotFound(message)) => Err(message),
+        Err(error) => {
+            let owned = error.to_string();
+            let text = owned
+                .strip_prefix("Database error: ")
+                .unwrap_or(owned.as_str());
+            if text.contains("mismatch")
+                || text.contains("blake3")
+                || text.contains("verification failed")
+                || text.contains("strata halt")
+                || text.contains("frame parse")
+                || text.contains("trailer")
+                || text.contains("segment header")
+            {
+                Err(text.to_string())
+            } else {
+                Err(safe_storage_error("replay", &error))
+            }
+        }
+    }
 }
 
 fn execute_replay(
@@ -473,11 +569,10 @@ fn assemble_walk_candidates(
             continue;
         }
         let age = (failure_created - origin.created_at).num_seconds() as f64 / 86_400.0;
-        let mut entities =
-            vestige_core::advanced::retroactive_backfill::extract_entities(
-                &current.content,
-                &current.tags,
-            );
+        let mut entities = vestige_core::advanced::retroactive_backfill::extract_entities(
+            &current.content,
+            &current.tags,
+        );
         if current.id != origin.id {
             for entity in vestige_core::advanced::retroactive_backfill::extract_entities(
                 &origin.content,
@@ -517,7 +612,9 @@ fn assemble_walk_candidates(
 
 /// Deterministic verdict summary: ids and rounded scores only, so two runs on
 /// an unchanged store serialize to identical bytes.
-fn walk_verdict_summary(result: &vestige_core::advanced::retroactive_backfill::BackfillResult) -> Value {
+fn walk_verdict_summary(
+    result: &vestige_core::advanced::retroactive_backfill::BackfillResult,
+) -> Value {
     json!({
         "triggered": result.triggered,
         "failureId": result.failure_id,
@@ -584,11 +681,10 @@ fn execute_walk_replay(
         }
     };
 
-    let mut failure_entities =
-        vestige_core::advanced::retroactive_backfill::extract_entities(
-            &failure_node.content,
-            &failure_node.tags,
-        );
+    let mut failure_entities = vestige_core::advanced::retroactive_backfill::extract_entities(
+        &failure_node.content,
+        &failure_node.tags,
+    );
     // Entity extraction iterates a hash set, so its order varies call to
     // call. Sorting here keeps replay output byte-stable; matching is by
     // membership, never by order.
@@ -624,9 +720,7 @@ fn execute_walk_replay(
     );
 
     // 3. Apply the remove_edge filter for the counterfactual run.
-    let (edge_source, edge_target) = match remove_edge
-        .map(|edge| edge.split_once("->"))
-    {
+    let (edge_source, edge_target) = match remove_edge.map(|edge| edge.split_once("->")) {
         Some(Some((source, target))) => (
             Some(source.trim().to_string()),
             Some(target.trim().to_string()),
@@ -635,12 +729,8 @@ fn execute_walk_replay(
     };
     let filter_matches = |candidate: &BackfillCandidate| -> bool {
         match (&edge_source, &edge_target) {
-            (Some(source), Some(target)) => {
-                &candidate.id == source || &candidate.id == target
-            }
-            _ => {
-                candidate.id == remove_edge.unwrap_or_default().trim()
-            }
+            (Some(source), Some(target)) => &candidate.id == source || &candidate.id == target,
+            _ => candidate.id == remove_edge.unwrap_or_default().trim(),
         }
     };
     let removed_candidate_ids: Vec<String> = candidates
@@ -955,7 +1045,10 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(actions, vec![json!("get"), json!("replay"), json!("save_walk")]);
+        assert_eq!(
+            actions,
+            vec![json!("get"), json!("replay"), json!("save_walk")]
+        );
         assert!(
             schema()["properties"]["withheld_slots"]["description"]
                 .as_str()
@@ -969,7 +1062,11 @@ mod tests {
 
     /// Seed the exact three-memory scenario from the backfill tool's live
     /// test: a quiet env-var cause, a semantic distractor, a failure.
-    fn seeded_walk_store() -> (Arc<Storage>, vestige_core::KnowledgeNode, vestige_core::KnowledgeNode) {
+    fn seeded_walk_store() -> (
+        Arc<Storage>,
+        vestige_core::KnowledgeNode,
+        vestige_core::KnowledgeNode,
+    ) {
         let (storage, _dir) = test_storage();
         let cause = storage
             .ingest(vestige_core::IngestInput {
@@ -984,9 +1081,8 @@ mod tests {
             .unwrap();
         let distractor = storage
             .ingest(vestige_core::IngestInput {
-                content:
-                    "A 500 Internal Server Error happened in the billing service last month"
-                        .to_string(),
+                content: "A 500 Internal Server Error happened in the billing service last month"
+                    .to_string(),
                 node_type: "event".to_string(),
                 tags: vec!["billing-service".to_string()],
                 ..Default::default()
@@ -1069,7 +1165,9 @@ mod tests {
 
         // Argument policing.
         assert_eq!(
-            execute(&storage, Some(json!({"action": "save_walk"}))).await.unwrap_err(),
+            execute(&storage, Some(json!({"action": "save_walk"})))
+                .await
+                .unwrap_err(),
             "save_walk requires a params object"
         );
         assert_eq!(
@@ -1109,10 +1207,7 @@ mod tests {
         assert_eq!(first["verdict"]["triggered"], true);
         assert_eq!(first["verdict"]["failureId"], json!(failure.id));
         assert!(
-            !first["verdict"]["causeIds"]
-                .as_array()
-                .unwrap()
-                .is_empty(),
+            !first["verdict"]["causeIds"].as_array().unwrap().is_empty(),
             "the seeded failure must surface candidates: {}",
             first["verdict"]["causeIds"]
         );
@@ -1199,7 +1294,10 @@ mod tests {
         assert_eq!(ablated["filter"]["removedCandidateIds"], json!([top]));
         assert_eq!(ablated["verdictDelta"]["filterApplied"], true);
         assert_eq!(ablated["verdictDelta"]["verdictChanged"], true);
-        assert_eq!(ablated["verdictDelta"]["baseline"]["topCauseId"], json!(top));
+        assert_eq!(
+            ablated["verdictDelta"]["baseline"]["topCauseId"],
+            json!(top)
+        );
         assert!(
             !ablated["verdictDelta"]["ablated"]["causeIds"]
                 .as_array()
@@ -1265,5 +1363,176 @@ mod tests {
             .unwrap_err(),
             "remove_edge is only valid when replaying a walk receipt (id 'wr_…')"
         );
+    }
+}
+
+#[cfg(test)]
+mod strata_replay {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use vestige_core::{IngestInput, Storage};
+
+    use super::execute;
+
+    fn open() -> (Arc<Storage>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<Storage> =
+            Arc::new(crate::strata_memory::StrataMemory::open(dir.path()).unwrap());
+        (storage, dir)
+    }
+
+    fn ingest(storage: &Arc<Storage>, content: &str) -> vestige_core::KnowledgeNode {
+        storage
+            .ingest(IngestInput {
+                content: content.into(),
+                ..IngestInput::default()
+            })
+            .unwrap()
+    }
+
+    /// blake3 over the log directory's file bytes, in path order.
+    fn log_digest(dir: &Path) -> String {
+        let log = dir.join("log");
+        let mut files = Vec::new();
+        let mut stack = vec![log.clone()];
+        while let Some(path) = stack.pop() {
+            let mut entries: Vec<_> = std::fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let rel = path
+                        .strip_prefix(&log)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    files.push((rel, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        files.sort();
+        let mut hasher = blake3::Hasher::new();
+        for (name, bytes) in files {
+            hasher.update(&(name.len() as u64).to_le_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(&bytes);
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
+    fn flip_segment(dir: &Path) {
+        let log = dir.join("log");
+        let mut segs: Vec<_> = std::fs::read_dir(&log)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("seg"))
+            .collect();
+        segs.sort();
+        let path = segs.first().expect("segment");
+        let mut bytes = std::fs::read(path).unwrap();
+        assert!(bytes.len() > 8, "segment too short to tamper");
+        let at = bytes.len() / 2;
+        bytes[at] ^= 0xff;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[tokio::test]
+    async fn valid_replay_matches_and_does_not_write_the_log() {
+        let (storage, dir) = open();
+        let node = ingest(&storage, "strata replay fixture");
+        let receipt = storage.get_receipt(&node.id).unwrap().unwrap();
+        let before = log_digest(dir.path());
+
+        let by_node = execute(
+            &storage,
+            Some(json!({
+                "action": "replay",
+                "receipt_id": node.id,
+                "withheld_slots": []
+            })),
+        )
+        .await
+        .unwrap();
+        let by_receipt = execute(
+            &storage,
+            Some(json!({"action": "replay", "receipt_id": receipt.receipt_id})),
+        )
+        .await
+        .unwrap();
+        let again = execute(
+            &storage,
+            Some(json!({"action": "replay", "receipt_id": node.id})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(before, log_digest(dir.path()), "replay wrote the log");
+        assert_eq!(by_node, again, "replay is not deterministic");
+        assert_eq!(by_node["action"], "replay");
+        assert_eq!(by_node["kind"], "strata");
+        assert_eq!(by_node["readOnly"], true);
+        assert_eq!(by_node["matched"], true);
+        assert_eq!(by_node["mismatches"], json!([]));
+        assert_eq!(by_node["nodeId"], node.id);
+        assert_eq!(by_node["receiptId"], receipt.receipt_id);
+        assert_eq!(by_node["stateDigest"], by_node["replayedDigest"]);
+        assert!(by_node["frames"].as_u64().unwrap() > 0);
+        assert_eq!(by_receipt["matched"], true);
+        assert_eq!(by_receipt["stateDigest"], by_node["stateDigest"]);
+        assert_eq!(by_receipt["receiptId"], receipt.receipt_id);
+    }
+
+    #[tokio::test]
+    async fn tampered_log_fails_and_replay_does_not_repair_it() {
+        let (storage, dir) = open();
+        let node = ingest(&storage, "strata tamper fixture");
+        flip_segment(dir.path());
+        let before = log_digest(dir.path());
+        let err = execute(
+            &storage,
+            Some(json!({"action": "replay", "receipt_id": node.id})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            before,
+            log_digest(dir.path()),
+            "failed replay mutated the log"
+        );
+        assert!(
+            err.contains("mismatch")
+                || err.contains("blake3")
+                || err.contains("frame parse")
+                || err.contains("trailer")
+                || err.contains("segment header")
+                || err.contains("strata halt"),
+            "{err}"
+        );
+        assert!(!err.starts_with("Database error"), "{err}");
+        assert!(!err.contains("pending_strata"), "{err}");
+        assert!(!err.contains("temporarily unavailable"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn unknown_receipt_is_rejected() {
+        let (storage, dir) = open();
+        let _node = ingest(&storage, "strata unknown fixture");
+        let before = log_digest(dir.path());
+        let err = execute(
+            &storage,
+            Some(json!({"action": "replay", "receipt_id": "no-such-receipt"})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(before, log_digest(dir.path()));
+        assert!(err.contains("no-such-receipt"), "{err}");
+        assert!(err.contains("not found"), "{err}");
     }
 }

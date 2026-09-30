@@ -18,8 +18,8 @@ use crate::protocol::messages::{
     ServerCapabilities, ServerInfo, ToolAnnotations, ToolDescription,
 };
 use crate::protocol::types::{
-    JsonRpcError, JsonRpcRequest, JsonRpcResponse, LEGACY_PROTOCOL_VERSIONS,
-    SUPPORTED_PROTOCOL_VERSIONS, MCP_VERSION,
+    JsonRpcError, JsonRpcRequest, JsonRpcResponse, LEGACY_PROTOCOL_VERSIONS, MCP_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::resources;
 use crate::tools;
@@ -225,14 +225,12 @@ fn decorate_modern_result(result: &mut serde_json::Value) {
         // id comes from the structured payload the receipt attach step wrote;
         // no additional lookup, no memory content added to the wire.
         if let Some(receipt_id) = receipt_id {
-            meta_object
-                .entry("ui".to_string())
-                .or_insert_with(|| {
-                    serde_json::json!({
-                        "resourceUri":
-                            crate::resources::receipt_card::resource_uri(&receipt_id),
-                    })
-                });
+            meta_object.entry("ui".to_string()).or_insert_with(|| {
+                serde_json::json!({
+                    "resourceUri":
+                        crate::resources::receipt_card::resource_uri(&receipt_id),
+                })
+            });
         }
     }
 }
@@ -254,6 +252,182 @@ const DISCOVER_TTL_MS: u64 = 3_600_000;
 ///
 /// `null` and `""` are treated as absent, so a client that always serialises
 /// the field is not punished for a cursor it never really set.
+/// Tools a Strata log withholds in 4.0, with every hidden alias. Erasure:
+/// the log is append-only, so these would hide a memory but keep its bytes.
+const STRATA_WITHHELD_TOOLS: &[&str] = &["purge", "delete_knowledge"];
+
+/// `(tool, action, why)` a Strata log cannot honor in 4.0. `None` is erasure
+/// (shared wording with the store). Each is dropped from the advertised
+/// schema and refused on call, so every advertised action works.
+const STRATA_WITHHELD_ACTIONS: &[(&str, &str, Option<&str>)] = &[
+    ("memory", "purge", None),
+    ("memory", "delete", None),
+    ("blast_radius", "retire", None),
+    (
+        "dedup",
+        "plan_merge",
+        Some("merge planning needs embeddings, which 4.0 removed"),
+    ),
+    (
+        "dedup",
+        "plan_supersede",
+        Some("supersede planning needs embeddings, which 4.0 removed"),
+    ),
+    (
+        "dedup",
+        "apply",
+        Some("there are no merge or supersede plans without embeddings"),
+    ),
+    (
+        "dedup",
+        "verdict",
+        Some("reconsolidation verdicts need embeddings, which 4.0 removed"),
+    ),
+    (
+        "dedup",
+        "protect",
+        Some("the Strata log has no protect flag yet"),
+    ),
+    (
+        "graph",
+        "get",
+        Some("composition events are not recorded on a Strata log"),
+    ),
+    (
+        "graph",
+        "memory",
+        Some("composition events are not recorded on a Strata log"),
+    ),
+    (
+        "graph",
+        "neighbors",
+        Some("composition events are not recorded on a Strata log"),
+    ),
+    (
+        "graph",
+        "label",
+        Some("composition events are not recorded on a Strata log"),
+    ),
+    (
+        "receipt",
+        "save_walk",
+        Some("walk receipts are not recorded on a Strata log yet"),
+    ),
+    (
+        "maintain",
+        "restore",
+        Some(
+            "Strata backups are directory copies; stop Vestige and copy a backup's log/ into the data directory",
+        ),
+    ),
+];
+
+/// The refusal for a call a Strata log withholds in 4.0, or `None`.
+fn strata_withheld_call(tool: &str, arguments: Option<&serde_json::Value>) -> Option<String> {
+    let field = |name: &str| {
+        arguments
+            .and_then(|args| args.get(name))
+            .and_then(|value| value.as_str())
+    };
+    if STRATA_WITHHELD_TOOLS.contains(&tool) {
+        return Some(crate::strata_memory::withheld_message(tool));
+    }
+    if tool == "memory_status"
+        && field("view") == Some("changelog")
+        && arguments.and_then(|args| args.get("memory_id")).is_some()
+    {
+        return Some(
+            "unavailable_in_4_0: memory_status changelog for one memory_id is not available on Strata in Vestige 4.0: a Strata log does not record per-memory state transitions. Use memory_status view='provenance' with memoryId, or receipt get, for that memory's recorded history.".to_string(),
+        );
+    }
+    let action = field("action")?;
+    if tool == "maintain" && action == "export" && field("format") == Some("portable") {
+        return Some(
+            "unavailable_in_4_0: maintain export format 'portable' is not written from a Strata log yet; use format 'json' or 'jsonl'.".to_string(),
+        );
+    }
+    let (_, _, why) = STRATA_WITHHELD_ACTIONS
+        .iter()
+        .find(|(name, withheld, _)| *name == tool && *withheld == action)?;
+    Some(match why {
+        None => crate::strata_memory::withheld_message(&format!("{tool} action '{action}'")),
+        Some(why) => format!(
+            "unavailable_in_4_0: {tool} action '{action}' is not available on Strata in Vestige 4.0: {why}."
+        ),
+    })
+}
+
+/// Drop what a Strata log withholds from the advertised tool list, so the
+/// surface matches what the log can honestly do.
+fn withhold_on_strata(tools: &mut Vec<ToolDescription>) {
+    tools.retain(|tool| !STRATA_WITHHELD_TOOLS.contains(&tool.name.as_str()));
+    for tool in tools.iter_mut() {
+        let removed = strip_withheld_actions(&tool.name, &mut tool.input_schema);
+        if tool.name == "suppress" {
+            // On Strata a suppression hides a memory for good (the log keeps
+            // the bytes), so the host should prompt, and reverse is refused.
+            if let Some(annotations) = tool.annotations.as_mut() {
+                annotations.destructive_hint = true;
+            }
+            tool.description = Some("Hide a memory from every read without deleting it: the Strata log keeps its bytes. On Strata in 4.0 this cannot be undone (reverse=true is refused). It is not erasure.".to_string());
+        } else if tool.name == "memory" {
+            tool.description = Some("Manage one memory: 'get', 'get_batch', 'state', 'promote' / 'demote' (demote never deletes), 'edit' (admit a successor, retire the previous node). Erasure is withheld on Strata in 4.0.".to_string());
+        } else if tool.name == "recall" {
+            // The v3 text sold keyword search and similarity modes, which a
+            // Strata log answers with similarity_disabled.
+            tool.description = Some("Find memories by exact handle: pass 'handle' as a memory id, a unique id prefix of 8+ characters, or an exact tag. In 4.0 a free-text 'query' and the 'reason' and 'contradictions' modes return similarity_disabled.".to_string());
+        } else if tool.name == "smart_ingest" {
+            tool.description = Some("Save one memory ('content') or up to 20 ('items'). Each write passes the log's gate and returns a receipt. Content that looks like a secret is refused unless allowSecrets is set.".to_string());
+        } else if tool.name == "receipt" {
+            tool.description = Some("'get' shows what a write did from its receipt id; 'replay' re-derives that state from the log and reports any mismatch.".to_string());
+        } else if !removed.is_empty() {
+            let note = format!(" Withheld on Strata in 4.0: {}.", removed.join(", "));
+            tool.description = tool.description.take().map(|text| text + &note);
+        }
+    }
+}
+
+/// Remove withheld selector values from one tool's schema; returns them.
+fn strip_withheld_actions(tool: &str, schema: &mut serde_json::Value) -> Vec<&'static str> {
+    let withheld: Vec<&'static str> = STRATA_WITHHELD_ACTIONS
+        .iter()
+        .filter(|(name, _, _)| *name == tool)
+        .map(|(_, action, _)| *action)
+        .collect();
+    if let Some(values) = schema
+        .pointer_mut("/properties/action/enum")
+        .and_then(|values| values.as_array_mut())
+    {
+        values.retain(|value| {
+            value
+                .as_str()
+                .is_none_or(|value| !withheld.contains(&value))
+        });
+    }
+    if tool == "memory"
+        && let Some(description) = schema.pointer_mut("/properties/action/description")
+    {
+        *description = serde_json::json!(
+            "'get', 'get_batch' (ids), 'state', 'promote' / 'demote' (retrieval strength; demote never deletes), 'edit' (admit a successor under rule edit, then retire the previous node). Erasure is withheld on Strata in 4.0."
+        );
+    }
+    if tool == "recall"
+        && let Some(description) = schema.pointer_mut("/properties/mode/description")
+    {
+        *description = serde_json::json!(
+            "'lookup' (default): by handle. 'reason' and 'contradictions' return similarity_disabled in 4.0."
+        );
+    }
+    if tool == "maintain"
+        && let Some(formats) = schema
+            .pointer_mut("/properties/format/enum")
+            .and_then(|values| values.as_array_mut())
+    {
+        formats.retain(|value| value != "portable");
+    }
+    withheld
+}
+
 fn reject_unknown_cursor(params: Option<&serde_json::Value>) -> Result<(), JsonRpcError> {
     let Some(cursor) = params.and_then(|p| p.get("cursor")) else {
         return Ok(());
@@ -427,8 +601,7 @@ impl McpServer {
     /// claims provenance.
     fn bound_actor_did(&self) -> Option<String> {
         let did = self.actor.did();
-        (self.storage.process_actor_did().as_deref() == Some(did))
-            .then(|| did.to_string())
+        (self.storage.process_actor_did().as_deref() == Some(did)).then(|| did.to_string())
     }
 
     /// Resolve the actor provenance for one tool call: the process identity
@@ -541,7 +714,10 @@ impl McpServer {
             )),
             "tools/list" => self.handle_tools_list(request.params.as_ref(), era).await,
             "tools/call" => self.handle_tools_call(request.params).await,
-            "resources/list" => self.handle_resources_list(request.params.as_ref(), era).await,
+            "resources/list" => {
+                self.handle_resources_list(request.params.as_ref(), era)
+                    .await
+            }
             "resources/templates/list" => {
                 self.handle_resources_templates_list(request.params.as_ref(), era)
             }
@@ -732,13 +908,13 @@ impl McpServer {
         self.initialized.load(Ordering::Acquire)
     }
 
-/// The advertised tool catalog. Single source of the full schemas:
-/// `handle_tools_list` compacts it for the wire (#212), and
-/// `tools::compact::full_schema` serves the same schemas in full through
-/// `memory_status` `view='tools'`. The parity guard test keeps this
-/// function and that registry name-for-name identical.
-fn tool_catalog() -> Vec<ToolDescription> {
-    vec![
+    /// The advertised tool catalog. Single source of the full schemas:
+    /// `handle_tools_list` compacts it for the wire (#212), and
+    /// `tools::compact::full_schema` serves the same schemas in full through
+    /// `memory_status` `view='tools'`. The parity guard test keeps this
+    /// function and that registry name-for-name identical.
+    fn tool_catalog() -> Vec<ToolDescription> {
+        vec![
             // ================================================================
             // RECALL — unified retrieval tool (v2.2). HOT PATH.
             // Folds search + deep_reference + cross_reference + contradictions.
@@ -804,16 +980,13 @@ description: Some("Inspect a persisted retrieval receipt ('get'), ablate its fro
                     idempotent_hint: false,
                     open_world_hint: false,
                 }),
-description: Some("Manage one memory: 'get', 'get_batch', 'state', 'promote' / 'demote' (demote never deletes), 'edit' (keeps FSRS state), 'purge' (for good; confirm=true). 'delete' aliases purge.".to_string()),
+description: Some("Manage one memory: 'get', 'get_batch', 'state', 'promote' / 'demote' (demote never deletes), 'edit' (keeps FSRS state), 'purge' (retired, can't be retrieved; confirm=true). 'delete' aliases purge.".to_string()),
                 input_schema: tools::compact::of(&tools::memory_unified::schema()),
                 ..Default::default()
             },
             // ================================================================
-            // PURGE (#219): the one irreversible call, on its own so a host
-            // can gate it without gating the reads that share `memory`.
-            // Claude Code honours `anthropic/requiresUserInteraction` with a
-            // prompt on every call. Same code path as memory(action='purge');
-            // the alias keeps working.
+            // PURGE (#219): its own tool so a host can prompt without prompting
+            // on the reads that share `memory`. Same path as memory(action='purge').
             // ================================================================
             ToolDescription {
                 name: "purge".to_string(),
@@ -824,7 +997,7 @@ description: Some("Manage one memory: 'get', 'get_batch', 'state', 'promote' / '
                     idempotent_hint: false,
                     open_world_hint: false,
                 }),
-                description: Some("Remove one memory's content and embeddings for good. Irreversible; confirm=true required, the client prompts. Same path as memory(action='purge').".to_string()),
+                description: Some("Retire one memory so it can't be retrieved. confirm=true required; the client prompts. Same path as memory(action='purge').".to_string()),
                 input_schema: tools::memory_unified::purge_schema(),
                 meta: Some(serde_json::json!({ "anthropic/requiresUserInteraction": true })),
                 ..Default::default()
@@ -898,7 +1071,10 @@ description: Some("Save to memory through Prediction Error Gating: 'content' is 
             },
             // ================================================================
             // EXTERNAL-SOURCE CONNECTORS (#57)
+            // Absent unless `--features connectors`. A default build must not
+            // advertise a tool whose dispatch would leave the machine.
             // ================================================================
+            #[cfg(feature = "connectors")]
             ToolDescription {
                 name: "source_sync".to_string(),
                 title: Some("Source Sync".to_string()),
@@ -1104,8 +1280,7 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
                 ..Default::default()
             },
             ]
-
-}
+    }
 
     /// Handle tools/list request
     async fn handle_tools_list(
@@ -1122,6 +1297,9 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
         // hidden redirects in handle_tools_call. See
         // docs/launch/tool-consolidation-v2.2.0.md.
         let mut tools = Self::tool_catalog();
+        if crate::strata_memory::is_strata_backend(self.storage.as_ref()) {
+            withhold_on_strata(&mut tools);
+        }
 
         // Per-tool result-size annotation `_meta["anthropic/maxResultSizeChars"]`.
         //
@@ -1207,7 +1385,7 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
         &self,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, JsonRpcError> {
-        let request: CallToolRequest = match params {
+        let mut request: CallToolRequest = match params {
             Some(p) => serde_json::from_value(p)
                 .map_err(|e| JsonRpcError::invalid_params(&e.to_string()))?,
             None => return Err(JsonRpcError::invalid_params("Missing tool call parameters")),
@@ -1218,6 +1396,31 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
             return Err(JsonRpcError::invalid_params(
                 "tools/call arguments must be an object",
             ));
+        }
+        // `tools/list` advertises filter fields grouped under `filters` and
+        // `source`; the handlers read them at the top level.
+        if let Some(arguments) = request.arguments.as_mut() {
+            tools::compact::unfold_arguments(&request.name, arguments);
+        }
+
+        // 4.0: erasure-class calls are withheld on a Strata log. Refuse before
+        // tracing and before the Memory-PR review gate, so a withheld call
+        // cannot open a pending purge or suppress review either.
+        if crate::strata_memory::is_strata_backend(self.storage.as_ref())
+            && let Some(message) = strata_withheld_call(&request.name, request.arguments.as_ref())
+        {
+            let error_content = serde_json::json!({ "error": message });
+            let call_result = CallToolResult {
+                content: vec![crate::protocol::messages::ToolResultContent {
+                    content_type: "text".to_string(),
+                    text: serde_json::to_string_pretty(&error_content)
+                        .unwrap_or_else(|_| error_content.to_string()),
+                }],
+                structured_content: Some(error_content),
+                is_error: Some(true),
+            };
+            return serde_json::to_value(call_result)
+                .map_err(|e| JsonRpcError::internal_error(&e.to_string()));
         }
 
         // Record activity on every tool call (non-blocking)
@@ -1309,6 +1512,22 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
             Err(protocol_error) => return Err(protocol_error),
         };
 
+        // Purge rebuilds this cache inside the tool. Suppress retires through
+        // the same read filter, so the in-process graph has to drop the id too.
+        if tool_name == "suppress"
+            && crate::strata_memory::is_strata_backend(self.storage.as_ref())
+            && result
+                .as_ref()
+                .ok()
+                .and_then(|content| content.get("success"))
+                .and_then(|value| value.as_bool())
+                == Some(true)
+        {
+            let mut rebuilt = CognitiveEngine::new();
+            rebuilt.hydrate(&self.storage);
+            *self.cognitive.lock().await = rebuilt;
+        }
+
         // ================================================================
         // DASHBOARD EVENT EMISSION (v2.0)
         // Emit real-time events to WebSocket clients after successful tool calls.
@@ -1349,11 +1568,11 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
                             .map(str::trim)
                             .filter(|role| !role.is_empty())
                     });
-                let actor_provenance = self
-                    .resolve_actor_provenance(claimed_role)
-                    .map(|(did, resolution)| {
-                        vestige_core::trace::ActorProvenance::from_resolution(&did, &resolution)
-                    });
+                let actor_provenance =
+                    self.resolve_actor_provenance(claimed_role)
+                        .map(|(did, resolution)| {
+                            vestige_core::trace::ActorProvenance::from_resolution(&did, &resolution)
+                        });
                 if let Some(receipt) = crate::trace_recorder::build_and_save_receipt(
                     &self.storage,
                     &trace_run_id,
@@ -1617,8 +1836,10 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
             }
 
             // ================================================================
-            // External-source connectors (#57)
+            // External-source connectors (#57). Without the feature this name
+            // falls through to the unknown-tool protocol error below.
             // ================================================================
+            #[cfg(feature = "connectors")]
             "source_sync" => tools::source_sync::execute(&self.storage, request.arguments).await,
 
             // ================================================================
@@ -1753,7 +1974,20 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
                 // does not apply here; the catalog rides with the same hints
                 // it has always carried.
                 let catalog = self.handle_tools_list(None, Era::LegacyHandshake).await?;
-                tools::memory_status::tool_guide(&catalog, request.arguments.as_ref().unwrap())
+                let mut guide =
+                    tools::memory_status::tool_guide(&catalog, request.arguments.as_ref().unwrap());
+                if crate::strata_memory::is_strata_backend(self.storage.as_ref())
+                    && let Ok(guide) = guide.as_mut()
+                    && let Some(entries) = guide["tools"].as_array_mut()
+                {
+                    for entry in entries.iter_mut() {
+                        let name = entry["name"].as_str().unwrap_or_default().to_string();
+                        if let Some(schema) = entry.get_mut("inputSchema") {
+                            strip_withheld_actions(&name, schema);
+                        }
+                    }
+                }
+                guide
             }
             "memory_status" => {
                 tools::memory_status::execute(
@@ -2376,8 +2610,8 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
         ];
 
         let result = ListResourcesResult { resources };
-        let mut value =
-            serde_json::to_value(result).map_err(|e| JsonRpcError::internal_error(&e.to_string()))?;
+        let mut value = serde_json::to_value(result)
+            .map_err(|e| JsonRpcError::internal_error(&e.to_string()))?;
         // Cache hints (`CacheableResult`): the list of advertised resources is
         // compile-time constant per binary, an hour is conservative;
         // `private` because feature flags can differ per install. Suppressed
@@ -2479,8 +2713,8 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
                         blob: None,
                     }],
                 };
-                let mut value =
-                    serde_json::to_value(result).map_err(|e| JsonRpcError::internal_error(&e.to_string()))?;
+                let mut value = serde_json::to_value(result)
+                    .map_err(|e| JsonRpcError::internal_error(&e.to_string()))?;
                 // Cache hints (`CacheableResult`). Resource content is
                 // user-data backed and can change on any write, so the honest
                 // hint is one second and `private` — the field pair is
@@ -2865,7 +3099,7 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
 // TESTS
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite"))]
 mod tests {
     use super::*;
     use crate::protocol::types::MODERN_PROTOCOL_VERSION;
@@ -2969,10 +3203,7 @@ mod tests {
     /// `method_params` must be an object (or null); `_meta` is inserted into
     /// it alongside the caller's own fields.
     fn modern_params(method_params: serde_json::Value) -> serde_json::Value {
-        let mut map = method_params
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
+        let mut map = method_params.as_object().cloned().unwrap_or_default();
         map.insert(
             "_meta".to_string(),
             serde_json::json!({
@@ -3004,8 +3235,14 @@ mod tests {
         let versions = result["supportedVersions"].as_array().unwrap();
         let versions: Vec<&str> = versions.iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(versions.first(), Some(&MODERN_PROTOCOL_VERSION));
-        assert!(versions.contains(&MCP_VERSION), "legacy clients negotiate down to {MCP_VERSION}");
-        assert_eq!(result["capabilities"]["tools"], serde_json::json!({ "listChanged": false }));
+        assert!(
+            versions.contains(&MCP_VERSION),
+            "legacy clients negotiate down to {MCP_VERSION}"
+        );
+        assert_eq!(
+            result["capabilities"]["tools"],
+            serde_json::json!({ "listChanged": false })
+        );
     }
 
     /// A modern client never shakes hands. A `ping` with per-request `_meta`
@@ -3015,7 +3252,10 @@ mod tests {
     async fn modern_ping_serves_statelessly_with_result_type() {
         let (server, _dir) = test_server().await;
         let response = server
-            .handle_request(make_request("ping", Some(modern_params(serde_json::json!({})))))
+            .handle_request(make_request(
+                "ping",
+                Some(modern_params(serde_json::json!({}))),
+            ))
             .await
             .unwrap();
         assert!(response.error.is_none(), "{:?}", response.error);
@@ -3130,7 +3370,10 @@ mod tests {
             .await
             .unwrap();
         let error = response.error.expect("must reject");
-        assert_eq!(error.code, -32022, "spec-defined UnsupportedProtocolVersion");
+        assert_eq!(
+            error.code, -32022,
+            "spec-defined UnsupportedProtocolVersion"
+        );
         let error_data = error.data.expect("-32022 carries data");
         assert_eq!(error_data["requested"], "1900-01-01");
         let supported = error_data["supported"].as_array().unwrap();
@@ -3152,7 +3395,10 @@ mod tests {
             .await
             .unwrap();
         let result = response.result.unwrap();
-        assert!(result.get("resultType").is_none(), "legacy envelope must not grow");
+        assert!(
+            result.get("resultType").is_none(),
+            "legacy envelope must not grow"
+        );
         assert_eq!(result["ttlMs"], 3_600_000);
     }
 
@@ -3242,9 +3488,10 @@ mod tests {
         // Legacy era: handshake first, no modern _meta.
         let legacy_server = make_server(true).await;
         let legacy_result = legacy_server
-            .handle_request(
-                make_request("resources/read", Some(serde_json::json!({ "uri": uri }))),
-            )
+            .handle_request(make_request(
+                "resources/read",
+                Some(serde_json::json!({ "uri": uri })),
+            ))
             .await
             .unwrap()
             .result
@@ -3325,10 +3572,7 @@ mod tests {
             .find(|t| t.name == "recall")
             .expect("recall in catalog");
         let meta = recall.meta.expect("recall carries _meta");
-        assert_eq!(
-            meta["ui"]["resourceUri"],
-            "ui://vestige/receipt/{id}"
-        );
+        assert_eq!(meta["ui"]["resourceUri"], "ui://vestige/receipt/{id}");
     }
 
     // ========================================================================
@@ -4198,17 +4442,22 @@ mod tests {
         }
     }
 
-    /// #212: the wire budget. tools/list must stay under 20 KiB no matter
+    /// #212: the wire budget. tools/list must stay under 22 KiB no matter
     /// how schemas grow; new surface goes through tools::compact or shrinks.
+    /// It was 20 KiB while compaction replaced a union's fields with one
+    /// `action`, which left smart_ingest without `content` on the wire. Every
+    /// field a call may send is on the wire now (see
+    /// `every_root_and_variant_field_reaches_the_wire`), and that costs
+    /// about 1.3 KiB.
     #[test]
-    fn tools_list_wire_payload_stays_under_20_kib() {
+    fn tools_list_wire_payload_stays_under_22_kib() {
         let catalog = McpServer::tool_catalog();
         let payload = serde_json::to_string(&catalog).unwrap();
         assert!(
-            payload.len() <= 20 * 1024,
+            payload.len() <= 22 * 1024,
             "tools/list payload is {} bytes (budget {}); compact the schema or shrink it",
             payload.len(),
-            20 * 1024
+            22 * 1024
         );
     }
 
@@ -4218,7 +4467,12 @@ mod tests {
     #[test]
     fn full_schema_registry_matches_the_advertised_catalog() {
         let catalog = McpServer::tool_catalog();
-        assert_eq!(catalog.len(), 18, "catalog size changed; update the registry");
+        let expected = if cfg!(feature = "connectors") { 18 } else { 17 };
+        assert_eq!(
+            catalog.len(),
+            expected,
+            "catalog size changed; update the registry"
+        );
         for tool in &catalog {
             assert!(
                 tools::compact::full_schema(&tool.name).is_some(),
@@ -4322,7 +4576,9 @@ mod tests {
                 serde_json::to_value(&full).unwrap()
             );
             assert!(
-                detail["structuredContent"]["tools"][0]["inputSchema"].to_string().len()
+                detail["structuredContent"]["tools"][0]["inputSchema"]
+                    .to_string()
+                    .len()
                     >= definition["inputSchema"].to_string().len(),
                 "full schema must not be smaller than the compact catalog schema"
             );
@@ -4398,13 +4654,15 @@ mod tests {
         // w3d: +2 with `selftest` + `forgotten_lesson`; v3.2: `causal_walk`
         // replaced `backfill` on the advertised surface (backfill stays
         // dispatchable as a hidden alias).
+        let expected = if cfg!(feature = "connectors") { 18 } else { 17 };
         assert_eq!(
             tools.len(),
-            18,
-            "Expected 18 tools: the v2.3/v3 consolidated set (dedup + memory_status + \
+            expected,
+            "Expected {expected} tools: the v2.3/v3 consolidated set (dedup + memory_status + \
              graph + maintain + recall; session_context renamed) plus `receipt`, \
              `causal_walk`, `project`, the #219 standalone `purge`, and the w3d \
-             `selftest` + `forgotten_lesson`"
+             `selftest` + `forgotten_lesson`. `source_sync` counts only with \
+             the connectors feature"
         );
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -4450,19 +4708,38 @@ mod tests {
         // (pure query) join the read-only set.
         assert_eq!(
             read_only,
-            ["forgotten_lesson", "memory_status", "selftest", "session_start"]
+            [
+                "forgotten_lesson",
+                "memory_status",
+                "selftest",
+                "session_start"
+            ]
         );
         // Reanchoring replaces existing evidence, so the mixed codebase tool
         // must advertise its destructive action conservatively.
         assert_eq!(
             destructive,
-            ["codebase", "dedup", "intention", "maintain", "memory", "purge"]
+            [
+                "codebase",
+                "dedup",
+                "intention",
+                "maintain",
+                "memory",
+                "purge"
+            ]
         );
-        assert_eq!(
-            open_world,
-            ["source_sync"],
-            "only the connector sync leaves the local store"
-        );
+        if cfg!(feature = "connectors") {
+            assert_eq!(
+                open_world,
+                ["source_sync"],
+                "only the connector sync leaves the local store"
+            );
+        } else {
+            assert!(
+                open_world.is_empty(),
+                "connectors is off, so no advertised tool leaves the local store: {open_world:?}"
+            );
+        }
 
         // Unified tools
         // (search folded into `recall` mode='lookup' in v2.2)
@@ -4483,8 +4760,15 @@ mod tests {
         // Core memory (smart_ingest absorbs ingest + checkpoint in v1.7)
         assert!(tool_names.contains(&"smart_ingest"));
 
-        // External-source connectors (#57)
-        assert!(tool_names.contains(&"source_sync"));
+        // External-source connectors (#57): advertised only when compiled in.
+        if cfg!(feature = "connectors") {
+            assert!(tool_names.contains(&"source_sync"));
+        } else {
+            assert!(
+                !tool_names.contains(&"source_sync"),
+                "source_sync must be absent unless --features connectors"
+            );
+        }
         assert!(
             !tool_names.contains(&"ingest"),
             "ingest should be removed in v1.7"
@@ -5107,6 +5391,37 @@ mod tests {
         assert_eq!(response.error.unwrap().code, -32602);
     }
 
+    /// `source_sync` is not a tool in a build without `connectors`. The call
+    /// is the same protocol error as any other unknown name: `-32602`, no
+    /// result body.
+    #[cfg(not(feature = "connectors"))]
+    #[tokio::test]
+    async fn source_sync_is_an_unknown_tool_without_connectors() {
+        let (server, _dir) = test_server().await;
+        server
+            .handle_request(make_request("initialize", Some(init_params())))
+            .await;
+
+        let response = server
+            .handle_request(make_request(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "source_sync",
+                    "arguments": { "source": "gitlab", "repo": "a/b" }
+                })),
+            ))
+            .await
+            .unwrap();
+        assert!(response.result.is_none(), "{response:?}");
+        let error = response.error.expect("protocol error");
+        assert_eq!(error.code, -32602);
+        assert!(
+            error.message.contains("Unknown tool") && error.message.contains("source_sync"),
+            "{}",
+            error.message
+        );
+    }
+
     // ========================================================================
     // PING TESTS
     // ========================================================================
@@ -5373,11 +5688,15 @@ mod tests {
         // Construction loads-or-mints the did:key from <data_dir>/actor.key
         // and binds it to the store.
         let did = server.bound_actor_did().expect("process actor bound");
-        assert!(did.starts_with("did:key:z6Mk"), "Ed25519 did:key shape: {did}");
+        assert!(
+            did.starts_with("did:key:z6Mk"),
+            "Ed25519 did:key shape: {did}"
+        );
 
         // Gate 1: a claimed privileged role never self-grants authority.
-        let (resolved_did, resolution) =
-            server.resolve_actor_provenance(Some("operator")).expect("resolve");
+        let (resolved_did, resolution) = server
+            .resolve_actor_provenance(Some("operator"))
+            .expect("resolve");
         assert_eq!(resolved_did, did, "identity comes from the process");
         assert_eq!(resolution.effective_role, "unattributed");
         assert_eq!(resolution.resolved_weight, 1.0);
@@ -5399,11 +5718,12 @@ mod tests {
         let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
         let server = McpServer::new(storage.clone(), cognitive);
         let claimed = "operator";
-        let actor_provenance = server
-            .resolve_actor_provenance(Some(claimed))
-            .map(|(did, resolution)| {
-                vestige_core::trace::ActorProvenance::from_resolution(&did, &resolution)
-            });
+        let actor_provenance =
+            server
+                .resolve_actor_provenance(Some(claimed))
+                .map(|(did, resolution)| {
+                    vestige_core::trace::ActorProvenance::from_resolution(&did, &resolution)
+                });
         let result = serde_json::json!({
             "results": [
                 { "id": "mem-1", "trustScore": 0.9 },
@@ -5419,7 +5739,12 @@ mod tests {
         )
         .expect("receipt built");
         let actor = receipt["actor"].as_object().expect("provenance block");
-        assert!(actor["actor_id"].as_str().unwrap().starts_with("did:key:z6Mk"));
+        assert!(
+            actor["actor_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("did:key:z6Mk")
+        );
         assert_eq!(actor["claimed_role"], "operator");
         assert_eq!(actor["effective_role"], "unattributed");
         assert_eq!(actor["resolved_weight"], 1.0);
@@ -5427,10 +5752,7 @@ mod tests {
         assert_eq!(actor["policy_version"], 1);
         // The persisted row round-trips the provenance.
         let receipt_id = receipt["receipt_id"].as_str().unwrap();
-        let stored = storage
-            .get_receipt(receipt_id)
-            .unwrap()
-            .expect("persisted");
+        let stored = storage.get_receipt(receipt_id).unwrap().expect("persisted");
         let stored_actor = stored.actor.expect("persisted provenance");
         assert_eq!(stored_actor.claimed_role.as_deref(), Some("operator"));
         assert_eq!(stored_actor.resolution_disposition, "unregistered_claim");

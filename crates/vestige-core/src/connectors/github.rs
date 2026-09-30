@@ -190,8 +190,12 @@ impl GithubConnector {
             });
         let hint = match status.as_u16() {
             401 => "unauthorized — the token was rejected; check GITHUB_TOKEN validity",
-            403 => "forbidden — the token lacks access to this repo (or a secondary rate limit applied)",
-            404 => "not found — check owner/repo spelling, and that the token (if set) can see this private repo",
+            403 => {
+                "forbidden — the token lacks access to this repo (or a secondary rate limit applied)"
+            }
+            404 => {
+                "not found — check owner/repo spelling, and that the token (if set) can see this private repo"
+            }
             _ => status.canonical_reason().unwrap_or("request failed"),
         };
         ConnectorError::Source {
@@ -337,7 +341,11 @@ impl GithubConnector {
         // case-sensitive and GitHub labels are commonly mixed-case ("Bug",
         // "Good First Issue"), which would make `tag_prefix=label:bug` miss
         // them. Same convention the Redmine connector uses.
-        tags.extend(labels.into_iter().map(|l| format!("label:{}", l.to_lowercase())));
+        tags.extend(
+            labels
+                .into_iter()
+                .map(|l| format!("label:{}", l.to_lowercase())),
+        );
 
         let envelope = SourceEnvelope {
             source_system: Some("github".to_string()),
@@ -698,7 +706,7 @@ mod tests {
 // error messages naming the exact failing call, and the comment retry-then-skip
 // path. A tiny hand-rolled HTTP server on 127.0.0.1 keeps this dependency-free.
 
-#[cfg(all(test, feature = "connectors"))]
+#[cfg(all(test, feature = "connectors", feature = "legacy-sqlite"))]
 mod http_tests {
     use super::*;
     use crate::storage::SqliteMemoryStore;
@@ -836,7 +844,9 @@ mod http_tests {
             r#"{{"number": {number}, "title": "Issue {number}", "body": "body {number}", "state": "open", "html_url": "https://github.com/o/r/issues/{number}", "updated_at": "2026-06-19T00:00:0{number}Z", "comments": {comments}, "labels": [], "user": {{"login": "octocat"}}"#
         );
         if pr {
-            issue.push_str(r#", "pull_request": {"url": "https://api.github.com/repos/o/r/pulls/1"}"#);
+            issue.push_str(
+                r#", "pull_request": {"url": "https://api.github.com/repos/o/r/pulls/1"}"#,
+            );
         }
         issue.push('}');
         issue
@@ -887,7 +897,10 @@ mod http_tests {
     #[tokio::test]
     async fn a_404_error_names_the_exact_failing_call() {
         let api = MockApi::spawn(Arc::new(|_path: &str, _base: &str| {
-            Response::json(404, r#"{"message": "Not Found", "documentation_url": "x"}"#.into())
+            Response::json(
+                404,
+                r#"{"message": "Not Found", "documentation_url": "x"}"#.into(),
+            )
         }));
         let err = connector(&api.base_url)
             .fetch_updated(None, None)
@@ -988,7 +1001,10 @@ mod http_tests {
     #[tokio::test]
     async fn pull_requests_are_dropped_and_never_fetch_comments() {
         let api = MockApi::spawn(Arc::new(|_path: &str, _base: &str| {
-            Response::json(200, format!("[{}, {}]", issue_json(1, 0, true), issue_json(2, 0, false)))
+            Response::json(
+                200,
+                format!("[{}, {}]", issue_json(1, 0, true), issue_json(2, 0, false)),
+            )
         }));
         let page = connector(&api.base_url)
             .fetch_updated(None, None)
@@ -1009,7 +1025,10 @@ mod http_tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let base = format!("http://127.0.0.1:{port}");
-        let err = connector(&base).fetch_updated(None, None).await.unwrap_err();
+        let err = connector(&base)
+            .fetch_updated(None, None)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains(&format!("GET {base}/repos/o/r/issues")),
@@ -1027,7 +1046,11 @@ mod http_tests {
     /// idempotent re-run (no duplicates).
     #[tokio::test]
     async fn integration_real_github_sync_readonly_end_to_end() {
-        if std::env::var("VESTIGE_SOURCE_SYNC_INTEGRATION").ok().as_deref() != Some("1") {
+        if std::env::var("VESTIGE_SOURCE_SYNC_INTEGRATION")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
             eprintln!("skipping: set VESTIGE_SOURCE_SYNC_INTEGRATION=1 to run");
             return;
         }
@@ -1065,20 +1088,19 @@ mod http_tests {
                      FROM knowledge_nodes WHERE source_system = 'github'",
                 )
                 .unwrap();
-            stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })
             .unwrap()
             .filter_map(Result::ok)
-                .collect()
+            .collect()
         };
         assert_eq!(
             rows.len(),

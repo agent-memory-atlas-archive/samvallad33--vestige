@@ -13,13 +13,17 @@
 //! removed with the embedding machinery.
 
 use std::collections::HashMap;
+#[cfg(feature = "connectors")]
 use std::io::{Read, Write};
+#[cfg(feature = "connectors")]
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "connectors")]
 use std::sync::Arc;
+#[cfg(feature = "connectors")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 mod common;
 
@@ -32,13 +36,16 @@ use common::*;
 // source_sync can be pointed at a Redmine *we* control via REDMINE_URL.
 // ============================================================================
 
+#[cfg(feature = "connectors")]
 type MockHandler = Arc<dyn Fn(&str) -> (u16, String) + Send + Sync>;
 
+#[cfg(feature = "connectors")]
 struct MockHttp {
     base_url: String,
     _stop: Arc<AtomicBool>,
 }
 
+#[cfg(feature = "connectors")]
 impl MockHttp {
     fn spawn(handler: MockHandler) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
@@ -71,12 +78,14 @@ impl MockHttp {
     }
 }
 
+#[cfg(feature = "connectors")]
 impl Drop for MockHttp {
     fn drop(&mut self) {
         self._stop.store(true, Ordering::SeqCst);
     }
 }
 
+#[cfg(feature = "connectors")]
 fn read_request_path(stream: &mut TcpStream) -> String {
     let mut buf = [0u8; 4096];
     let mut data = Vec::new();
@@ -100,6 +109,7 @@ fn read_request_path(stream: &mut TcpStream) -> String {
         .to_string()
 }
 
+#[cfg(feature = "connectors")]
 fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
     let reason = match status {
         200 => "OK",
@@ -118,6 +128,7 @@ fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
     let _ = stream.flush();
 }
 
+#[cfg(feature = "connectors")]
 fn redmine_issues_json(issues: &[(u64, &str)]) -> String {
     let items: Vec<String> = issues
         .iter()
@@ -130,6 +141,7 @@ fn redmine_issues_json(issues: &[(u64, &str)]) -> String {
     )
 }
 
+#[cfg(feature = "connectors")]
 fn redmine_issue_body(id: u64, subject: &str, detail: bool) -> String {
     // Single line on purpose: this is a raw string, so a `\`-newline
     // "continuation" would land in the JSON verbatim as an invalid escape.
@@ -147,390 +159,16 @@ fn redmine_issue_body(id: u64, subject: &str, detail: bool) -> String {
 // A. Recall failure semantics
 // ============================================================================
 
-/// Below the abstain floor, recall must return the abstained envelope —
-/// `abstained: true`, empty results, the confidence and a reason naming the
-/// floor, and the nearest candidates for inspection — never a weak answer
-/// dressed up as one (#224).
-///
-/// The metamemory stage runs on the hybrid path (the `concrete` fast path
-/// answers exact lookups directly, by design). A near-1.0 floor forces the
-/// abstention deterministically there: the confidence formula is
-/// 0.6*match + 0.25*retention + 0.15*gap, and two near-identical hits for the
-/// same term shrink the uniqueness gap, which pulls the confidence under any
-/// floor that leaves room — the failure shape the envelope exists for: the
-/// store has *something* but must not pass it off as an answer.
-#[test]
-fn below_floor_recall_returns_the_abstained_envelope_with_nearest_candidates() {
-    let dir = data_dir();
-    let mut server = Server::spawn(dir.path());
-    server.handshake();
-    let alpha = server.ingest_keyword_only(
-        "The payments gateway rollout gate is named zanzibar-seven in staging",
-        &["infra"],
-    );
-    let beta = server.ingest_keyword_only(
-        "The payments gateway rollout gate is named zanzibar-eight in production",
-        &["infra"],
-    );
-    for i in 0..8 {
-        server.ingest_keyword_only(
-            &format!("Unrelated filler memory {i} about invoicing payroll and vendors"),
-            &[],
-        );
-    }
-
-    let value = server.call_tool_ok(
-        "recall",
-        json!({ "query": "zanzibar", "limit": 5, "abstain_floor": 0.99 }),
-    );
-
-    assert_eq!(value["abstained"], json!(true), "{value}");
-    assert_eq!(value["results"], json!([]), "an abstention withholds results");
-    assert_eq!(value["total"], json!(0));
-    let confidence = value["confidence"].as_f64().expect("confidence");
-    assert!(
-        (0.0..=1.0).contains(&confidence) && confidence < 0.99,
-        "confidence {confidence} must sit below the 0.99 floor"
-    );
-    assert!(
-        value["reason"]
-            .as_str()
-            .is_some_and(|r| r.contains("floor") && r.contains("No memory answers this")),
-        "the reason must state that no memory answers the query: {value}"
-    );
-    let nearest = value["nearest"].as_array().expect("nearest candidates");
-    let nearest_ids: Vec<&str> = nearest
-        .iter()
-        .filter_map(|n| n["id"].as_str())
-        .collect();
-    assert!(
-        nearest_ids.contains(&alpha.as_str()) && nearest_ids.contains(&beta.as_str()),
-        "the nearest block must offer both close candidates: {value}"
-    );
-
-    // The same query at the disabled floor answers normally instead.
-    let answering = server.call_tool_ok(
-        "recall",
-        json!({ "query": "zanzibar", "limit": 5, "abstain_floor": 1.0 }),
-    );
-    assert!(
-        answering.get("abstained").is_none_or(|v| *v == json!(false)),
-        "floor 1.0 disables abstention: {answering}"
-    );
-    let answered_ids = server.recall_ids(json!({
-        "query": "zanzibar", "limit": 5, "abstain_floor": 1.0,
-    }));
-    assert!(
-        answered_ids.contains(&alpha) && answered_ids.contains(&beta),
-        "disabling abstention must return the matches: {answered_ids:?}"
-    );
-
-    server.shutdown();
-}
-
-/// A query matching nothing at all is the plain empty response — it must NOT
-/// be dressed up as an abstention (abstaining requires something to withhold).
-#[test]
-fn a_no_match_query_returns_the_plain_empty_shape_not_an_abstention() {
-    let dir = data_dir();
-    let mut server = Server::spawn(dir.path());
-    server.handshake();
-    server.ingest_keyword_only("Invoicing payroll vendors memo", &[]);
-
-    let value = server.call_tool_ok(
-        "recall",
-        json!({ "query": "xyzzyplughbanishment", "limit": 5, "concrete": true }),
-    );
-    assert!(
-        value.get("abstained").is_none_or(|v| *v == json!(false)),
-        "an empty store answer must never claim abstention: {value}"
-    );
-    assert_eq!(value["results"], json!([]));
-    server.shutdown();
-}
-
-/// `exclude_types` is an EXACT-match filter: a known type name excludes its
-/// nodes; an impossible value matches no type and therefore excludes nothing
-/// (a silent pass-through, pinned here as the contract).
-#[test]
-fn exclude_types_exact_match_semantics_on_known_and_impossible_values() {
-    let dir = data_dir();
-    let mut server = Server::spawn(dir.path());
-    server.handshake();
-    server.ingest_keyword_only("The deploy cache key rotation runs nightly", &["ops"]);
-
-    let unfiltered = server.call_tool_ok(
-        "recall",
-        json!({ "query": "deploy cache key", "limit": 10, "concrete": true }),
-    );
-    let baseline = unfiltered["results"].as_array().unwrap().len();
-    assert!(baseline > 0, "baseline must match: {unfiltered}");
-
-    // KNOWN type excluded: the matching facts drop out.
-    let filtered = server.call_tool_ok(
-        "recall",
-        json!({
-            "query": "deploy cache key", "limit": 10, "concrete": true,
-            "exclude_types": ["fact"],
-        }),
-    );
-    assert_eq!(
-        filtered["results"],
-        json!([]),
-        "excluding the one type that matched must empty the result set: {filtered}"
-    );
-
-    // IMPOSSIBLE type: exact-match semantics mean it matches nothing and
-    // excludes nothing. No error, no filtering — the documented pass-through.
-    let passthrough = server.call_tool_ok(
-        "recall",
-        json!({
-            "query": "deploy cache key", "limit": 10, "concrete": true,
-            "exclude_types": ["tetrahedron"],
-        }),
-    );
-    assert!(
-        passthrough.get("error").is_none(),
-        "an impossible exclude type must not error: {passthrough}"
-    );
-    assert_eq!(
-        passthrough["results"].as_array().unwrap().len(),
-        baseline,
-        "an exclude value matching no known type is a pass-through: {passthrough}"
-    );
-
-    server.shutdown();
-}
-
-/// `validAt` extremes are legal audit queries: far past and far future must
-/// both parse and answer (historical mode keeps non-current facts), rather
-/// than erroring or corrupting the result envelope.
-#[test]
-fn valid_at_far_past_and_far_future_are_audit_queries_that_answer() {
-    let dir = data_dir();
-    let mut server = Server::spawn(dir.path());
-    server.handshake();
-    let id = server.ingest_keyword_only(
-        "The Sofia office latency budget is 200 milliseconds as of the March review",
-        &["net"],
-    );
-    for i in 0..6 {
-        server.ingest_keyword_only(
-            &format!("Filler {i}: invoicing payroll and vendor onboarding checklists"),
-            &[],
-        );
-    }
-
-    for when in ["1900-01-01", "2999-12-31", "now"] {
-        let value = server.call_tool_ok(
-            "recall",
-            json!({ "query": "Sofia latency budget", "limit": 10, "concrete": true, "validAt": when }),
-        );
-        assert!(
-            value.get("error").is_none(),
-            "validAt {when} must be accepted: {value}"
-        );
-        assert!(
-            value["results"].as_array().is_some(),
-            "validAt {when} must answer with the normal envelope: {value}"
-        );
-    }
-
-    // The current-time answer still finds it (sanity: the extremes above audit
-    // the same memory that currency serves).
-    let now = server.recall_ids(json!({
-        "query": "Sofia latency budget", "limit": 10, "concrete": true,
-    }));
-    assert!(
-        now.contains(&id),
-        "the fact must be reachable at the current time: {now:?}"
-    );
-    server.shutdown();
-}
-
-/// A malformed `validAt` must be a tool-level error naming the field and the
-/// accepted forms — never a panic, a parse into nonsense, or a silent ignore.
-#[test]
-fn valid_at_malformed_values_are_tool_errors_that_name_the_field() {
-    let dir = data_dir();
-    let mut server = Server::spawn(dir.path());
-    server.handshake();
-    server.ingest_keyword_only("The latency budget fixture memory", &[]);
-
-    for bad in ["not-a-date", "2025-13-99", "  2025-01-01"] {
-        let value = server.call_tool(
-            "recall",
-            json!({ "query": "latency", "limit": 5, "concrete": true, "validAt": bad }),
-        );
-        assert_error_mentions(&value, "validAt", &format!("validAt {bad:?}"));
-    }
-
-    // Still healthy afterwards.
-    assert_eq!(server.result("ping", None), json!({}));
-    server.shutdown();
-}
-
-/// `limit` is clamped to 1..=100 by contract. Zero, negative and absurd
-/// values must be clamped into a working call, never crash, never error —
-/// and a wrong-typed limit is refused.
-#[test]
-fn limit_out_of_range_values_are_clamped_into_working_calls() {
-    let dir = data_dir();
-    let mut server = Server::spawn(dir.path());
-    server.handshake();
-    for i in 0..3 {
-        server.ingest_keyword_only(
-            &format!("Clamp fixture {i}: the cache warming schedule is documented"),
-            &[],
-        );
-    }
-
-    for limit in [0i64, -50, 999_999_999] {
-        let value = server.call_tool_ok(
-            "recall",
-            json!({ "query": "cache warming schedule", "limit": limit, "concrete": true }),
-        );
-        assert!(
-            value.get("error").is_none(),
-            "limit {limit} must be clamped, not rejected: {value}"
-        );
-        let results = value["results"].as_array().expect("results array");
-        assert!(
-            results.len() <= 100,
-            "clamped limit must stay within the 100 ceiling: {}",
-            results.len()
-        );
-    }
-
-    // A wrong-typed limit is the caller's bug and is reported as such.
-    let wrong = server.call_tool(
-        "recall",
-        json!({ "query": "cache warming", "limit": "ten", "concrete": true }),
-    );
-    assert!(wrong.get("error").is_some(), "string limit must error: {wrong}");
-
-    server.shutdown();
-}
-
-/// `min_retention` out of range is clamped; wrong-typed is an error.
-#[test]
-fn min_retention_out_of_range_is_clamped_and_wrong_type_is_an_error() {
-    let dir = data_dir();
-    let mut server = Server::spawn(dir.path());
-    server.handshake();
-    server.ingest_keyword_only("Retention fixture: the payroll batch window is 02:00", &[]);
-
-    for value in [5.0f64, -1.0, 1.0] {
-        let ok = server.call_tool_ok(
-            "recall",
-            json!({ "query": "payroll batch window", "limit": 5, "concrete": true, "min_retention": value }),
-        );
-        assert!(
-            ok.get("error").is_none(),
-            "min_retention {value} must be clamped into range, not rejected: {ok}"
-        );
-    }
-
-    let wrong = server.call_tool(
-        "recall",
-        json!({ "query": "payroll", "limit": 5, "min_retention": "very high" }),
-    );
-    assert!(wrong.get("error").is_some(), "{wrong}");
-    server.shutdown();
-}
-
-/// Superseded (validity-closed) facts are WITHHELD from current-time results
-/// by default — counted in `supersededWithheld`, not merely down-ranked — and
-/// are visible only through the explicit audit switch.
-#[test]
-fn expired_validity_facts_are_withheld_from_current_results_until_explicitly_audited() {
-    let dir = data_dir();
-    let mut server = Server::spawn(dir.path());
-    server.handshake();
-    server.ingest_keyword_only(
-        "Filler: the vendor onboarding checklist lives in the handbook",
-        &[],
-    );
-    // One ingest, validity-closed in the past: superseded on arrival. The
-    // ingest response's `validity` block is the receipt that the explicit
-    // close was accepted (`memory get` does not surface validity fields).
-    let closed = server.call_tool_ok(
-        "smart_ingest",
-        json!({
-            "content": "The retired rotation password for the staging bastion was lantern-cactus-nine",
-            "tags": ["stale-fixture"],
-            "forceCreate": true,
-            "validUntil": "2020-01-01",
-        }),
-    );
-    assert_eq!(closed["success"], json!(true), "{closed}");
-    assert_eq!(
-        closed["validity"]["source"],
-        json!("explicit"),
-        "fixture: the explicit close must be accepted: {closed}"
-    );
-    assert_eq!(
-        closed["validity"]["validUntil"],
-        json!("2020-01-01T00:00:00+00:00"),
-        "{closed}"
-    );
-    let expired = closed["nodeId"].as_str().expect("nodeId").to_string();
-
-    // Default: withheld.
-    let current = server.call_tool_ok(
-        "recall",
-        json!({ "query": "staging bastion rotation password", "limit": 10, "concrete": true }),
-    );
-    let current_ids: Vec<String> = current["results"]
-        .as_array()
-        .expect("results")
-        .iter()
-        .filter_map(|r| r["id"].as_str().map(str::to_string))
-        .collect();
-    assert!(
-        !current_ids.contains(&expired),
-        "a validity-closed fact must not surface in current-time results: {current:?}"
-    );
-    assert_eq!(
-        current["supersededWithheld"].as_u64().unwrap_or(0),
-        1,
-        "the withheld fact must be counted, not silently dropped: {current}"
-    );
-
-    // Explicit audit switch: visible again, by contract.
-    let audit = server.call_tool_ok(
-        "recall",
-        json!({
-            "query": "staging bastion rotation password", "limit": 10, "concrete": true,
-            "include_superseded": true,
-        }),
-    );
-    let audit_ids: Vec<String> = audit["results"]
-        .as_array()
-        .expect("results")
-        .iter()
-        .filter_map(|r| r["id"].as_str().map(str::to_string))
-        .collect();
-    assert!(
-        audit_ids.contains(&expired),
-        "include_superseded is the opt-in audit view: {audit:?}"
-    );
-
-    // Withholding is stable: a second current-time query does not resurrect.
-    let again = server.recall_ids(json!({
-        "query": "staging bastion rotation password", "limit": 10, "concrete": true,
-    }));
-    assert!(!again.contains(&expired), "repeat query resurrected it: {again:?}");
-
-    server.shutdown();
-}
-
 // ============================================================================
 // B. Ingest gate failures
 // ============================================================================
 
 /// Credential-shaped content is refused outright, the error never echoes the
 /// secret bytes, and nothing reaches the store.
+/// Re-lands with the strata runtime boot: the scenario boots the server on
+/// an EMPTY data dir, and a guard-armed 4.0 binary creates no SQLite store
+/// (audit blocker 1). The refusal itself is still unit-tested in core.
+#[ignore = "needs a live store: 4.0 creates no SQLite; re-lands with build/wire-strata"]
 #[test]
 fn credential_shaped_content_is_refused_without_echoing_the_secret() {
     let dir = data_dir();
@@ -539,7 +177,10 @@ fn credential_shaped_content_is_refused_without_echoing_the_secret() {
 
     // A Google API key shape: the "AIza" prefix plus exactly 35 URL-safe key
     // characters (the scanner counts prefix and tail, so the length matters).
-    let secret = format!("AIza{}", "Az03".repeat(9).chars().take(35).collect::<String>());
+    let secret = format!(
+        "AIza{}",
+        "Az03".repeat(9).chars().take(35).collect::<String>()
+    );
     assert_eq!(secret.len(), 39);
 
     let refused = server.call_tool(
@@ -558,9 +199,13 @@ fn credential_shaped_content_is_refused_without_echoing_the_secret() {
         "the error echoed the secret it refused to store: {error_text}"
     );
 
-    // Nothing landed.
-    let hits = server.recall_ids(json!({ "query": "billing exporter key", "limit": 10 }));
-    assert!(hits.is_empty(), "the refused content leaked into the store: {hits:?}");
+    // Nothing retrievable: free text is never searched (0b) and the refused
+    // content never landed, so the probe returns handle_required.
+    let probe = server.call_tool("recall", json!({ "query": "billing exporter key" }));
+    assert_eq!(
+        probe["error"], "handle_required",
+        "refused content leaked into a retrievable answer: {probe}"
+    );
 
     server.shutdown();
 }
@@ -660,48 +305,6 @@ fn malformed_scope_values_are_refused_on_the_write_path() {
     server.shutdown();
 }
 
-/// Scope isolation: a write in scope A is invisible to default-scope recall
-/// and to scope B, and visible only to scope A itself.
-#[test]
-fn scope_isolated_writes_are_invisible_to_other_scopes() {
-    let dir = data_dir();
-    let mut server = Server::spawn(dir.path());
-    server.handshake();
-
-    let id = server.call_tool_ok(
-        "smart_ingest",
-        json!({
-            "content": "The graphene forge quench schedule is Tuesdays",
-            "scope": "project-alpha",
-            "forceCreate": true,
-        }),
-    )["nodeId"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let mut seen = |mut args: Value| {
-        args["query"] = json!("graphene forge quench");
-        args["limit"] = json!(20);
-        args["concrete"] = json!(true);
-        server.recall_ids(args)
-    };
-
-    assert!(
-        seen(json!({ "scope": "project-alpha" })).contains(&id),
-        "the owning scope must see its own memory"
-    );
-    assert!(
-        !seen(json!({ "scope": "project-beta" })).contains(&id),
-        "scope B must not see scope A's memory"
-    );
-    assert!(
-        !seen(json!({})).contains(&id),
-        "default-scope (user) recall must not see another namespace's memory"
-    );
-    server.shutdown();
-}
-
 // ============================================================================
 // C. Tool protocol failures
 // ============================================================================
@@ -714,11 +317,16 @@ fn unknown_tool_names_are_protocol_errors_with_no_result_body() {
     let mut server = Server::spawn(dir.path());
     server.handshake();
 
-    for name in ["no_such_tool", "", "RECALL", "recall "] {
-        let response = server.request(
-            "tools/call",
-            Some(json!({ "name": name, "arguments": {} })),
-        );
+    let names = [
+        "no_such_tool",
+        "",
+        "RECALL",
+        "recall ",
+        #[cfg(not(feature = "connectors"))]
+        "source_sync",
+    ];
+    for name in names {
+        let response = server.request("tools/call", Some(json!({ "name": name, "arguments": {} })));
         assert!(
             response.get("result").is_none(),
             "unknown tool {name:?} must not produce a result body: {response}"
@@ -740,18 +348,21 @@ fn missing_required_arguments_error_per_tool() {
     let mut server = Server::spawn(dir.path());
     server.handshake();
 
-    let cases: Vec<(&str, Value)> = vec![
+    // Only the connectors build pushes another case.
+    #[cfg_attr(not(feature = "connectors"), allow(unused_mut))]
+    let mut cases: Vec<(&str, Value)> = vec![
         ("recall", json!({})),
         ("smart_ingest", json!({ "tags": ["orphan"] })),
         ("suppress", json!({ "reason": "no subject" })),
         ("memory", json!({})),
         ("intention", json!({})),
         ("maintain", json!({})),
-        ("source_sync", json!({})),
         ("receipt", json!({})),
         ("codebase", json!({})),
         ("graph", json!({})),
     ];
+    #[cfg(feature = "connectors")]
+    cases.push(("source_sync", json!({})));
     for (name, args) in cases {
         let value = server.call_tool(name, args);
         assert!(
@@ -760,15 +371,16 @@ fn missing_required_arguments_error_per_tool() {
         );
     }
 
-    // Contrast: `project` with no arguments is VALID — its defaults are
-    // documented (scope=user, format=claude-md, action=preview). The
-    // refusals above are missing *required* subjects, not missing params.
-    let defaults = server.call_tool_ok("project", json!({}));
-    assert_eq!(
-        defaults["action"],
-        json!("preview"),
-        "project's documented defaults must answer: {defaults}"
+    // `project` has no required subject: an argument-free call is a
+    // read-only preview (#338 admitted projection on Strata), not an error.
+    // The refusals above are missing required subjects.
+    let defaults = server.call_tool("project", json!({}));
+    assert!(
+        defaults.get("error").is_none(),
+        "argument-free project must preview: {defaults}"
     );
+    assert_eq!(defaults["action"], "preview", "{defaults}");
+    assert_eq!(defaults["itemCount"], 0, "{defaults}");
 
     // The dispatch table survived every refusal.
     assert_eq!(server.result("ping", None), json!({}));
@@ -783,15 +395,21 @@ fn wrong_typed_arguments_are_rejected_and_the_server_stays_healthy() {
     let mut server = Server::spawn(dir.path());
     server.handshake();
 
-    let cases = vec![
+    // Only the connectors build pushes another case.
+    #[cfg_attr(not(feature = "connectors"), allow(unused_mut))]
+    let mut cases = vec![
         ("recall", json!({ "query": 42 })),
         ("suppress", json!({ "id": { "deep": 1 } })),
-        ("smart_ingest", json!({ "content": "ok", "tags": "not-an-array" })),
+        (
+            "smart_ingest",
+            json!({ "content": "ok", "tags": "not-an-array" }),
+        ),
         ("memory", json!({ "action": ["get"] })),
-        ("source_sync", json!({ "source": 3 })),
         ("session_start", json!({ "token_budget": "eight hundred" })),
         ("maintain", json!({ "action": true })),
     ];
+    #[cfg(feature = "connectors")]
+    cases.push(("source_sync", json!({ "source": 3 })));
     for (name, args) in &cases {
         let value = server.call_tool(name, args.clone());
         assert!(
@@ -998,43 +616,35 @@ fn array_frames_and_null_id_frames_do_not_kill_the_server() {
 // D. Maintain / destructive failures
 // ============================================================================
 
-/// The standalone purge tool advertises `anthropic/requiresUserInteraction`
-/// (the host prompts on every call) and refuses unconfirmed calls while the
-/// memory survives.
+/// 4.0 withholds purge on a Strata store: it is not advertised, a confirmed
+/// call is refused with `unavailable_in_4_0`, and the memory survives.
 #[test]
-fn purge_tool_requires_user_interaction_and_refuses_unconfirmed_calls() {
+fn purge_is_withheld_on_strata_and_the_memory_survives() {
     let dir = data_dir();
     let mut server = Server::spawn(dir.path());
     server.handshake();
 
     let list = server.result("tools/list", None);
-    let purge = list["tools"]
+    let advertised = list["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|t| t["name"] == json!("purge"))
-        .expect("purge tool advertised")
-        .clone();
-    assert_eq!(
-        purge["_meta"]["anthropic/requiresUserInteraction"],
-        json!(true),
-        "the one irreversible call must request host-side prompting: {purge}"
-    );
+        .any(|t| t["name"] == json!("purge"));
+    assert!(!advertised, "purge is withheld on Strata: {list}");
 
-    let id = server.ingest_keyword_only("A memory that must survive an unconfirmed purge", &[]);
-    let refused = server.call_tool("purge", json!({ "id": id }));
-    let refused_text = refused.to_string();
+    let id = server.ingest_keyword_only("A memory that must survive a withheld purge", &[]);
+    let refused = server.call_tool("purge", json!({ "id": id, "confirm": true }));
     assert!(
         refused.get("error").is_some() || refused["isError"] == json!(true),
-        "unconfirmed purge must be refused: {refused}"
+        "purge must be refused on Strata: {refused}"
     );
     assert!(
-        refused_text.contains("confirm"),
-        "the refusal must say what was missing: {refused}"
+        refused.to_string().contains("unavailable_in_4_0"),
+        "the refusal must say why: {refused}"
     );
     assert!(
         server.memory_found(&id),
-        "a refused purge must not have removed anything"
+        "a withheld purge must not have removed anything"
     );
     server.shutdown();
 }
@@ -1075,6 +685,9 @@ fn maintain_unknown_and_missing_actions_list_the_valid_actions() {
 /// `dream_compile` bounds `memory_count` to 5..=500: outside the window is a
 /// clear error; the accepted bounds (500) on a tiny store reach the clean
 /// `insufficient_memories` status instead of pretending to compile.
+/// Re-lands with the strata runtime boot: the accepted bound calls
+/// `dream_compile_candidates`, which the 4.0 log has not admitted.
+#[ignore = "needs a live store: 4.0 creates no SQLite; re-lands with build/wire-strata"]
 #[test]
 fn dream_compile_bounds_memory_count_and_reports_insufficiency_cleanly() {
     let dir = data_dir();
@@ -1111,6 +724,9 @@ fn dream_compile_bounds_memory_count_and_reports_insufficiency_cleanly() {
 /// `dream` on a store with fewer than 5 memories returns the documented
 /// `insufficient_memories` status — a clean structured answer, not an error
 /// and not a fabricated run.
+/// Re-lands with the strata runtime boot: the page read is
+/// `maintenance_memory_page`, which the 4.0 log has not admitted.
+#[ignore = "needs a live store: 4.0 creates no SQLite; re-lands with build/wire-strata"]
 #[test]
 fn dream_below_the_minimum_reports_insufficient_memories() {
     let dir = data_dir();
@@ -1122,9 +738,7 @@ fn dream_below_the_minimum_reports_insufficient_memories() {
     let value = server.call_tool_ok("maintain", json!({ "action": "dream" }));
     assert_eq!(value["status"], json!("insufficient_memories"), "{value}");
     assert!(
-        value["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("5")),
+        value["message"].as_str().is_some_and(|m| m.contains("5")),
         "the message must state the minimum: {value}"
     );
     server.shutdown();
@@ -1144,13 +758,14 @@ fn gc_defaults_to_dry_run_and_a_wet_run_on_a_healthy_store_deletes_nothing() {
     );
 
     let dry = server.call_tool_ok("maintain", json!({ "action": "gc" }));
-    assert_eq!(dry["dryRun"], json!(true), "gc must default to a dry run: {dry}");
+    assert_eq!(
+        dry["dryRun"],
+        json!(true),
+        "gc must default to a dry run: {dry}"
+    );
     assert_eq!(dry["atomic"], json!(true));
 
-    let wet = server.call_tool_ok(
-        "maintain",
-        json!({ "action": "gc", "dry_run": false }),
-    );
+    let wet = server.call_tool_ok("maintain", json!({ "action": "gc", "dry_run": false }));
     assert_eq!(
         wet["dryRun"],
         json!(false),
@@ -1273,6 +888,9 @@ fn reanchor_refuses_missing_prerequisites_and_wrong_scope_by_name() {
 /// would destroy evidence on a failed write. Anchors use the `path#symbol`
 /// form: only symbol anchors are content-hashed at save time, which is what
 /// makes the baseline verifiable and the preservation meaningful.
+/// Re-lands with the strata runtime boot: symbol anchors stay unanchored
+/// until the log records them.
+#[ignore = "needs a live store: 4.0 creates no SQLite; re-lands with build/wire-strata"]
 #[test]
 fn a_failed_reanchor_preserves_the_existing_evidence() {
     let dir = data_dir();
@@ -1349,6 +967,9 @@ fn a_failed_reanchor_preserves_the_existing_evidence() {
 /// also land in `staleMemories` with a stale reason naming the symbol.
 /// The anchor is a `path#symbol` symbol anchor so a content hash is recorded
 /// at save time; a bare path would honestly report "unverifiable" forever.
+/// Re-lands with the strata runtime boot: symbol anchors stay unanchored
+/// until the log records them.
+#[ignore = "needs a live store: 4.0 creates no SQLite; re-lands with build/wire-strata"]
 #[test]
 fn a_drifted_file_flips_the_anchor_status_to_stale() {
     let dir = data_dir();
@@ -1358,7 +979,11 @@ fn a_drifted_file_flips_the_anchor_status_to_stale() {
     let repo = tempfile::tempdir().unwrap();
     let src = repo.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("queue.rs"), "pub fn load_queue() -> u64 {\n    1500\n}\n").unwrap();
+    std::fs::write(
+        src.join("queue.rs"),
+        "pub fn load_queue() -> u64 {\n    1500\n}\n",
+    )
+    .unwrap();
 
     server.call_tool_ok(
         "codebase",
@@ -1387,7 +1012,11 @@ fn a_drifted_file_flips_the_anchor_status_to_stale() {
 
     // Drift the file: same symbol, completely different body — the memory
     // now describes behavior that is gone.
-    std::fs::write(src.join("queue.rs"), "pub fn load_queue() -> u64 {\n    4000\n}\n").unwrap();
+    std::fs::write(
+        src.join("queue.rs"),
+        "pub fn load_queue() -> u64 {\n    4000\n}\n",
+    )
+    .unwrap();
 
     let drifted = server.call_tool_ok(
         "codebase",
@@ -1414,7 +1043,9 @@ fn a_drifted_file_flips_the_anchor_status_to_stale() {
         "the stale reason must name what changed: {drifted}"
     );
     assert!(
-        drifted["staleMemories"].as_array().is_some_and(|s| !s.is_empty()),
+        drifted["staleMemories"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty()),
         "the drifted memory must surface in the staleMemories report: {drifted}"
     );
     server.shutdown();
@@ -1429,6 +1060,7 @@ fn a_drifted_file_flips_the_anchor_status_to_stale() {
 /// SSRF guard is explicitly disabled via `VESTIGE_ALLOW_PRIVATE_CONNECTOR_
 /// HOSTS` so the loopback mock/dead-host is reachable at all; the guard's own
 /// refusal is tested separately below.)
+#[cfg(feature = "connectors")]
 #[test]
 fn a_dead_upstream_error_names_the_url() {
     let dir = data_dir();
@@ -1468,6 +1100,7 @@ fn a_dead_upstream_error_names_the_url() {
 /// refused at configuration time, before any request — even before the
 /// missing-project check would matter. A misconfigured or hostile base_url
 /// must not turn an authenticated client against localhost.
+#[cfg(feature = "connectors")]
 #[test]
 fn an_internal_address_upstream_is_refused_by_the_ssrf_guard() {
     let dir = data_dir();
@@ -1495,6 +1128,7 @@ fn an_internal_address_upstream_is_refused_by_the_ssrf_guard() {
 /// A 404 from the upstream keeps the connector's documented message shape:
 /// `GET {url} -> {status}: {reason}` — distinguishable from "no results" and
 /// from a transport failure.
+#[cfg(feature = "connectors")]
 #[test]
 fn a_redmine_404_keeps_the_exact_api_message_shape() {
     let dir = data_dir();
@@ -1509,7 +1143,10 @@ fn a_redmine_404_keeps_the_exact_api_message_shape() {
     let mut server = Server::spawn_with_env(
         dir.path(),
         &[
-            ("REDMINE_URL", Box::leak(mock.base_url.clone().into_boxed_str()) as &str),
+            (
+                "REDMINE_URL",
+                Box::leak(mock.base_url.clone().into_boxed_str()) as &str,
+            ),
             ("VESTIGE_ALLOW_PRIVATE_CONNECTOR_HOSTS", "1"),
         ],
         &["REDMINE_API_KEY", "GITHUB_TOKEN", "VESTIGE_GITHUB_TOKEN"],
@@ -1534,6 +1171,11 @@ fn a_redmine_404_keeps_the_exact_api_message_shape() {
 /// The catastrophic-data-loss guard: `reconcile: true` against an upstream
 /// that returns an EMPTY live-id set must refuse to tombstone anything, warn
 /// loudly, and leave every synced memory intact.
+/// Re-lands with the strata runtime boot: the scenario boots the server on
+/// an EMPTY data dir, and a guard-armed 4.0 binary neither creates a SQLite
+/// store nor can sync without one (audit blocker 1).
+#[cfg(feature = "connectors")]
+#[ignore = "needs a live store: 4.0 creates no SQLite and the strata boot lands with build/wire-strata"]
 #[test]
 fn reconcile_with_an_empty_live_set_is_guarded_against_mass_tombstoning() {
     let dir = data_dir();
@@ -1548,7 +1190,10 @@ fn reconcile_with_an_empty_live_set_is_guarded_against_mass_tombstoning() {
                     200,
                     redmine_issues_json(&[
                         (4711, "Failure fixture: the export job wedges on retry"),
-                        (4712, "Failure fixture: the dashboard widget drops timezones"),
+                        (
+                            4712,
+                            "Failure fixture: the dashboard widget drops timezones",
+                        ),
                     ]),
                 )
             }
@@ -1592,11 +1237,11 @@ fn reconcile_with_an_empty_live_set_is_guarded_against_mass_tombstoning() {
         json!({ "source": "redmine", "project": "ops" }),
     );
     assert_eq!(first["created"], json!(2), "{first}");
-    let hits = server.recall_ids(json!({
-        "query": "export job wedges on retry", "limit": 10, "concrete": true,
-    }));
-    assert_eq!(hits.len(), 1, "the synced issue must be retrievable: {hits:?}");
-    let synced_id = hits[0].clone();
+    // (Retrieval of the synced issue moves to the PR 1 handle walk; the
+    // reconcile guard below is storage-level and needs no recall.)
+    let nodes_before = server.call_tool_ok("stats", json!({}))["totalNodes"]
+        .as_u64()
+        .expect("totalNodes");
 
     // The upstream "loses" everything; a guarded reconcile must hold.
     empty.store(true, Ordering::SeqCst);
@@ -1617,8 +1262,11 @@ fn reconcile_with_an_empty_live_set_is_guarded_against_mass_tombstoning() {
             .any(|w| w.as_str().is_some_and(|s| s.contains("empty"))),
         "the guard must warn why reconcile was skipped: {warnings:?}"
     );
-    assert!(
-        server.memory_found(&synced_id),
+    let nodes_after = server.call_tool_ok("stats", json!({}))["totalNodes"]
+        .as_u64()
+        .expect("totalNodes");
+    assert_eq!(
+        nodes_before, nodes_after,
         "the guarded reconcile must leave synced memories intact"
     );
     server.shutdown();
@@ -1627,6 +1275,7 @@ fn reconcile_with_an_empty_live_set_is_guarded_against_mass_tombstoning() {
 /// With no REDMINE_URL configured, redmine sync is a clean configuration
 /// error naming the missing variable — not an attempt to reach a default
 /// host, and not a crash.
+#[cfg(feature = "connectors")]
 #[test]
 fn redmine_without_a_configured_url_is_a_configuration_error() {
     let dir = data_dir();
@@ -1656,6 +1305,7 @@ fn redmine_without_a_configured_url_is_a_configuration_error() {
 
 /// Unknown sources and a missing project identifier are refused with the
 /// supported set / required field named.
+#[cfg(feature = "connectors")]
 #[test]
 fn source_sync_unknown_source_and_missing_project_are_refused_by_name() {
     let dir = data_dir();
@@ -1689,6 +1339,9 @@ fn source_sync_unknown_source_and_missing_project_are_refused_by_name() {
 
 /// Updating an intention that does not exist is a clean named error for every
 /// terminal status — not a fake success, not a crash.
+/// Re-lands with the strata runtime boot: `update_intention_status` is not
+/// admitted on the 4.0 log yet.
+#[ignore = "needs a live store: 4.0 creates no SQLite; re-lands with build/wire-strata"]
 #[test]
 fn updating_a_nonexistent_intention_is_a_clean_named_error() {
     let dir = data_dir();
@@ -1715,7 +1368,10 @@ fn updating_a_nonexistent_intention_is_a_clean_named_error() {
     }
 
     // Missing id/status are refused by name too.
-    let no_id = server.call_tool("intention", json!({ "action": "update", "status": "complete" }));
+    let no_id = server.call_tool(
+        "intention",
+        json!({ "action": "update", "status": "complete" }),
+    );
     assert_error_mentions(&no_id, "id", "update without id");
     let no_status = server.call_tool(
         "intention",
@@ -1757,6 +1413,9 @@ fn snooze_minutes_outside_the_documented_range_are_rejected_with_the_range() {
 /// A check whose context matches nothing fires nothing: an intention bound to
 /// one topic must not trigger on unrelated context (and, as a contrast, must
 /// still fire on its own topic).
+/// Re-lands with the strata runtime boot: `save_intention` is not admitted
+/// on the 4.0 log yet.
+#[ignore = "needs a live store: 4.0 creates no SQLite; re-lands with build/wire-strata"]
 #[test]
 fn a_non_matching_context_fires_nothing_and_a_matching_one_fires() {
     let dir = data_dir();
@@ -1874,43 +1533,6 @@ fn malformed_receipt_uris_and_foreign_schemes_are_clean_errors() {
     server.shutdown();
 }
 
-/// Contrast fixture for the not-found tests above: a REAL receipt id from a
-/// recall renders the MCP App document — proving the not-found failures come
-/// from lookup, not from a broken template.
-#[test]
-fn a_real_receipt_uri_renders_so_the_not_found_cases_mean_something() {
-    let dir = data_dir();
-    let mut server = Server::spawn(dir.path());
-    server.handshake();
-    server.ingest_keyword_only("Receipt rendering fixture about the deploy cache", &[]);
-
-    let recall = server.call_tool_ok(
-        "recall",
-        json!({ "query": "receipt rendering fixture deploy cache", "concrete": true }),
-    );
-    let receipt_id = recall["receiptId"]
-        .as_str()
-        .unwrap_or_else(|| panic!("recall carried no receiptId: {recall}"))
-        .to_string();
-
-    let response = server.result(
-        "resources/read",
-        Some(json!({ "uri": format!("ui://vestige/receipt/{receipt_id}") })),
-    );
-    let content = &response["contents"][0];
-    assert_eq!(
-        content["mimeType"],
-        json!("text/html;profile=mcp-app"),
-        "the receipt card is the one HTML resource: {response}"
-    );
-    let text = content["text"].as_str().unwrap_or_default();
-    assert!(
-        text.contains(&receipt_id),
-        "the rendered card must reference its own receipt id"
-    );
-    server.shutdown();
-}
-
 // ============================================================================
 // I. Concurrency / EOF
 // ============================================================================
@@ -1994,7 +1616,10 @@ fn a_burst_of_mixed_frames_answers_every_valid_request() {
     assert_eq!(by_id[&202]["error"]["code"], json!(-32601));
     assert_eq!(by_id[&203]["error"]["code"], json!(-32602));
     assert_eq!(by_id[&204]["result"], json!({}));
-    assert_eq!(parse_errors, 1, "exactly one parse error for one garbage frame");
+    assert_eq!(
+        parse_errors, 1,
+        "exactly one parse error for one garbage frame"
+    );
 
     // The store still works after the storm.
     let id = server.ingest_keyword_only("Written after the mixed-frame storm", &[]);

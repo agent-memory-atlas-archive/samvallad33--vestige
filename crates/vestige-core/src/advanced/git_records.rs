@@ -134,7 +134,9 @@ pub fn parse_git_log(raw: &str) -> Vec<GitCommit> {
             if let Some(rest) = line.strip_prefix("diff --git a/") {
                 match rest.split_once(" b/") {
                     // git C-quotes exotic paths; the +++ line below re-captures them
-                    Some((_, b)) if !b.contains('"') => push_file(&mut files, b.trim(), &mut extra_files, &mut files_capped),
+                    Some((_, b)) if !b.contains('"') => {
+                        push_file(&mut files, b.trim(), &mut extra_files, &mut files_capped)
+                    }
                     _ => {}
                 }
             } else if let Some(rest) = line.strip_prefix("+++ b/") {
@@ -397,10 +399,34 @@ fn resolve_import(target: &str, kind: ImportKind, files: &[String]) -> Option<St
 /// `@@ ... @@ def save(self)` -> `save`.
 fn leading_identifier(ctx: &str) -> Option<String> {
     const KEYWORDS: &[&str] = &[
-        "fn", "def", "function", "func", "method", "class", "struct", "impl",
-        "public", "private", "protected", "static", "async", "const", "let",
-        "var", "extern", "unsafe", "pub", "export", "return", "type",
-        "interface", "enum", "trait", "virtual", "template", "override",
+        "fn",
+        "def",
+        "function",
+        "func",
+        "method",
+        "class",
+        "struct",
+        "impl",
+        "public",
+        "private",
+        "protected",
+        "static",
+        "async",
+        "const",
+        "let",
+        "var",
+        "extern",
+        "unsafe",
+        "pub",
+        "export",
+        "return",
+        "type",
+        "interface",
+        "enum",
+        "trait",
+        "virtual",
+        "template",
+        "override",
         "final",
     ];
     let mut ident = String::new();
@@ -422,14 +448,24 @@ fn leading_identifier(ctx: &str) -> Option<String> {
     // value-taking keywords ("return None;", "return true") hand us a VALUE,
     // not a declaration name; language literals are never hunk symbols
     const JUNK: &[&str] = &[
-        "none", "some", "ok", "err", "true", "false", "self", "super", "null",
-        "nil", "undefined", "return",
+        "none",
+        "some",
+        "ok",
+        "err",
+        "true",
+        "false",
+        "self",
+        "super",
+        "null",
+        "nil",
+        "undefined",
+        "return",
     ];
     let lower = ident.to_lowercase();
     (!ident.is_empty()
         && ident.chars().any(|c| !c.is_ascii_digit())
         && !JUNK.contains(&lower.as_str()))
-        .then_some(ident)
+    .then_some(ident)
 }
 
 /// Content for a commit record. Every token on the files/modules/symbols lines
@@ -511,7 +547,9 @@ pub fn extract_versions(text: &str) -> Vec<String> {
         let groups: Vec<&str> = tok.split('.').collect();
         let ok = groups.len() >= 2
             && groups.len() <= 3
-            && groups.iter().all(|g| !g.is_empty() && g.len() <= 3 && g.chars().all(|c| c.is_ascii_digit()));
+            && groups
+                .iter()
+                .all(|g| !g.is_empty() && g.len() <= 3 && g.chars().all(|c| c.is_ascii_digit()));
         if ok && !out.iter().any(|v| v == tok) {
             out.push(tok.clone());
         }
@@ -536,7 +574,10 @@ fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
     let (a, b) = (parse_version(a), parse_version(b));
     let n = a.len().max(b.len());
     for i in 0..n {
-        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
         if x != y {
             return x.cmp(&y);
         }
@@ -638,8 +679,14 @@ diff --git a/README.md b/README.md
                 "src/legacy.h"
             ]
         );
-        assert!(c.symbols.contains(&"events/local.py/write_event".to_string()));
-        assert!(c.symbols.contains(&"src/store.rs/LocalFileStore".to_string()));
+        assert!(
+            c.symbols
+                .contains(&"events/local.py/write_event".to_string())
+        );
+        assert!(
+            c.symbols
+                .contains(&"src/store.rs/LocalFileStore".to_string())
+        );
         assert_eq!(c.time.to_rfc3339(), "2026-09-01T12:00:00+00:00");
         // the docs commit touches files but has no parseable symbol context
         assert_eq!(commits[1].files, vec!["README.md"]);
@@ -716,7 +763,11 @@ diff --git a/README.md b/README.md
         let commits = parse_git_log(FIXTURE);
         let content = record_content(&commits[0]);
         let ents = extract_entities(&content, &[]);
-        for want in ["events/local.py", "src/store.rs", "events/local.py/write_event"] {
+        for want in [
+            "events/local.py",
+            "src/store.rs",
+            "events/local.py/write_event",
+        ] {
             assert!(ents.iter().any(|e| e == want), "missing {want} in {ents:?}");
         }
         // hunk spans and import edges are part of the record content
@@ -742,10 +793,22 @@ diff --git a/README.md b/README.md
             "crate::store::Store must resolve to src/store.rs: {imports:?}"
         );
         // quoted #include resolves verbatim; <> include has no repo mapping
-        assert!(imports.iter().any(|(f, t, r)| f == "src/wrap.c" && t == "src/legacy.h" && *r));
-        assert!(imports.iter().any(|(f, t, r)| f == "src/wrap.c" && t == "stdint.h" && !*r));
+        assert!(
+            imports
+                .iter()
+                .any(|(f, t, r)| f == "src/wrap.c" && t == "src/legacy.h" && *r)
+        );
+        assert!(
+            imports
+                .iter()
+                .any(|(f, t, r)| f == "src/wrap.c" && t == "stdint.h" && !*r)
+        );
         // `from events import local` maps onto the module dir of events/local.py
-        assert!(imports.iter().any(|(f, t, r)| f == "events/local.py" && t == "events" && *r));
+        assert!(
+            imports
+                .iter()
+                .any(|(f, t, r)| f == "events/local.py" && t == "events" && *r)
+        );
         // an external crate and a missing module stay unresolved and visible
         assert!(
             imports
@@ -817,7 +880,11 @@ diff --git a/README.md b/README.md
             .and_then(|rest| rest.split(' ').next())
             .and_then(|n| n.parse().ok())
             .expect("visible (+N more) counter");
-        assert_eq!(shown + hidden, 250, "shown {shown} + hidden {hidden} != 250");
+        assert_eq!(
+            shown + hidden,
+            250,
+            "shown {shown} + hidden {hidden} != 250"
+        );
     }
 
     #[test]
@@ -851,10 +918,21 @@ diff --git a/README.md b/README.md
         // hunks past the file cap must not be attributed to file #50 either:
         // 52 file blocks, but only the 50 recorded files keep their spans
         assert_eq!(commits[0].hunks.len(), MAX_FILES);
-        assert!(commits[0].hunks.iter().all(|h| h.file != "src/f50.rs" && h.file != "src/f51.rs"));
-        assert_eq!(commits[0].extra_hunks, 0, "dropped-for-attribution is not span overflow");
+        assert!(
+            commits[0]
+                .hunks
+                .iter()
+                .all(|h| h.file != "src/f50.rs" && h.file != "src/f51.rs")
+        );
+        assert_eq!(
+            commits[0].extra_hunks, 0,
+            "dropped-for-attribution is not span overflow"
+        );
         let content = record_content(&commits[0]);
-        assert!(content.contains("(+2 more)"), "truncation must be visible: {content}");
+        assert!(
+            content.contains("(+2 more)"),
+            "truncation must be visible: {content}"
+        );
     }
 
     #[test]
@@ -869,7 +947,12 @@ diff --git a/README.md b/README.md
             + "+++ b/\"spa ce\"\n"
             + "@@ -1,2 +1,3 @@ fn main()\n";
         let commits = parse_git_log(&raw);
-        assert_eq!(commits[0].files, vec!["spa ce"], "files: {:?}", commits[0].files);
+        assert_eq!(
+            commits[0].files,
+            vec!["spa ce"],
+            "files: {:?}",
+            commits[0].files
+        );
         assert!(commits[0].symbols.contains(&"spa ce/main".to_string()));
     }
 
@@ -879,8 +962,14 @@ diff --git a/README.md b/README.md
             leading_identifier("pub fn write_event(self, x: u8)"),
             Some("write_event".into())
         );
-        assert_eq!(leading_identifier("pub struct Config {"), Some("Config".into()));
-        assert_eq!(leading_identifier("export function save()"), Some("save".into()));
+        assert_eq!(
+            leading_identifier("pub struct Config {"),
+            Some("Config".into())
+        );
+        assert_eq!(
+            leading_identifier("export function save()"),
+            Some("save".into())
+        );
         assert_eq!(leading_identifier("return None;"), None);
         assert_eq!(leading_identifier("trait Store {"), Some("Store".into()));
     }

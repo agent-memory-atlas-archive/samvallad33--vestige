@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Qualify the installed Python runtime against a disposable real MCP server.
+"""Qualify the installed Python runtime against a Strata MCP server.
 
-Requires vestige-runtime installed in the invoking Python environment. No SDK or
-model is called. The transcript contains only synthetic fixture information.
+Keyword lookup and packet reuse are not Strata operations. The proof is:
+force-create, exact handle recall, query recall refused, and provider
+request bodies built with zero model calls.
 """
 
 import argparse
@@ -33,7 +34,7 @@ def run(binary, output):
             session = DeveloperSession(catalog, call)
             session.discover(["smart_ingest", "recall"])
             session.add_user("Remember the synthetic fixture timeout decision")
-            session.execute_tool(
+            created = session.execute_tool(
                 "ingest",
                 "smart_ingest",
                 {
@@ -41,12 +42,15 @@ def run(binary, output):
                     "forceCreate": True,
                 },
             )
-            args = {"query": "RUNTIME_FIXTURE_TIMEOUT", "mode": "lookup"}
-            first = session.execute_tool("lookup-1", "recall", args)
-            assert first["notModified"] is False and first.get("packetId"), first
-            assert first["results"], first
-            second = session.execute_tool("lookup-2", "recall", args)
-            assert second["notModified"] is True and not second.get("results"), second
+            node_id = created["nodeId"]
+            assert node_id.startswith("mem-"), created
+            handle = call("recall", {"handle": node_id})
+            assert handle.get("isError") is not True, handle
+            body = handle.get("structuredContent") or json.loads(handle["content"][0]["text"])
+            assert "RUNTIME_FIXTURE_TIMEOUT" in json.dumps(body), body
+            refused = call("recall", {"query": "RUNTIME_FIXTURE_TIMEOUT", "mode": "lookup"})
+            assert refused.get("isError") is True, refused
+            assert "similarity_disabled" in json.dumps(refused)
             requests = {
                 provider: session.request(
                     provider,
@@ -55,10 +59,6 @@ def run(binary, output):
                 )
                 for provider in ("openai_responses", "anthropic_messages")
             }
-            session.reset_context(summary="Continue the synthetic timeout task")
-            third = session.execute_tool("lookup-3", "recall", args)
-            assert third["notModified"] is False and third["results"], third
-            assert "known_packet_id" not in calls[-1]["arguments"]
             proof = {
                 "kind": "installed_runtime_real_stdio_synthetic_fixture",
                 "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
@@ -67,22 +67,23 @@ def run(binary, output):
                 "selected_tool_count": len(requests["openai_responses"]["tools"]),
                 "calls": calls,
                 "provider_request_bodies": requests,
-                "packet_reuse_verified": True,
-                "compaction_refresh_verified": True,
+                "handle_recall_verified": True,
+                "query_recall_refused": True,
+                "packet_reuse_verified": False,
                 "provider_model_calls": 0,
-                "local_embeddings": "server configured runtime may run",
+                "local_embeddings": "refused; similarity is not a Strata operation",
                 "billing_savings_measured": False,
             }
             if output:
                 output.write_text(json.dumps(proof, indent=2) + "\n")
             print(
-                "PASS installed runtime, real stdio, retained packet reuse and compaction refresh; zero provider model calls"
+                "PASS installed runtime, real stdio, handle recall, query refusal; zero provider model calls"
             )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--binary", type=Path, default=Path("target/debug/vestige-mcp"))
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     run(args.binary, args.output)

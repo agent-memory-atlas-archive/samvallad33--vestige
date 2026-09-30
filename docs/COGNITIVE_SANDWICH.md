@@ -1,5 +1,7 @@
 # Cognitive Sandwich
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../README.md) and the [4.0.0 changelog](../CHANGELOG.md).
+
 **Vestige's defense-in-depth safety architecture for Claude Code.**
 
 The default Cognitive Sandwich installer only stages files and removes old v2.1.0 hook wiring. It activates no Claude Code hooks and makes no automatic model calls. Both the preflight layer and the Stop-hook layer are explicit opt-ins:
