@@ -2491,6 +2491,22 @@ impl MemoryStoreSend for StrataMemory {
         // deleted); on Strata it cannot be reversed.
         let mut store = self.lock();
         let receipt = retire_live(&mut store, id, strata_store::RULE_SUPPRESS, false)?;
+        // A GhostLink composition record names both members in its source
+        // key. Suppression hides a memory from every read, so each live
+        // record composed from it is withdrawn with it, through the gate
+        // with its own receipt.
+        let compositions: Vec<String> = store
+            .nodes()
+            .into_iter()
+            .filter(|record| record.is_live())
+            .filter(|record| {
+                strata_store::composition_pair(record).is_some_and(|(a, b)| a == id || b == id)
+            })
+            .map(|record| record.id)
+            .collect();
+        for record in compositions {
+            retire_live(&mut store, &record, strata_store::RULE_SUPPRESS, false)?;
+        }
         // The trait returns a node, not a receipt. `source` carries the eff-
         // id for this call only; the log record is unchanged.
         let mut node = KnowledgeNode::default();
@@ -3684,5 +3700,86 @@ mod tests {
         let reopened = super::open(dir.path()).unwrap();
         assert!(reopened.get_node(&node.id).unwrap().is_none());
         assert!(no_sqlite(dir.path()));
+    }
+
+    #[test]
+    fn suppressing_a_woven_member_withdraws_its_composition_records() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = super::open(dir.path()).unwrap();
+        let ingest = |content: &str| {
+            storage
+                .ingest(vestige_core::IngestInput {
+                    content: content.into(),
+                    node_type: "fact".into(),
+                    ..vestige_core::IngestInput::default()
+                })
+                .unwrap()
+                .id
+        };
+        let kept = ingest("KEPT_WOVEN_VISIBLE");
+        let doomed = ingest("DOOMED_WOVEN_MARKER_41d9");
+        let woven =
+            super::ghostlink::weave(storage.as_ref(), &kept, &doomed, "helpful", None).unwrap();
+        let record = woven["recordId"].as_str().unwrap().to_string();
+        assert!(storage.get_node(&record).unwrap().is_some());
+
+        let suppressed = storage.suppress_memory(&doomed).unwrap();
+        assert_eq!(suppressed.id, doomed);
+
+        // Neither the suppressed member's id nor its record surfaces in any
+        // GhostLink read or in a plain read of the surviving member.
+        let hidden = |what: &str, text: String| {
+            assert!(
+                !text.contains(&doomed),
+                "{what} leaked the suppressed id: {text}"
+            );
+            assert!(
+                !text.contains(&record),
+                "{what} leaked the withdrawn record: {text}"
+            );
+        };
+        for view in ["recent", "memory"] {
+            hidden(
+                view,
+                super::ghostlink::inspect(storage.as_ref(), view, None, Some(&kept), 10)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|err| err),
+            );
+        }
+        hidden(
+            "associations",
+            super::ghostlink::explore(storage.as_ref(), "associations", &kept, None, 10)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|err| err),
+        );
+        // A chain asked for by the suppressed id echoes only the caller's own
+        // argument: no path, no record, no content.
+        let chain =
+            super::ghostlink::explore(storage.as_ref(), "chain", &kept, Some(&doomed), 10).unwrap();
+        assert_eq!(chain["steps"], json!([]), "{chain}");
+        let text = chain.to_string();
+        assert!(
+            !text.contains(&record) && !text.contains("DOOMED_WOVEN_MARKER_41d9"),
+            "{text}"
+        );
+        assert!(
+            storage.get_node(&record).unwrap().is_none(),
+            "record withdrawn"
+        );
+        let kept_node = storage.get_node(&kept).unwrap().expect("kept stays");
+        hidden(
+            "memory get kept",
+            serde_json::to_string(&kept_node).unwrap(),
+        );
+        hidden(
+            "connections of kept",
+            format!("{:?}", storage.get_connections_for_memory(&kept).unwrap()),
+        );
+
+        // The withdrawal is a gated write that survives a reopen.
+        drop(storage);
+        let reopened = super::open(dir.path()).unwrap();
+        assert!(reopened.get_node(&record).unwrap().is_none());
+        assert!(reopened.get_node(&kept).unwrap().is_some());
     }
 }
