@@ -387,3 +387,48 @@ fn rows_without_scheduling_columns_import_v3_defaults() {
         .iter()
         .all(|r| r.legacy_id != "11111111-1111-4111-8111-111111111111"));
 }
+
+/// One node stamped far in the future must not move the fit clock of the
+/// rest of the store: cards are fitted no later than the moment of import.
+#[test]
+fn a_future_dated_node_does_not_move_the_fit_clock() {
+    let (tmp, db, ids) = fresh("future");
+    let future = Utc::now() + Duration::days(3650);
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE knowledge_nodes SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![future.to_rfc3339(), ids[3]],
+        )
+        .unwrap();
+    }
+    let dir = tmp.path().join("strata");
+    let report = migrate(&db, &dir).expect("migrate");
+    let after = Utc::now().timestamp_millis();
+    assert!(report.verify_passed);
+
+    let snapshot = read_snapshot(&StrataLog::open(&dir).unwrap()).unwrap();
+    let rows = planted_rows();
+    let at = DateTime::from_timestamp_millis(after).unwrap();
+    // The two memories at least a day old read what v3 reads now.
+    for index in [0usize, 1] {
+        let record = snapshot
+            .fsrs_states
+            .iter()
+            .find(|r| r.legacy_id == ids[index])
+            .unwrap();
+        assert!(
+            record.fitted_at_ms <= after,
+            "{}: fitted {} after the import finished at {after}",
+            ids[index],
+            record.fitted_at_ms
+        );
+        let v3 = v3_retrievability(&rows[index], at);
+        let strata = strata_retrievability(record, at);
+        assert!(
+            (strata - v3).abs() < 0.01,
+            "{}: strata {strata} vs v3 {v3} at import time",
+            ids[index]
+        );
+    }
+}
