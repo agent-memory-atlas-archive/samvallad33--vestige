@@ -1810,12 +1810,24 @@ fn imported_scope_suppression_and_supersession_survive_replay() {
     append_payload(
         &dir,
         KIND_STORE_WRITE,
-        &imported_node(project, &[("scope", "biohub"), ("suppression_count", "0")]),
+        &imported_node(
+            project,
+            &[
+                ("knowledge_nodes.scope", "biohub"),
+                ("knowledge_nodes.suppression_count", "0"),
+            ],
+        ),
     );
     append_payload(
         &dir,
         KIND_STORE_WRITE,
-        &imported_node(suppressed, &[("scope", "user"), ("suppression_count", "2")]),
+        &imported_node(
+            suppressed,
+            &[
+                ("knowledge_nodes.scope", "user"),
+                ("knowledge_nodes.suppression_count", "2"),
+            ],
+        ),
     );
     append_payload(&dir, KIND_STORE_WRITE, &imported_node(old, &[]));
     append_payload(&dir, KIND_STORE_WRITE, &imported_node(new, &[]));
@@ -1837,7 +1849,10 @@ fn imported_scope_suppression_and_supersession_survive_replay() {
     assert_eq!(kept.scope, "biohub");
     assert!(kept.is_live());
     assert!(!store.get_node(suppressed).expect("suppressed").is_live());
-    assert_eq!(store.get_node(old).expect("old").superseded_by.as_deref(), Some(new));
+    assert_eq!(
+        store.get_node(old).expect("old").superseded_by.as_deref(),
+        Some(new)
+    );
     assert!(store.get_node(new).expect("new").is_live());
     assert_eq!(store.get_node(old).expect("old").scope, "user");
 

@@ -621,10 +621,12 @@ impl StrataStore {
 
     /// Imported node. Kind stays on the edge records; this only fills the registry.
     fn apply_imported_node(&mut self, node: &strata_migrate::NodeRecord) {
+        // The importer keys every carried v3 column as `<table>.<column>`.
         let legacy = |column: &str| {
+            let qualified = format!("knowledge_nodes.{column}");
             node.legacy
                 .iter()
-                .find(|(key, _)| key == column)
+                .find(|(key, _)| *key == qualified)
                 .map(|(_, value)| value.as_str())
         };
         // v3 kept each memory's project namespace in `scope`; keep it, or
