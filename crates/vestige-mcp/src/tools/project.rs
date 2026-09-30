@@ -559,11 +559,28 @@ mod strata_preview {
             None,
         );
         drop(storage);
+        let aged;
         {
             let mut store =
                 strata_store::StrataStore::open_with_policy(dir.path(), permissive_policy())
                     .unwrap();
             store.supersede(&superseded, &decision).unwrap();
+            // A decision written long ago has decayed with elapsed time.
+            aged = store
+                .ingest_in_scope(
+                    strata_store::IngestInput {
+                        content: "Decision written a year ago".into(),
+                        source: None,
+                        source_updated_at_ms: None,
+                        node_type: "decision".into(),
+                        tags: Vec::new(),
+                        created_at_ms: Some(Utc::now().timestamp_millis() - 365 * 86_400_000),
+                        valid_from_ms: None,
+                        valid_until_ms: None,
+                    },
+                    "user",
+                )
+                .unwrap();
         }
         let storage = crate::strata_memory::open(dir.path()).unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -597,7 +614,15 @@ mod strata_preview {
         assert!(ids.contains(&pattern.as_str()), "{ids:?}");
         assert!(ids.contains(&rule.as_str()), "{ids:?}");
         assert!(ids.contains(&convention.as_str()), "{ids:?}");
-        for excluded in [&superseded, &plain, &keyword, &expired, &future, &other] {
+        for excluded in [
+            &superseded,
+            &plain,
+            &keyword,
+            &expired,
+            &future,
+            &other,
+            &aged,
+        ] {
             assert!(!ids.contains(&excluded.as_str()), "{excluded} in {ids:?}");
         }
         let region = value["region"].as_str().unwrap();
@@ -627,7 +652,8 @@ mod strata_preview {
         )
         .await
         .unwrap();
-        assert_eq!(floor["itemCount"], 0, "{floor}");
+        // Fresh memories meet a floor of 1.0; the year-old decision does not.
+        assert_eq!(floor["itemCount"], 4, "{floor}");
         assert_eq!(blake3_tree(dir.path()), log_after);
 
         let capped = execute(

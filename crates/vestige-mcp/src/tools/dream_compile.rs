@@ -390,7 +390,12 @@ mod strata_tests {
                                 source_updated_at_ms: None,
                                 node_type: "fact".into(),
                                 tags: Vec::new(),
-                                created_at_ms: Some(1_700_000_000_000),
+                                // Later ingests are fresher: retention follows
+                                // the creation clock, one day apart.
+                                created_at_ms: Some(
+                                    chrono::Utc::now().timestamp_millis()
+                                        - (6 - index as i64) * 86_400_000,
+                                ),
                                 valid_from_ms: None,
                                 valid_until_ms: None,
                             },

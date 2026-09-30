@@ -1861,8 +1861,9 @@ impl StrataStore {
     /// never stored, and reads append nothing (v1).
     ///
     /// An explicit review with `reviewed_at_ms` measures elapsed whole days
-    /// from that timestamp. `None` uses sequence distance from `last_seq`
-    /// to the log head.
+    /// from that timestamp; a card still at its ingest review measures from
+    /// the node's creation time. Otherwise sequence distance from `last_seq`
+    /// to the log head is used.
     pub fn retrievability(&self, id: &str) -> Result<Option<f64>, StoreError> {
         self.retrievability_at(id, admission_now_ms())
     }
@@ -1873,9 +1874,19 @@ impl StrataStore {
         let Some(card) = self.fsrs.cards.get(&handle) else {
             return Ok(None);
         };
+        // A card still at its ingest review has no explicit review clock;
+        // the node's recorded creation time stands in, so retention follows
+        // elapsed time rather than log writes. A node with no recorded
+        // creation time (0) keeps the sequence-distance fallback.
+        let clock = self.reviewed_at.get(&handle).copied().or_else(|| {
+            (card.review_count <= 1)
+                .then(|| self.nodes.get(id).map(|record| record.created_at_ms))
+                .flatten()
+                .filter(|ms| *ms > 0)
+        });
         FsrsFold::retrievability_at_review(
             card,
-            self.reviewed_at.get(&handle).copied(),
+            clock,
             as_of_ms,
             self.log.head().last_acked_seq,
             ALGO_V2,
