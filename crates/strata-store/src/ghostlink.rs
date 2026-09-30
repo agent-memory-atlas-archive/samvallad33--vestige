@@ -358,10 +358,10 @@ impl Slot {
             }
             let block = self.i / self.s;
             if block % 2 != self.p {
-                self.i = (block + 1) * self.s;
+                self.i = (block + 1).checked_mul(self.s)?;
                 continue;
             }
-            if self.i + self.s >= n {
+            if self.i.checked_add(self.s)? >= n {
                 if self.p == 0 {
                     self.p = 1;
                     self.i = self.s;
@@ -1135,10 +1135,19 @@ impl<'s> GhostSnapshot<'s> {
         let number = |at: usize| parts[at].parse::<usize>().map_err(|_| bad());
         let measured_offset = number(3)?;
         let (s, p, i) = (number(4)?, number(5)?, number(6)?);
+        // Every cursor this snapshot issues stays inside its own pool: the
+        // measured offset never passes the pool's pair count, and a slot
+        // pairs positions `i` and `i + s` of an `n`-member order. Anything
+        // else was not issued here, and paging on it would index past the
+        // order.
+        let n = self.pool.len();
+        if measured_offset as u64 > pairs(n as u64) {
+            return Err(bad());
+        }
         let slot = if s == 0 {
             None
         } else {
-            if p > 1 {
+            if p > 1 || i.checked_add(s).is_none_or(|end| end >= n) {
                 return Err(bad());
             }
             Some(Slot { s, p, i })
@@ -1407,7 +1416,8 @@ impl<'s> GhostSnapshot<'s> {
             },
         };
         let mut summary = self.summary();
-        let (ranked, measured_total, members) = self.measured_top(cursor.measured_offset + limit);
+        let (ranked, measured_total, members) =
+            self.measured_top(cursor.measured_offset.saturating_add(limit));
         summary.measured_members_evaluated = members;
         let measured: Vec<DivergentEval> = ranked
             .iter()

@@ -577,6 +577,52 @@ fn a_cursor_goes_stale_when_the_log_moves() {
 }
 
 #[test]
+fn a_crafted_cursor_is_refused_never_a_panic() {
+    let dir = temp_dir("div-crafted");
+    cold_store(&dir, 6, |at| format!("m{at}"));
+    let store = StrataStore::open(&dir).expect("open");
+    let snapshot = store.ghost_snapshot(user());
+    let next = snapshot
+        .divergent_page(None, 1)
+        .expect("page")
+        .next_cursor
+        .expect("more pages");
+    // gl1.<head>.<filter>.<measured_offset>.<s>.<p>.<i>
+    let parts: Vec<&str> = next.split('.').collect();
+    assert_eq!(parts.len(), 7, "{next}");
+    let craft = |offset: &str, s: &str, p: &str, i: &str| {
+        format!(
+            "{}.{}.{}.{offset}.{s}.{p}.{i}",
+            parts[0], parts[1], parts[2]
+        )
+    };
+    let max = usize::MAX.to_string();
+    for cursor in [
+        // A measured offset past every pair the pool can hold.
+        craft(&max, parts[4], parts[5], parts[6]),
+        // A slot index past the pool: i + s wraps.
+        craft(parts[3], "1", "1", &max),
+        // (block + 1) * s wraps.
+        craft(parts[3], "2", "0", &max),
+        // A step no schedule round has.
+        craft(parts[3], &max, "0", "0"),
+        // Parity is 0 or 1.
+        craft(parts[3], "1", "2", "0"),
+    ] {
+        let err = snapshot
+            .divergent_page(Some(&cursor), 3)
+            .expect_err(&cursor);
+        assert!(
+            err.to_string().contains("not a GhostLink divergent cursor"),
+            "{cursor}: {err}"
+        );
+    }
+    // The real cursor still pages.
+    assert!(snapshot.divergent_page(Some(&next), 3).is_ok());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn identical_content_and_tags_give_no_advantage() {
     let same = temp_dir("div-same-content");
     let differ = temp_dir("div-differ-content");
