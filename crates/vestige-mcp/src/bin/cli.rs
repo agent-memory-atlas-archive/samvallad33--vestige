@@ -4932,11 +4932,41 @@ fn run_ghostlink_propose(
     };
     let answer =
         propose(storage.as_ref(), &request).map_err(|e| anyhow::anyhow!("compose error: {e}"))?;
+    let candidates = answer["candidates"].as_array().cloned().unwrap_or_default();
     if json {
-        println!("{}", serde_json::to_string_pretty(&answer)?);
+        // The 4.0.0 `--json` contract: an array of pairs with a_id / b_id and
+        // the legacy keys. Each pair also carries its lens, lane and proof.
+        let pairs: Vec<serde_json::Value> = candidates
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "a_id": c["firstId"],
+                    "b_id": c["secondId"],
+                    "score": c["score"],
+                    "novelty": c.get("noveltyScore").cloned().unwrap_or(serde_json::Value::Null),
+                    "bridge": c.get("bridgeScore").cloned().unwrap_or(serde_json::Value::Null),
+                    "trust": c.get("trustScore").cloned().unwrap_or(serde_json::Value::Null),
+                    "a": c["firstPreview"],
+                    "b": c["secondPreview"],
+                    "shared_tags": [],
+                    "question": c["compositionQuestion"],
+                    "reason": c["reason"],
+                    "lens": c["lens"],
+                    "lane": c.get("lane").cloned().unwrap_or(serde_json::Value::Null),
+                    "hops": c.get("hops").cloned().unwrap_or(serde_json::Value::Null),
+                    "pathMin": c.get("pathMin").cloned().unwrap_or(serde_json::Value::Null),
+                    "proof": c["proof"],
+                })
+            })
+            .collect();
+        if pairs.is_empty()
+            && let Some(why) = answer["admission"]["emptyBecause"].as_str()
+        {
+            eprintln!("compose: {why}");
+        }
+        println!("{}", serde_json::to_string_pretty(&pairs)?);
         return Ok(());
     }
-    let candidates = answer["candidates"].as_array().cloned().unwrap_or_default();
     let scope_label = request.scope.as_deref().unwrap_or("user");
     if candidates.is_empty() {
         let why = answer["admission"]["emptyBecause"]
@@ -4980,6 +5010,24 @@ fn run_ghostlink_propose(
             truncate(c["secondPreview"].as_str().unwrap_or(""), 70)
         );
         println!("   why: {}", c["reason"].as_str().unwrap_or(""));
+        if let Some(path) = c["proof"]["path"]
+            .as_array()
+            .filter(|path| !path.is_empty())
+        {
+            // The proof itself: each recorded edge, in walk order.
+            let mut line = path[0]["from"].as_str().unwrap_or("?").to_string();
+            for step in path {
+                let kind = step["kind"].as_str().unwrap_or("?");
+                let arrow = if step["reversed"].as_bool().unwrap_or(false) {
+                    format!(" <-{kind}- ")
+                } else {
+                    format!(" -{kind}-> ")
+                };
+                line.push_str(&arrow);
+                line.push_str(step["to"].as_str().unwrap_or("?"));
+            }
+            println!("   path: {line}");
+        }
         if let Some(q) = c["compositionQuestion"].as_str().filter(|q| !q.is_empty()) {
             println!("   Q: {q}");
         }

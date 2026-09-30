@@ -510,16 +510,21 @@ fn compose_runs_both_ghostlink_lenses_with_proofs() {
         pair.sort();
         (pair[0].clone(), pair[1].clone())
     };
+    // `--json` keeps the 4.0.0 contract: an array of pairs with a_id / b_id
+    // and the legacy keys, each also carrying its lens, lane and proof.
     let pairs_of = |answer: &Value| -> Vec<(String, String)> {
-        answer["candidates"]
+        answer
             .as_array()
-            .unwrap_or_else(|| panic!("no candidates: {answer}"))
+            .unwrap_or_else(|| panic!("--json must print an array: {answer}"))
             .iter()
             .map(|c| {
-                sorted(
-                    c["firstId"].as_str().unwrap(),
-                    c["secondId"].as_str().unwrap(),
-                )
+                for key in [
+                    "score", "novelty", "bridge", "trust", "a", "b", "question", "reason",
+                ] {
+                    assert!(c.get(key).is_some(), "legacy key {key} missing: {c}");
+                }
+                assert_eq!(c["shared_tags"], serde_json::json!([]), "{c}");
+                sorted(c["a_id"].as_str().unwrap(), c["b_id"].as_str().unwrap())
             })
             .collect()
     };
@@ -529,13 +534,13 @@ fn compose_runs_both_ghostlink_lenses_with_proofs() {
     let bridge = vestige(seeded.path(), &["compose", "--limit", "10", "--json"]);
     assert!(bridge.ok, "{}", bridge.text());
     let bridge: Value = serde_json::from_str(&bridge.stdout).unwrap();
-    assert_eq!(bridge["lens"], "bridge", "{bridge}");
     assert_eq!(
         pairs_of(&bridge),
         vec![sorted(&seeded.alpha, &seeded.beta)],
         "{bridge}"
     );
-    let only = &bridge["candidates"][0];
+    let only = &bridge[0];
+    assert_eq!(only["lens"], "bridge", "{only}");
     assert_eq!(only["proof"]["hops"], 1, "{only}");
     assert!(
         only["reason"]
@@ -563,13 +568,26 @@ fn compose_runs_both_ghostlink_lenses_with_proofs() {
         pairs[0].0 == seeded.gamma || pairs[0].1 == seeded.gamma,
         "{divergent}"
     );
-    assert!(divergent["candidates"][0]["score"].is_null(), "{divergent}");
+    assert!(divergent[0]["score"].is_null(), "{divergent}");
+    assert_eq!(divergent[0]["lane"], "juxtaposition", "{divergent}");
 
     // Human output names the lens and the reason; an unknown lens fails.
     let human = vestige(seeded.path(), &["compose"]);
     assert!(human.ok, "{}", human.text());
     assert!(human.stdout.contains("bridge lens"), "{}", human.text());
     assert!(human.stdout.contains("typed-edge hop"), "{}", human.text());
+    // Every pair prints its proof path.
+    let path_line = human
+        .stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("path: "))
+        .unwrap_or_else(|| panic!("no proof path printed: {}", human.text()));
+    assert!(
+        path_line.contains("derived_from")
+            && path_line.contains(&seeded.alpha)
+            && path_line.contains(&seeded.beta),
+        "{path_line}"
+    );
     let bad = vestige(seeded.path(), &["compose", "--lens", "nearest"]);
     assert!(!bad.ok, "{}", bad.text());
     assert!(bad.text().contains("unknown lens"), "{}", bad.text());

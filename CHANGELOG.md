@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `weave` records what a tested pair showed: a composition record and two `derived_from` edges, each through the gate with its receipt. The pair leaves both lenses, and its members gain typed profiles. Suppressing a member withdraws the records composed from it, each with its own receipt.
   - `inspect` reads woven compositions (`recent`, `get`, `memory`, `neighbors`).
   - `harden` seeds invariant laws from `<data-dir>/ghostlink-laws.json`, then `~/.vestige/ghostlink-laws.json`, then six built-in laws. It is idempotent by law id, reports seeded, already present and failed counts, and names a malformed laws file instead of skipping it.
-- `vestige compose --lens bridge|divergent` runs the same engine from the terminal.
+- `vestige compose --lens bridge|divergent` runs the same engine from the terminal. `--json` keeps its array of pairs (`a_id`, `b_id` and the other 4.0.0 keys), each also carrying its lens, lane and proof, and the text output prints each pair's proof path.
 
 ### Changed
 
