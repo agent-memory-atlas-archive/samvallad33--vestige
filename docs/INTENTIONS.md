@@ -1,5 +1,7 @@
 # Evidence-aware intentions
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../README.md) and the [4.0.0 changelog](../CHANGELOG.md).
+
 Vestige intentions connect a future plan to the premises and observations that
 support it. The first implementation is a deterministic, local evaluator: it
 can show which plans are affected when supplied evidence changes, reconcile a

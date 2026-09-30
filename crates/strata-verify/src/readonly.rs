@@ -178,6 +178,23 @@ fn scan_frames(
             ));
         }
         if rem == TRAILER_WIRE_SIZE {
+            // A 35-byte-payload frame is also 104 bytes; a frame that parses,
+            // hashes and chains is a frame, as in strata's own recovery.
+            if let Ok((frame, used)) = parse_frame(&bytes[off..])
+                && used == rem
+                && frame.payload_blake3 == payload_blake3(frame.kind, &frame.payload)
+                && frame.prev_frame_hash == last_frame_hash
+            {
+                last_frame_hash = frame_hash(&frame);
+                leaves.push(frame.payload_blake3);
+                frames.push(ScannedFrame {
+                    kind: frame.kind,
+                    payload: frame.payload,
+                });
+                frame_count += 1;
+                off += used;
+                continue;
+            }
             let trailer = borsh::from_slice::<SegmentTrailer>(&bytes[off..])
                 .map_err(|_| format!("segment {segment_no}: trailer-sized tail failed to parse"))?;
             return Ok((

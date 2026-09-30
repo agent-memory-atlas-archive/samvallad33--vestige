@@ -88,9 +88,51 @@ fn pid_alive(pid: u64) -> bool {
         let err = std::io::Error::last_os_error();
         !matches!(err.raw_os_error(), Some(libc::ESRCH))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows_pid_alive(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         true // conservative on unsupported platforms
+    }
+}
+
+/// `OpenProcess` + `GetExitCodeProcess`. Answering "alive" for every pid, as
+/// this used to, left a killed process's lock in place for good: every later
+/// open failed with `Locked` until the file was deleted by hand.
+#[cfg(windows)]
+fn windows_pid_alive(pid: u64) -> bool {
+    type Handle = *mut core::ffi::c_void;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+        fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
+        fn CloseHandle(object: Handle) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    // Windows process ids are 32-bit; a larger value names no process.
+    let Ok(pid) = u32::try_from(pid) else {
+        return false;
+    };
+    // Safety: plain Win32 calls on values we own; the handle is closed before
+    // returning and `code` outlives the call that writes it.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // Access denied: the process exists and belongs to someone else.
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let queried = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        // A failed query is treated as alive (conservative, like pid 0).
+        queried == 0 || code == STILL_ACTIVE
     }
 }
 

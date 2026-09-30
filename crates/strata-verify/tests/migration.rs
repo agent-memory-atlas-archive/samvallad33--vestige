@@ -167,3 +167,73 @@ fn migrated_log_wrong_receipt_key_fails() {
     );
     assert!(receipt.verify_checksum(), "checksum stays key-independent");
 }
+
+/// The upgrade admits carried intentions after the receipt, and every later
+/// store write lands there too. Kinds 0x20/0x21 after the receipt are
+/// STORE_WRITE/STORE_CHECKPOINT, so the receipt's counts still match.
+#[test]
+fn store_writes_after_the_receipt_keep_the_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_dir = dir.path().join("log");
+    build_log(&log_dir);
+    let mut store = strata_store::StrataStore::open(dir.path()).unwrap();
+    store
+        .upsert_intentions(vec![strata_store::IntentionRecord {
+            id: "int-after-receipt".into(),
+            content: "carried".into(),
+            trigger_type: "manual".into(),
+            trigger_data: "{}".into(),
+            priority: 2,
+            status: "active".into(),
+            created_at_ms: 1_700_000_000_000,
+            deadline_ms: None,
+            fulfilled_at_ms: None,
+            reminder_count: 0,
+            last_reminded_at_ms: None,
+            notes: None,
+            tags: Vec::new(),
+            related_memories: Vec::new(),
+            snoozed_until_ms: None,
+            source_type: "mcp".into(),
+            source_data: None,
+            scope: None,
+        }])
+        .unwrap();
+    store
+        .ingest(strata_store::IngestInput {
+            content: "written after the upgrade".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    drop(store);
+
+    let report = verify_migrated_log(&log_dir).expect("verification runs");
+    assert!(report.ok, "{report:?}");
+    assert!(report.counts_match);
+    assert!(strata_verify::verify_path(&log_dir).ok);
+}
+
+/// `strata-verify <data-dir>` is the form the README documents. For an
+/// upgraded store it must check the migration receipt in `log/` exactly as
+/// `strata-verify <data-dir>/log` does. It used to scan only the chain, so a
+/// swapped receipt-signing key beside the log still printed OK.
+#[test]
+fn data_dir_form_verifies_the_migration_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    build_log(&dir.path().join("log"));
+
+    let report = strata_verify::verify_path(dir.path());
+    assert!(report.ok, "{}", report.failures.join("; "));
+    let json: serde_json::Value = serde_json::from_str(&report.json).unwrap();
+    assert_eq!(json["signature_ok"], true, "{}", report.json);
+    assert_eq!(json["counts_match"], true, "{}", report.json);
+    assert_eq!(json["key_pin"], "receipt-signing.key", "{}", report.json);
+
+    std::fs::write(dir.path().join("receipt-signing.key"), [9u8; 32]).unwrap();
+    let swapped = strata_verify::verify_path(dir.path());
+    assert!(
+        !swapped.ok,
+        "a receipt key that no longer matches the pin must fail the data-dir form: {}",
+        swapped.json
+    );
+}

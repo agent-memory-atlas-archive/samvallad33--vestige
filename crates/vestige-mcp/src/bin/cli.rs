@@ -36,10 +36,7 @@ use vestige_core::{
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "CLI for the Vestige cognitive memory system")]
 #[command(
-    long_about = "Vestige is a cognitive memory system based on 130 years of memory research.\n\nIt implements FSRS-6, spreading activation, synaptic tagging, and more."
-)]
-#[command(
-    after_help = "Vestige Pro: your memory on every machine, end-to-end encrypted. $19/mo -> https://github.com/samvallad33/vestige#vestige-pro"
+    long_about = "Vestige is a local-first memory system for coding agents.\n\nVestige 4.0 keeps memories in a Strata log inside the data directory: an append-only log where every write passes a gate and FSRS-6 schedules review. Recall is by exact handle (memory id, id prefix, tag); a Strata log runs no similarity search. Builds with the legacy-sqlite feature keep the v3 SQLite engine."
 )]
 struct Cli {
     /// Use a specific Vestige data directory for this command.
@@ -51,6 +48,10 @@ struct Cli {
 }
 
 static CLI_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// `.serve.lock`, held from the first `open_storage` to exit. The Strata log
+/// has one writer; a CLI command that opens it is that writer while it runs.
+static CLI_SERVE_LOCK: OnceLock<fs::File> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Args)]
 struct SandwichInstallOptions {
@@ -120,14 +121,18 @@ enum Commands {
     /// Run health check with warnings and recommendations
     Health,
 
-    /// Run memory consolidation cycle
+    /// Run the memory consolidation cycle (a no-op on a Strata log in 4.0)
+    ///
+    /// A legacy SQLite store runs decay, promotion, pruning and dedup. A
+    /// Strata log runs none of those passes in 4.0, so nothing changes.
     Consolidate,
 
-    /// Apply pending storage migrations, or rehearse them on a copy first
+    /// Import a v3 vestige.db into a Strata log by running vestige-upgrade
+    ///
+    /// vestige.db is read and left byte-identical. Once a Strata log exists in
+    /// the data directory it is the live store and there is nothing to import.
     Upgrade {
-        /// Copy the store to a temp directory, run every migration and strict
-        /// check against the copy, report what would happen, and leave the
-        /// original untouched.
+        /// Report what would be imported without running vestige-upgrade.
         #[arg(long)]
         dry_run: bool,
     },
@@ -164,15 +169,33 @@ enum Commands {
         command: SandwichCommands,
     },
 
-    /// Restore memories from backup file
+    /// Re-ingest memories from a JSON file (for example a `vestige export`)
+    ///
+    /// Each memory in a `vestige export --format json` file (or an MCP recall
+    /// result) is ingested as a new record: new id, created now, fresh review
+    /// state. Ids, timestamps, review history and edges in the file are not
+    /// restored. Portable archives import only into a legacy SQLite store.
+    ///
+    /// A Strata backup made by `vestige backup` is a directory. Restore it by
+    /// stopping Vestige and copying the backup's log/ (and store.meta, when
+    /// present) into the data directory in place of its log/. This command
+    /// does not do that.
     Restore {
-        /// Path to backup JSON file
+        /// Path to the JSON file
         file: PathBuf,
     },
 
-    /// Create a full backup of the SQLite database
+    /// Back up the live store
+    ///
+    /// On a Strata log (the 4.0 store) this seals the log and copies log/
+    /// (plus store.meta, when present) into a new directory. vestige.db is
+    /// never copied: after an upgrade it is the old v3 file, not the live
+    /// store. Restore by stopping Vestige and copying the backup's log/ into
+    /// the data directory. A legacy SQLite store is written as one consistent
+    /// snapshot file (VACUUM INTO).
     Backup {
-        /// Output file path for the backup
+        /// Destination: a new (or empty) directory for a Strata log, a file
+        /// for a legacy SQLite store
         output: PathBuf,
     },
 
@@ -228,13 +251,19 @@ enum Commands {
         since: Option<String>,
     },
 
-    /// Export an exact portable archive for Vestige-to-Vestige transfer
+    /// Export an exact portable archive (legacy SQLite stores only)
+    ///
+    /// A Strata log in 4.0 does not write portable archives and refuses. Use
+    /// `vestige export` for the memories or `vestige backup` for an exact copy
+    /// of the log.
     PortableExport {
         /// Output archive path
         output: PathBuf,
     },
 
-    /// Import an exact portable archive
+    /// Import an exact portable archive (legacy SQLite stores only)
+    ///
+    /// A Strata log in 4.0 does not read portable archives and refuses.
     PortableImport {
         /// Input archive path
         input: PathBuf,
@@ -243,7 +272,11 @@ enum Commands {
         merge: bool,
     },
 
-    /// Two-way sync with a file-backed portable archive, or Vestige Cloud
+    /// Two-way sync with a portable archive file or Vestige Cloud (legacy
+    /// SQLite stores only)
+    ///
+    /// Sync merges portable archives, which a Strata log in 4.0 does not write
+    /// or read, so it refuses there. Use `vestige export` or `vestige backup`.
     Sync {
         /// Sync archive path, often in Dropbox/iCloud/Syncthing/Git.
         /// Omit when using --cloud.
@@ -259,7 +292,10 @@ enum Commands {
         endpoint: Option<String>,
     },
 
-    /// Garbage collect stale memories below retention threshold
+    /// Delete stale memories below a retention threshold (legacy SQLite stores)
+    ///
+    /// Deletion is withheld on a Strata log in 4.0: the log is append-only.
+    /// --dry-run still lists the memories below the threshold.
     Gc {
         /// Minimum retention strength to keep (delete below this)
         #[arg(long, default_value = "0.1")]
@@ -285,7 +321,10 @@ enum Commands {
         no_open: bool,
     },
 
-    /// Ingest a memory (routes through Prediction Error Gating)
+    /// Ingest a memory as a new record
+    ///
+    /// Nothing is merged by similarity. On a Strata log the write passes the
+    /// log's gate before it is admitted.
     Ingest {
         /// Content to remember
         content: String,
@@ -298,11 +337,13 @@ enum Commands {
         /// Source reference
         #[arg(long)]
         source: Option<String>,
-        /// Backdate this memory N days in the past (for demos / seeding history)
+        /// Backdate this memory N days in the past (legacy SQLite stores; a
+        /// Strata log refuses before writing)
         #[arg(long)]
         ago_days: Option<i64>,
-        /// Exact creation time (RFC 3339) — the true origin time of an
-        /// external record (an issue, a commit) so the backward reach is exact.
+        /// Exact creation time (RFC 3339) of an external record such as an
+        /// issue or a commit (legacy SQLite stores; a Strata log refuses
+        /// before writing)
         #[arg(long)]
         created_at: Option<String>,
         /// Deliberately allow a detected credential to be stored. Prefer a
@@ -311,8 +352,11 @@ enum Commands {
         allow_secrets: bool,
     },
 
-    /// Ingest git commits as memory records: files, modules and hunk-header
-    /// symbols become the entities the backfill joins on. Idempotent per commit.
+    /// Ingest git commits as memory records (legacy SQLite stores only)
+    ///
+    /// One record per commit, upserted by repo and sha and dated to the commit
+    /// time, so re-running is idempotent. The Strata store in 4.0 exposes no
+    /// source upsert or creation-time rewrite, so it refuses before writing.
     IngestGit {
         /// Path to the git repository
         path: PathBuf,
@@ -345,9 +389,13 @@ enum Commands {
         limit: Option<usize>,
     },
 
-    /// Retroactive Salience Backfill — reach BACKWARD from a failure and surface
-    /// the quiet earlier memory that caused it (the root cause a vector search
-    /// can't find). Cai 2024 Nature. "Memory with hindsight."
+    /// Retroactive Salience Backfill (legacy SQLite stores; use causal-walk)
+    ///
+    /// Reaches backward from a failure and lists earlier memories that share
+    /// an exact entity (env var, path, identifier) with it. Candidates are
+    /// associations, not proven causes. A shared name is not a recorded edge,
+    /// so a Strata log in 4.0 refuses: use `vestige causal-walk
+    /// --logged-write <memory-id>`, which walks recorded causal edges.
     Backfill {
         /// ID of the failure memory; if omitted, the latest failure-like memory is used
         #[arg(long)]
@@ -361,8 +409,8 @@ enum Commands {
         /// Dry run: don't actually promote the surfaced cause
         #[arg(long)]
         no_promote: bool,
-        /// Demo mode: first show what a plain SEMANTIC SEARCH returns for the
-        /// failure (the lookalike, NOT the cause), then what Postdict surfaces.
+        /// Demo mode: first show what a plain keyword (BM25) search returns
+        /// for the failure (the lookalike, NOT the cause), then the backfill.
         #[arg(long)]
         contrast: bool,
         /// Machine-readable: print the raw backfill result as JSON (for tooling /
@@ -385,26 +433,38 @@ enum Commands {
         why_not: Option<String>,
     },
 
-    /// Causal walk — investigate a failure from EXPLICIT start points (a
-    /// failing test, a stack frame, a CI run, a logged write, a version
-    /// range) through exact mechanism edges to the change records behind it.
-    /// Successor to `backfill`; refuses with a needs_report instead of
-    /// guessing when a start point anchors to nothing.
+    /// Causal walk: investigate a failure from an explicit start point
+    ///
+    /// Successor to `backfill`. It refuses with a needs_report instead of
+    /// guessing when no start point is given.
+    ///
+    /// On a Strata log (4.0) only --logged-write is walked: a bounded backward
+    /// walk from that memory over recorded causal edges (closed_by,
+    /// derived_from, evidence_of, touched). It writes nothing. --failing-test,
+    /// --stack-frame, --ci-run and version ranges resolve through shared
+    /// names, which are not recorded edges, so a Strata log refuses them.
+    ///
+    /// A legacy SQLite store walks every start point through shared exact
+    /// anchors to change records and, unless --no-promote, records
+    /// evidence_of edges. Results are hypotheses, not proven causes.
     CausalWalk {
-        /// Failing test name (walked to its file's co-touch commits)
+        /// Failing test name, walked to its file's co-touch commits (legacy
+        /// SQLite stores)
         #[arg(long)]
         failing_test: Option<String>,
-        /// Stack frame "file:line" or "file" (last pre-failure toucher is the
-        /// prime suspect, SZZ-lite)
+        /// Stack frame "file:line" or "file"; the last pre-failure toucher is
+        /// the prime suspect, SZZ-lite (legacy SQLite stores)
         #[arg(long)]
         stack_frame: Option<String>,
-        /// Agent-trace run id (its failure channel seeds the anchors)
+        /// Agent-trace run id whose failure channel seeds the anchors (legacy
+        /// SQLite stores)
         #[arg(long)]
         ci_run: Option<String>,
-        /// Memory / tool-call record id (its edges are walked)
+        /// Memory / tool-call record id whose recorded edges are walked
         #[arg(long)]
         logged_write: Option<String>,
-        /// Git repository for --worked-in/--broke-in (single repo per call)
+        /// Git repository for --worked-in/--broke-in, single repo per call
+        /// (legacy SQLite stores)
         #[arg(long)]
         git_repo: Option<PathBuf>,
         /// Last-known-good tag (with --git-repo)
@@ -413,10 +473,12 @@ enum Commands {
         /// First-bad tag (with --git-repo)
         #[arg(long)]
         broke_in: Option<String>,
-        /// How many days back from the failure anchor suspects may lie
+        /// How many days back from the failure anchor suspects may lie (legacy
+        /// SQLite stores; a Strata walk is bounded by depth and node count)
         #[arg(long, default_value = "30")]
         lookback_days: i64,
-        /// Dry run: don't persist evidence_of trail edges
+        /// Dry run: don't persist evidence_of trail edges (a Strata walk never
+        /// writes)
         #[arg(long)]
         no_promote: bool,
         /// Project namespace to walk (default: user)
@@ -427,13 +489,26 @@ enum Commands {
         json: bool,
     },
 
-    /// Recall + reason across memories (deep_reference): hybrid search, FSRS-6 trust,
-    /// spreading activation, supersession + contradiction analysis. Returns the
-    /// synthesized answer, evidence, and confidence.
+    /// Recall memories by exact handle (--handle), or by free text on a legacy
+    /// SQLite store
+    ///
+    /// On a Strata log (4.0) recall is by exact handle only: a memory id, a
+    /// unique id prefix of 8 or more characters, or an exact tag. It prints
+    /// the matching memories and their one-hop recorded edges, like the MCP
+    /// recall tool's `handle` argument. A free-text QUERY is refused there,
+    /// with any handles found in the text.
+    ///
+    /// On a legacy SQLite store a QUERY runs the v3 deep_reference engine
+    /// (keyword search, FSRS-6 trust, spreading activation, supersession and
+    /// contradiction analysis) and prints its answer, evidence and confidence.
     Recall {
-        /// The query / claim to reason about
-        query: String,
-        /// How many memories to analyze (candidate depth)
+        /// Free-text query or claim to reason about (legacy SQLite stores)
+        #[arg(required_unless_present = "handle", conflicts_with = "handle")]
+        query: Option<String>,
+        /// Exact handle: memory id, unique id prefix (8+ chars), or exact tag
+        #[arg(long)]
+        handle: Option<String>,
+        /// How many memories to analyze for a QUERY (candidate depth)
         #[arg(long, default_value = "20")]
         depth: i64,
         /// Output raw JSON instead of the human-readable summary
@@ -441,16 +516,27 @@ enum Commands {
         json: bool,
     },
 
-    /// Compose: surface NEVER-COMPOSED memory pairs — two memories you wrote that nobody
-    /// (including you) ever connected — and the testable question they imply. The insight
-    /// generator: semantic-band + structural-bridge ranking over your cross-domain memory.
+    /// Compose: list NEVER-COMPOSED memory pairs as leads, not findings
+    ///
+    /// On a Strata log (4.0) a pair is two live memories in one scope with no
+    /// recorded edge between them, listed in memory-id order: no ranking, zero
+    /// scores and no question.
+    ///
+    /// On a legacy SQLite store a pair is linked within three recorded
+    /// causal-edge hops (touched, derived_from, closed_by) but never joined by
+    /// a composition event. Pairs are ranked by hop distance, composition
+    /// novelty and retention, each with a question to test.
     Compose {
-        /// How many candidate insight pairs to surface
+        /// How many pairs to list
         #[arg(long, default_value = "5")]
         limit: i32,
         /// Optional tag filter (comma-separated) to focus a domain
         #[arg(long)]
         tags: Option<String>,
+        /// Exact project namespace. Default: `user` on a Strata log, every
+        /// scope on a legacy SQLite store.
+        #[arg(long)]
+        scope: Option<String>,
         /// Output raw JSON instead of the human-readable summary
         #[arg(long)]
         json: bool,
@@ -496,10 +582,20 @@ enum Commands {
         dashboard_port: u16,
     },
 
-    /// Run the planted-cause selftest against a throwaway copy of the store
+    /// Run the planted-cause selftest in a throwaway store (the live store is
+    /// only read)
+    ///
+    /// On a Strata log it plants a cause, an intermediate and a symptom with
+    /// recorded derived_from edges plus distractors in a temp log, walks back
+    /// over recorded causal edges, and deletes the temp log. A legacy SQLite
+    /// store runs backfill hit@1/hit@3 and gap calibration on a temp copy.
     Selftest,
 
-    /// Find decayed fix/lesson memories sharing an anchor with a failure
+    /// Find decayed fix/lesson memories linked to a failure
+    ///
+    /// On a Strata log (4.0) the link is a recorded causal edge (corrects,
+    /// derived_from, evidence_of, closed_by), walked back from the failure. A
+    /// legacy SQLite store matches a shared exact anchor instead.
     ForgottenLesson {
         /// Failure memory id to inspect
         failure_id: String,
@@ -652,8 +748,18 @@ fn main() -> anyhow::Result<()> {
             scope,
             json,
         ),
-        Commands::Recall { query, depth, json } => run_recall(query, depth, json),
-        Commands::Compose { limit, tags, json } => run_compose(limit, tags, json),
+        Commands::Recall {
+            query,
+            handle,
+            depth,
+            json,
+        } => run_recall(query, handle, depth, json),
+        Commands::Compose {
+            limit,
+            tags,
+            scope,
+            json,
+        } => run_compose(limit, tags, scope, json),
         Commands::Project {
             out,
             format,
@@ -1646,13 +1752,10 @@ fn run_update(
         "vestige-restore",
         "vestige-upgrade",
     ];
-    let mut expected_members = binaries
+    let expected_members = binaries
         .iter()
         .map(|binary| format!("{}{}", binary, asset.binary_suffix))
         .collect::<Vec<_>>();
-    if asset.target == "x86_64-apple-darwin" {
-        expected_members.push("INSTALL-INTEL-MAC.md".to_string());
-    }
 
     println!("{}", "Extracting release archive...".cyan());
     extract_archive(
@@ -1799,7 +1902,9 @@ fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
         println!();
         println!("{}", "=== Retention Distribution ===".yellow().bold());
 
-        let memories = storage.get_all_nodes(500, 0)?;
+        // Every memory, not the first page: a sample would misstate the
+        // distribution on a store of thousands.
+        let memories = fetch_all_nodes(&storage)?;
         let total = memories.len();
 
         if total > 0 {
@@ -1832,7 +1937,9 @@ fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
             "=== Cognitive State Distribution ===".magenta().bold()
         );
 
-        let memories = storage.get_all_nodes(500, 0)?;
+        // Every memory, not the first page: a sample would misstate the
+        // distribution on a store of thousands.
+        let memories = fetch_all_nodes(&storage)?;
         let total = memories.len();
 
         if total > 0 {
@@ -1917,6 +2024,10 @@ fn print_distribution_bar(label: &str, count: usize, total: usize, color: &str) 
 fn run_health() -> anyhow::Result<()> {
     let storage = open_storage()?;
     let stats = storage.get_stats()?;
+    // A Strata log has no embeddings, no keyword search and a no-op
+    // consolidation in 4.0, so none of the v3 embedding or consolidation
+    // advice applies to it.
+    let strata = is_strata(&storage);
 
     println!("{}", "=== Vestige Health Check ===".cyan().bold());
     println!();
@@ -1958,46 +2069,61 @@ fn run_health() -> anyhow::Result<()> {
     } else {
         0.0
     };
-    println!(
-        "{}: {:.1}%",
-        "Active Embedding Coverage".white(),
-        embedding_coverage
-    );
-    // w1b: the embedding runtime was removed; keyword search is the only
-    // engine. Saying anything else here would read as a store-health verdict
-    // (issue #191) when it is a statement about the build.
-    println!(
-        "{}: {}",
-        "Embedding Service".white(),
-        "removed from this build (keyword search only)".yellow()
-    );
+    if strata {
+        println!(
+            "{}: {}",
+            "Retrieval".white(),
+            "exact handles only (Strata log: no embeddings, no keyword search)".yellow()
+        );
+    } else {
+        println!(
+            "{}: {:.1}%",
+            "Active Embedding Coverage".white(),
+            embedding_coverage
+        );
+        // w1b: the embedding runtime was removed; keyword search is the only
+        // engine. Saying anything else here would read as a store-health
+        // verdict (issue #191) when it is a statement about the build.
+        println!(
+            "{}: {}",
+            "Embedding Service".white(),
+            "removed from this build (keyword search only)".yellow()
+        );
+    }
 
     // Warnings
     let mut warnings = Vec::new();
 
     if stats.average_retention < 0.5 && stats.total_nodes > 0 {
-        warnings
-            .push("Low average retention - consider running consolidation or reviewing memories");
+        warnings.push(if strata {
+            "Low average retention - review the memories you still need"
+        } else {
+            "Low average retention - consider running consolidation or reviewing memories"
+        });
     }
 
     if stats.nodes_due_for_review > 10 {
         warnings.push("Many memories are due for review");
     }
 
-    if stats.total_nodes > 0 && stats.nodes_with_active_embeddings == 0 {
-        warnings.push(if vestige_mcp::embeddings_compiled_in() {
-            "No active-model embeddings generated - semantic search unavailable"
-        } else {
-            "Built without embeddings - semantic search is unavailable in this build by construction"
-        });
-    }
+    // Embedding warnings describe a SQLite store; a Strata log never has
+    // vectors to cover.
+    if !strata {
+        if stats.total_nodes > 0 && stats.nodes_with_active_embeddings == 0 {
+            warnings.push(if vestige_mcp::embeddings_compiled_in() {
+                "No active-model embeddings generated - semantic search unavailable"
+            } else {
+                "Built without embeddings - semantic search is unavailable in this build by construction"
+            });
+        }
 
-    if embedding_coverage < 50.0 && stats.total_nodes > 10 {
-        warnings.push("Low embedding coverage - run consolidation to improve semantic search");
-    }
+        if embedding_coverage < 50.0 && stats.total_nodes > 10 {
+            warnings.push("Low embedding coverage - run consolidation to improve semantic search");
+        }
 
-    if stats.nodes_with_mismatched_embeddings > 0 {
-        warnings.push("Stored embeddings from another model are present - run consolidation after changing embedding models");
+        if stats.nodes_with_mismatched_embeddings > 0 {
+            warnings.push("Stored embeddings from another model are present - run consolidation after changing embedding models");
+        }
     }
 
     if !warnings.is_empty() {
@@ -2020,12 +2146,14 @@ fn run_health() -> anyhow::Result<()> {
         recommendations.push("Review due memories to strengthen retention.");
     }
 
-    if stats.nodes_with_active_embeddings < stats.total_nodes {
+    // Consolidation is a no-op on a Strata log in 4.0, so recommending it
+    // there would promise work that does not happen.
+    if !strata && stats.nodes_with_active_embeddings < stats.total_nodes {
         recommendations
             .push("Run 'vestige consolidate' to generate active-model embeddings for better semantic search.");
     }
 
-    if stats.total_nodes > 100 && stats.average_retention < 0.7 {
+    if !strata && stats.total_nodes > 100 && stats.average_retention < 0.7 {
         recommendations.push("Consider running periodic consolidation to maintain memory health.");
     }
 
@@ -2048,15 +2176,6 @@ fn run_health() -> anyhow::Result<()> {
         };
         println!("  {} {}", icon, text);
     }
-
-    println!();
-    println!(
-        "{} {}",
-        "Pro:".cyan().bold(),
-        "sync this memory across machines, end-to-end encrypted ($19/mo) — \
-         https://github.com/samvallad33/vestige#vestige-pro"
-            .white()
-    );
 
     Ok(())
 }
@@ -2107,6 +2226,17 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
     if !vestige_mcp::v3_launch::db_present(&source) {
         anyhow::bail!("no store at {} (nothing to upgrade)", source.display());
     }
+    // The v3 file stays after a successful upgrade. Once the Strata log is
+    // published it is the live store and vestige-upgrade is not run again,
+    // so neither mode may report an import.
+    if vestige_mcp::v3_launch::strata_log_published(&source) {
+        println!(
+            "Already upgraded: the Strata log in {} is the live store. {} is kept byte-identical and is not read; nothing to import.",
+            cli_data_dir()?.join("log").display(),
+            source.display()
+        );
+        return Ok(());
+    }
     if dry_run {
         println!(
             "Dry run: vestige-upgrade would import {} and leave that file byte-identical.",
@@ -2126,10 +2256,19 @@ fn run_upgrade(dry_run: bool) -> anyhow::Result<()> {
 fn run_consolidate() -> anyhow::Result<()> {
     println!("{}", "=== Vestige Consolidation ===".cyan().bold());
     println!();
-    println!("Running memory consolidation cycle...");
-    println!();
 
     let storage = open_storage()?;
+    if is_strata(&storage) {
+        println!(
+            "{}",
+            "Strata log: consolidation is a no-op in Vestige 4.0. No decay, promotion, pruning, dedup or embedding pass runs on the log, so nothing was changed."
+                .yellow()
+        );
+        return Ok(());
+    }
+
+    println!("Running memory consolidation cycle...");
+    println!();
     let result = storage.run_consolidation()?;
 
     println!(
@@ -2186,9 +2325,36 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
     println!();
     println!("Loading backup from: {}", backup_path.display());
 
+    // A Strata backup (`vestige backup`) is a directory. Restoring one means
+    // replacing the live log while Vestige is stopped, which this command
+    // must not do behind a running server.
+    let meta = std::fs::metadata(&backup_path)
+        .with_context(|| format!("cannot read {}", backup_path.display()))?;
+    if meta.is_dir() {
+        if backup_path.join("log").is_dir() {
+            anyhow::bail!(
+                "unavailable_in_4_0: restore does not load a Strata backup directory. {} is a copy of a Strata log: stop Vestige, then copy its log/ (and store.meta, when present) into the data directory in place of the existing log/.",
+                backup_path.display()
+            );
+        }
+        anyhow::bail!(
+            "{} is a directory, not a JSON restore file",
+            backup_path.display()
+        );
+    }
+
+    let storage = open_storage()?;
+    let strata = is_strata(&storage);
+
     // Read and parse backup
     let backup_bytes = std::fs::read(&backup_path)?;
     if backup_bytes.starts_with(b"SQLite format 3\0") {
+        if strata {
+            anyhow::bail!(
+                "unavailable_in_4_0: {} is a v3 SQLite database, and restore does not write SQLite into a Strata log. To import it, save it as vestige.db in a data directory that has no log/ yet and run `vestige --data-dir <that dir> upgrade` (it runs vestige-upgrade and leaves the file unchanged).",
+                backup_path.display()
+            );
+        }
         anyhow::bail!(
             "{} is a raw SQLite database backup, not a JSON restore file. Use portable-export/portable-import for cross-device transfer, or replace the database file manually while Vestige is stopped.",
             backup_path.display()
@@ -2200,6 +2366,11 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
     if let Ok(archive) = serde_json::from_str::<vestige_core::PortableArchive>(&backup_content)
         && archive.archive_format == vestige_core::PORTABLE_ARCHIVE_FORMAT
     {
+        if strata {
+            anyhow::bail!(
+                "unavailable_in_4_0: restore of a portable archive is not available on Strata in Vestige 4.0: a Strata log does not read portable archives yet. {STRATA_EXACT_RESTORE_HINT}"
+            );
+        }
         println!("Detected portable archive.");
         println!("{}: {}", "Format".white().bold(), archive.archive_format);
         println!("{}: {}", "Schema".white().bold(), archive.schema_version);
@@ -2207,7 +2378,6 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
         println!("{}: {}", "Rows".white().bold(), archive.total_rows());
         println!();
 
-        let storage = open_storage()?;
         let report = storage.import_portable_archive(&archive, PortableImportMode::EmptyOnly)?;
 
         println!(
@@ -2269,12 +2439,18 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
 
     println!("Found {} memories to restore", memories.len());
     println!();
+    if strata {
+        println!(
+            "{}",
+            "Strata log: each memory is ingested as a new record (new id, created now, fresh review state). Ids, timestamps, review history and edges in the file are not restored."
+                .yellow()
+        );
+        println!("{}", STRATA_EXACT_RESTORE_HINT.dimmed());
+        println!();
+    }
 
-    // Initialize storage
-    println!("Initializing storage...");
-    let storage = open_storage()?;
-
-    println!("Generating embeddings and ingesting memories...");
+    // 4.0 builds have no embedding runtime: restore only ingests.
+    println!("Ingesting memories...");
     println!();
 
     let total = memories.len();
@@ -2313,22 +2489,92 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
 
     println!();
     println!(
-        "Restore complete: {}/{} memories restored",
+        "Restore complete: {}/{} memories {}",
         success_count.to_string().green().bold(),
-        total
+        total,
+        if strata {
+            "ingested as new records"
+        } else {
+            "restored"
+        }
     );
 
     // Show stats
     let stats = storage.get_stats()?;
     println!();
     println!("{}: {}", "Total Nodes".white(), stats.total_nodes);
-    println!(
-        "{}: {}",
-        "Active Embeddings".white(),
-        stats.nodes_with_active_embeddings
-    );
+    if !strata {
+        println!(
+            "{}: {}",
+            "Active Embeddings".white(),
+            stats.nodes_with_active_embeddings
+        );
+    }
 
     Ok(())
+}
+
+/// How an exact Strata restore works: the backup is a directory copy of the
+/// log, put back while no Vestige process holds the store.
+const STRATA_EXACT_RESTORE_HINT: &str = "For an exact restore, stop Vestige and copy the log/ of a `vestige backup` directory (and its store.meta, when present) into the data directory in place of the existing log/.";
+
+/// The durable store this invocation opened is a Strata log.
+fn is_strata(storage: &Arc<Storage>) -> bool {
+    vestige_mcp::strata_memory::is_strata_backend(storage.as_ref())
+}
+
+/// `path` made absolute with its deepest existing ancestor canonicalized, so
+/// a destination that does not exist yet still compares against real paths.
+fn resolve_existing_prefix(path: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut existing = absolute.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                missing.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => break,
+        }
+    }
+    let mut resolved = std::fs::canonicalize(existing).unwrap_or_else(|_| existing.to_path_buf());
+    for name in missing.into_iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
+}
+
+/// Total bytes under `path` (a file, or a directory walked recursively).
+fn path_size(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| path_size(&entry.path()))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} bytes", bytes)
+    }
 }
 
 /// Get the default database path
@@ -2415,11 +2661,12 @@ fn run_migrate_to_strata_linked(
     }
     println!("{} {}", "Destination:".bold(), destination.display());
     println!(
-        "{} {} nodes, {} edges, {} fsrs events",
+        "{} {} nodes, {} edges, {} fsrs events, {} fsrs cards",
         "Migrated:".green().bold(),
         report.nodes,
         report.edges,
-        report.fsrs_events
+        report.fsrs_events,
+        report.fsrs_states
     );
     if report.dropped_vectors > 0 {
         println!(
@@ -2455,8 +2702,50 @@ fn run_migrate_to_strata_linked(
 fn open_storage() -> anyhow::Result<std::sync::Arc<Storage>> {
     let dir = cli_data_dir()?;
     // Same check `vestige-mcp` runs before stdio. `vestige.db` is not opened.
+    // It runs before the lock: the upgrade helper takes that lock itself.
     vestige_mcp::v3_launch::upgrade_or_refuse(&dir.join("vestige.db"))?;
+    if !take_cli_lock(&dir)? {
+        return Err(served_elsewhere(&dir));
+    }
     Ok(vestige_mcp::strata_memory::open(&dir)?)
+}
+
+/// Take the store's serve lock for the rest of this process. `false` when a
+/// Vestige server (or another command) holds it.
+fn take_cli_lock(dir: &Path) -> anyhow::Result<bool> {
+    if CLI_SERVE_LOCK.get().is_some() {
+        return Ok(true);
+    }
+    fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create the data directory {}", dir.display()))?;
+    match vestige_mcp::attach::try_serve_lock(dir)? {
+        Some(lock) => {
+            let _ = CLI_SERVE_LOCK.set(lock);
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Who holds the store, for messages. A pid is named only when that process
+/// answers the attach handshake; the endpoint file can outlive it.
+fn store_holder(dir: &Path) -> String {
+    match vestige_mcp::attach::probe_owner_blocking(dir) {
+        Some(pid) => format!("vestige-mcp (pid {pid})"),
+        None => "another Vestige process (a vestige command, vestige-upgrade, or a server that is not answering)".to_string(),
+    }
+}
+
+/// Why a command that opens the log cannot run while the store is served.
+fn served_elsewhere(dir: &Path) -> anyhow::Error {
+    let holder = store_holder(dir);
+    anyhow::anyhow!(
+        "{holder} is serving {}. This command opens the log directly, and the log has one \
+         writer, so it runs only while no Vestige server holds the store. Use the matching \
+         MCP tool through your agent, or stop the Vestige server and run it again. \
+         `vestige backup` works while a server runs.",
+        dir.display()
+    )
 }
 
 /// Fetch all nodes from storage using pagination
@@ -2478,12 +2767,34 @@ fn fetch_all_nodes(storage: &Arc<Storage>) -> anyhow::Result<Vec<vestige_core::K
     Ok(all_nodes)
 }
 
-/// Run backup command using SQLite's consistent-snapshot export.
+/// Back up the live store. A Strata log is copied as a directory through
+/// `Storage::backup_to`, the same path as the MCP `maintain backup`; a
+/// legacy SQLite store is written as one consistent snapshot file.
 fn run_backup(output: PathBuf) -> anyhow::Result<()> {
     println!("{}", "=== Vestige Backup ===".cyan().bold());
     println!();
 
+    let data_dir = cli_data_dir()?;
     let db_path = get_default_db_path()?;
+    // Opening creates an empty store, and a backup of that would hide a
+    // wrong --data-dir behind a success line.
+    if !data_dir.join("log").is_dir() && !vestige_mcp::v3_launch::db_present(&db_path) {
+        anyhow::bail!(
+            "no Vestige store in {}: no Strata log/ and no vestige.db (nothing to back up)",
+            data_dir.display()
+        );
+    }
+
+    // A running server holds the store: back up through it.
+    vestige_mcp::v3_launch::upgrade_or_refuse(&db_path)?;
+    if !take_cli_lock(&data_dir)? {
+        return run_backup_through_server(&data_dir, &output);
+    }
+
+    let storage = open_storage()?;
+    if is_strata(&storage) {
+        return run_strata_backup(&storage, &data_dir, &output);
+    }
 
     if !db_path.exists() {
         anyhow::bail!("Database not found at: {}", db_path.display());
@@ -2503,17 +2814,9 @@ fn run_backup(output: PathBuf) -> anyhow::Result<()> {
     println!("Creating a consistent SQLite snapshot...");
     println!("  {} {}", "From:".dimmed(), db_path.display());
     println!("  {}   {}", "To:".dimmed(), output.display());
-    let storage = open_storage()?;
     storage.backup_to(&output)?;
 
-    let file_size = std::fs::metadata(&output)?.len();
-    let size_display = if file_size >= 1024 * 1024 {
-        format!("{:.2} MB", file_size as f64 / (1024.0 * 1024.0))
-    } else if file_size >= 1024 {
-        format!("{:.1} KB", file_size as f64 / 1024.0)
-    } else {
-        format!("{} bytes", file_size)
-    };
+    let size_display = format_size(std::fs::metadata(&output)?.len());
 
     println!();
     println!(
@@ -2524,6 +2827,183 @@ fn run_backup(output: PathBuf) -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+/// Copy a Strata log into a new directory: the log is sealed, then every
+/// log file except its lock (plus `store.meta`) is copied. `vestige.db` is
+/// never part of it, even when the v3 file is still beside the log.
+fn run_strata_backup(storage: &Arc<Storage>, data_dir: &Path, output: &Path) -> anyhow::Result<()> {
+    check_strata_backup_destination(data_dir, output)?;
+    let log_dir = data_dir.join("log");
+    println!("Sealing and copying the Strata log...");
+    println!("  {} {}", "From:".dimmed(), log_dir.display());
+    println!("  {}   {}", "To:".dimmed(), output.display());
+    storage
+        .backup_to(output)
+        .map_err(|err| anyhow::anyhow!("Strata backup failed: {err}"))?;
+    print_strata_backup_summary(data_dir, output);
+    Ok(())
+}
+
+/// The same backup, made by the `vestige-mcp` that serves the store (its
+/// `maintain backup`, into `<data-dir>/backups`) and then moved to `output`.
+fn run_backup_through_server(data_dir: &Path, output: &Path) -> anyhow::Result<()> {
+    check_strata_backup_destination(data_dir, output)?;
+    let holder = store_holder(data_dir);
+    println!("{holder} holds this store; backing up through it...");
+    let rt = tokio::runtime::Runtime::new()?;
+    let made = rt
+        .block_on(vestige_mcp::attach::call_tool(
+            data_dir,
+            "maintain",
+            serde_json::json!({"action": "backup"}),
+        ))
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "{err}. Stop the Vestige server and run `vestige backup` again, or ask your agent to run maintain backup."
+            )
+        })?;
+    let made = made
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("the server's backup answer named no path: {made}"))?;
+    println!("  {} {}", "Made:".dimmed(), made.display());
+    println!("  {}   {}", "To:".dimmed(), output.display());
+    if made != output {
+        // The destination check allows an empty directory; `rename` onto one
+        // is not portable, so it goes first.
+        if output.is_dir() {
+            fs::remove_dir(output)?;
+        }
+        if fs::rename(&made, output).is_err() {
+            // Another filesystem: copy into a sibling, sync it, then rename
+            // it into place, so a failed copy never leaves a partial backup
+            // at the requested path.
+            let staged = output.with_file_name(format!(
+                ".{}.partial-{}",
+                output
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "backup".to_string()),
+                std::process::id()
+            ));
+            let copied = copy_dir_all(&made, &staged).and_then(|()| fs::rename(&staged, output));
+            if let Err(err) = copied {
+                let _ = fs::remove_dir_all(&staged);
+                anyhow::bail!(
+                    "failed to copy the backup to {}: {err}. The server's copy is still at {}",
+                    output.display(),
+                    made.display()
+                );
+            }
+            fs::remove_dir_all(&made).with_context(|| {
+                format!("copied the backup, but could not remove {}", made.display())
+            })?;
+        }
+    }
+    print_strata_backup_summary(data_dir, output);
+    Ok(())
+}
+
+/// Copy a directory tree (a Strata backup: plain files in plain directories).
+fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+            fs::File::open(&target)?.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+/// A Strata backup goes to a new (or empty) directory outside the live log.
+fn check_strata_backup_destination(data_dir: &Path, output: &Path) -> anyhow::Result<()> {
+    let log_dir = data_dir.join("log");
+    if let Ok(meta) = std::fs::metadata(output) {
+        let empty_dir = meta.is_dir() && std::fs::read_dir(output)?.next().is_none();
+        if !empty_dir {
+            anyhow::bail!(
+                "{} already exists. A Strata backup is a new directory; pass a path that does not exist yet (or an empty directory) so no older files mix into the copy.",
+                output.display()
+            );
+        }
+    }
+    // A destination inside the live log would be read back as log files
+    // while they are being copied.
+    let canonical_log = std::fs::canonicalize(&log_dir).unwrap_or_else(|_| log_dir.clone());
+    if resolve_existing_prefix(output)?.starts_with(&canonical_log) {
+        anyhow::bail!(
+            "{} is inside the live log {}; pick a destination outside log/",
+            output.display(),
+            log_dir.display()
+        );
+    }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn print_strata_backup_summary(data_dir: &Path, output: &Path) {
+    let files = std::fs::read_dir(output.join("log"))
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0);
+    let size_display = format_size(path_size(output));
+
+    println!();
+    println!(
+        "{}",
+        format!(
+            "Backup complete: {} ({}, {} files in log/)",
+            output.display(),
+            size_display,
+            files
+        )
+        .green()
+        .bold()
+    );
+    println!(
+        "  {} log/{}",
+        "Contains:".dimmed(),
+        if output.join("store.meta").exists() {
+            " and store.meta"
+        } else {
+            ""
+        }
+    );
+    let db_path = data_dir.join("vestige.db");
+    if vestige_mcp::v3_launch::db_present(&db_path) {
+        println!(
+            "  {} {} is the v3 file kept after the upgrade, not the live store; it was not copied.",
+            "Not copied:".dimmed(),
+            db_path.display()
+        );
+    }
+    let keys: Vec<&str> = ["receipt-signing.key", "actor.key"]
+        .into_iter()
+        .filter(|name| data_dir.join(name).is_file())
+        .collect();
+    if !keys.is_empty() {
+        println!(
+            "  {} {} beside log/ in {} (keep them with the data directory).",
+            "Not copied:".dimmed(),
+            keys.join(", "),
+            data_dir.display()
+        );
+    }
+    println!(
+        "  {} stop Vestige, then copy {} into the data directory in place of its log/.",
+        "Restore:".dimmed(),
+        output.join("log").display()
+    );
 }
 
 /// Run the planted-cause selftest (the MCP `selftest` tool) from the CLI.
@@ -2540,7 +3020,21 @@ fn run_selftest() -> anyhow::Result<()> {
         .block_on(vestige_mcp::tools::selftest::execute(&storage, None))
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    if result["hits"] == serde_json::json!(result["rounds"]) && result["gap_calibration"] == true {
+    if result["kind"] == "recorded_edge_walk" {
+        // Strata payload: named checks over a planted recorded-edge chain,
+        // not the backfill hit@k rounds a legacy SQLite store reports.
+        let line = format!(
+            "recorded-edge walk: {}/{} checks passed",
+            result["checks_passed"], result["checks_total"]
+        );
+        if result["all_passed"] == true {
+            println!("{}", line.green().bold());
+        } else {
+            println!("{}", line.yellow());
+        }
+    } else if result["hits"] == serde_json::json!(result["rounds"])
+        && result["gap_calibration"] == true
+    {
         println!(
             "{}",
             format!(
@@ -2564,7 +3058,18 @@ fn run_selftest() -> anyhow::Result<()> {
             .yellow()
         );
     }
-    println!("{}", "(live store untouched; temp copy deleted)".dimmed());
+    if result["kind"] == "recorded_edge_walk" {
+        println!(
+            "{}",
+            format!(
+                "(live store touched: {}; temp log deleted: {})",
+                result["live_store_touched"], result["temp_store_deleted"]
+            )
+            .dimmed()
+        );
+    } else {
+        println!("{}", "(live store untouched; temp copy deleted)".dimmed());
+    }
     println!();
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
@@ -2595,6 +3100,9 @@ fn run_forgotten_lesson(
 
     println!("{}", "=== Forgotten Lessons ===".cyan().bold());
     println!();
+    // A Strata log links lessons by recorded causal edges (`edge_path`); a
+    // legacy SQLite store by a shared exact anchor (`shared_anchor`).
+    let strata = is_strata(&storage);
     let lessons = result["forgotten_lessons"]
         .as_array()
         .cloned()
@@ -2602,15 +3110,38 @@ fn run_forgotten_lesson(
     if lessons.is_empty() {
         println!(
             "{}",
-            "No decayed lesson shares an anchor with this failure.".dimmed()
+            if strata {
+                "No decayed lesson is reached from this failure over recorded causal edges."
+            } else {
+                "No decayed lesson shares an anchor with this failure."
+            }
+            .dimmed()
         );
     } else {
         for lesson in &lessons {
+            let link = if strata {
+                let hops: Vec<String> = lesson["edge_path"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|hop| {
+                        format!(
+                            "{} -[{}]-> {}",
+                            hop["source_id"].as_str().unwrap_or("?"),
+                            hop["link_type"].as_str().unwrap_or("?"),
+                            hop["target_id"].as_str().unwrap_or("?")
+                        )
+                    })
+                    .collect();
+                format!("edges {}", hops.join(", "))
+            } else {
+                format!("anchor {}", lesson["shared_anchor"].as_str().unwrap_or("?"))
+            };
             println!(
-                "  {} · retention {}% · anchor {}",
+                "  {} · retention {}% · {}",
                 lesson["lesson_id"].as_str().unwrap_or("?").normal(),
                 lesson["retention_pct"].to_string().yellow(),
-                lesson["shared_anchor"].as_str().unwrap_or("?").cyan(),
+                link.cyan(),
             );
             let preview = lesson["content_preview"].as_str().unwrap_or("");
             if !preview.is_empty() {
@@ -2764,23 +3295,23 @@ fn run_portable_export(output: PathBuf) -> anyhow::Result<()> {
     println!("{}", "=== Vestige Portable Export ===".cyan().bold());
     println!();
 
+    let storage = open_storage()?;
+    // Refuse before creating anything at the destination.
+    if is_strata(&storage) {
+        anyhow::bail!(
+            "unavailable_in_4_0: portable-export is not available on Strata in Vestige 4.0: a Strata log does not write portable archives yet. {STRATA_PORTABLE_ALTERNATIVES}"
+        );
+    }
+
     if let Some(parent) = output.parent()
         && !parent.exists()
     {
         std::fs::create_dir_all(parent)?;
     }
 
-    let storage = open_storage()?;
     let archive = storage.export_portable_archive_to_path(&output)?;
 
-    let file_size = std::fs::metadata(&output)?.len();
-    let size_display = if file_size >= 1024 * 1024 {
-        format!("{:.2} MB", file_size as f64 / (1024.0 * 1024.0))
-    } else if file_size >= 1024 {
-        format!("{:.1} KB", file_size as f64 / 1024.0)
-    } else {
-        format!("{} bytes", file_size)
-    };
+    let size_display = format_size(std::fs::metadata(&output)?.len());
 
     println!("{}: {}", "Archive".white().bold(), output.display());
     println!("{}: {}", "Format".white().bold(), archive.archive_format);
@@ -2823,6 +3354,11 @@ fn run_portable_import(input: PathBuf, merge: bool) -> anyhow::Result<()> {
     println!();
 
     let storage = open_storage()?;
+    if is_strata(&storage) {
+        anyhow::bail!(
+            "unavailable_in_4_0: portable-import is not available on Strata in Vestige 4.0: a Strata log does not read portable archives yet. {STRATA_EXACT_RESTORE_HINT} `vestige restore <file.json>` re-ingests a `vestige export` file as new memories."
+        );
+    }
     let report = storage.import_portable_archive_from_path(&input, mode)?;
 
     println!(
@@ -2878,10 +3414,25 @@ fn run_sync_file(archive: PathBuf) -> anyhow::Result<()> {
     println!("{}: {}", "Archive".white().bold(), archive.display());
 
     let storage = open_storage()?;
+    refuse_sync_on_strata(&storage)?;
     let report = storage.sync_portable_archive_file(&archive)?;
     print_sync_report(&report);
     Ok(())
 }
+
+/// Sync (file or cloud) merges portable archives, which a Strata log does not
+/// write or read in 4.0.
+fn refuse_sync_on_strata(storage: &Arc<Storage>) -> anyhow::Result<()> {
+    if is_strata(storage) {
+        anyhow::bail!(
+            "unavailable_in_4_0: sync is not available on Strata in Vestige 4.0: sync merges portable archives, which a Strata log does not write or read yet. Nothing was read or written. {STRATA_PORTABLE_ALTERNATIVES}"
+        );
+    }
+    Ok(())
+}
+
+/// What works on a Strata log in place of a portable archive.
+const STRATA_PORTABLE_ALTERNATIVES: &str = "Use `vestige export <file> --format json` (or jsonl) for the memories, or `vestige backup <dir>` for an exact copy of the log.";
 
 #[cfg(feature = "cloud-sync")]
 fn run_sync_cloud(endpoint: Option<String>) -> anyhow::Result<()> {
@@ -2930,6 +3481,7 @@ fn run_sync_cloud(endpoint: Option<String>) -> anyhow::Result<()> {
     );
 
     let storage = open_storage()?;
+    refuse_sync_on_strata(&storage)?;
     let report = storage.sync_portable_archive_cloud(&endpoint, &sync_key, Some(encryption_key))?;
     print_sync_report(&report);
     Ok(())
@@ -2984,6 +3536,13 @@ fn run_gc(
     println!();
 
     let storage = open_storage()?;
+    // Deletion is erasure-class and withheld on an append-only Strata log.
+    // Refuse before the confirmation prompt, which would promise a delete
+    // that cannot happen. A dry run is read-only and still lists candidates.
+    let strata = is_strata(&storage);
+    if strata && !dry_run {
+        anyhow::bail!(vestige_mcp::strata_memory::withheld_message("gc deletion"));
+    }
     let all_nodes = fetch_all_nodes(&storage)?;
     let now = Utc::now();
 
@@ -3016,7 +3575,13 @@ fn run_gc(
     }
     println!(
         "{}: {} / {} total",
-        "Candidates for deletion".white().bold(),
+        if strata {
+            "Below threshold"
+        } else {
+            "Candidates for deletion"
+        }
+        .white()
+        .bold(),
         candidates.len(),
         all_nodes.len()
     );
@@ -3032,7 +3597,16 @@ fn run_gc(
 
     // Show sample of what would be deleted
     println!();
-    println!("{}", "Sample of memories to be removed:".yellow().bold());
+    println!(
+        "{}",
+        if strata {
+            "Sample of memories below the threshold:"
+        } else {
+            "Sample of memories to be removed:"
+        }
+        .yellow()
+        .bold()
+    );
     let sample_count = candidates.len().min(10);
     for node in candidates.iter().take(sample_count) {
         let age_days = (now - node.created_at).num_days();
@@ -3054,15 +3628,18 @@ fn run_gc(
 
     if dry_run {
         println!();
-        println!(
-            "{}",
+        let line = if strata {
+            format!(
+                "Dry run: {} memories are below the threshold. Deleting them is withheld on Strata in Vestige 4.0 (the log is append-only), so gc cannot remove them.",
+                candidates.len()
+            )
+        } else {
             format!(
                 "Dry run: {} memories would be deleted. Re-run without --dry-run to delete.",
                 candidates.len()
             )
-            .yellow()
-            .bold()
-        );
+        };
+        println!("{}", line.yellow().bold());
         return Ok(());
     }
 
@@ -3177,6 +3754,14 @@ fn run_ingest(
     };
 
     let storage = open_storage()?;
+    // The Strata adapter does not expose a creation-time rewrite in 4.0.
+    // Refuse before ingesting, or the memory would land with the current
+    // time and the command would still fail.
+    if is_strata(&storage) && (ago_days.is_some() || created_at_ts.is_some()) {
+        anyhow::bail!(
+            "unavailable_in_4_0: ingest --ago-days/--created-at is not available on Strata in Vestige 4.0: the Strata store does not expose a creation-time rewrite yet, so the memory would keep the time it was written. Nothing was written; drop the flag to ingest with the current time."
+        );
+    }
     let secret_policy = if allow_secrets {
         SecretPolicy::AllowExplicitly
     } else {
@@ -3327,7 +3912,15 @@ fn run_scan_secrets(
                 );
             }
         }
-        println!("Rotate live credentials, then remove or replace affected memories manually.");
+        if is_strata(&storage) {
+            // Erasure is withheld on the append-only log: suppress hides a
+            // memory from reads, but its bytes stay in log/ and in backups.
+            println!(
+                "Rotate live credentials. On a Strata log the memory's bytes stay in the append-only log (and in every backup of it): suppress hides it from reads, and erasure is withheld in 4.0, so treat these credentials as exposed."
+            );
+        } else {
+            println!("Rotate live credentials, then remove or replace affected memories manually.");
+        }
     }
 
     Ok(())
@@ -3348,6 +3941,15 @@ fn run_backfill(
     why_not: Option<String>,
 ) -> anyhow::Result<()> {
     let storage = open_storage()?;
+    // Backfill joins memories by shared entity names. A shared name is not a
+    // recorded edge, so a Strata log refuses and names the successor, which
+    // walks recorded causal edges only.
+    if is_strata(&storage) {
+        let start = failure_id.as_deref().unwrap_or("<memory-id>");
+        anyhow::bail!(
+            "unavailable_in_4_0: backfill is not available on Strata in Vestige 4.0: it joins memories by shared entity names, which are not recorded edges. Use its successor, `vestige causal-walk --logged-write {start}`, which walks recorded causal edges (closed_by, derived_from, evidence_of, touched) backward from that memory."
+        );
+    }
 
     // Resolve the failure text up front (used by the contrast baseline).
     // Use the SAME failure detector the backfill tool uses (content + tags, full
@@ -3576,6 +4178,31 @@ fn run_causal_walk(
 ) -> anyhow::Result<()> {
     use vestige_core::advanced::causal_walk as cw;
 
+    let storage = open_storage()?;
+    if is_strata(&storage) {
+        // These start points resolve through shared names (a test's file, a
+        // frame's path, a run's anchors, a tag range's commits), which are not
+        // recorded edges. Refuse them rather than silently dropping them.
+        let name_based: Vec<&str> = [
+            ("--failing-test", failing_test.is_some()),
+            ("--stack-frame", stack_frame.is_some()),
+            ("--ci-run", ci_run.is_some()),
+            ("--git-repo", git_repo.is_some()),
+            ("--worked-in", worked_in.is_some()),
+            ("--broke-in", broke_in.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(flag, given)| given.then_some(flag))
+        .collect();
+        if !name_based.is_empty() {
+            anyhow::bail!(
+                "unavailable_in_4_0: causal-walk {} is not available on Strata in Vestige 4.0: that start point resolves through shared names, which are not recorded edges. Pass --logged-write <memory-id> to walk the recorded causal edges into that memory.",
+                name_based.join(", ")
+            );
+        }
+        return run_causal_walk_strata(&storage, logged_write, scope, json);
+    }
+
     // Assemble start points; the walk refuses (needs_report) rather than
     // guessing when none resolve.
     let mut start_points: Vec<cw::StartPoint> = Vec::new();
@@ -3599,7 +4226,6 @@ fn run_causal_walk(
         });
     }
 
-    let storage = open_storage()?;
     #[cfg(vestige_embeddings_removed)]
     {
         let _ = storage.init_embeddings();
@@ -3687,6 +4313,108 @@ fn run_causal_walk(
     Ok(())
 }
 
+/// Causal walk on a Strata log: the MCP `causal_walk` tool's recorded-edge
+/// path, a bounded backward BFS from one memory over recorded causal edges.
+/// Read-only: nothing is persisted, whatever --no-promote says.
+fn run_causal_walk_strata(
+    storage: &Arc<Storage>,
+    logged_write: Option<String>,
+    scope: String,
+    json: bool,
+) -> anyhow::Result<()> {
+    let args = serde_json::json!({ "scope": scope, "logged_write": logged_write });
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt
+        .block_on(vestige_mcp::tools::causal_walk::execute(
+            storage,
+            Some(args),
+        ))
+        .map_err(anyhow::Error::msg)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    println!("{}", "=== Causal Walk ===".magenta().bold());
+    println!(
+        "  {} backward over recorded causal edges only (closed_by, derived_from, evidence_of, touched); hypotheses, not proven causes",
+        "note:".dimmed()
+    );
+    println!();
+
+    if let Some(report) = result["needs_report"].as_object() {
+        println!("{}", "NEEDS REPORT (the walk refused):".yellow().bold());
+        for missing in report
+            .get("missing")
+            .and_then(|m| m.as_array())
+            .into_iter()
+            .flatten()
+        {
+            println!("  {} {}", "!".red(), missing.as_str().unwrap_or("?"));
+        }
+        if let Some(detail) = report.get("detail").and_then(|d| d.as_str()) {
+            println!("  {detail}");
+        }
+        println!(
+            "{} {}",
+            "Provide:".white(),
+            "--logged-write <memory-id>".cyan()
+        );
+        return Ok(());
+    }
+
+    let preview = |value: &serde_json::Value| truncate(value.as_str().unwrap_or(""), 100);
+    if let Some(start) = result["nodes"].as_array().and_then(|nodes| nodes.first()) {
+        println!(
+            "{} {}  {}",
+            "Start:".white().bold(),
+            start["id"].as_str().unwrap_or("?"),
+            preview(&start["content"]).dimmed()
+        );
+        println!();
+    }
+    let causes = result["causes"].as_array().cloned().unwrap_or_default();
+    if causes.is_empty() {
+        println!(
+            "{}",
+            "No recorded causal edge leads into this memory.".dimmed()
+        );
+    }
+    for (rank, cause) in causes.iter().enumerate() {
+        println!(
+            "{} {} depth {}",
+            format!("#{}", rank + 1).green().bold(),
+            cause["id"].as_str().unwrap_or("?"),
+            cause["depth"]
+        );
+        println!("  {}", preview(&cause["content"]));
+        for hop in cause["path"].as_array().into_iter().flatten() {
+            println!(
+                "  {} {} -[{}]-> {}",
+                "->".cyan(),
+                hop["source_id"].as_str().unwrap_or("?"),
+                hop["link_type"].as_str().unwrap_or("?"),
+                hop["target_id"].as_str().unwrap_or("?")
+            );
+        }
+        println!();
+    }
+    if result["truncated"] == true {
+        println!(
+            "  {} stopped at the walk bounds (depth {}, {} nodes); more recorded causes lie beyond",
+            "truncated:".yellow(),
+            result["bounds"]["max_depth"],
+            result["bounds"]["max_nodes"]
+        );
+    }
+    println!(
+        "  {}",
+        "(read-only: a Strata walk persists nothing)".dimmed()
+    );
+    Ok(())
+}
+
 /// Normalized remote identity for a repo: `git config remote.origin.url`
 /// stripped of protocol and `.git` (`https://github.com/a/b.git`,
 /// `git@github.com:a/b` -> `github.com/a/b`). None when no remote is set.
@@ -3726,6 +4454,12 @@ fn run_ingest_git(
     max_commits: usize,
     json: bool,
 ) -> anyhow::Result<()> {
+    let storage = open_storage()?;
+    if is_strata(&storage) {
+        anyhow::bail!(
+            "unavailable_in_4_0: ingest-git is not available on Strata in Vestige 4.0: it upserts each commit by source key and dates it to the commit time, and the Strata store exposes neither operation yet. Nothing was written."
+        );
+    }
     let repo_display = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -3765,7 +4499,6 @@ fn run_ingest_git(
     let commits =
         vestige_core::advanced::git_records::parse_git_log(&String::from_utf8_lossy(&out.stdout));
 
-    let storage = open_storage()?;
     let mut created = 0usize;
     let mut updated = 0usize;
     let mut unchanged = 0usize;
@@ -3832,14 +4565,57 @@ fn run_ingest_git(
     Ok(())
 }
 
-/// Recall + reason across memories using the real deep_reference engine.
-fn run_recall(query: String, depth: i64, json: bool) -> anyhow::Result<()> {
+/// Recall by exact handle (both stores), or by free text through the real
+/// deep_reference engine (legacy SQLite stores only).
+fn run_recall(
+    query: Option<String>,
+    handle: Option<String>,
+    depth: i64,
+    json: bool,
+) -> anyhow::Result<()> {
     use vestige_mcp::cognitive::CognitiveEngine;
 
     let storage = open_storage()?;
-
     let rt = tokio::runtime::Runtime::new()?;
-    let result = rt.block_on(async move {
+
+    // Handle mode goes through the MCP recall tool's `handle` argument, so
+    // the CLI resolves exactly what the tool resolves.
+    let recall_handle = |args: serde_json::Value| -> anyhow::Result<serde_json::Value> {
+        let cognitive = Arc::new(tokio::sync::Mutex::new(CognitiveEngine::new()));
+        rt.block_on(vestige_mcp::tools::recall::execute(
+            &storage,
+            &cognitive,
+            &vestige_core::OutputConfig::default(),
+            Some(args),
+        ))
+        .map_err(|e| anyhow::anyhow!("recall error: {e}"))
+    };
+
+    if let Some(handle) = handle {
+        let value = recall_handle(serde_json::json!({ "handle": handle }))?;
+        return print_handle_recall(&handle, &value, json);
+    }
+    let query = query.context("pass a QUERY or --handle")?;
+
+    if is_strata(&storage) {
+        // Free text needs similarity, which a Strata log does not run.
+        if json {
+            // The MCP tool's handle_required payload, candidates included.
+            let value = recall_handle(serde_json::json!({ "handle": "", "query": query }))?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        let suggestions = handle_suggestions(&storage, &query);
+        let found = if suggestions.is_empty() {
+            "No word in the text is a handle in this store.".to_string()
+        } else {
+            format!("Handles in your text: {}.", suggestions.join("; "))
+        };
+        anyhow::bail!(
+            "similarity_disabled: free-text recall is not a Strata operation in Vestige 4.0 (no embeddings, BM25, FTS or keyword matching). Recall by exact handle instead: vestige recall --handle <memory id | unique id prefix of 8+ chars | exact tag>. {found}"
+        );
+    }
+
+    let result = rt.block_on(async {
         let cognitive = Arc::new(tokio::sync::Mutex::new(CognitiveEngine::new()));
         {
             let mut cog = cognitive.lock().await;
@@ -3908,7 +4684,129 @@ fn run_recall(query: String, depth: i64, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Compose: surface never-composed memory pairs + the testable question they imply.
+/// Words of `text` that resolve as exact handles, as `--handle` arguments.
+/// Same tokens the MCP tool mines (the whole text, then up to eight
+/// identifier-shaped words of 3+ chars), resolved exactly: no fuzzy match.
+fn handle_suggestions(storage: &Arc<Storage>, text: &str) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut queries: Vec<&str> = vec![text];
+    queries.extend(
+        text.split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-')))
+            .filter(|token| token.len() >= 3)
+            .take(8),
+    );
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for query in queries {
+        if !seen.insert(query) {
+            continue;
+        }
+        let resolution = storage.resolve_handle(query);
+        let count = resolution.ids.len();
+        if count == 0 {
+            continue;
+        }
+        out.push(format!(
+            "--handle {query} ({}, {count} memor{})",
+            resolution.kind.as_str(),
+            if count == 1 { "y" } else { "ies" }
+        ));
+    }
+    out
+}
+
+/// Most resolved memories printed for one handle; --json prints every one.
+const HANDLE_PRINT_LIMIT: usize = 20;
+
+/// Render the MCP recall tool's handle payload. An ambiguous or unmatched
+/// handle is an error (non-zero exit), after the JSON when --json is set.
+fn print_handle_recall(handle: &str, value: &serde_json::Value, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    }
+    let candidates: Vec<&str> = value["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    match value["error"].as_str() {
+        Some("ambiguous") => anyhow::bail!(
+            "ambiguous: handle '{handle}' is a prefix of {} memory ids; pass a longer prefix or the full id. Candidates: {}",
+            candidates.len(),
+            candidates.join(", ")
+        ),
+        Some(error) => anyhow::bail!(
+            "{error}: nothing matches handle '{handle}'. A handle is a memory id, a unique id prefix of 8+ characters, or an exact tag (case-sensitive); legacy SQLite stores also resolve commit shas, files, symbols, tests and run ids."
+        ),
+        None => {}
+    }
+    if json {
+        return Ok(());
+    }
+
+    let nodes = value["nodes"].as_array().cloned().unwrap_or_default();
+    println!(
+        "{}  handle={}  kind={}  exact={}  {} memor{}",
+        "Recall".cyan().bold(),
+        handle,
+        value["kind"].as_str().unwrap_or("?"),
+        value["exact"],
+        nodes.len(),
+        if nodes.len() == 1 { "y" } else { "ies" }
+    );
+    for node in nodes.iter().take(HANDLE_PRINT_LIMIT) {
+        let tags: Vec<&str> = node["tags"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.as_str())
+            .collect();
+        println!();
+        println!(
+            "{}  [{}]  {} {}",
+            node["id"].as_str().unwrap_or("?").white().bold(),
+            node["type"].as_str().unwrap_or("?"),
+            "tags:".dimmed(),
+            tags.join(", ")
+        );
+        println!(
+            "  {}",
+            truncate(node["content"].as_str().unwrap_or(""), 300)
+        );
+    }
+    if nodes.len() > HANDLE_PRINT_LIMIT {
+        println!();
+        println!(
+            "  {} ... and {} more (pass --json for every memory)",
+            "".dimmed(),
+            nodes.len() - HANDLE_PRINT_LIMIT
+        );
+    }
+
+    let neighbors = value["neighbors"].as_array().cloned().unwrap_or_default();
+    println!();
+    println!(
+        "{} ({})",
+        "Recorded edges, one hop".white().bold(),
+        neighbors.len()
+    );
+    for edge in &neighbors {
+        println!(
+            "  {} -[{}]-> {}  {}",
+            edge["from"].as_str().unwrap_or("?"),
+            edge["link_type"].as_str().unwrap_or("?"),
+            edge["to"].as_str().unwrap_or("?"),
+            truncate(edge["node"]["content"].as_str().unwrap_or(""), 70).dimmed()
+        );
+    }
+    Ok(())
+}
+
+/// Project the durable subset of a scope into a fenced rule-file region.
 fn run_project(
     out: PathBuf,
     format: String,
@@ -3997,8 +4895,15 @@ fn run_project(
     Ok(())
 }
 
-fn run_compose(limit: i32, tags: Option<String>, json: bool) -> anyhow::Result<()> {
+/// Compose: list never-composed memory pairs.
+fn run_compose(
+    limit: i32,
+    tags: Option<String>,
+    scope: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
     let storage = open_storage()?;
+    let strata = is_strata(&storage);
 
     let tag_vec: Option<Vec<String>> = tags.map(|t| {
         t.split(',')
@@ -4006,16 +4911,32 @@ fn run_compose(limit: i32, tags: Option<String>, json: bool) -> anyhow::Result<(
             .filter(|s| !s.is_empty())
             .collect()
     });
+    let scope = scope.map(|s| s.trim().to_string());
+    if scope.as_deref().is_some_and(str::is_empty) {
+        anyhow::bail!("--scope must not be empty");
+    }
 
+    // The scoped call is the one the MCP `graph never_composed` action makes.
+    // With no scope a Strata log lists `user` (its unscoped call lists
+    // nothing), and a legacy SQLite store considers every scope, as before.
     let candidates = storage
-        .get_never_composed_candidates(limit, tag_vec.as_deref())
+        .get_never_composed_candidates_in_scope(limit, tag_vec.as_deref(), scope.as_deref())
         .map_err(|e| anyhow::anyhow!("compose error: {}", e))?;
+    let scope_label = scope.clone().unwrap_or_else(|| {
+        if strata {
+            vestige_core::DEFAULT_MEMORY_SCOPE.to_string()
+        } else {
+            "every scope".to_string()
+        }
+    });
 
     if json {
         let arr: Vec<_> = candidates
             .iter()
             .map(|c| {
                 serde_json::json!({
+                    "a_id": c.first_id,
+                    "b_id": c.second_id,
                     "score": c.score,
                     "novelty": c.novelty_score,
                     "bridge": c.bridge_score,
@@ -4034,17 +4955,41 @@ fn run_compose(limit: i32, tags: Option<String>, json: bool) -> anyhow::Result<(
 
     if candidates.is_empty() {
         println!(
-            "{}  no never-composed candidates surfaced (try a wider --limit or remove --tags)",
-            "Compose".magenta().bold()
+            "{}  no never-composed pairs in {} (try a wider --limit, another --scope, or remove --tags)",
+            "Compose".magenta().bold(),
+            scope_label
         );
         return Ok(());
     }
 
+    if strata {
+        println!(
+            "{}  {} pair{} in scope {} with no recorded edge between them (Strata log: memory-id order, unranked; leads, not findings):\n",
+            "Compose".magenta().bold(),
+            candidates.len(),
+            if candidates.len() == 1 { "" } else { "s" },
+            scope_label
+        );
+        for (i, c) in candidates.iter().enumerate() {
+            println!(
+                "{} {} / {}",
+                format!("{}.", i + 1).cyan().bold(),
+                c.first_id,
+                c.second_id
+            );
+            println!("   A: {}", truncate(&c.first_preview, 70));
+            println!("   B: {}", truncate(&c.second_preview, 70));
+            println!();
+        }
+        return Ok(());
+    }
+
     println!(
-        "{}  {} never-composed insight{} — pairs you wrote that were never connected:\n",
+        "{}  {} never-composed pair{} in {}, linked by recorded causal edges but never composed:\n",
         "Compose".magenta().bold(),
         candidates.len(),
-        if candidates.len() == 1 { "" } else { "s" }
+        if candidates.len() == 1 { "" } else { "s" },
+        scope_label
     );
 
     for (i, c) in candidates.iter().enumerate() {
@@ -4089,14 +5034,62 @@ fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
 
     println!("{}", "=== Vestige Dashboard ===".cyan().bold());
     println!();
+
+    let dir = cli_data_dir()?;
+    // Same check `vestige-mcp` runs before stdio. It runs before the lock:
+    // the upgrade helper takes that lock itself.
+    vestige_mcp::v3_launch::upgrade_or_refuse(&dir.join("vestige.db"))?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let mut open_browser = open_browser;
+
+    // Usually an agent's vestige-mcp holds the store. That process serves the
+    // dashboard on request, for as long as this command runs; if it exits,
+    // this process takes the store and serves the dashboard itself.
+    let wait = vestige_mcp::attach::election_wait();
+    let mut deadline = std::time::Instant::now() + wait;
+    while !take_cli_lock(&dir)? {
+        match rt.block_on(vestige_mcp::attach::request_dashboard(&dir, port)) {
+            Ok(lease) => {
+                println!("Dashboard: {}", lease.url.cyan());
+                println!(
+                    "  {} served by vestige-mcp (pid {}), the Vestige server your agents use",
+                    ">".cyan(),
+                    lease.owner_pid
+                );
+                if open_browser {
+                    let _ = open::that(&lease.url);
+                    open_browser = false;
+                }
+                println!("{}", "Press Ctrl+C to stop.".dimmed());
+                rt.block_on(lease.closed());
+                println!("That Vestige server exited; moving the dashboard here...");
+                deadline = std::time::Instant::now() + wait;
+            }
+            Err(err) => {
+                // A definite refusal (the port is taken, say) is not retried.
+                if err.kind() == std::io::ErrorKind::ConnectionRefused {
+                    anyhow::bail!(
+                        "the Vestige server holding {} could not start the dashboard: {err}",
+                        dir.display()
+                    );
+                }
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "{} holds {} and did not start the dashboard: {err}",
+                        store_holder(&dir),
+                        dir.display()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+
     println!(
         "Starting dashboard at {}...",
         format!("http://127.0.0.1:{}", port).cyan()
     );
-
     let storage = open_storage()?;
-
-    let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         // Initialize cognitive engine for dream and other cognitive features
         let cognitive = Arc::new(tokio::sync::Mutex::new(CognitiveEngine::new()));
@@ -4104,10 +5097,30 @@ fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
             let mut cog = cognitive.lock().await;
             cog.hydrate(&storage); // Load persisted connections
         }
-
-        vestige_mcp::dashboard::start_dashboard(storage, Some(cognitive), port, open_browser)
+        let (event_tx, _) = tokio::sync::broadcast::channel::<
+            vestige_mcp::dashboard::events::VestigeEvent,
+        >(vestige_mcp::dashboard::state::EVENT_CHANNEL_CAPACITY);
+        let dashboard = vestige_mcp::dashboard::DashboardOnDemand::new(
+            Arc::clone(&storage),
+            Arc::clone(&cognitive),
+            event_tx.clone(),
+        );
+        let running = dashboard
+            .ensure(port)
             .await
-            .map_err(|e| anyhow::anyhow!("Dashboard error: {}", e))
+            .map_err(|e| anyhow::anyhow!("Dashboard error: {}", e))?;
+        // This process holds the store, so MCP clients started meanwhile
+        // attach here instead of waiting for it to exit.
+        let _attach_point =
+            open_cli_attach_point(&storage, &cognitive, &event_tx, Some(dashboard.starter())).await;
+        let url = format!("http://127.0.0.1:{running}");
+        println!("Dashboard: {}", url.cyan());
+        if open_browser {
+            let _ = open::that(&url);
+        }
+        println!("{}", "Press Ctrl+C to stop.".dimmed());
+        tokio::signal::ctrl_c().await.ok();
+        Ok(())
     })
 }
 
@@ -4132,29 +5145,26 @@ fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Re
             vestige_mcp::dashboard::events::VestigeEvent,
         >(vestige_mcp::dashboard::state::EVENT_CHANNEL_CAPACITY);
 
+        let dashboard = vestige_mcp::dashboard::DashboardOnDemand::new(
+            Arc::clone(&storage),
+            Arc::clone(&cognitive),
+            event_tx.clone(),
+        );
         // Optionally start dashboard
         if with_dashboard {
-            let ds = Arc::clone(&storage);
-            let dc = Arc::clone(&cognitive);
-            let dtx = event_tx.clone();
+            let dashboard = dashboard.clone();
             tokio::spawn(async move {
-                match vestige_mcp::dashboard::start_background_with_event_tx(
-                    ds,
-                    Some(dc),
-                    dtx,
-                    dashboard_port,
-                )
-                .await
-                {
-                    Ok(_) => println!(
-                        "  {} Dashboard: http://127.0.0.1:{}",
-                        ">".cyan(),
-                        dashboard_port
-                    ),
+                match dashboard.ensure(dashboard_port).await {
+                    Ok(port) => println!("  {} Dashboard: http://127.0.0.1:{}", ">".cyan(), port),
                     Err(e) => eprintln!("  {} Dashboard failed: {}", "!".yellow(), e),
                 }
             });
         }
+
+        // This process holds the store, so MCP stdio clients started
+        // meanwhile attach here instead of waiting for it to exit.
+        let _attach_point =
+            open_cli_attach_point(&storage, &cognitive, &event_tx, Some(dashboard.starter())).await;
 
         // Get auth token
         let token = vestige_mcp::protocol::auth::get_or_create_auth_token()
@@ -4191,6 +5201,43 @@ fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Re
 
         Ok(())
     })
+}
+
+/// Accept attached MCP sessions for as long as this long-running command
+/// holds the store. A failure only means clients wait for this to exit.
+async fn open_cli_attach_point(
+    storage: &Arc<Storage>,
+    cognitive: &Arc<tokio::sync::Mutex<vestige_mcp::cognitive::CognitiveEngine>>,
+    event_tx: &tokio::sync::broadcast::Sender<vestige_mcp::dashboard::events::VestigeEvent>,
+    dashboard: Option<vestige_mcp::attach::DashboardStarter>,
+) -> Option<vestige_mcp::attach::AttachPoint> {
+    let dir = cli_data_dir().ok()?;
+    let storage = Arc::clone(storage);
+    let cognitive = Arc::clone(cognitive);
+    let event_tx = event_tx.clone();
+    match vestige_mcp::attach::AttachPoint::open(
+        &dir,
+        move || {
+            vestige_mcp::server::McpServer::new_with_events(
+                Arc::clone(&storage),
+                Arc::clone(&cognitive),
+                event_tx.clone(),
+            )
+        },
+        dashboard,
+    )
+    .await
+    {
+        Ok(point) => Some(point),
+        Err(err) => {
+            eprintln!(
+                "  {} MCP clients cannot attach while this runs: {}",
+                "!".yellow(),
+                err
+            );
+            None
+        }
+    }
 }
 
 /// Truncate a string for display (UTF-8 safe)
@@ -4295,5 +5342,129 @@ mod tests {
         assert_eq!(user_hooks[0]["command"], "/tmp/custom-user-hook.sh");
         assert!(settings["hooks"].get("Stop").is_none());
         assert_eq!(settings["other"], true);
+    }
+}
+
+/// Help text and argument shape for the 4.0 (Strata) build. Runs without
+/// `legacy-sqlite`; the behavior itself is covered by `tests/cli_strata.rs`.
+#[cfg(test)]
+mod strata_cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn long_help(path: &[&str]) -> String {
+        let mut command = Cli::command();
+        for name in path {
+            command = command
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("no subcommand {name}"))
+                .clone();
+        }
+        command.render_long_help().to_string()
+    }
+
+    #[test]
+    fn help_text_makes_no_v3_only_claims() {
+        let banned = [
+            "semantic-band",
+            "hybrid search",
+            "full backup of the SQLite database",
+            "Prediction Error Gating",
+            "vector search",
+            "SEMANTIC SEARCH",
+            "synaptic tagging",
+            "rehearse them on a copy",
+            "entities the backfill joins on",
+        ];
+        let mut pages = vec![long_help(&[])];
+        for sub in Cli::command().get_subcommands() {
+            pages.push(long_help(&[sub.get_name()]));
+        }
+        for page in &pages {
+            for claim in banned {
+                assert!(
+                    !page.contains(claim),
+                    "help still claims {claim:?}:\n{page}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strata_help_names_what_works() {
+        let backup = long_help(&["backup"]);
+        assert!(backup.contains("Strata log"), "{backup}");
+        assert!(backup.contains("vestige.db is never copied"), "{backup}");
+        let backfill = long_help(&["backfill"]);
+        assert!(backfill.contains("vestige causal-walk"), "{backfill}");
+        let recall = long_help(&["recall"]);
+        assert!(recall.contains("--handle"), "{recall}");
+        assert!(recall.contains("exact tag"), "{recall}");
+        for sub in ["portable-export", "portable-import", "sync"] {
+            let page = long_help(&[sub]);
+            assert!(page.contains("legacy SQLite stores only"), "{sub}: {page}");
+        }
+        let compose = long_help(&["compose"]);
+        assert!(compose.contains("no recorded edge"), "{compose}");
+    }
+
+    #[test]
+    fn recall_takes_a_query_or_a_handle_but_not_both() {
+        let handle = Cli::try_parse_from(["vestige", "recall", "--handle", "mem-1"]).unwrap();
+        assert!(matches!(
+            handle.command,
+            Commands::Recall {
+                query: None,
+                handle: Some(_),
+                ..
+            }
+        ));
+        let query = Cli::try_parse_from(["vestige", "recall", "what broke"]).unwrap();
+        assert!(matches!(
+            query.command,
+            Commands::Recall {
+                query: Some(_),
+                handle: None,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["vestige", "recall"]).is_err());
+        assert!(Cli::try_parse_from(["vestige", "recall", "q", "--handle", "h"]).is_err());
+    }
+
+    #[test]
+    fn compose_takes_an_optional_scope() {
+        let cli = Cli::try_parse_from(["vestige", "compose", "--scope", "proj"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Compose { scope: Some(ref s), .. } if s == "proj"
+        ));
+    }
+
+    #[test]
+    fn backup_destination_inside_the_log_is_detected_before_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        std::fs::create_dir_all(&log).unwrap();
+        let canonical_log = std::fs::canonicalize(&log).unwrap();
+        let inside = resolve_existing_prefix(&log.join("a").join("b")).unwrap();
+        assert!(inside.starts_with(&canonical_log), "{inside:?}");
+        let beside = resolve_existing_prefix(&dir.path().join("backups").join("x")).unwrap();
+        assert!(!beside.starts_with(&canonical_log), "{beside:?}");
+        assert!(
+            !dir.path().join("backups").exists(),
+            "resolving created a directory"
+        );
+    }
+
+    #[test]
+    fn path_size_sums_a_directory_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("log")).unwrap();
+        std::fs::write(dir.path().join("log").join("a.seg"), [0u8; 10]).unwrap();
+        std::fs::write(dir.path().join("store.meta"), [0u8; 5]).unwrap();
+        assert_eq!(path_size(dir.path()), 15);
+        assert_eq!(format_size(15), "15 bytes");
+        assert_eq!(format_size(2048), "2.0 KB");
     }
 }

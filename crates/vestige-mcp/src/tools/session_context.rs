@@ -134,9 +134,16 @@ pub async fn execute(
     let include_status = args.include_status.unwrap_or(true);
     let include_intentions = args.include_intentions.unwrap_or(true);
     let include_predictions = args.include_predictions.unwrap_or(true);
-    let queries = args
-        .queries
-        .unwrap_or_else(|| vec!["user preferences".to_string()]);
+    // Strata has no query search (explicit queries are refused below), so a
+    // bare session_start on a Strata store opens the session without the
+    // default "user preferences" search instead of failing.
+    let queries = args.queries.unwrap_or_else(|| {
+        if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+            Vec::new()
+        } else {
+            vec!["user preferences".to_string()]
+        }
+    });
 
     if queries.len() > 16 {
         return Err("At most 16 startup queries are supported per call".into());

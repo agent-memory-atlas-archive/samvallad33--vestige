@@ -2325,6 +2325,7 @@ dependencies = [
  "blake3",
  "borsh",
  "ed25519-dalek",
+ "getrandom 0.4.3",
  "libc",
 ]
 
@@ -2355,6 +2356,7 @@ dependencies = [
  "borsh",
  "chrono",
  "ed25519-dalek",
+ "getrandom 0.4.3",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2865,7 +2867,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vestige-core"
-version = "3.1.1"
+version = "4.0.0"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -2922,7 +2924,7 @@ dependencies = [
 
 [[package]]
 name = "vestige-mcp"
-version = "3.1.1"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2934,6 +2936,7 @@ dependencies = [
  "directories",
  "ed25519-dalek",
  "futures-util",
+ "getrandom 0.4.3",
  "include_dir",
  "libc",
  "mime_guess",
@@ -2985,7 +2988,7 @@ dependencies = [
 
 [[package]]
 name = "vestige-upgrade"
-version = "3.1.1"
+version = "4.0.0"
 dependencies = [
  "directories",
  "libc",
@@ -2993,6 +2996,7 @@ dependencies = [
  "sha2",
  "strata",
  "strata-migrate",
+ "strata-store",
  "strata-verify",
  "tempfile",
  "vestige-core",

@@ -15,6 +15,8 @@ const C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const LEFT: &str = "11111111-1111-4111-8111-111111111111";
 const MID: &str = "22222222-2222-4222-8222-222222222222";
 const RIGHT: &str = "33333333-3333-4333-8333-333333333333";
+const SCOPED: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const SUPPRESSED: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -37,6 +39,33 @@ fn sha256_file(path: &Path) -> String {
 
 fn plant_touched_chain(db: &Path) {
     let conn = rusqlite::Connection::open(db).unwrap();
+    // Later v3 schemas carry scope and suppression columns that the v3.1.1
+    // sample predates; real stores have them.
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('knowledge_nodes')")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for (name, ddl) in [
+        (
+            "scope",
+            "ALTER TABLE knowledge_nodes ADD COLUMN scope TEXT NOT NULL DEFAULT 'user'",
+        ),
+        (
+            "suppression_count",
+            "ALTER TABLE knowledge_nodes ADD COLUMN suppression_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "suppressed_at",
+            "ALTER TABLE knowledge_nodes ADD COLUMN suppressed_at TEXT",
+        ),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            conn.execute(ddl, []).unwrap();
+        }
+    }
     for (id, content) in [
         (A, "chain node A declared touched"),
         (B, "chain node B declared touched"),
@@ -51,6 +80,25 @@ fn plant_touched_chain(db: &Path) {
         )
         .unwrap();
     }
+    conn.execute(
+        "INSERT INTO knowledge_nodes
+         (id, content, node_type, created_at, updated_at, last_accessed, tags, source, scope)
+         VALUES (?1, 'scoped tagged import', 'decision', '2026-01-15T10:00:00+00:00',
+                 '2026-02-20T11:30:00+00:00', '2026-03-01T09:15:00+00:00', '[\"imported-tag\"]',
+                 'fixture', 'project-x')",
+        rusqlite::params![SCOPED],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO knowledge_nodes
+         (id, content, node_type, created_at, updated_at, last_accessed, tags, source,
+          suppression_count, suppressed_at)
+         VALUES (?1, 'suppressed in v3', 'fact', '2026-01-15T10:00:00+00:00',
+                 '2026-02-20T11:30:00+00:00', '2026-03-01T09:15:00+00:00', '[\"imported-tag\"]',
+                 'fixture', 2, '2026-03-01 09:15:00')",
+        rusqlite::params![SUPPRESSED],
+    )
+    .unwrap();
     for (source, target) in [(A, B), (B, C)] {
         conn.execute(
             "INSERT INTO memory_connections
@@ -217,15 +265,61 @@ fn imported_graph_chain_over_stdio() {
     )
     .unwrap();
 
-    // `search` was removed; `recall` is the concrete lookup.
-    let found = server.tool("recall", json!({ "query": LEFT }));
-    let results = found["results"]
+    // Imported memories resolve by exact handle, like native ones.
+    let found = server.tool("recall", json!({ "handle": LEFT }));
+    assert_eq!(found["kind"], json!("memory"), "{found}");
+    assert_eq!(found["exact"], json!(true), "{found}");
+    assert_eq!(found["nodes"][0]["id"], json!(LEFT), "{found}");
+    // An exact tag handle reaches the live imported memory and skips the one
+    // v3 had suppressed; the suppressed id itself does not resolve.
+    let tagged = server.tool("recall", json!({ "handle": "imported-tag" }));
+    assert_eq!(tagged["kind"], json!("tag"), "{tagged}");
+    let tagged_ids: Vec<_> = tagged["nodes"]
         .as_array()
-        .unwrap_or_else(|| panic!("recall results: {found}"));
-    assert!(
-        results.iter().any(|row| row["id"] == json!(LEFT)),
-        "search missed the imported node: {found}"
+        .unwrap()
+        .iter()
+        .filter_map(|node| node["id"].as_str())
+        .collect();
+    assert_eq!(tagged_ids, vec![SCOPED], "{tagged}");
+    let hidden = server.tool("memory", json!({ "action": "get", "id": SUPPRESSED }));
+    assert_eq!(
+        hidden["found"],
+        json!(false),
+        "v3-suppressed must stay hidden: {hidden}"
     );
+    // v3 scope survives the upgrade: the memory counts in its own project,
+    // not in `user`.
+    let project = server.tool(
+        "memory_status",
+        json!({ "view": "stats", "scope": "project-x" }),
+    );
+    assert!(project.to_string().contains(SCOPED), "{project}");
+    let user = server.tool("memory_status", json!({ "view": "stats", "scope": "user" }));
+    assert!(!user.to_string().contains(SCOPED), "{user}");
+    // Provenance names the upgrade as the origin of an imported memory.
+    let provenance = server.tool(
+        "memory_status",
+        json!({ "view": "provenance", "memoryId": LEFT }),
+    );
+    assert_eq!(provenance["found"], json!(true), "{provenance}");
+    assert_eq!(
+        provenance["origin"]["kind"],
+        json!("v3_import"),
+        "{provenance}"
+    );
+    // Reviewing an imported memory proves, and receipts keep resolving.
+    let promoted = server.tool("memory", json!({ "action": "promote", "id": LEFT }));
+    assert!(
+        promoted["receiptId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("eff-")),
+        "{promoted}"
+    );
+    let receipt = server.tool(
+        "receipt",
+        json!({ "action": "get", "receipt_id": promoted["receiptId"] }),
+    );
+    assert!(receipt.get("error").is_none(), "{receipt}");
     let got = server.tool("memory", json!({ "action": "get", "id": LEFT }));
     assert_eq!(got["found"], json!(true), "{got}");
     assert_eq!(got["node"]["id"], json!(LEFT));

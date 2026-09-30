@@ -2417,6 +2417,16 @@ pub async fn list_memory_prs(
     State(state): State<AppState>,
     Query(params): Query<MemoryPrListParams>,
 ) -> Result<Json<Value>, StatusCode> {
+    if crate::strata_memory::is_strata_backend(state.storage.as_ref()) {
+        return Ok(Json(serde_json::json!({
+            "total": 0,
+            "pendingCount": 0,
+            "mode": vestige_core::ReviewMode::Fast.as_str(),
+            "prs": [],
+            "available": false,
+            "reason": "Memory PR review is not available on a Strata log in Vestige 4.0. Every write passes the log's gate and leaves a receipt instead.",
+        })));
+    }
     let limit = params.limit.unwrap_or(100).clamp(1, 500);
     let status = params.status.as_deref().and_then(|s| {
         serde_json::from_value::<vestige_core::MemoryPrStatus>(serde_json::Value::String(
@@ -2619,6 +2629,13 @@ pub async fn set_review_mode(
 ) -> Result<Json<Value>, StatusCode> {
     let mode =
         vestige_core::ReviewMode::try_from_label(&body.mode).ok_or(StatusCode::BAD_REQUEST)?;
+    // No Memory PR store on Strata in 4.0: a gated mode would hide writes it
+    // can never release, so only fast can be set there.
+    if !matches!(mode, vestige_core::ReviewMode::Fast)
+        && crate::strata_memory::is_strata_backend(state.storage.as_ref())
+    {
+        return Err(StatusCode::CONFLICT);
+    }
     let path = review_mode_path(&state);
     let payload = serde_json::json!({ "mode": mode.as_str() });
     // B7: atomic write (temp + rename) so a concurrent read can never see a

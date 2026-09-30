@@ -452,7 +452,9 @@ where
                 match result {
                     Ok(None) => {
                         // Clean EOF — stdin closed
-                        info!("stdin closed (EOF), shutting down");
+                        // Also an attached session's socket closing, where
+                        // the serving process itself keeps running.
+                        info!("client input closed (EOF); ending this session");
                         break;
                     }
                     Ok(Some(raw)) => {

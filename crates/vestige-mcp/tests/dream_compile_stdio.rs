@@ -135,8 +135,28 @@ fn link(storage: &vestige_core::Storage, source: &str, target: &str, link_type: 
         .unwrap();
 }
 
+/// strata-verify is a workspace-excluded crate, so no `CARGO_BIN_EXE_` exists
+/// for it here. Build it into its own crate-local target dir (the one the
+/// later CI step reuses) instead of assuming an earlier step already did. A
+/// separate target dir also keeps this nested cargo off the lock the outer
+/// `cargo test` holds.
 fn verify_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../strata-verify/target/debug/strata-verify")
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../strata-verify");
+    let target_dir = crate_dir.join("target");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(crate_dir.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .env_remove("CARGO_TARGET_DIR")
+        .status()
+        .expect("run cargo build for strata-verify");
+    assert!(status.success(), "cargo build strata-verify failed");
+    target_dir
+        .join("debug")
+        .join(format!("strata-verify{}", std::env::consts::EXE_SUFFIX))
 }
 
 #[test]

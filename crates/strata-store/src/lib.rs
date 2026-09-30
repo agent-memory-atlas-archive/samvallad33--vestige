@@ -43,6 +43,12 @@
 //! `32` = `STORE_WRITE` (payload `borsh(StoreOp)`), `33` = `STORE_CHECKPOINT`
 //! (payload `borsh(strata_kernel::Checkpoint)`).
 //!
+//! An upgraded store also replays the v3 importer's frames: nodes and edges
+//! (sharing `32`/`33`), `0x24` supersessions, and FSRS state. `0x22`
+//! `FSRS_REVIEW` folds a v3 `fsrs_cards` rating series and `0x27`
+//! `FSRS_STATE` folds a v3 card carried from `knowledge_nodes`, both onto
+//! the node's card handle and into the checkpointed fold.
+//!
 //! ## v1 scope (documented deviations in SCOPE-HANDOFF.md)
 //!
 //! Single-writer (`Send` via the gate-log mutex); reads append
@@ -52,12 +58,16 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod anchor;
+mod card;
 mod error;
 mod gate_log;
 mod op;
 mod store;
 mod types;
 
+#[cfg(test)]
+mod import_tests;
 #[cfg(test)]
 mod tests;
 
@@ -70,6 +80,6 @@ pub use store::{
     RULE_EDIT, RULE_INTENTIONS, RULE_PURGE, RULE_SUPPRESS,
 };
 pub use types::{
-    looks_like_failure, ConnectionRecord, EdgeDirection, EdgeKind, IngestInput, IntentionRecord,
-    NodeRecord, SourceKey, TYPED_EDGE_VOCABULARY, VALID_FOREVER_MS,
+    looks_like_failure, AnchorRecord, ConnectionRecord, EdgeDirection, EdgeKind, IngestInput,
+    IntentionRecord, NodeRecord, SourceKey, TYPED_EDGE_VOCABULARY, VALID_FOREVER_MS,
 };

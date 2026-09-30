@@ -77,13 +77,16 @@ fn default_data_dir() -> PathBuf {
 
 fn hold_store_lock(data_dir: &Path) -> Result<File, ExitCode> {
     let path = data_dir.join(".serve.lock");
-    let file = match File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
+    let mut options = File::options();
+    options.read(true).write(true).create(true).truncate(false);
+    // Owner-only, like vestige-mcp's: a lock other users can open is one
+    // they can hold to lock the owner out.
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = match options.open(&path) {
         Ok(file) => file,
         Err(err) => {
             eprintln!(

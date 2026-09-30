@@ -1,5 +1,7 @@
 # ComposedGraph
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../README.md) and the [4.0.0 changelog](../CHANGELOG.md).
+
 ComposedGraph records memory combinations as durable reasoning events.
 
 Most memory systems store facts, entities, or relationships. ComposedGraph stores a

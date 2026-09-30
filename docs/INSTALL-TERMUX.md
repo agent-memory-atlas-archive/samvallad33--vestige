@@ -1,5 +1,7 @@
 # Android (Termux) Installation
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../README.md) and the [4.0.0 changelog](../CHANGELOG.md).
+
 Vestige runs on Android inside [Termux](https://termux.dev). Today that means
 building from source in a configuration without embeddings; a prebuilt
 `aarch64-linux-android` release asset and `npm install -g` support are the next

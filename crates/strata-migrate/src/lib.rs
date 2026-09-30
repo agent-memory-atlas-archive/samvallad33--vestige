@@ -11,8 +11,10 @@
 //!
 //! | SQLite source                    | STRATA record                                  |
 //! |----------------------------------|------------------------------------------------|
-//! | `GENESIS` / `PARAMS v4-migrate/1`| provenance + parameter frames on a fresh log   |
+//! | `GENESIS` / `PARAMS v4-migrate/2`| provenance + parameter frames on a fresh log   |
 //! | `knowledge_nodes` rows           | `NODE` frames (kernel_id v1 + legacy UUID)      |
+//! | `knowledge_nodes` FSRS columns   | `FSRS_STATE` frames, one per row with no        |
+//! |                                  | `fsrs_cards` row (see FSRS state below)         |
 //! | V40 `walk_receipts` rows         | reference `NODE` frames tagged migrated_from_v4 |
 //! | `knowledge_nodes.superseded_by`  | `SUPERSESSION` frames                           |
 //! | `memory_connections` rows        | `EDGE` frames (declared 8-type vocabulary;      |
@@ -20,8 +22,23 @@
 //! | `fsrs_cards` rows                | `FSRS_REVIEW` frames (kernel `ReviewEvent`       |
 //! |                                  | plus `borsh(Option<i64>)` `reviewed_at_ms`)      |
 //! | `sync_tombstones` / `deletion_tombstones` | `TOMBSTONE` frames                     |
+//! | `intentions` rows                | no migration frame: decoded into [`Carryover`]  |
+//! |                                  | for [`MigrateOptions::carry_over`], which admits |
+//! |                                  | them as store writes after the receipt           |
 //! | everything else with rows        | counted in `MigrationReport::skipped_tables`    |
 //! | final frame                      | signed `MIGRATION_RECEIPT` (kind 46)            |
+//!
+//! Intentions are store state, not history: on Strata they only exist as
+//! gate-admitted `UpsertIntentions` writes, which is what gives each row a
+//! receipt. This crate cannot encode a store op (the store depends on it),
+//! so it reads the rows from the same snapshot the receipt hashes and hands
+//! them to the caller's `carry_over` hook, which runs on the staged log
+//! before the rename. Without a hook, `intentions` stays in `skipped_tables`.
+//!
+//! Only frames before the receipt are migration frames. `0x20` and `0x21`
+//! are shared with the store's `STORE_WRITE` and `STORE_CHECKPOINT`, so a
+//! frame after the receipt (a carried intention, or any later store write)
+//! is store data that the receipt never counted.
 //!
 //! The run re-hashes the source after the replay and refuses to seal if a
 //! single byte changed (the reader is read-only at the SQLite VFS level,
@@ -31,11 +48,12 @@
 //!
 //! ## FSRS fold semantics (read before relying on it)
 //!
-//! SQLite stores only FINAL FSRS state (`reps`, `lapses`, floats) — the
-//! review history that produced it is gone. Migration therefore synthesizes
-//! a deterministic event series per card: `reps - lapses` rating-3 (good)
-//! events followed by `lapses` rating-1 (again) events. The kernel fold
-//! reproduces `review_count == reps` and `lapse_count == lapses` EXACTLY;
+//! An `fsrs_cards` row stores only FINAL FSRS state (`reps`, `lapses`,
+//! floats) — the review history that produced it is gone. Migration
+//! therefore synthesizes a deterministic event series per card:
+//! `reps - lapses` rating-3 (good) events followed by `lapses` rating-1
+//! (again) events. The kernel fold reproduces `review_count == reps` and
+//! `lapse_count == lapses` EXACTLY;
 //! stability/difficulty are recomputed by the deterministic fold and become
 //! the new truth (the legacy floats were not reproducible from any log).
 //!
@@ -51,6 +69,28 @@
 //! empty, or missing. The kernel `ReviewEvent` prefix is unchanged, so
 //! checkpoint hashes stay valid. Retrievability uses this clock instead of
 //! the import-time frame seq.
+//!
+//! ## FSRS state from `knowledge_nodes` (read before relying on it)
+//!
+//! Real v3 stores leave `fsrs_cards` empty. Scheduling lives on
+//! `knowledge_nodes` (`stability`, `difficulty`, `reps`, `lapses`,
+//! `learning_state`, `last_accessed`, `sentiment_magnitude`), and v3 raised
+//! stability on access without counting a review, so almost every row has
+//! `reps = 0`. A rating series would carry nothing for those rows. Every
+//! `knowledge_nodes` row without an `fsrs_cards` row therefore gets one
+//! `FSRS_STATE` frame ([`FsrsStateRecord`]) carrying the card itself.
+//!
+//! v3 computed retrievability as `vestige_core::fsrs::retrievability_with_decay`
+//! over `stability * (1 + 0.5 * sentiment_magnitude)` and the days since
+//! `last_accessed`, with the store's personalized `fsrs_config.w20` (default
+//! [`vestige_core::fsrs::DEFAULT_DECAY`]). Strata's pinned curve decays at a
+//! different rate, so the importer refits stability: at the fit clock (the
+//! latest `knowledge_nodes` timestamp in the source, or one day after the
+//! row's `last_accessed` when that is later), Strata's retrievability for the
+//! card equals v3's for the same row. The clock comes from the source, never
+//! the wall clock, so the frame depends only on the source. After the fit,
+//! the card decays on Strata's curve. `reps`, `lapses`, and `difficulty`
+//! carry over, and the last review clock is `last_accessed`.
 //!
 //! ## Determinism
 //!
@@ -91,15 +131,28 @@ use vestige_core::storage::PortableArchive;
 use vestige_core::storage::PortableValue;
 
 pub use records::{
-    EdgeRecord, GenesisRecord, MigrationReceipt, NodeRecord, ParamsRecord, ReceiptBody, SourceKey,
-    SupersessionRecord, TombstoneRecord, KIND_MIGRATION_RECEIPT, RECEIPT_SIGNING_KEY_ID,
-    RECORD_VERSION,
+    EdgeRecord, FsrsStateRecord, GenesisRecord, MigrationReceipt, NodeRecord, ParamsRecord,
+    ReceiptBody, SourceKey, SupersessionRecord, TombstoneRecord, KIND_FSRS_STATE,
+    KIND_MIGRATION_RECEIPT, RECEIPT_SIGNING_KEY_ID, RECORD_VERSION,
 };
 pub use snapshot::{read_snapshot, Snapshot};
 
 /// Parameter set implemented by this migrator. Written as the `PARAMS`
-/// frame on a fresh log.
-pub const PARAMS_ID: &str = "v4-migrate/1";
+/// frame on a fresh log. `v4-migrate/2` adds `FSRS_STATE` frames.
+pub const PARAMS_ID: &str = "v4-migrate/2";
+
+/// The first parameter set. Its logs carry no `FSRS_STATE` frames.
+pub const PARAMS_ID_V1: &str = "v4-migrate/1";
+
+/// Whether a log written under `params_id` carries one `FSRS_STATE` frame
+/// per `knowledge_nodes` row without an `fsrs_cards` row.
+pub fn params_carry_fsrs_states(params_id: &str) -> bool {
+    params_id != PARAMS_ID_V1
+}
+
+/// Algorithm version the `FSRS_STATE` stability fit targets: the version
+/// strata-store folds reviews and derives retrievability under.
+pub const FSRS_STATE_ALGO: u32 = strata_kernel::fsrs::ALGO_V2;
 
 /// Frames per `append_batch` call: bounds peak memory on huge stores while
 /// staying far above the log's own 64-frame group-commit cap.
@@ -140,6 +193,78 @@ pub const LEGACY_INFERRED_KIND: &str = "legacy_inferred";
 /// before the rename. Only the lock holder runs it.
 pub type BeforePublish = Box<dyn FnOnce(&Path) -> Result<(), String>>;
 
+/// Source table whose rows ride in [`Carryover::intentions`].
+pub const INTENTIONS_TABLE: &str = "intentions";
+/// v3 code anchors: carried like intentions, as admitted store writes.
+pub const CODE_ANCHORS_TABLE: &str = "code_memory_anchors";
+
+/// One v3 `intentions` row, decoded from the snapshot the receipt hashes.
+///
+/// Field for field this is `strata_store::IntentionRecord` (this crate does
+/// not depend on the store). Timestamps are unix milliseconds; v3 wrote
+/// microseconds, so sub-millisecond digits are dropped. Text is verbatim:
+/// statuses, trigger JSON, and scope are not normalized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentionRow {
+    pub id: String,
+    pub content: String,
+    pub trigger_type: String,
+    pub trigger_data: String,
+    /// v3 default when NULL or absent: 2 (normal).
+    pub priority: i32,
+    /// v3 default when NULL or absent: `active`.
+    pub status: String,
+    pub created_at_ms: i64,
+    pub deadline_ms: Option<i64>,
+    pub fulfilled_at_ms: Option<i64>,
+    pub reminder_count: i32,
+    pub last_reminded_at_ms: Option<i64>,
+    pub notes: Option<String>,
+    pub tags: Vec<String>,
+    pub related_memories: Vec<String>,
+    pub snoozed_until_ms: Option<i64>,
+    /// v3 default when NULL or absent: `api`.
+    pub source_type: String,
+    pub source_data: Option<String>,
+    /// `None` for rows written before v3 schema 37 added the column.
+    pub scope: Option<String>,
+}
+
+/// One v3 `code_memory_anchors` row. Field for field this is
+/// `strata_store::AnchorRecord`; timestamps are unix milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorRow {
+    pub id: String,
+    pub node_id: String,
+    pub file_path: String,
+    pub symbol: Option<String>,
+    pub symbol_kind: Option<String>,
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
+    pub span_lines: Option<u32>,
+    pub content_hash: Option<String>,
+    pub captured_at_ms: i64,
+    pub last_verified_at_ms: Option<i64>,
+    pub last_status: Option<String>,
+}
+
+/// v3 rows the migration log has no frame kind for, in source row order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Carryover {
+    /// Every `intentions` row.
+    pub intentions: Vec<IntentionRow>,
+    /// Every `code_memory_anchors` row. The hook admits the ones whose
+    /// memory is live on the staged log.
+    pub anchors: Vec<AnchorRow>,
+}
+
+/// Admits a [`Carryover`] into the staged log and returns how many
+/// intention rows the staged log now holds. Runs after
+/// [`MigrateOptions::before_publish`] passes and before the rename. A count
+/// short of `carryover.intentions.len()`, or an error, deletes staging and
+/// leaves the destination untouched.
+pub type CarryOverHook = Box<dyn FnOnce(&Path, &Carryover) -> Result<u64, String>>;
+
 /// Options for one migration run.
 #[derive(Default)]
 pub struct MigrateOptions {
@@ -161,6 +286,10 @@ pub struct MigrateOptions {
     /// the rename. Only the process holding the staging lock runs it. An
     /// error deletes staging and leaves the destination untouched.
     pub before_publish: Option<BeforePublish>,
+    /// Receives the source's `intentions` rows after `before_publish`
+    /// passes, on the same staging directory. See [`CarryOverHook`].
+    /// `None` leaves `intentions` in `skipped_tables`.
+    pub carry_over: Option<CarryOverHook>,
 }
 
 impl std::fmt::Debug for MigrateOptions {
@@ -177,6 +306,7 @@ impl std::fmt::Debug for MigrateOptions {
                 "before_publish",
                 &self.before_publish.as_ref().map(|_| "Some"),
             )
+            .field("carry_over", &self.carry_over.as_ref().map(|_| "Some"))
             .finish()
     }
 }
@@ -248,13 +378,19 @@ pub struct MigrationReport {
     pub edges: u64,
     /// FSRS_REVIEW frames appended.
     pub fsrs_events: u64,
+    /// `intentions` rows the `carry_over` hook admitted into the log (0 when
+    /// no hook ran).
+    pub intentions_carried: u64,
     /// Source tables that contained rows but have no STRATA mapping.
+    /// `intentions` is listed unless `carry_over` admitted every row.
     pub skipped_tables: Vec<String>,
     /// Whether kernel replay verification AND log tail verification both
     /// passed over the finished log.
     pub verify_passed: bool,
     /// `node_embeddings` rows whose vector values were never read.
     pub dropped_vectors: u64,
+    /// FSRS_STATE frames: `knowledge_nodes` rows with no `fsrs_cards` row.
+    pub fsrs_states: u64,
     /// Last verified `receipt_envelopes` entry digest (empty = none).
     pub envelope_head: String,
     /// BLAKE3 hex of the source files (identical before and after; the run
@@ -315,8 +451,11 @@ pub fn migrate_with_options(
             snapshot,
             started,
             None,
-            options.before_import,
-            options.before_publish,
+            Hooks {
+                before_import: options.before_import,
+                before_publish: options.before_publish,
+                carry_over: options.carry_over,
+            },
         );
     }
 
@@ -341,9 +480,20 @@ pub fn migrate_with_options(
         snapshot,
         started,
         Some(files),
-        options.before_import,
-        options.before_publish,
+        Hooks {
+            before_import: options.before_import,
+            before_publish: options.before_publish,
+            carry_over: options.carry_over,
+        },
     )
+}
+
+/// The caller's staging hooks, moved into the lock holder.
+#[cfg(feature = "sqlite-reader")]
+struct Hooks {
+    before_import: Option<BeforePublish>,
+    before_publish: Option<BeforePublish>,
+    carry_over: Option<CarryOverHook>,
 }
 
 /// Appended to the destination directory's file name. The first-launch
@@ -351,15 +501,9 @@ pub fn migrate_with_options(
 /// `<data-dir>/log.strata-staging`.
 pub const STAGING_SUFFIX: &str = ".strata-staging";
 
-/// Lock file inside the staging directory. A dotfile, so destination
-/// occupancy and the migrator ignore it. Held with `File::try_lock`.
+/// How often a process that finds the staging lock held checks again.
 #[cfg(feature = "sqlite-reader")]
-const STAGING_LOCK_NAME: &str = ".upgrade.lock";
-
-/// How long a loser looks for the lock file after `create_dir` and before
-/// `try_lock`. This covers that gap only. A held lock is not abandoned on a timer.
-#[cfg(feature = "sqlite-reader")]
-const LOCK_FILE_APPEAR: Duration = Duration::from_millis(200);
+const STAGING_LOCK_POLL: Duration = Duration::from_millis(20);
 
 /// Sibling of `dest`: `<dest>`'s file name plus [`STAGING_SUFFIX`].
 #[cfg(feature = "sqlite-reader")]
@@ -368,6 +512,20 @@ fn staging_path(dest: &Path) -> std::path::PathBuf {
     let mut staging_name = name.to_os_string();
     staging_name.push(STAGING_SUFFIX);
     dest.with_file_name(staging_name)
+}
+
+/// The staging lock: a dotfile beside the staging directory, `.<staging>.lock`.
+/// Beside it, not inside: Windows cannot rename a directory while a file in it
+/// is open, and the lock stays held until staging is renamed onto `dest`.
+#[cfg(feature = "sqlite-reader")]
+fn staging_lock_path(staging: &Path) -> std::path::PathBuf {
+    let name = staging
+        .file_name()
+        .unwrap_or(std::ffi::OsStr::new("strata-staging"));
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(name);
+    lock_name.push(".lock");
+    staging.with_file_name(lock_name)
 }
 
 /// True when `dir` contains anything other than dotfiles. A missing path
@@ -436,11 +594,11 @@ fn receipt_matching(dir: &Path, source_blake3: &str) -> Option<records::Migratio
 ///
 /// `allow_idempotent` is set for SQLite sources, whose receipt is keyed by
 /// the source BLAKE3. Nothing is written to `dest` until every pre-check
-/// has passed. The winner is `create_dir` of the staging directory plus
-/// `File::try_lock` on a file inside it. The kernel drops that lock when
-/// the process dies, including SIGKILL. A later process that can take the
-/// lock wipes the staging directory and starts over. A process that finds
-/// the lock held waits until the rename publishes `dest`.
+/// has passed. The winner is whoever takes the staging lock
+/// ([`staging_lock_path`], `File::try_lock`); the kernel drops that lock
+/// when the process dies, including SIGKILL. The holder wipes any staging
+/// directory an earlier importer left and starts over. A process that finds
+/// the lock held waits for it, then sees `dest` published or takes over.
 #[cfg(feature = "sqlite-reader")]
 #[allow(clippy::too_many_arguments)]
 fn stage_import(
@@ -451,13 +609,13 @@ fn stage_import(
     snapshot: source::SourceSnapshot,
     started: Instant,
     files: Option<source::SourceFiles>,
-    mut before_import: Option<BeforePublish>,
-    mut before_publish: Option<BeforePublish>,
+    hooks: Hooks,
 ) -> Result<MigrationReport, MigrationError> {
     let staging = staging_path(dest);
     if let Some(parent) = staging.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let lock_path = staging_lock_path(&staging);
     loop {
         if destination_occupied(dest)? {
             if allow_idempotent {
@@ -469,36 +627,38 @@ fn stage_import(
                 path: dest.display().to_string(),
             });
         }
-        match std::fs::create_dir(&staging) {
-            Ok(()) => {
-                let lock = match lock_new_staging(&staging) {
-                    Ok(lock) => lock,
-                    Err(err) => {
-                        let _ = std::fs::remove_dir_all(&staging);
-                        return Err(err);
-                    }
-                };
-                return import_holding_lock(
-                    lock,
-                    &staging,
-                    dest,
-                    seed,
-                    source_blake3,
-                    snapshot,
-                    started,
-                    files,
-                    before_import.take(),
-                    before_publish.take(),
-                );
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                wait_or_reclaim(&staging, dest)?;
-            }
-            Err(err) => return Err(err.into()),
+        let Some(lock) = try_staging_lock(&lock_path)? else {
+            // Another importer holds it. It publishes `dest` (checked at the
+            // top of the loop) or dies, and the kernel frees the lock.
+            std::thread::sleep(STAGING_LOCK_POLL);
+            continue;
+        };
+        // Held now, so no importer is running: `dest` may have been
+        // published while this process waited, and any staging directory
+        // is an earlier importer's leftover.
+        if destination_occupied(dest)? {
+            drop(lock);
+            continue;
         }
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        std::fs::create_dir(&staging)?;
+        return import_holding_lock(
+            lock,
+            &staging,
+            dest,
+            seed,
+            source_blake3,
+            snapshot,
+            started,
+            files,
+            hooks,
+        );
     }
 }
 
+#[cfg(feature = "sqlite-reader")]
 #[allow(clippy::too_many_arguments)]
 fn import_holding_lock(
     lock: std::fs::File,
@@ -509,9 +669,23 @@ fn import_holding_lock(
     snapshot: source::SourceSnapshot,
     started: Instant,
     files: Option<source::SourceFiles>,
-    before_import: Option<BeforePublish>,
-    before_publish: Option<BeforePublish>,
+    hooks: Hooks,
 ) -> Result<MigrationReport, MigrationError> {
+    let Hooks {
+        before_import,
+        before_publish,
+        carry_over,
+    } = hooks;
+    // Decoded before the backup and the import, so a corrupt row stops the
+    // run early. Nobody reads the rows without a hook.
+    let carryover = if carry_over.is_some() {
+        match extract_carryover(&snapshot.archive) {
+            Ok(carryover) => carryover,
+            Err(err) => return Err(discard_staging(lock, staging, err)),
+        }
+    } else {
+        Carryover::default()
+    };
     if let Some(hook) = before_import {
         if let Err(detail) = hook(staging) {
             return Err(discard_staging(
@@ -563,7 +737,7 @@ fn import_holding_lock(
         source_blake3.to_string()
     };
 
-    let report = match finish(log, staging, outcome, snapshot, &sealed_hash, started) {
+    let mut report = match finish(log, staging, outcome, snapshot, &sealed_hash, started) {
         Ok(report) => report,
         Err(err) => return Err(discard_staging(lock, staging, err)),
     };
@@ -583,10 +757,38 @@ fn import_holding_lock(
             ));
         }
     }
+    if let Some(hook) = carry_over {
+        let expected = carryover.intentions.len() as u64;
+        match hook(staging, &carryover) {
+            Ok(carried) if carried == expected => {
+                report.intentions_carried = carried;
+                report
+                    .skipped_tables
+                    .retain(|table| table != INTENTIONS_TABLE && table != CODE_ANCHORS_TABLE);
+            }
+            Ok(carried) => {
+                return Err(discard_staging(
+                    lock,
+                    staging,
+                    MigrationError::Strata(format!(
+                        "carry-over admitted {carried} of {expected} intentions"
+                    )),
+                ));
+            }
+            Err(detail) => {
+                return Err(discard_staging(
+                    lock,
+                    staging,
+                    MigrationError::Strata(detail),
+                ));
+            }
+        }
+    }
     if let Err(err) = publish(staging, dest) {
         return Err(discard_staging(lock, staging, err));
     }
-    let _ = std::fs::remove_file(dest.join(STAGING_LOCK_NAME));
+    // The lock file stays: deleting it would let one waiter lock the old
+    // file while another creates and locks a new one.
     drop(lock);
     Ok(report)
 }
@@ -598,110 +800,20 @@ fn discard_staging(lock: std::fs::File, staging: &Path, err: MigrationError) -> 
     err
 }
 
+/// Take the staging lock without waiting. `None` when another process holds it.
 #[cfg(feature = "sqlite-reader")]
-fn lock_new_staging(staging: &Path) -> Result<std::fs::File, MigrationError> {
-    let path = staging.join(STAGING_LOCK_NAME);
+fn try_staging_lock(path: &Path) -> Result<Option<std::fs::File>, MigrationError> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .create_new(true)
-        .open(&path)?;
+        .create(true)
+        .truncate(false)
+        .open(path)?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(MigrationError::Io(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "staging lock already held",
-        ))),
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(err)) => Err(err.into()),
     }
-}
-
-#[cfg(feature = "sqlite-reader")]
-enum Held {
-    Acquired(std::fs::File),
-    Busy,
-    Missing,
-}
-
-#[cfg(feature = "sqlite-reader")]
-fn try_hold(staging: &Path) -> Result<Held, MigrationError> {
-    let path = staging.join(STAGING_LOCK_NAME);
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-    {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Held::Missing),
-        Err(err) => return Err(err.into()),
-    };
-    match file.try_lock() {
-        Ok(()) => Ok(Held::Acquired(file)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(Held::Busy),
-        Err(std::fs::TryLockError::Error(err)) => Err(err.into()),
-    }
-}
-
-/// Staging already exists. Take the lock and wipe it when the owner is
-/// dead, or wait while a live owner still holds it.
-#[cfg(feature = "sqlite-reader")]
-fn wait_or_reclaim(staging: &Path, dest: &Path) -> Result<(), MigrationError> {
-    match try_hold(staging)? {
-        Held::Acquired(lock) => {
-            let _ = std::fs::remove_dir_all(staging);
-            drop(lock);
-            return Ok(());
-        }
-        Held::Missing if !lock_file_appears(staging, dest) => {
-            return reclaim_if_abandoned(staging, dest);
-        }
-        Held::Missing | Held::Busy => {}
-    }
-    loop {
-        if destination_occupied(dest)? || !staging.exists() {
-            return Ok(());
-        }
-        match try_hold(staging)? {
-            Held::Acquired(lock) => {
-                let _ = std::fs::remove_dir_all(staging);
-                drop(lock);
-                return Ok(());
-            }
-            Held::Busy => std::thread::sleep(Duration::from_millis(20)),
-            Held::Missing => {
-                if !lock_file_appears(staging, dest) {
-                    return reclaim_if_abandoned(staging, dest);
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "sqlite-reader")]
-fn lock_file_appears(staging: &Path, dest: &Path) -> bool {
-    let path = staging.join(STAGING_LOCK_NAME);
-    let started = Instant::now();
-    while started.elapsed() < LOCK_FILE_APPEAR {
-        if path.exists() {
-            return true;
-        }
-        if !staging.exists() || destination_occupied(dest).unwrap_or(false) {
-            return path.exists();
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    path.exists()
-}
-
-#[cfg(feature = "sqlite-reader")]
-fn reclaim_if_abandoned(staging: &Path, dest: &Path) -> Result<(), MigrationError> {
-    if destination_occupied(dest)? || !staging.exists() {
-        return Ok(());
-    }
-    // The directory exists and nobody holds the lock file. The creator died
-    // between `create_dir` and `try_lock`, or the file never appeared.
-    let _ = std::fs::remove_dir_all(staging);
-    Ok(())
 }
 
 #[cfg(feature = "sqlite-reader")]
@@ -732,9 +844,11 @@ fn idempotent_report(
         nodes: table_rows(snapshot, "knowledge_nodes"),
         edges: table_rows(snapshot, "memory_connections"),
         fsrs_events: table_rows(snapshot, "fsrs_cards"),
+        intentions_carried: 0,
         skipped_tables: skipped_tables_for(snapshot),
         verify_passed: true,
         dropped_vectors: snapshot.dropped_vectors,
+        fsrs_states: planned_fsrs_states(&snapshot.archive),
         envelope_head: snapshot.envelope_head.clone().unwrap_or_default(),
         source_blake3: receipt.body.source_blake3_before.clone(),
         receipt_digest: Some(hex32(&receipt.checksum)),
@@ -758,18 +872,11 @@ fn open_log(
         Some(seed) => seed,
         None => {
             let mut seed = [0u8; 32];
-            std::fs::File::open("/dev/urandom")
-                .and_then(|mut f| {
-                    use std::io::Read;
-                    f.read_exact(&mut seed)?;
-                    Ok(())
-                })
-                .map_err(|e| {
-                    MigrationError::Io(std::io::Error::new(
-                        e.kind(),
-                        format!("no OS entropy for the log signing seed: {e}"),
-                    ))
-                })?;
+            getrandom::fill(&mut seed).map_err(|e| {
+                MigrationError::Io(std::io::Error::other(format!(
+                    "no OS entropy for the log signing seed: {e}"
+                )))
+            })?;
             seed
         }
     };
@@ -786,11 +893,13 @@ fn dry_run_report(
         nodes: table_rows(snapshot, "knowledge_nodes"),
         edges: table_rows(snapshot, "memory_connections"),
         fsrs_events: table_rows(snapshot, "fsrs_cards"),
+        intentions_carried: 0,
         skipped_tables: skipped_tables_for(snapshot),
         // A dry run writes nothing; the envelope chain is verified during
         // the read, so reaching this point means the chain held.
         verify_passed: true,
         dropped_vectors: snapshot.dropped_vectors,
+        fsrs_states: planned_fsrs_states(&snapshot.archive),
         envelope_head: snapshot.envelope_head.clone().unwrap_or_default(),
         source_blake3: source_blake3.to_string(),
         receipt_digest: None,
@@ -825,6 +934,7 @@ struct ReplayOutcome {
     nodes: u64,
     edges: u64,
     fsrs_events: u64,
+    fsrs_states: u64,
     /// Hash of the last fold checkpoint (the replay anchor), or `[0; 32]`
     /// when the log carries no checkpoint.
     anchor: [u8; 32],
@@ -928,6 +1038,14 @@ fn migrate_snapshot_into(
             }
         }
     }
+
+    // ---- knowledge_nodes scheduling columns -> imported card states ------
+    // Rows with an fsrs_cards row already have a rating series above.
+    let mut fsrs_states = 0u64;
+    for record in extract_fsrs_states(archive, &node_records)? {
+        writer.push(records::KIND_FSRS_STATE, borsh::to_vec(&record))?;
+        fsrs_states += 1;
+    }
     writer.flush()?;
 
     // ---- fold + checkpoint ------------------------------------------------
@@ -966,6 +1084,7 @@ fn migrate_snapshot_into(
         nodes,
         edges,
         fsrs_events,
+        fsrs_states,
         anchor,
     })
 }
@@ -1031,9 +1150,11 @@ fn finish(
         nodes: outcome.nodes,
         edges: outcome.edges,
         fsrs_events: outcome.fsrs_events,
+        intentions_carried: 0,
         skipped_tables: skipped_tables_for(&snapshot),
         verify_passed,
         dropped_vectors: snapshot.dropped_vectors,
+        fsrs_states: outcome.fsrs_states,
         envelope_head: snapshot.envelope_head.unwrap_or_default(),
         source_blake3: source_blake3.to_string(),
         receipt_digest: Some(hex32(&receipt.checksum)),
@@ -1153,6 +1274,7 @@ fn verify_migrated(log: &StrataLog, anchor: [u8; 32]) -> Result<bool, MigrationE
 ///
 /// NULL, `""`, or a table without the column is `None` (the option tag is
 /// still written). A non-empty value that is not RFC3339 is corrupt.
+#[cfg(feature = "sqlite-reader")]
 fn last_review_ms(row: &source::Row<'_>) -> Result<Option<i64>, MigrationError> {
     if !row.columns().iter().any(|column| column == "last_review") {
         return Ok(None);
@@ -1207,6 +1329,203 @@ fn attach_fsrs_legacy(
         }
     }
     Ok(())
+}
+
+/// One day in unix milliseconds (Strata measures review age in whole days).
+#[cfg(feature = "sqlite-reader")]
+const DAY_MS: i64 = 86_400_000;
+
+/// v3 `apply_decay` stretched stability for emotional memories:
+/// `stability * (1 + sentiment_magnitude * 0.5)`.
+#[cfg(feature = "sqlite-reader")]
+const V3_SENTIMENT_STABILITY_BOOST: f64 = 0.5;
+
+/// Memory ids that have an `fsrs_cards` row (and so a rating series).
+#[cfg(feature = "sqlite-reader")]
+fn carded_memory_ids(
+    archive: &PortableArchive,
+) -> Result<std::collections::HashSet<String>, MigrationError> {
+    let mut ids = std::collections::HashSet::new();
+    if let Some(table) = source::table(archive, "fsrs_cards") {
+        for index in 0..table.rows.len() {
+            ids.insert(
+                source::Row::new(table, index)
+                    .text("memory_id")?
+                    .to_string(),
+            );
+        }
+    }
+    Ok(ids)
+}
+
+/// `FSRS_STATE` frames a run over this archive appends: `knowledge_nodes`
+/// rows without an `fsrs_cards` row. Used by the dry-run and idempotent
+/// reports, which write nothing.
+#[cfg(feature = "sqlite-reader")]
+fn planned_fsrs_states(archive: &PortableArchive) -> u64 {
+    let Some(table) = source::table(archive, "knowledge_nodes") else {
+        return 0;
+    };
+    let carded = carded_memory_ids(archive).unwrap_or_default();
+    (0..table.rows.len())
+        .filter(|index| {
+            source::Row::new(table, *index)
+                .text("id")
+                .is_ok_and(|id| !carded.contains(id))
+        })
+        .count() as u64
+}
+
+/// v3's forgetting-curve decay: `fsrs_config.w20` when set to a positive
+/// finite number, else `vestige_core::fsrs::DEFAULT_DECAY` (what v3's
+/// `apply_decay` fell back to).
+#[cfg(feature = "sqlite-reader")]
+fn v3_decay(archive: &PortableArchive) -> f64 {
+    let default = vestige_core::fsrs::DEFAULT_DECAY;
+    let Some(table) = source::table(archive, "fsrs_config") else {
+        return default;
+    };
+    (0..table.rows.len())
+        .map(|index| source::Row::new(table, index))
+        .find(|row| row.text("key").is_ok_and(|key| key == "w20"))
+        .and_then(|row| row.get("value").ok().and_then(portable_f64))
+        .filter(|w20| w20.is_finite() && *w20 > 0.0)
+        .unwrap_or(default)
+}
+
+/// A numeric SQLite value. v3 columns are dynamically typed, so a numeric
+/// string also counts. NULL, blobs, and other text are `None`.
+#[cfg(feature = "sqlite-reader")]
+fn portable_f64(value: &PortableValue) -> Option<f64> {
+    match value {
+        PortableValue::Real(v) => Some(*v),
+        PortableValue::Integer(v) => Some(*v as f64),
+        PortableValue::Text(text) => text.trim().parse().ok(),
+        PortableValue::Null | PortableValue::Blob(_) => None,
+    }
+}
+
+/// Scheduling column as `f64`. A missing column, NULL, non-number, or
+/// non-finite value reads as v3's column default: these are scheduling
+/// metadata, and one bad float should not stop the whole upgrade.
+#[cfg(feature = "sqlite-reader")]
+fn fsrs_column(row: &source::Row<'_>, name: &str, default: f64) -> f64 {
+    if !row.columns().iter().any(|column| column == name) {
+        return default;
+    }
+    row.get(name)
+        .ok()
+        .and_then(portable_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+}
+
+/// v3 `learning_state` as a kernel phase. The kernel has no `new` phase;
+/// a never-reviewed card is `Learning`.
+#[cfg(feature = "sqlite-reader")]
+fn v3_phase(row: &source::Row<'_>) -> strata_kernel::fsrs::CardPhase {
+    use strata_kernel::fsrs::CardPhase;
+    let state = if row.columns().iter().any(|c| c == "learning_state") {
+        row.opt_text("learning_state").ok().flatten().unwrap_or("")
+    } else {
+        ""
+    };
+    match state.trim().to_ascii_lowercase().as_str() {
+        "review" => CardPhase::Review,
+        "relearning" => CardPhase::Relearning,
+        _ => CardPhase::Learning,
+    }
+}
+
+/// One `FSRS_STATE` record per `knowledge_nodes` row without an
+/// `fsrs_cards` row, in source row order. See the crate docs.
+///
+/// `node_records[i]` must be row `i` of `knowledge_nodes`, as
+/// [`extract_nodes`] builds it.
+#[cfg(feature = "sqlite-reader")]
+fn extract_fsrs_states(
+    archive: &PortableArchive,
+    node_records: &[NodeRecord],
+) -> Result<Vec<FsrsStateRecord>, MigrationError> {
+    use strata_kernel::canonical::to_q32_32;
+    use strata_kernel::fsrs::{FsrsFold, D_MAX, D_MIN};
+
+    let Some(table) = source::table(archive, "knowledge_nodes") else {
+        return Ok(Vec::new());
+    };
+    if node_records.len() != table.rows.len() {
+        return Err(MigrationError::Corrupt(format!(
+            "knowledge_nodes has {} rows but {} node records",
+            table.rows.len(),
+            node_records.len()
+        )));
+    }
+    let carded = carded_memory_ids(archive)?;
+    let w20 = v3_decay(archive);
+    // The source's own "now": its latest node timestamp.
+    let source_clock = node_records
+        .iter()
+        .map(|node| {
+            node.created_ms
+                .max(node.updated_ms)
+                .max(node.last_accessed_ms)
+        })
+        .max()
+        .unwrap_or(0);
+
+    let mut records = Vec::new();
+    for (index, node) in node_records.iter().enumerate() {
+        let row = source::Row::new(table, index);
+        if row.text("id")? != node.legacy_id {
+            return Err(MigrationError::Corrupt(format!(
+                "knowledge_nodes row {index} is not node {}",
+                node.legacy_id
+            )));
+        }
+        if carded.contains(&node.legacy_id) {
+            continue;
+        }
+        let stability = fsrs_column(&row, "stability", 1.0);
+        let difficulty = fsrs_column(&row, "difficulty", 5.0);
+        let sentiment = fsrs_column(&row, "sentiment_magnitude", 0.0);
+        let reps = (fsrs_column(&row, "reps", 0.0) as i64).clamp(0, i64::from(u32::MAX));
+        let lapses = (fsrs_column(&row, "lapses", 0.0) as i64).clamp(0, reps);
+
+        // Fit at the source clock, or one day after the last access when
+        // that is later: Strata measures whole days, and a card younger
+        // than a day reads 1.0 whatever its stability.
+        let reviewed_at_ms = node.last_accessed_ms;
+        let fitted_at_ms = source_clock.max(reviewed_at_ms.saturating_add(DAY_MS));
+        let elapsed_ms = fitted_at_ms.saturating_sub(reviewed_at_ms);
+        // v3: (now - last_accessed).num_seconds() / 86400.
+        let v3_days = (elapsed_ms / 1000) as f64 / 86_400.0;
+        let v3_retrievability = vestige_core::fsrs::retrievability_with_decay(
+            stability * (1.0 + sentiment * V3_SENTIMENT_STABILITY_BOOST),
+            v3_days,
+            w20,
+        );
+        let whole_days = FsrsFold::elapsed_review_days(reviewed_at_ms, fitted_at_ms);
+        let fitted =
+            FsrsFold::stability_for_retrievability(v3_retrievability, whole_days, FSRS_STATE_ALGO)
+                .map_err(|e| MigrationError::Kernel(e.to_string()))?;
+
+        records.push(FsrsStateRecord {
+            record_version: RECORD_VERSION,
+            kernel_id: node.kernel_id,
+            legacy_id: node.legacy_id.clone(),
+            algo_version: FSRS_STATE_ALGO,
+            stability_q: to_q32_32(fitted),
+            difficulty_q: to_q32_32(difficulty.clamp(D_MIN, D_MAX)),
+            review_count: reps as u32,
+            lapse_count: lapses as u32,
+            phase: v3_phase(&row),
+            reviewed_at_ms,
+            v3_retrievability_q: to_q32_32(v3_retrievability),
+            v3_decay_q: to_q32_32(w20),
+            fitted_at_ms,
+        });
+    }
+    Ok(records)
 }
 
 /// V40 `walk_receipts` rows become reference nodes tagged `migrated_from_v4`
@@ -1296,6 +1615,7 @@ type NodeSet = (
 );
 
 /// TEXT column, or `None` when the column is absent or empty.
+#[cfg(feature = "sqlite-reader")]
 fn column_text<'a>(row: &source::Row<'a>, name: &str) -> Result<Option<&'a str>, MigrationError> {
     if !row.columns().iter().any(|column| column == name) {
         return Ok(None);
@@ -1311,6 +1631,7 @@ fn column_text<'a>(row: &source::Row<'a>, name: &str) -> Result<Option<&'a str>,
 /// `source_updated_at` column, so a sourced row keeps its `updated_at`
 /// instead. A row with neither a source nor a source timestamp yields
 /// `(None, None)`.
+#[cfg(feature = "sqlite-reader")]
 fn node_provenance(
     row: &source::Row<'_>,
 ) -> Result<(Option<SourceKey>, Option<i64>), MigrationError> {
@@ -1516,6 +1837,131 @@ fn extract_tombstones(archive: &PortableArchive) -> Result<Vec<TombstoneRecord>,
     Ok(records)
 }
 
+/// Decode `intentions` into [`Carryover`] rows, source row order.
+///
+/// Mirrors v3's `row_to_intention`: a column older schemas lack reads as its
+/// v3 default, and `tags` / `related_memories` are tolerant JSON arrays.
+/// Unlike v3, a non-empty timestamp that does not parse is corrupt instead
+/// of becoming "now" or `None`, and the run stops.
+#[cfg(feature = "sqlite-reader")]
+fn extract_carryover(archive: &PortableArchive) -> Result<Carryover, MigrationError> {
+    Ok(Carryover {
+        intentions: extract_intention_rows(archive)?,
+        anchors: extract_anchor_rows(archive)?,
+    })
+}
+
+/// Decode `code_memory_anchors` rows, source row order. A missing table (v3
+/// before code anchors) is no rows.
+#[cfg(feature = "sqlite-reader")]
+fn extract_anchor_rows(archive: &PortableArchive) -> Result<Vec<AnchorRow>, MigrationError> {
+    let Some(table) = source::table(archive, CODE_ANCHORS_TABLE) else {
+        return Ok(Vec::new());
+    };
+    let has = |name: &str| table.columns.iter().any(|column| column == name);
+    let mut anchors = Vec::with_capacity(table.rows.len());
+    for index in 0..table.rows.len() {
+        let row = source::Row::new(table, index);
+        let opt_text = |name: &str| -> Result<Option<String>, MigrationError> {
+            if !has(name) {
+                return Ok(None);
+            }
+            Ok(row.opt_text(name)?.map(str::to_string))
+        };
+        let opt_line = |name: &str| -> Result<Option<u32>, MigrationError> {
+            if !has(name) {
+                return Ok(None);
+            }
+            match row.integer_or(name, -1)? {
+                -1 => Ok(None),
+                value => u32::try_from(value).map(Some).map_err(|_| {
+                    MigrationError::Corrupt(format!(
+                        "code_memory_anchors row {index} column {name}: {value} is out of range"
+                    ))
+                }),
+            }
+        };
+        let opt_ms = |name: &str| -> Result<Option<i64>, MigrationError> {
+            match opt_text(name)? {
+                Some(raw) if !raw.is_empty() => Ok(Some(source::timestamp_ms(&raw)?)),
+                _ => Ok(None),
+            }
+        };
+        anchors.push(AnchorRow {
+            id: row.text("id")?.to_string(),
+            node_id: row.text("node_id")?.to_string(),
+            file_path: row.text("file_path")?.to_string(),
+            symbol: opt_text("symbol")?,
+            symbol_kind: opt_text("symbol_kind")?,
+            start_line: opt_line("start_line")?,
+            end_line: opt_line("end_line")?,
+            span_lines: opt_line("span_lines")?,
+            content_hash: opt_text("content_hash")?,
+            captured_at_ms: source::timestamp_ms(row.text("captured_at")?)?,
+            last_verified_at_ms: opt_ms("last_verified_at")?,
+            last_status: opt_text("last_status")?,
+        });
+    }
+    Ok(anchors)
+}
+
+#[cfg(feature = "sqlite-reader")]
+fn extract_intention_rows(archive: &PortableArchive) -> Result<Vec<IntentionRow>, MigrationError> {
+    let Some(table) = source::table(archive, INTENTIONS_TABLE) else {
+        return Ok(Vec::new());
+    };
+    let has = |name: &str| table.columns.iter().any(|column| column == name);
+    let mut intentions = Vec::with_capacity(table.rows.len());
+    for index in 0..table.rows.len() {
+        let row = source::Row::new(table, index);
+        let opt_text = |name: &str| -> Result<Option<String>, MigrationError> {
+            if !has(name) {
+                return Ok(None);
+            }
+            Ok(row.opt_text(name)?.map(str::to_string))
+        };
+        let opt_ms = |name: &str| -> Result<Option<i64>, MigrationError> {
+            match opt_text(name)? {
+                Some(raw) if !raw.is_empty() => Ok(Some(source::timestamp_ms(&raw)?)),
+                _ => Ok(None),
+            }
+        };
+        let int32 = |name: &str, default: i64| -> Result<i32, MigrationError> {
+            let value = if has(name) {
+                row.integer_or(name, default)?
+            } else {
+                default
+            };
+            i32::try_from(value).map_err(|_| {
+                MigrationError::Corrupt(format!(
+                    "intentions row {index} column {name}: {value} is out of range"
+                ))
+            })
+        };
+        intentions.push(IntentionRow {
+            id: row.text("id")?.to_string(),
+            content: row.text("content")?.to_string(),
+            trigger_type: row.text("trigger_type")?.to_string(),
+            trigger_data: row.text("trigger_data")?.to_string(),
+            priority: int32("priority", 2)?,
+            status: opt_text("status")?.unwrap_or_else(|| "active".to_string()),
+            created_at_ms: source::timestamp_ms(row.text("created_at")?)?,
+            deadline_ms: opt_ms("deadline")?,
+            fulfilled_at_ms: opt_ms("fulfilled_at")?,
+            reminder_count: int32("reminder_count", 0)?,
+            last_reminded_at_ms: opt_ms("last_reminded_at")?,
+            notes: opt_text("notes")?,
+            tags: source::parse_tags(opt_text("tags")?.as_deref()),
+            related_memories: source::parse_tags(opt_text("related_memories")?.as_deref()),
+            snoozed_until_ms: opt_ms("snoozed_until")?,
+            source_type: opt_text("source_type")?.unwrap_or_else(|| "api".to_string()),
+            source_data: opt_text("source_data")?,
+            scope: opt_text("scope")?,
+        });
+    }
+    Ok(intentions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1594,6 +2040,88 @@ mod tests {
         );
         assert_eq!(source::parse_tags(Some("null")), Vec::<String>::new());
         assert_eq!(source::parse_tags(Some("{broken")), Vec::<String>::new());
+    }
+
+    #[cfg(feature = "sqlite-reader")]
+    fn portable_table(
+        name: &str,
+        columns: &[&str],
+        rows: Vec<Vec<PortableValue>>,
+    ) -> PortableArchive {
+        PortableArchive {
+            archive_format: source::PORTABLE_ARCHIVE_FORMAT.to_string(),
+            vestige_version: "3.1.1".to_string(),
+            schema_version: 40,
+            exported_at: chrono::Utc::now(),
+            mode: "exact".to_string(),
+            tables: vec![vestige_core::storage::PortableTable {
+                name: name.to_string(),
+                columns: columns.iter().map(|c| c.to_string()).collect(),
+                rows,
+            }],
+        }
+    }
+
+    #[cfg(feature = "sqlite-reader")]
+    #[test]
+    fn scheduling_columns_read_tolerantly_with_v3_defaults() {
+        use PortableValue::{Blob, Integer, Null, Real, Text};
+        let archive = portable_table(
+            "knowledge_nodes",
+            &["stability", "reps", "learning_state"],
+            vec![
+                vec![Real(2.5), Integer(4), Text("review".into())],
+                vec![Text(" 7.25 ".into()), Real(2.0), Text("Relearning".into())],
+                vec![Null, Null, Null],
+                vec![Real(f64::NAN), Text("x".into()), Text("new".into())],
+                vec![Blob("00".into()), Integer(1), Text("learning".into())],
+            ],
+        );
+        let table = &archive.tables[0];
+        let read = |index: usize| {
+            let row = source::Row::new(table, index);
+            (
+                fsrs_column(&row, "stability", 1.0),
+                fsrs_column(&row, "reps", 0.0),
+                fsrs_column(&row, "difficulty", 5.0),
+                v3_phase(&row),
+            )
+        };
+        use strata_kernel::fsrs::CardPhase::{Learning, Relearning, Review};
+        assert_eq!(read(0), (2.5, 4.0, 5.0, Review));
+        assert_eq!(read(1), (7.25, 2.0, 5.0, Relearning));
+        assert_eq!(read(2), (1.0, 0.0, 5.0, Learning));
+        assert_eq!(read(3), (1.0, 0.0, 5.0, Learning));
+        assert_eq!(read(4), (1.0, 1.0, 5.0, Learning));
+    }
+
+    #[cfg(feature = "sqlite-reader")]
+    #[test]
+    fn v3_decay_reads_w20_or_falls_back_to_the_v3_default() {
+        use PortableValue::{Real, Text};
+        let config = |value: PortableValue| {
+            portable_table(
+                "fsrs_config",
+                &["key", "value", "updated_at"],
+                vec![
+                    vec![Text("w17".into()), Real(9.0), Text(String::new())],
+                    vec![Text("w20".into()), value, Text(String::new())],
+                ],
+            )
+        };
+        assert_eq!(v3_decay(&config(Real(0.0803))), 0.0803);
+        assert_eq!(v3_decay(&config(Text("0.2".into()))), 0.2);
+        let default = vestige_core::fsrs::DEFAULT_DECAY;
+        assert_eq!(v3_decay(&config(Real(0.0))), default);
+        assert_eq!(v3_decay(&config(Real(-1.0))), default);
+        assert_eq!(v3_decay(&config(PortableValue::Null)), default);
+        assert_eq!(v3_decay(&portable_table("other", &[], Vec::new())), default);
+    }
+
+    #[test]
+    fn params_v1_logs_carry_no_fsrs_states() {
+        assert!(!params_carry_fsrs_states(PARAMS_ID_V1));
+        assert!(params_carry_fsrs_states(PARAMS_ID));
     }
 
     #[test]

@@ -103,14 +103,16 @@ fn assert_fixture_landed(db: &Path, log_dir: &Path) {
         .find(|edge| edge.legacy_link_type == "causal")
         .expect("causal link dropped");
     assert!(causal.legacy_inferred);
-    assert_eq!(causal.link_type, "derived_from");
+    // #318: an inferred v3 link is history, not recorded causal proof, so it
+    // migrates as legacy_inferred rather than a Strata edge kind.
+    assert_eq!(causal.link_type, strata_migrate::LEGACY_INFERRED_KIND);
     let semantic = snap
         .edges
         .iter()
         .find(|edge| edge.legacy_link_type == "semantic")
         .expect("semantic link dropped");
     assert!(semantic.legacy_inferred);
-    assert_eq!(semantic.link_type, "derived_from");
+    assert_eq!(semantic.link_type, strata_migrate::LEGACY_INFERRED_KIND);
     let touched = snap
         .edges
         .iter()
@@ -663,4 +665,278 @@ fn assert_memory_count(db: &Path, log_dir: &Path) {
         snap.nodes.len(),
         ids.len()
     );
+}
+
+/// v3 `MIGRATION_V3_UP` intentions table plus `MIGRATION_V37_UP` `scope`.
+/// The committed fixture predates intentions, so tests plant them.
+const INTENTIONS_DDL: &str = r#"
+CREATE TABLE intentions (
+    id TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    trigger_type TEXT NOT NULL,
+    trigger_data TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 2,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    deadline TEXT,
+    fulfilled_at TEXT,
+    reminder_count INTEGER DEFAULT 0,
+    last_reminded_at TEXT,
+    notes TEXT,
+    tags TEXT DEFAULT '[]',
+    related_memories TEXT DEFAULT '[]',
+    snoozed_until TEXT,
+    source_type TEXT NOT NULL DEFAULT 'api',
+    source_data TEXT
+);
+ALTER TABLE intentions ADD COLUMN scope TEXT;
+"#;
+
+/// One row per v3 status, plus the columns each one exercises.
+fn plant_intentions(db: &Path) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute_batch(INTENTIONS_DDL).unwrap();
+    conn.execute_batch(
+        r#"
+        INSERT INTO intentions (id, content, trigger_type, trigger_data, priority, status,
+            created_at, deadline, tags, related_memories, source_type, scope)
+        VALUES ('6fc170c5-67b5-432e-acee-eed12881067b', 'Post the launch thread', 'time',
+            '{"type":"time","at":"2026-10-01T09:00:00Z"}', 4, 'active',
+            '2026-01-27T04:45:43.353514+00:00', '2026-10-01T09:00:00+00:00',
+            '["launch","hn"]', '["11111111-1111-4111-8111-111111111111"]', 'mcp', 'vestige');
+        INSERT INTO intentions (id, content, trigger_type, trigger_data, priority, status,
+            created_at, fulfilled_at, reminder_count, last_reminded_at, source_type)
+        VALUES ('94169f00-004f-4a6e-b7ed-25d99d7dfd21', 'Check PR 654', 'context',
+            '{"type":"context","topic":"pr"}', 3, 'fulfilled',
+            '2026-02-04T01:15:46.898393+00:00', '2026-02-04T01:18:28.837461+00:00', 2,
+            '2026-02-04T01:17:00+00:00', 'mcp');
+        INSERT INTO intentions (id, content, trigger_type, trigger_data, priority, status,
+            created_at, notes, source_type, source_data, scope)
+        VALUES ('ad4f0e90-95e8-4f37-bca3-6f95ecb424e7', 'Buy concert tickets', 'event',
+            '{"type":"event","condition":"tickets on sale"}', 1, 'cancelled',
+            '2026-01-27T07:59:57.263471+00:00', 'plans changed', 'nlp',
+            '{"text":"remind me to buy tickets"}', 'user');
+        INSERT INTO intentions (id, content, trigger_type, trigger_data, status,
+            created_at, snoozed_until)
+        VALUES ('f0000000-0000-4000-8000-000000000004', 'Snoozed legacy row', 'manual', '{}',
+            'snoozed', '2026-02-10 23:41:40', '2026-10-01T09:00:00+00:00');
+        "#,
+    )
+    .unwrap();
+}
+
+/// What the Strata store must hold for [`plant_intentions`], in id order.
+fn planted_intentions() -> Vec<strata_store::IntentionRecord> {
+    let base = strata_store::IntentionRecord {
+        id: String::new(),
+        content: String::new(),
+        trigger_type: String::new(),
+        trigger_data: String::new(),
+        priority: 2,
+        status: "active".into(),
+        created_at_ms: 0,
+        deadline_ms: None,
+        fulfilled_at_ms: None,
+        reminder_count: 0,
+        last_reminded_at_ms: None,
+        notes: None,
+        tags: Vec::new(),
+        related_memories: Vec::new(),
+        snoozed_until_ms: None,
+        source_type: "api".into(),
+        source_data: None,
+        scope: None,
+    };
+    vec![
+        strata_store::IntentionRecord {
+            id: "6fc170c5-67b5-432e-acee-eed12881067b".into(),
+            content: "Post the launch thread".into(),
+            trigger_type: "time".into(),
+            trigger_data: r#"{"type":"time","at":"2026-10-01T09:00:00Z"}"#.into(),
+            priority: 4,
+            created_at_ms: 1_769_489_143_353,
+            deadline_ms: Some(1_790_845_200_000),
+            tags: vec!["launch".into(), "hn".into()],
+            related_memories: vec!["11111111-1111-4111-8111-111111111111".into()],
+            source_type: "mcp".into(),
+            scope: Some("vestige".into()),
+            ..base.clone()
+        },
+        strata_store::IntentionRecord {
+            id: "94169f00-004f-4a6e-b7ed-25d99d7dfd21".into(),
+            content: "Check PR 654".into(),
+            trigger_type: "context".into(),
+            trigger_data: r#"{"type":"context","topic":"pr"}"#.into(),
+            priority: 3,
+            status: "fulfilled".into(),
+            created_at_ms: 1_770_167_746_898,
+            fulfilled_at_ms: Some(1_770_167_908_837),
+            reminder_count: 2,
+            last_reminded_at_ms: Some(1_770_167_820_000),
+            source_type: "mcp".into(),
+            ..base.clone()
+        },
+        strata_store::IntentionRecord {
+            id: "ad4f0e90-95e8-4f37-bca3-6f95ecb424e7".into(),
+            content: "Buy concert tickets".into(),
+            trigger_type: "event".into(),
+            trigger_data: r#"{"type":"event","condition":"tickets on sale"}"#.into(),
+            priority: 1,
+            status: "cancelled".into(),
+            created_at_ms: 1_769_500_797_263,
+            notes: Some("plans changed".into()),
+            source_type: "nlp".into(),
+            source_data: Some(r#"{"text":"remind me to buy tickets"}"#.into()),
+            scope: Some("user".into()),
+            ..base.clone()
+        },
+        strata_store::IntentionRecord {
+            id: "f0000000-0000-4000-8000-000000000004".into(),
+            content: "Snoozed legacy row".into(),
+            trigger_type: "manual".into(),
+            trigger_data: "{}".into(),
+            status: "snoozed".into(),
+            created_at_ms: 1_770_766_900_000,
+            snoozed_until_ms: Some(1_790_845_200_000),
+            ..base
+        },
+    ]
+}
+
+fn intention_receipts(store: &strata_store::StrataStore) -> Vec<String> {
+    store
+        .prove_effects()
+        .unwrap()
+        .into_iter()
+        .filter(|proof| proof.action == strata_store::EffectAction::Intention)
+        .map(|proof| proof.node_id)
+        .collect()
+}
+
+#[test]
+fn v3_intentions_survive_the_upgrade_a_reopen_and_a_relaunch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = plant(dir.path());
+    plant_intentions(&db);
+    let before = sha256_file(&db);
+
+    let status = vestige_upgrade::upgrade_if_needed(&db).unwrap();
+    let UpgradeStatus::StrataReady { log_dir } = status else {
+        panic!("expected an installed strata log");
+    };
+    assert_eq!(before, sha256_file(&db), "upgrade modified the v3 file");
+    assert!(!staging_directory(dir.path()).exists());
+    let expected = planted_intentions();
+    let mut ids: Vec<String> = expected.iter().map(|row| row.id.clone()).collect();
+    ids.sort();
+
+    // The server's open: the same data dir, the default policy.
+    let store = strata_store::StrataStore::open(dir.path()).unwrap();
+    assert_eq!(store.intentions(), expected);
+    let mut proved = intention_receipts(&store);
+    proved.sort();
+    assert_eq!(proved, ids, "every intention needs its own receipt");
+    let digest = store.state_digest();
+    let frames = store.log().head().frames_total;
+    drop(store);
+
+    let logged = fs::read_to_string(dir.path().join(UPGRADE_LOG_NAME)).unwrap();
+    assert!(
+        logged.contains("4 intentions imported"),
+        "upgrade.log does not report the carry-over\n{logged}"
+    );
+
+    // Relaunch: the installed log is complete, so nothing is admitted again.
+    let again = vestige_upgrade::upgrade_if_needed(&db).unwrap();
+    assert!(matches!(again, UpgradeStatus::StrataReady { .. }));
+    let reopened = strata_store::StrataStore::open(dir.path()).unwrap();
+    assert_eq!(reopened.intentions(), expected);
+    assert_eq!(reopened.state_digest(), digest);
+    assert_eq!(reopened.log().head().frames_total, frames);
+    assert_eq!(intention_receipts(&reopened).len(), expected.len());
+    drop(reopened);
+
+    // The migration itself still verifies with store writes after its receipt.
+    assert_fixture_landed(&db, &log_dir);
+}
+
+#[test]
+fn a_failed_intention_carry_installs_no_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = plant(dir.path());
+    plant_intentions(&db);
+    // The store refuses an empty intention id, so the carry-over fails.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO intentions (id, content, trigger_type, trigger_data, created_at)
+             VALUES ('', 'no id', 'manual', '{}', '2026-02-10T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+    let before = sha256_file(&db);
+    let err = vestige_upgrade::upgrade_if_needed(&db).unwrap_err();
+    let text = err.to_string();
+    assert_failure_message(&text, &dir.path().join(UPGRADE_LOG_NAME));
+    assert!(text.contains("intention carry-over failed"), "{text}");
+    assert_eq!(before, sha256_file(&db));
+    assert!(!staging_directory(dir.path()).exists());
+    assert!(
+        !dir.path().join(LOG_DIR_NAME).exists(),
+        "a failed carry-over left an installed log the next launch would skip"
+    );
+}
+
+/// v3 code anchors ride the same staged carry-over as intentions: each live
+/// memory keeps its anchors, admitted through the gate, after a reopen.
+#[test]
+fn v3_code_anchors_survive_the_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = plant(dir.path());
+    let node = "11111111-1111-4111-8111-111111111111";
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS code_memory_anchors (
+                id TEXT PRIMARY KEY, node_id TEXT NOT NULL, file_path TEXT NOT NULL,
+                symbol TEXT, symbol_kind TEXT, start_line INTEGER, end_line INTEGER,
+                span_lines INTEGER, content_hash TEXT, captured_at TEXT NOT NULL,
+                last_verified_at TEXT, last_status TEXT)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_memory_anchors VALUES
+             ('anchor-a', ?1, 'src/state.rs', 'load_config', 'fn', 3, 6, 4,
+              'v2:0123456789abcdef', '2026-03-01 09:15:00', NULL, NULL)",
+            [node],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_memory_anchors VALUES
+             ('anchor-b', ?1, 'README.md', NULL, NULL, NULL, NULL, NULL, NULL,
+              '2026-03-01T09:15:00+00:00', '2026-03-02T09:15:00+00:00', 'verified')",
+            [node],
+        )
+        .unwrap();
+    }
+    let before = sha256_file(&db);
+    let status = vestige_upgrade::upgrade_if_needed(&db).unwrap();
+    assert!(matches!(status, UpgradeStatus::StrataReady { .. }));
+    assert_eq!(before, sha256_file(&db), "upgrade modified the v3 file");
+
+    let store = strata_store::StrataStore::open(dir.path()).unwrap();
+    let anchors = store.anchors_for(node);
+    assert_eq!(anchors.len(), 2, "{anchors:?}");
+    let symbol = anchors.iter().find(|a| a.id == "anchor-a").unwrap();
+    assert_eq!(symbol.symbol.as_deref(), Some("load_config"));
+    assert_eq!(
+        (symbol.start_line, symbol.end_line, symbol.span_lines),
+        (Some(3), Some(6), Some(4))
+    );
+    assert_eq!(symbol.content_hash.as_deref(), Some("v2:0123456789abcdef"));
+    let path = anchors.iter().find(|a| a.id == "anchor-b").unwrap();
+    assert_eq!(path.last_status.as_deref(), Some("verified"));
+    assert!(path.last_verified_at_ms.is_some());
+    let logged = fs::read_to_string(dir.path().join(UPGRADE_LOG_NAME)).unwrap();
+    assert!(logged.contains("carried 2 code anchors"), "{logged}");
 }

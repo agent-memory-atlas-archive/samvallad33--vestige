@@ -80,6 +80,9 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
 
     let sys = ActiveForgettingSystem::new();
 
+    if args.reverse && crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        return Err("unavailable_in_4_0: suppress reverse is not available on Strata in Vestige 4.0: a Strata suppression cannot be undone. The memory's bytes stay on the log; it is only hidden from reads.".to_string());
+    }
     if args.reverse {
         // Reverse path — only allowed within labile window.
         match storage.reverse_suppression(&args.id, sys.labile_hours) {

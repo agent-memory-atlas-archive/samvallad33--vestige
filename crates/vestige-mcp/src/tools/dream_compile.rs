@@ -124,6 +124,12 @@ fn run_strata_dream_compile(
     let mut insights_generated = 0usize;
     let consolidate_at = Instant::now();
     for edge in &edges {
+        // Imported v3 links (`legacy_inferred`) are history, not recorded
+        // edges: the store will not admit them as typed edges, so dream
+        // leaves them as imported instead of failing the whole run.
+        if strata_store::EdgeKind::parse(&edge.link_type).is_none() {
+            continue;
+        }
         let both =
             replay.contains(edge.source_id.as_str()) && replay.contains(edge.target_id.as_str());
         if both && edge.link_type == "corrects" {

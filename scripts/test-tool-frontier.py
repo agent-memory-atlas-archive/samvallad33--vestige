@@ -95,8 +95,11 @@ def run(binary, output):
             handshake()
             catalog = rpc("tools/list", {})["tools"]
             names = [x["name"] for x in catalog]
-            assert len(names) == 17, names
+            assert len(names) == 16, names
             assert "source_sync" not in names, names
+            assert "purge" not in names and "suppress" in names, names
+            memory_actions = next(x for x in catalog if x["name"] == "memory")["inputSchema"]["properties"]["action"]["enum"]
+            assert "purge" not in memory_actions and "delete" not in memory_actions, memory_actions
             guide = tool("memory_status", {"view": "tools"})["tools"]
             assert [x["name"] for x in guide] == names
             for entry, definition in zip(guide, catalog):
@@ -120,7 +123,6 @@ def run(binary, output):
             annotations = {x["name"]: x["annotations"] for x in catalog}
             assert annotations["recall"]["readOnlyHint"] is False
             assert annotations["recall"]["idempotentHint"] is False
-            assert annotations["suppress"]["idempotentHint"] is False
             passed("all installed tool and action definitions match progressive discovery")
 
             typed("maintain", {"action": "consolidate", "phase": "embeddings", "batchSize": 2},
@@ -145,6 +147,7 @@ def run(binary, output):
             receipt = tool("receipt", {"action": "get", "receipt_id": node_id})
             assert "receipt" in receipt
             typed("recall", {"query": marker}, "similarity_disabled")
+            typed("recall", {"query": "which fixture handle did we store"}, "similarity_disabled")
             handle = tool("recall", {"handle": node_id})
             assert marker in json.dumps(handle) and handle["exact"] is True
             passed("ingest, exact get, write receipt, and handle recall; query recall is refused")
@@ -215,13 +218,13 @@ def run(binary, output):
             typed("memory", {"action": "edit", "id": "mem-ffffffffffffffff", "content": "nope"}, "not found")
             doomed = tool("smart_ingest", {"content": "STRATA_PURGE_DOOMED", "forceCreate": True})
             doomed_id = doomed["nodeId"]
-            typed("purge", {"id": doomed_id, "confirm": False}, "confirm=true")
-            purged = tool("purge", {"id": doomed_id, "confirm": True})
-            assert purged["rule"] == "purge" and purged["nodeId"] == doomed_id
-            assert str(purged["receiptId"]).startswith("eff-")
-            hidden = tool("memory", {"action": "get", "id": doomed_id})
-            assert "STRATA_PURGE_DOOMED" not in json.dumps(hidden)
-            assert hidden["message"] == "retired, can't be retrieved"
+            # 4.0 withholds erasure on Strata: every route refuses, the node stays.
+            typed("purge", {"id": doomed_id, "confirm": True}, "unavailable_in_4_0")
+            typed("memory", {"action": "purge", "id": doomed_id, "confirm": True}, "unavailable_in_4_0")
+            typed("memory", {"action": "delete", "id": doomed_id, "confirm": True}, "unavailable_in_4_0")
+            typed("delete_knowledge", {"id": doomed_id, "confirm": True}, "unavailable_in_4_0")
+            still = tool("memory", {"action": "get", "id": doomed_id})
+            assert "STRATA_PURGE_DOOMED" in json.dumps(still)
             context = tool("codebase", {"action": "get_context", "codebase": "fixture"})
             assert marker not in json.dumps(context)
             project_preview = tool("project", {"action": "preview"})
@@ -327,9 +330,11 @@ def run(binary, output):
             typed("session_start", {"queries": [marker], "include_predictions": False, "include_intentions": False}, "similarity_disabled")
             doomed_suppress = tool("smart_ingest", {"content": "STRATA_SUPPRESS_DOOMED", "forceCreate": True})
             suppress_id = doomed_suppress["nodeId"]
+            typed("blast_radius", {"action": "retire", "ids": [suppress_id], "reason": "fixture"}, "unavailable_in_4_0")
+            passed("purge and delete are withheld on Strata and change nothing")
+            assert annotations["suppress"]["destructiveHint"] is True
             suppressed = tool("suppress", {"id": suppress_id, "reason": "fixture"})
             assert suppressed["success"] is True and suppressed["rule"] == "suppress"
-            assert suppressed["id"] == suppress_id
             assert str(suppressed["receiptId"]).startswith("eff-")
             assert "STRATA_SUPPRESS_DOOMED" not in json.dumps(suppressed)
             hidden_suppress = tool("memory", {"action": "get", "id": suppress_id})
@@ -337,14 +342,76 @@ def run(binary, output):
             assert "STRATA_SUPPRESS_DOOMED" not in json.dumps(hidden_suppress)
             hidden_recall = tool("recall", {"handle": suppress_id})
             assert "STRATA_SUPPRESS_DOOMED" not in json.dumps(hidden_recall)
-            typed("causal_walk", {"scope": "user"}, "pending_strata")
-            typed("selftest", {}, "pending_strata")
-            typed("forgotten_lesson", {"failure_id": node_id}, "pending_strata")
+            typed("suppress", {"id": suppress_id, "reverse": True}, "unavailable_in_4_0")
+            passed("suppress hides a memory from every read; reverse is refused on Strata")
+            anchored_repo = root / "anchored-repo"
+            (anchored_repo / "src").mkdir(parents=True)
+            anchored_source = anchored_repo / "src" / "state.rs"
+            anchored_source.write_text(
+                "use std::fs;\n\npub fn load_config(path: &str) -> Config {\n"
+                "    let raw = fs::read_to_string(path).unwrap();\n    parse(&raw)\n}\n"
+            )
+            anchored_files = ["src/state.rs#load_config"]
+            saved_pattern = tool("codebase", {
+                "action": "remember_pattern", "name": "Eager config read",
+                "description": "load_config reads the whole file eagerly",
+                "files": anchored_files, "repoPath": str(anchored_repo), "codebase": "anchored",
+            })
+            saved_anchors = saved_pattern["anchors"]
+            assert saved_anchors["count"] == 1 and saved_anchors["verifiable"] == 1, saved_pattern
+            assert saved_anchors["recorded"] == 1 and saved_anchors.get("error") is None, saved_pattern
+            pattern_id = saved_pattern["nodeId"]
+            verify_args = {"action": "verify", "codebase": "anchored", "repoPath": str(anchored_repo)}
+            context_args = {"action": "get_context", "codebase": "anchored", "repoPath": str(anchored_repo)}
+            fresh_report = tool("codebase", verify_args)
+            assert fresh_report["checked"] == 1 and fresh_report["fresh"] == 1, fresh_report
+            assert fresh_report["stale"] == 0, fresh_report
+            current = tool("codebase", context_args)
+            assert current["patterns"]["items"][0]["anchorStatus"] == "verified", current
+            assert current["staleMemories"] == [], current
+            anchored_source.write_text("pub fn load_config(path: &str) -> Config {\n    Config::from_env()\n}\n")
+            drift_report = tool("codebase", verify_args)
+            assert drift_report["stale"] == 1 and drift_report["fresh"] == 0, drift_report
+            assert drift_report["staleMemories"][0]["id"] == pattern_id, drift_report
+            assert drift_report["staleMemories"][0]["status"] == "drifted", drift_report
+            stale_context = tool("codebase", context_args)
+            assert stale_context["staleMemories"] == [pattern_id], stale_context
+            assert stale_context["patterns"]["items"][0]["stale"] is True, stale_context
+            reanchored = tool("codebase", {
+                "action": "reanchor", "memoryId": pattern_id,
+                "repoPath": str(anchored_repo), "files": anchored_files,
+            })
+            assert reanchored["anchorsReplaced"] == 1, reanchored
+            assert reanchored["memoryContentChanged"] is False, reanchored
+            reanchored_report = tool("codebase", verify_args)
+            assert reanchored_report["fresh"] == 1 and reanchored_report["stale"] == 0, reanchored_report
+            pattern_receipt = tool("receipt", {"action": "get", "receipt_id": pattern_id})
+            assert pattern_receipt["receipt"]["mutations"][0]["kind"] == "created", pattern_receipt
+            proc.terminate()
+            proc.wait(timeout=10)
+            spawn()
+            handshake()
+            replayed_report = tool("codebase", verify_args)
+            assert replayed_report["fresh"] == 1 and replayed_report["stale"] == 0, replayed_report
+            assert_no_sqlite()
+            passed("codebase anchors record, verify fresh, flag drift, reanchor, and replay after restart")
+            unanchored = tool("causal_walk", {"scope": "user"})
+            assert unanchored["status"] == "completed" and unanchored["causes"] == []
+            assert unanchored["needs_report"]["missing"] == ["node_id"], unanchored
+            walked = tool("causal_walk", {"node_id": successor})
+            assert walked["start"] == successor and walked["direction"] == "backward"
+            assert walked["truncated"] is False and walked["needs_report"] is None
+            selftest = tool("selftest", {})
+            assert selftest["all_passed"] is True and selftest["deterministic"] is True
+            assert selftest["checks_passed"] == selftest["checks_total"] > 0, selftest
+            lessons = tool("forgotten_lesson", {"failure_id": successor})
+            assert lessons["failure_id"] == successor and isinstance(lessons["forgotten_lessons"], list)
+            passed("causal_walk, selftest and forgotten_lesson answer from recorded edges only")
             called = {row["tool"] for row in coverage}
             missing = [name for name in names if name not in called]
             assert not missing, missing
             assert_no_sqlite()
-            passed("all 17 tools answered on Strata: real writes, or a typed error")
+            passed(f"all {len(names)} tools answered on Strata: real writes, or a typed error")
         finally:
             if proc and proc.poll() is None:
                 proc.terminate()

@@ -588,6 +588,24 @@ pub async fn execute_consolidate(
 }
 
 /// Backup tool
+/// Bytes on disk for a backup: the file, or every file under a directory.
+fn path_size(path: &std::path::Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| path_size(&entry.path()))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 pub async fn execute_backup(storage: &Arc<Storage>, _args: Option<Value>) -> Result<Value, String> {
     // Determine backup path
     let backup_dir = storage.sidecar_dir("backups");
@@ -596,18 +614,24 @@ pub async fn execute_backup(storage: &Arc<Storage>, _args: Option<Value>) -> Res
         .map_err(|e| format!("Failed to create backup directory: {}", e))?;
 
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
-    let backup_path = backup_dir.join(format!("vestige-{}.db", timestamp));
+    // A SQLite backup is one file; a Strata backup is a copy of the log
+    // directory, so it gets no `.db` suffix.
+    let strata = crate::strata_memory::is_strata_backend(storage.as_ref());
+    let name = if strata {
+        format!("vestige-{timestamp}.strata")
+    } else {
+        format!("vestige-{timestamp}.db")
+    };
+    let backup_path = backup_dir.join(name);
 
-    // Use VACUUM INTO for a consistent backup (handles WAL properly)
+    // SQLite: VACUUM INTO (consistent under WAL). Strata: sealed log copy.
     {
         storage
             .backup_to(&backup_path)
             .map_err(|e| format!("Failed to create backup: {}", e))?;
     }
 
-    let file_size = std::fs::metadata(&backup_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let file_size = path_size(&backup_path);
 
     Ok(serde_json::json!({
         "tool": "backup",

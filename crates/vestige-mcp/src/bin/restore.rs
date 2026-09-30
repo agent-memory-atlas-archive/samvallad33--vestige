@@ -68,13 +68,31 @@ fn main() -> anyhow::Result<()> {
     println!("Found {} memories to restore", memories.len());
 
     println!("Initializing storage...");
-    let dir = directories::ProjectDirs::from("com", "vestige", "core")
-        .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?
-        .data_dir()
-        .to_path_buf();
+    // Same data directory as vestige-mcp and vestige: VESTIGE_DATA_DIR, then
+    // the platform directory.
+    let dir = match std::env::var_os("VESTIGE_DATA_DIR").filter(|value| !value.is_empty()) {
+        Some(value) => PathBuf::from(value),
+        None => directories::ProjectDirs::from("com", "vestige", "core")
+            .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?
+            .data_dir()
+            .to_path_buf(),
+    };
+    // A v3 store is upgraded first. Opening a Strata log beside an
+    // un-upgraded vestige.db would create an empty log, and every later
+    // launch would then skip the import and strand the v3 memories.
+    vestige_mcp::v3_launch::upgrade_or_refuse(&dir.join("vestige.db"))?;
+    std::fs::create_dir_all(&dir)?;
+    // The log has one writer. While a Vestige server holds the store, a
+    // second writer here loses acknowledged writes.
+    let Some(_serve_lock) = vestige_mcp::attach::try_serve_lock(&dir)? else {
+        anyhow::bail!(
+            "a Vestige server is serving {}. vestige-restore writes to the log directly and the log has one writer: quit the apps running Vestige (and stop the dashboard agent if you run one), then run vestige-restore again.",
+            dir.display()
+        );
+    };
     let storage = vestige_mcp::strata_memory::open(&dir)?;
 
-    println!("Generating embeddings and ingesting memories...\n");
+    println!("Ingesting memories...\n");
 
     let total = memories.len();
     let mut success_count = 0;

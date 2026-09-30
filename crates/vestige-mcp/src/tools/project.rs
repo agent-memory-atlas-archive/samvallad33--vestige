@@ -768,10 +768,12 @@ mod strata_preview {
                 .iter()
                 .all(|edge| edge.meta_sha.as_deref() == Some(hash.as_str()))
         );
+        // The write records the canonical path (macOS temp dirs sit behind the
+        // /var -> /private/var symlink), so compare against the canonical form.
+        let canonical_target = target.canonicalize().unwrap().display().to_string();
         assert!(
-            edges
-                .iter()
-                .all(|edge| edge.target_id == target.display().to_string())
+            edges.iter().all(|edge| edge.target_id == canonical_target),
+            "{edges:?}"
         );
         store.seal_checkpoint().unwrap();
         drop(store);

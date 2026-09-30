@@ -49,6 +49,13 @@ pub fn upgrade_or_refuse(db_path: &Path) -> Result<(), LaunchError> {
     if !db_present(db_path) {
         return Ok(());
     }
+    // The v3 file is kept after a successful upgrade, so it is present on
+    // every later launch. Once the Strata log is published there is nothing
+    // to upgrade: start without spawning the helper, which a later install
+    // may not even ship.
+    if strata_log_published(db_path) {
+        return Ok(());
+    }
     let Some(bin) = find_upgrade() else {
         return Err(LaunchError::MissingTool {
             message: refusal(db_path),
@@ -74,6 +81,23 @@ pub fn upgrade_or_refuse(db_path: &Path) -> Result<(), LaunchError> {
     } else {
         Err(LaunchError::UpgradeFailed { status })
     }
+}
+
+/// True once `<data-dir>/log` holds a segment or its `strata.key`. The
+/// upgrade publishes by renaming a verified staging directory onto `log/`,
+/// so a present log means the upgrade completed. Stat and directory reads
+/// only; the v3 file is never opened.
+pub fn strata_log_published(db_path: &Path) -> bool {
+    let data_dir = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::read_dir(data_dir.join("log")).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            name == "strata.key" || Path::new(&name).extension().is_some_and(|ext| ext == "seg")
+        })
+    })
 }
 
 fn refusal(db_path: &Path) -> String {
@@ -114,4 +138,37 @@ fn find_upgrade() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// After a completed upgrade the kept v3 file must not send every launch
+    /// through the helper: a published log starts without it.
+    #[test]
+    fn published_log_starts_without_the_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("vestige.db");
+        std::fs::write(&db, b"SQLite format 3\0kept v3 store").unwrap();
+        std::fs::create_dir_all(dir.path().join("log")).unwrap();
+        std::fs::write(dir.path().join("log").join("00000000-ab.seg"), b"segment").unwrap();
+
+        assert!(upgrade_or_refuse(&db).is_ok());
+        // The helper logs every run it makes; none happened.
+        assert!(!dir.path().join("upgrade.log").exists());
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            b"SQLite format 3\0kept v3 store"
+        );
+    }
+
+    #[test]
+    fn a_log_dir_without_segments_is_not_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("vestige.db");
+        std::fs::write(&db, b"SQLite format 3\0").unwrap();
+        std::fs::create_dir_all(dir.path().join("log")).unwrap();
+        assert!(!strata_log_published(&db));
+    }
 }

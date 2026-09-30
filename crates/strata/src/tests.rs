@@ -490,3 +490,185 @@ fn merkle_tree_shapes() {
     assert_eq!(format::merkle_root(&l), reference(&leaves));
     assert_ne!(format::merkle_root(&l[..2]), format::merkle_root(&l[..3]));
 }
+
+/// The log signing key must come from the OS CSPRNG on every platform. A
+/// derivable seed (clock plus pid) would let anyone re-derive `strata.key`
+/// and forge segments, so two fresh logs must get distinct, non-trivial keys.
+#[test]
+fn fresh_logs_get_distinct_os_entropy_signing_keys() {
+    let _serial = serialize();
+    reset_failpoints();
+    let a = test_dir("entropy-a");
+    let b = test_dir("entropy-b");
+    drop(StrataLog::open(&a).unwrap());
+    drop(StrataLog::open(&b).unwrap());
+    let key_a = fs::read(a.join("strata.key")).unwrap();
+    let key_b = fs::read(b.join("strata.key")).unwrap();
+    assert_eq!(key_a.len(), 32);
+    assert_eq!(key_b.len(), 32);
+    assert_ne!(key_a, key_b, "two fresh logs shared a signing key");
+    assert!(key_a.iter().any(|&x| x != 0), "signing key is all zero");
+    assert!(key_b.iter().any(|&x| x != 0), "signing key is all zero");
+}
+
+/// Power fails inside a group commit before its sync: a later frame's page
+/// landed and an earlier one did not, so a complete frame above the recorded
+/// watermark fails its hash. It was never acked; recovery drops it.
+#[test]
+fn corrupt_complete_frame_above_the_watermark_is_truncated() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("above-wm");
+    {
+        let log = StrataLog::open(&dir).unwrap();
+        append_many(&log, 3);
+        let head = log.head();
+        let bad = format::Frame {
+            kind: 9,
+            payload: b"never-acked".to_vec(),
+            payload_blake3: format::payload_blake3(9, b"a different payload"),
+            prev_frame_hash: head.last_frame_hash,
+        };
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(only_segment(&dir))
+            .unwrap();
+        f.write_all(&borsh::to_vec(&bad).unwrap()).unwrap();
+        f.sync_all().unwrap();
+    }
+    let log = StrataLog::open(&dir).unwrap();
+    assert_eq!(
+        log.read_frames(1).unwrap().len(),
+        3,
+        "acked history survives"
+    );
+    assert_eq!(log.append(4, b"after").unwrap().seq, 4);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+fn segments(dir: &Path) -> Vec<PathBuf> {
+    crate::log::list_segments(dir)
+        .unwrap()
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// Power fails while `seal` writes the trailer: the file covers every
+/// trailer byte but half are zeros, and the next segment was never created.
+/// Every frame before it is acked, so the torn trailer is dropped.
+#[test]
+fn a_seal_torn_by_a_crash_reopens_with_every_frame() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("torn-seal");
+    {
+        let log = StrataLog::open(&dir).unwrap();
+        append_many(&log, 3);
+        log.seal().unwrap();
+    }
+    let segs = segments(&dir);
+    assert_eq!(segs.len(), 2);
+    fs::remove_file(&segs[1]).unwrap();
+    let mut bytes = fs::read(&segs[0]).unwrap();
+    let len = bytes.len();
+    for byte in &mut bytes[len - 52..] {
+        *byte = 0;
+    }
+    fs::write(&segs[0], &bytes).unwrap();
+
+    let log = StrataLog::open(&dir).unwrap();
+    assert_eq!(log.read_frames(1).unwrap().len(), 3);
+    assert_eq!(log.append(4, b"after").unwrap().seq, 4);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An unacked tear that leaves exactly a trailer's worth of bytes is still a
+/// tear, not a seal.
+#[test]
+fn an_unacked_tear_of_trailer_size_is_truncated() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("tear-104");
+    {
+        let log = StrataLog::open(&dir).unwrap();
+        append_many(&log, 3);
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(only_segment(&dir))
+            .unwrap();
+        f.write_all(&[0xA5; format::TRAILER_WIRE_SIZE]).unwrap();
+        f.sync_all().unwrap();
+    }
+    let log = StrataLog::open(&dir).unwrap();
+    assert_eq!(log.read_frames(1).unwrap().len(), 3);
+    assert_eq!(log.append(4, b"after").unwrap().seq, 4);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A frame whose payload is 35 bytes is exactly as long as a trailer. It is
+/// a frame: acked, and still there after a reopen.
+#[test]
+fn a_trailer_sized_frame_is_read_as_a_frame() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("frame-104");
+    let payload = [7u8; 35];
+    {
+        let log = StrataLog::open(&dir).unwrap();
+        append_many(&log, 2);
+        log.append(3, &payload).unwrap();
+        let tail = fs::read(only_segment(&dir)).unwrap();
+        let (_, used) =
+            format::parse_frame(&tail[tail.len() - format::TRAILER_WIRE_SIZE..]).unwrap();
+        assert_eq!(
+            used,
+            format::TRAILER_WIRE_SIZE,
+            "the frame is trailer-sized"
+        );
+    }
+    let log = StrataLog::open(&dir).unwrap();
+    let frames = log.read_frames(1).unwrap();
+    assert_eq!(frames.len(), 3);
+    assert_eq!(frames[2].payload, payload);
+    assert_eq!(log.append(4, b"after").unwrap().seq, 4);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `seal` wrote its trailer, then could not create the next segment. The log
+/// fails stop and wakes everyone; an append afterwards returns at once
+/// instead of waiting forever.
+#[cfg(unix)]
+#[test]
+fn a_seal_that_cannot_roll_the_segment_does_not_hang_appends() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("seal-roll");
+    let log = Arc::new(StrataLog::open(&dir).unwrap());
+    append_many(&log, 2);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let sealed = log.seal();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        sealed.is_err(),
+        "creating the next segment should have failed"
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let appender = Arc::clone(&log);
+    std::thread::spawn(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            appender.append(1, b"after a failed seal")
+        }));
+        let _ = tx.send(outcome.is_err() || outcome.is_ok_and(|r| r.is_err()));
+    });
+    let failed_fast = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("append after a failed seal hung");
+    assert!(failed_fast, "append after a failed seal must not succeed");
+    drop(log);
+    let reopened = StrataLog::open(&dir).unwrap();
+    assert_eq!(reopened.read_frames(1).unwrap().len(), 2);
+    fs::remove_dir_all(&dir).unwrap();
+}

@@ -411,299 +411,107 @@ fn log_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-fn assert_no_marker(value: &serde_json::Value, marker: &str) {
-    let text = value.to_string();
-    assert!(!text.contains(marker), "{text}");
-}
-
-fn hide_check(mcp: &mut McpSession, marker: &str, purged: &str, kept: &str, kept_marker: &str) {
-    let got = tool_body(
-        mcp,
-        "memory",
-        serde_json::json!({ "action": "get", "id": purged }),
-    );
-    assert_eq!(got["message"], "retired, can't be retrieved");
-    assert_no_marker(&got, marker);
-    for (name, args) in [
-        (
-            "memory",
-            serde_json::json!({ "action": "get_batch", "ids": [purged, kept] }),
-        ),
-        (
-            "memory",
-            serde_json::json!({ "action": "state", "id": purged }),
-        ),
-        ("recall", serde_json::json!({ "handle": purged })),
-        (
-            "recall",
-            serde_json::json!({ "query": "unrelated fixture" }),
-        ),
-        (
-            "graph",
-            serde_json::json!({ "action": "chain", "from": kept, "to": purged }),
-        ),
-        (
-            "graph",
-            serde_json::json!({ "action": "associations", "from": kept }),
-        ),
-        (
-            "graph",
-            serde_json::json!({ "action": "neighbors", "memory_id": kept }),
-        ),
-        (
-            "graph",
-            serde_json::json!({ "action": "memory_graph", "center_id": kept }),
-        ),
-        (
-            "graph",
-            serde_json::json!({ "action": "recent", "limit": 5 }),
-        ),
-        ("memory_status", serde_json::json!({ "view": "timeline" })),
-        ("memory_status", serde_json::json!({ "view": "stats" })),
-        ("memory_status", serde_json::json!({ "view": "health" })),
-        (
-            "codebase",
-            serde_json::json!({ "action": "get_context", "codebase": "fixture" }),
-        ),
-        (
-            "receipt",
-            serde_json::json!({ "action": "get", "receipt_id": purged }),
-        ),
-    ] {
-        assert_no_marker(&tool_body(mcp, name, args), marker);
-    }
-    let kept_body = tool_body(
-        mcp,
-        "memory",
-        serde_json::json!({ "action": "get", "id": kept }),
-    );
-    assert!(kept_body.to_string().contains(kept_marker));
-    assert_no_marker(&kept_body, marker);
-}
-
+/// 4.0 withholds erasure on Strata. Over real stdio: purge, the memory
+/// purge/delete actions and the hidden delete_knowledge alias all refuse,
+/// purge is not advertised, the log is byte-identical afterwards, and the
+/// memory is still readable after a restart. Suppress stays advertised as a
+/// destructive hide (it never erased).
 #[test]
-fn stdio_purge_retires_with_confirm_and_refuses_without_a_log_change() {
-    let dir = std::env::temp_dir().join(format!("vestige-purge-stdio-{}", std::process::id()));
+fn stdio_erasure_is_withheld_and_writes_nothing() {
+    let dir = std::env::temp_dir().join(format!("vestige-withheld-stdio-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("data dir");
-    let marker = "STDIO_PURGE_MARKER_9f3a";
+    let marker = "STDIO_WITHHELD_MARKER_9f3a";
 
-    let (purged_id, kept_id) = {
+    let node_id = {
         let mut mcp = spawn(env!("CARGO_BIN_EXE_vestige-mcp"), &dir);
         handshake(&mut mcp);
-        let purged_id = ingest(&mut mcp, marker);
-        let kept_id = ingest(&mut mcp, "STDIO_PURGE_KEPT");
+        let node_id = ingest(&mut mcp, marker);
         mcp.close();
-        (purged_id, kept_id)
+        node_id
     };
     let before = log_files(&dir);
 
     {
         let mut mcp = spawn(env!("CARGO_BIN_EXE_vestige-mcp"), &dir);
         handshake(&mut mcp);
-        let refused = tool_body(
-            &mut mcp,
-            "purge",
-            serde_json::json!({ "id": purged_id, "confirm": false }),
+        let listed = mcp.rpc("tools/list", serde_json::json!({}));
+        let names: Vec<&str> = listed["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(!names.contains(&"purge"), "{names:?}");
+        let suppress = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "suppress")
+            .expect("suppress stays advertised: it hides, it never erased");
+        assert_eq!(
+            suppress["annotations"]["destructiveHint"],
+            serde_json::json!(true),
+            "{suppress}"
         );
-        assert!(refused.to_string().contains("confirm=true"), "{refused}");
-        mcp.close();
-    }
-    assert_eq!(log_files(&dir), before, "unconfirmed purge changed the log");
-    {
-        let store = StrataStore::open(&dir).expect("open after refuse");
+        let memory = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "memory")
+            .expect("memory tool");
+        let actions = memory["inputSchema"]["properties"]["action"]["enum"].to_string();
         assert!(
-            store
-                .get_node(&purged_id)
-                .expect("node")
-                .superseded_by
-                .is_none()
+            !actions.contains("purge") && !actions.contains("delete"),
+            "{actions}"
         );
-    }
 
-    {
-        let mut store = StrataStore::open(&dir).expect("edge writer");
-        store
-            .save_connection(&strata_store::ConnectionRecord {
-                source_id: kept_id.clone(),
-                target_id: purged_id.clone(),
-                strength_milli: 1000,
-                link_type: "derived_from".into(),
-                meta_sha: None,
-                created_at_ms: 0,
-                activation_count: 0,
-            })
-            .expect("recorded edge");
-    }
-
-    let receipt_id = {
-        let mut mcp = spawn(env!("CARGO_BIN_EXE_vestige-mcp"), &dir);
-        handshake(&mut mcp);
-        let purged = mcp.tool(
-            "purge",
-            serde_json::json!({ "id": purged_id, "confirm": true }),
-        );
-        assert_eq!(purged["nodeId"], purged_id);
-        assert_eq!(purged["rule"], "purge");
-        let receipt_id = purged["receiptId"].as_str().expect("receipt").to_string();
-        assert!(receipt_id.starts_with("eff-"), "{receipt_id}");
-        assert!(!purged.to_string().contains(marker));
-        hide_check(&mut mcp, marker, &purged_id, &kept_id, "STDIO_PURGE_KEPT");
-        mcp.close();
-        receipt_id
-    };
-
-    {
-        let mut mcp = spawn(env!("CARGO_BIN_EXE_vestige-mcp"), &dir);
-        handshake(&mut mcp);
-        hide_check(&mut mcp, marker, &purged_id, &kept_id, "STDIO_PURGE_KEPT");
+        for (name, args) in [
+            (
+                "purge",
+                serde_json::json!({ "id": node_id, "confirm": true }),
+            ),
+            (
+                "memory",
+                serde_json::json!({ "action": "purge", "id": node_id, "confirm": true }),
+            ),
+            (
+                "memory",
+                serde_json::json!({ "action": "delete", "id": node_id, "confirm": true }),
+            ),
+            (
+                "delete_knowledge",
+                serde_json::json!({ "id": node_id, "confirm": true }),
+            ),
+        ] {
+            let result = mcp.rpc(
+                "tools/call",
+                serde_json::json!({ "name": name, "arguments": args }),
+            );
+            assert_eq!(
+                result["isError"],
+                serde_json::json!(true),
+                "{name}: {result}"
+            );
+            assert!(
+                result.to_string().contains("unavailable_in_4_0"),
+                "{name}: {result}"
+            );
+        }
         mcp.close();
     }
+    assert_eq!(log_files(&dir), before, "a withheld call changed the log");
 
     {
-        let store = StrataStore::open(&dir).expect("reopen");
-        let seq = u64::from_str_radix(receipt_id.trim_start_matches("eff-"), 16).expect("seq");
-        let again = store.retire_receipt(seq).expect("replayed receipt");
-        assert_eq!(again.rule_id, Some(strata_store::RULE_PURGE));
-        assert_eq!(again.receipt_id, receipt_id);
-        assert_eq!(store.get_node(&purged_id).expect("stored").content, marker);
-    }
-
-    vestige_ok(&["strata-verify", dir.to_str().expect("utf8 dir")]);
-
-    let migrated = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../strata-migrate/tests/fixtures/v3.1.1-sample.sqlite");
-    let dest = std::env::temp_dir().join(format!("vestige-purge-migrated-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dest);
-    vestige_ok(&[
-        "migrate-to-strata",
-        "--from",
-        migrated.to_str().expect("fixture path"),
-        "--to",
-        dest.to_str().expect("dest path"),
-    ]);
-    vestige_ok(&["strata-verify", dest.to_str().expect("dest path")]);
-
-    std::fs::remove_dir_all(&dir).ok();
-    std::fs::remove_dir_all(&dest).ok();
-}
-
-#[test]
-fn stdio_suppress_retires_and_stays_hidden_across_restart() {
-    let dir = std::env::temp_dir().join(format!("vestige-suppress-stdio-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("data dir");
-    let marker = "STDIO_SUPPRESS_MARKER_4c1b";
-    let kept_marker = "STDIO_SUPPRESS_KEPT";
-
-    let (suppressed_id, kept_id) = {
         let mut mcp = spawn(env!("CARGO_BIN_EXE_vestige-mcp"), &dir);
         handshake(&mut mcp);
-        let suppressed_id = ingest(&mut mcp, marker);
-        let kept_id = ingest(&mut mcp, kept_marker);
-        mcp.close();
-        (suppressed_id, kept_id)
-    };
-
-    {
-        let mut store = StrataStore::open(&dir).expect("edge writer");
-        store
-            .save_connection(&strata_store::ConnectionRecord {
-                source_id: kept_id.clone(),
-                target_id: suppressed_id.clone(),
-                strength_milli: 1000,
-                link_type: "derived_from".into(),
-                meta_sha: None,
-                created_at_ms: 0,
-                activation_count: 0,
-            })
-            .expect("recorded edge");
-    }
-
-    let receipt_id = {
-        let mut mcp = spawn(env!("CARGO_BIN_EXE_vestige-mcp"), &dir);
-        handshake(&mut mcp);
-        let linked = tool_body(
-            &mut mcp,
-            "graph",
-            serde_json::json!({ "action": "associations", "from": kept_id }),
-        );
-        assert!(
-            linked.to_string().contains(&suppressed_id),
-            "edge was not visible before suppress: {linked}"
-        );
-        let suppressed = mcp.tool(
-            "suppress",
-            serde_json::json!({ "id": suppressed_id, "reason": "fixture" }),
-        );
-        assert_eq!(suppressed["success"], true);
-        assert_eq!(suppressed["rule"], "suppress");
-        assert_eq!(suppressed["id"], suppressed_id);
-        let receipt_id = suppressed["receiptId"]
-            .as_str()
-            .expect("receipt")
-            .to_string();
-        assert!(receipt_id.starts_with("eff-"), "{receipt_id}");
-        assert!(!suppressed.to_string().contains("pending_strata"));
-        assert!(!suppressed.to_string().contains(marker));
-        let recalled = tool_body(
-            &mut mcp,
-            "recall",
-            serde_json::json!({ "handle": suppressed_id }),
-        );
-        assert_no_marker(&recalled, marker);
-        assert!(
-            !recalled.to_string().contains(&suppressed_id),
-            "recall still names the suppressed node: {recalled}"
-        );
         let got = tool_body(
             &mut mcp,
             "memory",
-            serde_json::json!({ "action": "get", "id": suppressed_id }),
+            serde_json::json!({ "action": "get", "id": node_id }),
         );
-        assert_eq!(got["message"], "retired, can't be retrieved");
-        assert_no_marker(&got, marker);
-        let graph = tool_body(
-            &mut mcp,
-            "graph",
-            serde_json::json!({ "action": "associations", "from": kept_id }),
-        );
-        assert!(
-            !graph.to_string().contains(&suppressed_id),
-            "graph still names the suppressed node: {graph}"
-        );
-        assert_no_marker(&graph, marker);
-        hide_check(&mut mcp, marker, &suppressed_id, &kept_id, kept_marker);
-        mcp.close();
-        receipt_id
-    };
-
-    {
-        let mut mcp = spawn(env!("CARGO_BIN_EXE_vestige-mcp"), &dir);
-        handshake(&mut mcp);
-        hide_check(&mut mcp, marker, &suppressed_id, &kept_id, kept_marker);
-        let graph = tool_body(
-            &mut mcp,
-            "graph",
-            serde_json::json!({ "action": "associations", "from": kept_id }),
-        );
-        assert!(!graph.to_string().contains(&suppressed_id), "{graph}");
-        assert_no_marker(&graph, marker);
+        assert!(got.to_string().contains(marker), "{got}");
         mcp.close();
     }
-
-    {
-        let store = StrataStore::open(&dir).expect("reopen");
-        let seq = u64::from_str_radix(receipt_id.trim_start_matches("eff-"), 16).expect("seq");
-        let again = store.retire_receipt(seq).expect("replayed receipt");
-        assert_eq!(again.rule_id, Some(RULE_SUPPRESS));
-        assert_eq!(again.receipt_id, receipt_id);
-        assert_eq!(
-            store.get_node(&suppressed_id).expect("stored").content,
-            marker
-        );
-    }
-
-    vestige_ok(&["strata-verify", dir.to_str().expect("utf8 dir")]);
-    std::fs::remove_dir_all(&dir).ok();
+    let _ = std::fs::remove_dir_all(&dir);
 }

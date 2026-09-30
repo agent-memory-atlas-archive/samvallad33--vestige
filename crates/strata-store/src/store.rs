@@ -14,18 +14,20 @@ use strata_gate::policy::{ANY_KIND, WILDCARD_PREFIX};
 use strata_gate::record::{action_kind, EffectRecord, GateRecord, Propose, RecordKind, Verdict};
 use strata_gate::{GateRuntime, Policy, Rule, SeqAck};
 use strata_kernel::checkpoint::{checkpoint_hash, Checkpoint};
-use strata_kernel::event::ReviewEvent;
+use strata_kernel::event::{ReviewEvent, StrataEvent};
 use strata_kernel::fsrs::{FsrsFold, ALGO_V2};
 use strata_kernel::kernel::Kernel;
 use strata_kernel::state::State;
 use strata_kernel::verify::verify_with_head;
 
+use crate::anchor::AnchorIndex;
+use crate::card::{CardEvent, ImportedCard};
 use crate::error::StoreError;
 use crate::gate_log::StrataEventLog;
 use crate::op::{StoreOp, KIND_STORE_CHECKPOINT, KIND_STORE_WRITE};
 use crate::types::{
-    ConnectionRecord, EdgeDirection, EdgeKind, IngestInput, IntentionRecord, NodeRecord,
-    VALID_FOREVER_MS,
+    AnchorRecord, ConnectionRecord, EdgeDirection, EdgeKind, IngestInput, IntentionRecord,
+    NodeRecord, VALID_FOREVER_MS,
 };
 
 /// Subdirectory holding the durable log.
@@ -186,7 +188,7 @@ pub fn default_policy() -> Policy {
     }
 }
 
-/// What an admitted node effect did. Derived by replaying the log.
+/// What an admitted node or intention effect did. Derived by replaying the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectAction {
     /// First upsert of a node (ingest). Folds one Good review.
@@ -198,17 +200,29 @@ pub enum EffectAction {
     Edit,
     /// Explicit FSRS review. `rating` is 1..=4.
     Review,
+    /// Intention row inserted or replaced by `UpsertIntentions`. A batch
+    /// proves one effect per row, all citing the same EFFECT. Not a card.
+    Intention,
+    /// Code anchor recorded by `RecordAnchors` or `ReplaceAnchors`. One
+    /// effect per anchor row, named by the anchor id. Not a card.
+    Anchor,
+    /// Verification verdict cached by `RecordAnchorVerdict`, named by the
+    /// anchor id. Not a card.
+    AnchorVerdict,
 }
 
-/// One node effect proved from the log: covering propose, Allow gate, and a
-/// data frame whose blake3 matches the effect's payload digest.
+/// One node, intention or anchor effect proved from the log: covering
+/// propose, Allow gate, and a data frame whose blake3 matches the effect's
+/// payload digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectProof {
     /// Gate-space seq of the EFFECT record (`eff-` receipt id).
     pub effect_seq: u64,
     /// Log seq of the STORE_WRITE frame (FSRS `event_seq` for reviews).
     pub data_seq: u64,
-    /// Node the effect names.
+    /// Node the effect names. An intention id for [`EffectAction::Intention`];
+    /// an anchor id for [`EffectAction::Anchor`] and
+    /// [`EffectAction::AnchorVerdict`].
     pub node_id: String,
     /// Which mutation landed.
     pub action: EffectAction,
@@ -257,6 +271,8 @@ struct StateDigest<'a> {
     /// card handle → latest explicit `reviewed_at_ms`.
     reviewed_at: Vec<(u64, i64)>,
     intentions: Vec<(&'a str, &'a IntentionRecord)>,
+    /// Code anchors in (node id, anchor id) order.
+    anchors: Vec<&'a AnchorRecord>,
 }
 
 /// A payload is this type only when borsh consumes it exactly. Kind bytes
@@ -370,6 +386,9 @@ struct AdmittedEffect {
 /// single-threaded single-writer (`!Send` through the gate-log cache).
 pub struct StrataStore {
     dir: PathBuf,
+    /// The log directory: `<dir>/log`, or the staged log the upgrade admits
+    /// into before renaming it there.
+    log_dir: PathBuf,
     log: StrataLog,
     gate_log: StrataEventLog,
     policy: Policy,
@@ -388,10 +407,12 @@ pub struct StrataStore {
     reverse: BTreeMap<String, Vec<usize>>,
     /// FSRS fold state (derived, kernel-canonical).
     fsrs: State,
-    /// Review events in fold order with their hashes (reused by verification).
-    review_events: Vec<(u64, [u8; 32], ReviewEvent)>,
-    /// Latest explicit review clock per card. Rebuilt from `ReviewNode`
-    /// payloads. Empty when the latest review frame omitted the field.
+    /// Card-fold events (reviews and imported v3 cards) in fold order with
+    /// their hashes (reused by verification).
+    review_events: Vec<(u64, [u8; 32], CardEvent)>,
+    /// Latest review clock per card. Rebuilt from `ReviewNode` payloads and
+    /// imported `FSRS_REVIEW` / `FSRS_STATE` frames. Empty when the latest
+    /// review frame omitted the field.
     reviewed_at: BTreeMap<u64, i64>,
     /// Sealed checkpoints in log order.
     checkpoints: Vec<Checkpoint>,
@@ -407,6 +428,9 @@ pub struct StrataStore {
     /// rebuilds it. Undo reads it to append a compensating record; it never
     /// rewrites or truncates the log.
     upserts: BTreeMap<String, Vec<(u64, NodeRecord)>>,
+    /// Code anchors (derived). Rows of a retired node stay here; reads
+    /// filter them out.
+    anchors: AnchorIndex,
 }
 
 impl StrataStore {
@@ -422,12 +446,30 @@ impl StrataStore {
     /// policy than the one that wrote the log is safe; it only affects new
     /// admissions (and `rederive_verdicts`).
     pub fn open_with_policy(dir: impl AsRef<Path>, policy: Policy) -> Result<Self, StoreError> {
+        let dir = dir.as_ref();
+        Self::open_log_with_policy(dir, dir.join(LOG_DIR), policy)
+    }
+
+    /// Open a store whose log lives at `log_dir` instead of `<dir>/log`.
+    /// `store.meta` is still read from and written to `dir`.
+    ///
+    /// The v3 upgrade admits carried-over rows into the staged log
+    /// (`<dir>/log.strata-staging`) with the normal write path, then renames
+    /// it onto `<dir>/log`. The frames do not name their directory, so
+    /// [`StrataStore::open`] on `dir` after the rename replays the same state.
+    pub fn open_log_with_policy(
+        dir: impl AsRef<Path>,
+        log_dir: impl AsRef<Path>,
+        policy: Policy,
+    ) -> Result<Self, StoreError> {
         let dir = dir.as_ref().to_path_buf();
+        let log_dir = log_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        let log = StrataLog::open(dir.join(LOG_DIR))?;
+        let log = StrataLog::open(&log_dir)?;
         let gate_log = StrataEventLog::new(log.clone())?;
         let mut store = Self {
             dir,
+            log_dir,
             log,
             gate_log,
             policy,
@@ -446,6 +488,7 @@ impl StrataStore {
             call_admitted: BTreeSet::new(),
             retire_rules: BTreeMap::new(),
             upserts: BTreeMap::new(),
+            anchors: AnchorIndex::default(),
         };
         store.replay()?;
         store.verify_checkpoint_chain()?;
@@ -465,6 +508,9 @@ impl StrataStore {
         // payload_digest -> admitted-but-unconsumed effect gate seqs.
         let mut pending: HashMap<[u8; 32], VecDeque<u64>> = HashMap::new();
         let mut gate_seq_counter: u64 = 0;
+        // Importer kernel id -> v3 memory id. Imported FSRS frames name
+        // cards by kernel id; the store keys cards by `handle_of(id)`.
+        let mut imported_ids: HashMap<u64, String> = HashMap::new();
 
         for frame in frames {
             let seq = frame.seq;
@@ -522,7 +568,10 @@ impl StrataStore {
                             self.orphan_writes += 1;
                         }
                     }
-                    WritePayload::ImportedNode(node) => self.apply_imported_node(&node),
+                    WritePayload::ImportedNode(node) => {
+                        imported_ids.insert(node.kernel_id, node.legacy_id.clone());
+                        self.apply_imported_node(&node);
+                    }
                     WritePayload::Neither => self.orphan_writes += 1,
                 }
             } else if frame.kind == KIND_STORE_CHECKPOINT {
@@ -531,6 +580,20 @@ impl StrataStore {
                     CheckpointPayload::Checkpoint(cp) => self.checkpoints.push(cp),
                     CheckpointPayload::ImportedEdge(edge) => self.apply_imported_edge(&edge),
                     CheckpointPayload::Neither => {}
+                }
+            } else if frame.kind == strata_migrate::records::KIND_SUPERSESSION {
+                // A v3 `superseded_by` link, carried by the importer. The old
+                // node stops being live and its successor stays the answer.
+                if let Ok(link) = strata_migrate::records::decode_supersession(&frame.payload) {
+                    self.apply_imported_supersession(&link);
+                }
+            } else if frame.kind == strata_migrate::records::KIND_FSRS_REVIEW {
+                // A synthetic review from a v3 `fsrs_cards` row.
+                self.apply_imported_review(&frame.payload, seq, &imported_ids)?;
+            } else if frame.kind == strata_migrate::records::KIND_FSRS_STATE {
+                // A v3 card carried from the `knowledge_nodes` columns.
+                if let Ok(record) = strata_migrate::records::decode_fsrs_state(&frame.payload) {
+                    self.apply_imported_fsrs_state(&record, seq)?;
                 }
             }
             // Unknown kinds are ignored: forward compatibility.
@@ -606,16 +669,47 @@ impl StrataStore {
                     self.intentions.insert(record.id.clone(), record.clone());
                 }
             }
+            // Anchors are not origins: a receipt replay of a memory resolves
+            // through the node's own write, never through its anchors.
+            StoreOp::RecordAnchors { anchors } => self.anchors.record(anchors),
+            StoreOp::ReplaceAnchors { node_id, anchors } => {
+                self.anchors.replace(node_id, anchors);
+            }
+            StoreOp::RecordAnchorVerdict {
+                anchor_id,
+                status,
+                checked_at_ms,
+            } => self.anchors.verdict(anchor_id, status, *checked_at_ms),
         }
         Ok(())
     }
 
     /// Imported node. Kind stays on the edge records; this only fills the registry.
     fn apply_imported_node(&mut self, node: &strata_migrate::NodeRecord) {
+        // The importer keys every carried v3 column as `<table>.<column>`.
+        let legacy = |column: &str| {
+            let qualified = format!("knowledge_nodes.{column}");
+            node.legacy
+                .iter()
+                .find(|(key, _)| *key == qualified)
+                .map(|(_, value)| value.as_str())
+        };
+        // v3 kept each memory's project namespace in `scope`; keep it, or
+        // every project's memories would merge into `user`.
+        let scope = legacy("scope")
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty() && *scope != "NULL")
+            .unwrap_or("user")
+            .to_string();
+        // A v3-suppressed memory was out of retrieval. Keep it that way: the
+        // record stays on the log and in the backup, but it is not live.
+        let suppressed = legacy("suppression_count")
+            .and_then(|count| count.trim().parse::<i64>().ok())
+            .is_some_and(|count| count > 0);
         let record = NodeRecord {
             id: node.legacy_id.clone(),
             kernel_id: ALGO_V2,
-            scope: "user".to_string(),
+            scope,
             content: node.content.clone(),
             node_type: if node.node_type.is_empty() {
                 DEFAULT_NODE_TYPE.to_string()
@@ -626,7 +720,7 @@ impl StrataStore {
             created_at_ms: node.created_ms,
             valid_from_ms: node.created_ms,
             valid_until_ms: VALID_FOREVER_MS,
-            superseded_by: None,
+            superseded_by: suppressed.then(|| IMPORTED_SUPPRESSED_MARKER.to_string()),
             source: node.source.as_ref().map(|key| crate::types::SourceKey {
                 system: key.system.clone(),
                 project: key.project.clone(),
@@ -635,6 +729,16 @@ impl StrataStore {
             source_updated_at_ms: node.source_updated_at_ms,
         };
         self.nodes.insert(record.id.clone(), record);
+    }
+
+    /// Imported v3 supersession: both ends must be imported nodes.
+    fn apply_imported_supersession(&mut self, link: &strata_migrate::records::SupersessionRecord) {
+        if !self.nodes.contains_key(&link.superseded_by_legacy_id) {
+            return;
+        }
+        if let Some(record) = self.nodes.get_mut(&link.superseded_legacy_id) {
+            record.superseded_by = Some(link.superseded_by_legacy_id.clone());
+        }
     }
 
     /// Imported edge. `link_type` is copied, including `legacy_inferred`.
@@ -666,6 +770,80 @@ impl StrataStore {
         self.edges.push(record);
     }
 
+    /// Imported `FSRS_REVIEW` frame (a v3 `fsrs_cards` rating series).
+    ///
+    /// The importer names the card by its kernel id; the fold keys it by
+    /// the node's handle, like every admitted review. The frame's seq is the
+    /// event seq. The payload's `reviewed_at_ms` sets the review clock as a
+    /// `ReviewNode` would. A review naming no imported node is ignored.
+    fn apply_imported_review(
+        &mut self,
+        payload: &[u8],
+        frame_seq: u64,
+        imported_ids: &HashMap<u64, String>,
+    ) -> Result<(), StoreError> {
+        let (Ok(event), Ok(reviewed_at_ms)) = (
+            strata_migrate::records::decode_review(payload),
+            strata_migrate::records::decode_reviewed_at_ms(payload),
+        ) else {
+            return Ok(());
+        };
+        let Some(id) = imported_ids.get(&event.card_id) else {
+            return Ok(());
+        };
+        if !self.nodes.contains_key(id) {
+            return Ok(());
+        }
+        let handle = handle_of(id);
+        self.fold_review(handle, event.rating, ALGO_V2, frame_seq)?;
+        match reviewed_at_ms {
+            Some(ms) => {
+                self.reviewed_at.insert(handle, ms);
+            }
+            None => {
+                self.reviewed_at.remove(&handle);
+            }
+        }
+        Ok(())
+    }
+
+    /// Imported `FSRS_STATE` frame: the v3 card itself.
+    ///
+    /// Folds a [`CardEvent::Import`] at the frame's seq and sets the review
+    /// clock to v3's `last_accessed`. Only a node with no card yet takes
+    /// it, so a later frame never rewinds a card that already folded
+    /// reviews. A record for an unknown node, or from another wire version,
+    /// is ignored.
+    fn apply_imported_fsrs_state(
+        &mut self,
+        record: &strata_migrate::FsrsStateRecord,
+        frame_seq: u64,
+    ) -> Result<(), StoreError> {
+        if record.record_version != strata_migrate::RECORD_VERSION
+            || !self.nodes.contains_key(&record.legacy_id)
+        {
+            return Ok(());
+        }
+        let handle = handle_of(&record.legacy_id);
+        if self.fsrs.cards.contains_key(&handle) {
+            return Ok(());
+        }
+        self.fold_card(
+            CardEvent::Import(ImportedCard {
+                card_id: handle,
+                event_seq: frame_seq,
+                stability_q: record.stability_q,
+                difficulty_q: record.difficulty_q,
+                review_count: record.review_count,
+                lapse_count: record.lapse_count,
+                phase: record.phase,
+            }),
+            ALGO_V2,
+        )?;
+        self.reviewed_at.insert(handle, record.reviewed_at_ms);
+        Ok(())
+    }
+
     fn fold_review(
         &mut self,
         card_id: u64,
@@ -673,16 +851,22 @@ impl StrataStore {
         kernel_id: u32,
         event_seq: u64,
     ) -> Result<(), StoreError> {
-        let event = ReviewEvent {
-            card_id,
-            rating,
-            event_seq,
-        };
+        self.fold_card(
+            CardEvent::Review(ReviewEvent {
+                card_id,
+                rating,
+                event_seq,
+            }),
+            kernel_id,
+        )
+    }
+
+    fn fold_card(&mut self, event: CardEvent, kernel_id: u32) -> Result<(), StoreError> {
         let event_hash = hash32(&borsh_vec(&event)?);
-        let kernel = Kernel::<ReviewEvent>::for_version(kernel_id)
+        let kernel = Kernel::<CardEvent>::for_version(kernel_id)
             .map_err(|e| StoreError::Verify(e.to_string()))?;
         kernel.apply(&mut self.fsrs, &event);
-        self.review_events.push((event_seq, event_hash, event));
+        self.review_events.push((event.seq(), event_hash, event));
         Ok(())
     }
 
@@ -879,6 +1063,138 @@ impl StrataStore {
     /// Every intention, in id order.
     pub fn intentions(&self) -> Vec<IntentionRecord> {
         self.intentions.values().cloned().collect()
+    }
+
+    /// A node that exists and is not retired, or why not.
+    fn require_live_node(&self, id: &str) -> Result<&NodeRecord, StoreError> {
+        let record = self.require_node(id)?;
+        if !record.is_live() {
+            return Err(StoreError::InvalidInput(format!("node {id} is retired")));
+        }
+        Ok(record)
+    }
+
+    /// Shape checks shared by record and replace. Writes nothing.
+    fn check_anchor_batch(&self, anchors: &[AnchorRecord]) -> Result<(), StoreError> {
+        if anchors.is_empty() {
+            return Err(StoreError::InvalidInput("anchor batch is empty".into()));
+        }
+        let mut seen = BTreeSet::new();
+        for anchor in anchors {
+            if anchor.id.is_empty() || anchor.node_id.is_empty() || anchor.file_path.is_empty() {
+                return Err(StoreError::InvalidInput(
+                    "anchor id, node id and file path must not be empty".into(),
+                ));
+            }
+            if !seen.insert(anchor.id.as_str()) {
+                let id = &anchor.id;
+                return Err(StoreError::InvalidInput(format!(
+                    "duplicate anchor id {id}"
+                )));
+            }
+            self.require_live_node(&anchor.node_id)?;
+        }
+        Ok(())
+    }
+
+    /// Insert or replace code anchors by anchor id through one admitted
+    /// write. Every anchor must name a live node. Returns the gate-space
+    /// effect seq; a refused batch appends nothing.
+    pub fn record_anchors(&mut self, anchors: Vec<AnchorRecord>) -> Result<u64, StoreError> {
+        self.check_anchor_batch(&anchors)?;
+        let nodes: BTreeSet<&str> = anchors
+            .iter()
+            .map(|anchor| anchor.node_id.as_str())
+            .collect();
+        let context = self.context_for(&nodes.into_iter().collect::<Vec<_>>());
+        let (effect_seq, _) = self.admit_write(
+            StoreOp::RecordAnchors { anchors },
+            action_kind::WRITE,
+            context,
+        )?;
+        Ok(effect_seq)
+    }
+
+    /// Replace every anchor of `node_id` with `anchors` through one admitted
+    /// write. The memory itself is not rewritten. Every row must name
+    /// `node_id`, and the node must be live.
+    pub fn replace_anchors(
+        &mut self,
+        node_id: &str,
+        anchors: Vec<AnchorRecord>,
+    ) -> Result<u64, StoreError> {
+        self.require_live_node(node_id)?;
+        self.check_anchor_batch(&anchors)?;
+        if anchors.iter().any(|anchor| anchor.node_id != node_id) {
+            return Err(StoreError::InvalidInput(format!(
+                "every replacement anchor must name node {node_id}"
+            )));
+        }
+        let context = self.context_for(&[node_id]);
+        let (effect_seq, _) = self.admit_write(
+            StoreOp::ReplaceAnchors {
+                node_id: node_id.to_string(),
+                anchors,
+            },
+            action_kind::WRITE,
+            context,
+        )?;
+        Ok(effect_seq)
+    }
+
+    /// Cache one anchor's latest verdict. `Ok(None)` and nothing appended
+    /// when the anchor is unknown or its node is retired (the SQLite store's
+    /// `UPDATE` of zero rows).
+    pub fn record_anchor_verdict(
+        &mut self,
+        anchor_id: &str,
+        status: &str,
+        checked_at_ms: i64,
+    ) -> Result<Option<u64>, StoreError> {
+        if status.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "anchor verdict must not be empty".into(),
+            ));
+        }
+        let Some(node_id) = self.anchor(anchor_id).map(|anchor| anchor.node_id) else {
+            return Ok(None);
+        };
+        let context = self.context_for(&[node_id.as_str()]);
+        let (effect_seq, _) = self.admit_write(
+            StoreOp::RecordAnchorVerdict {
+                anchor_id: anchor_id.to_string(),
+                status: status.to_string(),
+                checked_at_ms,
+            },
+            action_kind::WRITE,
+            context,
+        )?;
+        Ok(Some(effect_seq))
+    }
+
+    /// Anchors of a live node, ordered by file path, start line, then id.
+    /// A retired or unknown node has none.
+    pub fn anchors_for(&self, node_id: &str) -> Vec<AnchorRecord> {
+        if !self.nodes.get(node_id).is_some_and(NodeRecord::is_live) {
+            return Vec::new();
+        }
+        let mut rows = self.anchors.rows_of(node_id);
+        rows.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.start_line.cmp(&b.start_line))
+                .then(a.id.cmp(&b.id))
+        });
+        rows
+    }
+
+    /// One anchor by id, when its node is live.
+    pub fn anchor(&self, anchor_id: &str) -> Option<AnchorRecord> {
+        let row = self.anchors.get(anchor_id)?;
+        self.nodes
+            .get(&row.node_id)
+            .is_some_and(NodeRecord::is_live)
+            .then(|| row.clone())
     }
 
     /// Gate-space effect seq of the write that created `id`, if it exists.
@@ -1289,16 +1605,30 @@ impl StrataStore {
         result
     }
 
-    /// Review events in fold order. The kernel test replays these independently.
+    /// Review events in fold order (imported cards left out). The kernel
+    /// test replays these independently.
     #[cfg(test)]
     pub(crate) fn review_events(&self) -> Vec<ReviewEvent> {
         self.review_events
             .iter()
-            .map(|(_, _, event)| event.clone())
+            .filter_map(|(_, _, event)| match event {
+                CardEvent::Review(review) => Some(*review),
+                CardEvent::Import(_) => None,
+            })
             .collect()
     }
 
-    /// Every node effect proved from the log, in effect-seq order.
+    /// Every card-fold event (reviews and imported cards) in fold order.
+    #[cfg(test)]
+    pub(crate) fn card_events(&self) -> Vec<CardEvent> {
+        self.review_events
+            .iter()
+            .map(|(_, _, event)| *event)
+            .collect()
+    }
+
+    /// Every node, intention and code-anchor effect proved from the log, in
+    /// effect-seq order.
     ///
     /// `verify_tail` checks the active segment's hash chain (and the trailer
     /// signature when the segment is sealed). Each effect must cite an Allow
@@ -1367,6 +1697,11 @@ impl StrataStore {
                 let Some((effect_seq, rule)) =
                     pending.get_mut(&digest).and_then(|queue| queue.pop_front())
                 else {
+                    // Not an admitted write: an imported v3 node is still a
+                    // card later reviews may name (promote/demote on it).
+                    if let Some(node) = migration_node(&frame.payload) {
+                        handles.insert(handle_of(&node.legacy_id), node.legacy_id);
+                    }
                     continue;
                 };
                 let Some(op) = StoreOp::try_from_slice(&frame.payload).ok() else {
@@ -1422,9 +1757,40 @@ impl StrataStore {
                             rating: Some(rating),
                         }
                     }
-                    StoreOp::SaveEdge { .. }
-                    | StoreOp::SupersedeNode { .. }
-                    | StoreOp::UpsertIntentions { .. } => continue,
+                    StoreOp::UpsertIntentions { records } => {
+                        // One admitted batch: every row cites this effect.
+                        proofs.extend(records.into_iter().map(|record| EffectProof {
+                            effect_seq,
+                            data_seq: frame.seq,
+                            node_id: record.id,
+                            action: EffectAction::Intention,
+                            payload_digest: digest,
+                            rating: None,
+                        }));
+                        continue;
+                    }
+                    StoreOp::RecordAnchors { anchors }
+                    | StoreOp::ReplaceAnchors { anchors, .. } => {
+                        // One admitted batch: every anchor row cites this effect.
+                        proofs.extend(anchors.into_iter().map(|anchor| EffectProof {
+                            effect_seq,
+                            data_seq: frame.seq,
+                            node_id: anchor.id,
+                            action: EffectAction::Anchor,
+                            payload_digest: digest,
+                            rating: None,
+                        }));
+                        continue;
+                    }
+                    StoreOp::RecordAnchorVerdict { anchor_id, .. } => EffectProof {
+                        effect_seq,
+                        data_seq: frame.seq,
+                        node_id: anchor_id,
+                        action: EffectAction::AnchorVerdict,
+                        payload_digest: digest,
+                        rating: None,
+                    },
+                    StoreOp::SaveEdge { .. } | StoreOp::SupersedeNode { .. } => continue,
                 };
                 proofs.push(proof);
             }
@@ -1440,7 +1806,7 @@ impl StrataStore {
             .find(|proof| proof.effect_seq == effect_seq))
     }
 
-    /// The latest proved node effect for `node_id`.
+    /// The latest proved effect for `node_id` (a node or an intention id).
     pub fn latest_effect(&self, node_id: &str) -> Result<Option<EffectProof>, StoreError> {
         Ok(self
             .prove_effects()?
@@ -1600,7 +1966,7 @@ impl StrataStore {
             }
         };
         let last_log_seq = self.checkpoints.last().map_or(0, |head| head.log_seq);
-        let events: Vec<(u64, [u8; 32], ReviewEvent)> = self
+        let events: Vec<(u64, [u8; 32], CardEvent)> = self
             .review_events
             .iter()
             .filter(|(seq, _, _)| *seq <= last_log_seq)
@@ -1620,7 +1986,7 @@ impl StrataStore {
         self.log.seal()?;
         let dest_log = dest.join(LOG_DIR);
         std::fs::create_dir_all(&dest_log)?;
-        for entry in std::fs::read_dir(self.dir.join(LOG_DIR))? {
+        for entry in std::fs::read_dir(&self.log_dir)? {
             let path = entry?.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
@@ -1656,8 +2022,8 @@ impl StrataStore {
 
     /// blake3 digest over the canonical projection of every derived map
     /// (nodes, origins, edges, FSRS state root, checkpoint hashes, orphan
-    /// count, explicit review clocks, intentions). Two stores replaying the
-    /// same log produce the same digest.
+    /// count, explicit review clocks, intentions, code anchors). Two stores
+    /// replaying the same log produce the same digest.
     pub fn state_digest(&self) -> [u8; 32] {
         let digest = StateDigest {
             nodes: self.nodes.iter().map(|(k, v)| (k.as_str(), v)).collect(),
@@ -1672,6 +2038,7 @@ impl StrataStore {
                 .iter()
                 .map(|(id, record)| (id.as_str(), record))
                 .collect(),
+            anchors: self.anchors.iter().collect(),
         };
         hash32(&borsh_vec(&digest).expect("state digest serialization is infallible"))
     }
@@ -1688,6 +2055,7 @@ impl StrataStore {
         let gate_mismatches = gate_verdict_mismatches(self, &frames)?;
         let mut scratch = Self {
             dir: self.dir.clone(),
+            log_dir: self.log_dir.clone(),
             log: self.log.clone(),
             gate_log: self.gate_log.clone(),
             policy: self.policy.clone(),
@@ -1706,6 +2074,7 @@ impl StrataStore {
             call_admitted: BTreeSet::new(),
             retire_rules: BTreeMap::new(),
             upserts: BTreeMap::new(),
+            anchors: AnchorIndex::default(),
         };
         scratch.replay()?;
         let mut retrievability = BTreeMap::new();
@@ -1730,9 +2099,8 @@ impl StrataStore {
     /// chain is an error — unlike [`StrataLog::read_frames`], which stops at
     /// the first bad frame and returns the prefix.
     fn verify_segments(&self) -> Result<(), StoreError> {
-        let dir = self.dir.join(LOG_DIR);
         let mut paths = Vec::new();
-        for entry in std::fs::read_dir(&dir)? {
+        for entry in std::fs::read_dir(&self.log_dir)? {
             let path = entry?.path();
             if path.extension().and_then(|ext| ext.to_str()) == Some("seg") {
                 paths.push(path);
@@ -1783,6 +2151,16 @@ impl StrataStore {
         self.nodes.values().cloned().collect()
     }
 
+    /// Ids of nodes (native and imported) that satisfy `keep`, in id order.
+    /// Borrows each record instead of cloning its content.
+    pub fn node_ids_where(&self, keep: impl Fn(&NodeRecord) -> bool) -> Vec<String> {
+        self.nodes
+            .values()
+            .filter(|record| keep(record))
+            .map(|record| record.id.clone())
+            .collect()
+    }
+
     /// Every typed edge, in landing order.
     pub fn edges(&self) -> Vec<ConnectionRecord> {
         self.edges.clone()
@@ -1808,7 +2186,8 @@ impl StrataStore {
         &self.checkpoints
     }
 
-    /// Review events retained for verification, in fold order.
+    /// Card-fold events (reviews and imported v3 cards) retained for
+    /// verification, in fold order.
     pub fn review_event_count(&self) -> usize {
         self.review_events.len()
     }
@@ -1901,6 +2280,10 @@ impl StrataStore {
 /// The node stays in the log and in the derived map, and [`NodeRecord::is_live`]
 /// is false, so reads that honor liveness do not return it.
 const UNDO_MARKER_PREFIX: &str = "undo:";
+
+/// `superseded_by` marker on an imported memory that v3 had suppressed.
+/// Like the undo marker it names no node; [`NodeRecord::is_live`] is false.
+const IMPORTED_SUPPRESSED_MARKER: &str = "v3:suppressed";
 
 /// One admitted `UpsertNode`, classified for the reversible operation log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2002,6 +2385,26 @@ fn scan_segment(bytes: &[u8], name: &str) -> Result<ScannedSegment, StoreError> 
             });
         }
         if rem == strata::TRAILER_WIRE_SIZE {
+            // A 35-byte-payload frame is also 104 bytes; a frame that parses,
+            // hashes and chains is a frame, as in strata's own recovery.
+            let chained = match strata::parse_frame(&bytes[off..]) {
+                Ok((frame, used))
+                    if used == rem
+                        && frame.payload_blake3
+                            == strata::payload_blake3(frame.kind, &frame.payload)
+                        && frame.prev_frame_hash == prev =>
+                {
+                    Some((frame, used))
+                }
+                _ => None,
+            };
+            if let Some((frame, used)) = chained {
+                prev = strata::frame_hash(&frame);
+                leaves.push(frame.payload_blake3);
+                frames += 1;
+                off += used;
+                continue;
+            }
             let trailer: strata::SegmentTrailer =
                 borsh::from_slice(&bytes[off..]).map_err(|_| {
                     StoreError::Verify(format!("{name}: trailer-sized tail failed to parse"))

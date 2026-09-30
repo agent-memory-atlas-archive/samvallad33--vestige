@@ -1,5 +1,7 @@
 # JetBrains (IntelliJ, WebStorm, PyCharm, etc.)
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../../README.md) and the [4.0.0 changelog](../../CHANGELOG.md).
+
 > Give your JetBrains AI assistant a brain that remembers.
 
 JetBrains IDEs (2025.2+) have built-in MCP support. Vestige integrates through the MCP server settings, giving your AI assistant persistent memory across sessions.

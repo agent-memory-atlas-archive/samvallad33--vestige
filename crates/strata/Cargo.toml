@@ -16,6 +16,9 @@ publish = false
 borsh = { version = "1", features = ["derive"] }
 blake3 = "1.8"
 ed25519-dalek = "3"
+# OS CSPRNG for the log signing seed and ids on every platform, so the
+# Windows path is the same code CI exercises on unix.
+getrandom = "0.4"
 
 # Unix-only: libc provides fcntl(F_FULLFSYNC) on macOS and kill(pid, 0) for the
 # stale single-writer lock probe; neither is reachable from std.
