@@ -16,6 +16,10 @@ use vestige_core::projection::{self, ProjectionFormat, ProjectionOptions};
 /// Longest diff excerpt returned in a preview.
 const DIFF_LINES: usize = 200;
 
+/// Largest existing target file the tool will read. Rule files are small
+/// text; anything bigger is not a projection target.
+const MAX_TARGET_BYTES: u64 = 2 * 1024 * 1024;
+
 pub fn schema() -> Value {
     json!({
         "type": "object",
@@ -76,6 +80,12 @@ fn resolve_target(root: Option<&str>, path: &str) -> Result<PathBuf, String> {
     let root = root
         .canonicalize()
         .map_err(|e| format!("root {} is not a readable directory: {e}", root.display()))?;
+    if root.parent().is_none() {
+        return Err(
+            "root must not be the filesystem root; name the directory projections stay inside"
+                .into(),
+        );
+    }
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
@@ -100,6 +110,49 @@ fn resolve_target(root: Option<&str>, path: &str) -> Result<PathBuf, String> {
         return Err("projection target must not be a symlink".into());
     }
     Ok(target)
+}
+
+/// Read an existing target: a regular file no larger than `MAX_TARGET_BYTES`.
+/// The type and size are checked on the opened handle, and the open does not
+/// wait on a pipe, so a special file cannot stall or exhaust the call.
+fn read_target(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "{} is not a regular file; projections only read regular files",
+            path.display()
+        ));
+    }
+    if meta.len() > MAX_TARGET_BYTES {
+        return Err(format!(
+            "{} is too large to project into (limit {MAX_TARGET_BYTES} bytes)",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_TARGET_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if bytes.len() as u64 > MAX_TARGET_BYTES {
+        return Err(format!(
+            "{} is too large to project into (limit {MAX_TARGET_BYTES} bytes)",
+            path.display()
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("{} is not valid UTF-8 text", path.display()))
 }
 
 fn gate_refused(err: &str) -> bool {
@@ -155,10 +208,7 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
         None => None,
     };
     let existing = match &target {
-        Some(path) if path.exists() => Some(
-            std::fs::read_to_string(path)
-                .map_err(|e| format!("cannot read {}: {e}", path.display()))?,
-        ),
+        Some(path) if path.exists() => Some(read_target(path)?),
         _ => None,
     };
     let new_text = projection::splice(existing.as_deref().unwrap_or(""), &projection.region);
@@ -881,5 +931,79 @@ mod strata_preview {
                 .iter()
                 .all(|edge| edge.link_type != "projected_to")
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_target_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("CLAUDE.md"), vec![b'a'; 8 * 1024 * 1024]).unwrap();
+        let err = execute(
+            &storage,
+            Some(json!({ "path": "CLAUDE.md", "root": root.path() })),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn directory_target_is_refused_as_not_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("sub")).unwrap();
+        let err = execute(
+            &storage,
+            Some(json!({ "path": "sub", "root": root.path() })),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("regular file"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_target_is_refused_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("CLAUDE.md");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root_path = root.path().to_path_buf();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(execute(
+                &storage,
+                Some(json!({ "path": "CLAUDE.md", "root": root_path })),
+            ));
+            let _ = tx.send(result);
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(10));
+        if outcome.is_err() {
+            // Release a blocked reader so the worker thread can finish.
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        }
+        let result = outcome.expect("project blocked on a FIFO target");
+        let err = result.unwrap_err();
+        assert!(err.contains("regular file"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_root_is_not_an_acceptable_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        let err = execute(&storage, Some(json!({ "path": "dev/null", "root": "/" })))
+            .await
+            .unwrap_err();
+        assert!(err.contains("filesystem root"), "{err}");
     }
 }
