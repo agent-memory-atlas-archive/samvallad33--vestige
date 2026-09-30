@@ -1,5 +1,7 @@
 # OpenCode
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../../README.md) and the [4.0.0 changelog](../../CHANGELOG.md).
+
 > Give OpenCode persistent local memory across TUI, CLI, and desktop sessions.
 
 OpenCode supports local MCP servers through its `mcp` config. Add Vestige once and your OpenCode agents can remember project decisions, architecture context, preferences, and previous fixes between sessions.

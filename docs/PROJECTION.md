@@ -1,5 +1,7 @@
 # Markdown projection
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../README.md) and the [4.0.0 changelog](../CHANGELOG.md).
+
 Vestige stays the source of truth. `project` renders the durable subset of a scope into the rule files other agent clients already read, inside a fenced region the store owns. Everything outside the fence is the human's and is never touched.
 
 ## What gets projected

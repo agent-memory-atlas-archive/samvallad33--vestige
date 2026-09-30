@@ -1,5 +1,7 @@
 # Memory Cinema — Complete Feature Reference
 
+> **This page describes Vestige v3.** Vestige 4.0 stores memory on Strata and changes recall, backups and several tools. This page is being rewritten for 4.0.x. For how 4.0 behaves, see the [README](../README.md) and the [4.0.0 changelog](../CHANGELOG.md).
+
 Memory Cinema turns your real memory graph into a directed, narrated, infinitely-
 diving cinematic experience rendered as a 150,000-particle WebGPU compute storm.
 It is the dashboard's signature pillar.
