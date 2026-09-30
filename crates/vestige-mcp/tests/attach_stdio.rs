@@ -697,3 +697,68 @@ fn the_lock_file_and_data_dir_are_owner_only() {
     assert_eq!(mode(&dir.path().join(".serve.endpoint")), 0o600);
     assert_eq!(mode(dir.path()), 0o700);
 }
+
+/// Leave `log/strata.lock` the way a writer that died mid-open, or one whose
+/// pid has since been reused, would. Nothing holds it.
+fn leave_log_lock(data_dir: &Path, bytes: &[u8]) {
+    let log = data_dir.join("log");
+    std::fs::create_dir_all(&log).unwrap();
+    std::fs::write(log.join("strata.lock"), bytes).unwrap();
+}
+
+#[test]
+fn a_leftover_log_lock_file_does_not_lock_the_store_against_its_server() {
+    let dir = tempfile::tempdir().unwrap();
+    // A writer killed between creating the lock file and recording its pid.
+    leave_log_lock(dir.path(), &[]);
+    let mut first = Client::spawn("after-a-kill-during-open", dir.path());
+    first.initialize();
+    let id = first.remember("lock test: written after an empty leftover lock file");
+    first.close_stdin();
+    assert!(first.wait_exit(Duration::from_secs(30)).success());
+
+    // A crashed owner whose pid now belongs to some other live process.
+    leave_log_lock(dir.path(), &u64::from(std::process::id()).to_le_bytes());
+    let mut second = Client::spawn("after-pid-reuse", dir.path());
+    second.initialize();
+    assert!(second.sees(&id));
+    second.close_stdin();
+    assert!(second.wait_exit(Duration::from_secs(30)).success());
+
+    // The same holds for a command that opens the log itself.
+    leave_log_lock(dir.path(), &u64::from(std::process::id()).to_le_bytes());
+    let stats = cli(dir.path(), &["stats"]);
+    assert!(
+        stats.status.success(),
+        "stats was refused by a leftover lock file:\n{}",
+        text(&stats)
+    );
+}
+
+#[test]
+fn a_served_log_stays_locked_against_any_second_opener() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = Client::spawn("server", dir.path());
+    server.initialize();
+    let id = server.remember("lock test: acknowledged before a second open is attempted");
+
+    let lock = dir.path().join("log").join("strata.lock");
+    assert!(lock.exists(), "the log lock file was removed while served");
+    // Another process opening the log directly must be refused for as long
+    // as the server has it open.
+    match vestige_mcp::strata_memory::open(dir.path()) {
+        Ok(_) => panic!("a second writer opened a log a server holds"),
+        Err(error) => assert!(
+            error.to_string().to_lowercase().contains("lock"),
+            "unexpected refusal: {error}"
+        ),
+    }
+    assert!(lock.exists());
+    assert!(server.sees(&id));
+
+    server.close_stdin();
+    assert!(server.wait_exit(Duration::from_secs(30)).success());
+    let log = dir.path().join("log");
+    let verify = cli(dir.path(), &["strata-verify", &log.to_string_lossy()]);
+    assert!(verify.status.success(), "{}", text(&verify));
+}

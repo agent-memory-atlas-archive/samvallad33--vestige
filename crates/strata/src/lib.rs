@@ -51,11 +51,11 @@
 //!
 //! ## Single writer
 //!
-//! Enforced by `strata.lock`, created with `O_EXCL`, holding the owner pid.
-//! Stale locks are detected best-effort with a `kill(pid, 0)` liveness probe;
-//! the probe/unlink pair is racy (TOCTOU) and an unparseable or empty lock
-//! file is treated as held. Remove the file by hand if a writer crashed
-//! between creating the lock and writing its pid.
+//! Enforced by an OS advisory lock on `strata.lock`, held on an open file for
+//! the life of the log and released by the kernel when the holder exits, so a
+//! killed writer never leaves the directory locked and a recycled pid never
+//! looks like a holder. The file records the holder's pid for diagnostics
+//! only, and is never removed while a writer has the log open.
 
 mod error;
 mod format;

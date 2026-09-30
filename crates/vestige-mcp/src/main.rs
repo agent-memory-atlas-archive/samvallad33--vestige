@@ -520,11 +520,9 @@ async fn serve() {
             std::process::exit(1);
         }
     };
-    // Held for the life of `serve`. `log/strata.lock` is a pid file: while
-    // this process is alive it also stops a reader (`dump-migration` opens
-    // that same directory with `StrataLog::open`). The serve lock is taken
-    // first, then the pid file is dropped so the reader can reopen the log
-    // this process is serving.
+    // Held for the life of `serve`. `log/strata.lock` is an OS lock the log
+    // holds while it is open, so a second opener of this directory is refused
+    // for as long as this process serves it; the file is left in place.
     let _serve_lock = serve_lock;
     let storage = match vestige_mcp::strata_memory::open(&strata_dir) {
         Ok(s) => {
@@ -536,7 +534,6 @@ async fn serve() {
             std::process::exit(1);
         }
     };
-    let _ = fs::remove_file(strata_dir.join("log").join("strata.lock"));
 
     // Preserve the released Nomic default in the background so MCP clients can
     // finish their stdio handshake before a first-run model download. Optional
