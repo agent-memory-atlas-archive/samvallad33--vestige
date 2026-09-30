@@ -5,7 +5,77 @@ All notable changes to Vestige will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.0.0] - Unreleased
+
+Vestige 4.0 moves your memory onto Strata, an append-only signed log on your
+machine. Every write goes through a gate and leaves a receipt, every read
+answers from what the log recorded, and a link only counts when the log
+recorded it. Embeddings, keyword search and SQLite are gone from the
+default binaries.
+
+### Upgrading from v3
+
+- The first 4.0 launch upgrades a v3 store: it reads `vestige.db`, builds
+  and verifies a Strata log next to it, and only then publishes `log/`. The v3 file is never modified. A backup copy is written
+  first, owner-only, and a retried upgrade reuses a byte-identical backup
+  instead of stacking another.
+- What carries over: every memory with its scope, its tags and its v3
+  scheduling state; links (as `legacy_inferred` history, never presented as
+  recorded proof); supersession; suppression (suppressed memories stay
+  hidden); intentions; and code anchors. Measured on a real 8,902-memory,
+  34-scope store: all memories, 13,407 links, 54 intentions and 18 anchors
+  carried, and average retention right after the upgrade was 0.810 against
+  0.8105 computed by v3 itself.
+- If the upgrade fails, the v3 data is untouched and the message says so.
+  You can keep using v3.1.1 until the issue is fixed.
+- A store already upgraded by a 4.0 release candidate is missing intentions,
+  scheduling state and anchors. Move its `log/` aside and relaunch to upgrade
+  again from the kept `vestige.db`. Anything written since that first
+  upgrade stays in the moved-aside log.
+
+### Changed
+
+- Recall is by exact handle: a memory id or unique prefix, or an exact tag.
+  Free-text recall, `mode='reason'` and `mode='contradictions'` return
+  `similarity_disabled`. There is no embedding model to download.
+- `tools/list` advertises 16 tools: `causal_walk`, `codebase`, `dedup`,
+  `forgotten_lesson`, `graph`, `intention`, `maintain`, `memory`,
+  `memory_status`, `project`, `recall`, `receipt`, `selftest`,
+  `session_start`, `smart_ingest`, `suppress`.
+- `suppress` hides a memory from every read and keeps its bytes on the log.
+  On Strata it cannot be undone; `reverse=true` is refused. It never meant
+  erasure and it does not claim it.
+- The shipped binaries link no SQLite. `vestige-mcp` is about 7.7 MB on
+  macOS arm64, down from 31.5 MB in v3.1.1.
+- `maintain backup` on Strata writes a copy of the log directory
+  (`backups/vestige-<time>.strata`) and reports its real size. `maintain
+  export` writes JSON or JSONL.
+
+### Withheld in 4.0
+
+Purge is the one tool 4.0 does not ship. On an append-only signed log a
+purge can hide a memory but cannot erase its bytes, and a tool called purge
+must not pretend otherwise. `purge`, `memory` `purge`/`delete` and
+`delete_knowledge` return `unavailable_in_4_0`. Real erasure (per-memory key
+shredding) is the 4.0.x follow-up.
+
+These actions are also refused on Strata with the reason, and left out of
+the advertised schemas: `dedup` `plan_merge`, `plan_supersede`, `apply` and
+`verdict` (they need embeddings), `dedup` `protect`, `graph` `get`, `memory`,
+`neighbors` and `label` (Strata records no composition events), `receipt`
+`save_walk`, `maintain` `restore` (restore a backup by copying its `log/`
+back), `maintain` `export` format `portable`, and `memory_status`
+`changelog` for one `memory_id`.
+
+### Known limits
+
+- The upgrade runs before the first MCP handshake. It took about 16 seconds
+  on a 297 MB store. A much larger store could exceed an MCP client's
+  startup timeout on that first launch.
+- After the upgrade, scheduling follows Strata's fixed forgetting curve, not
+  the personal curve v3 had fitted, so retention drifts slightly from what
+  v3 would have shown (about 0.06 lower after a week).
+
 
 ### Fixed
 
@@ -23,7 +93,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migration receipt as the migration, so a used store's log no longer fails
   the receipt's frame counts.
 
-- Fresh reflections surface in recall (#232): an `Insight` written in the
+- In builds with the v3 SQLite engine (not the 4.0 default), fresh
+  reflections surface in recall (#232): an `Insight` written in the
   last 24 hours takes the lead slot when it is at least 30% as relevant as
   the top result. Raw term-score gaps between a terse reflection and a
   content-rich memory (measured 2.75x on a two-node corpus) previously hid
@@ -47,12 +118,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cargo flags do not pass `connectors` or `cloud-sync` on any target. The
   release workflow rejects a target feature set that links `reqwest`.
 
-- `tools/list` payloads dropped from 56 KB to 19.8 KB (#212): discriminator
-  enums and types stay on the wire, deep variant trees and per-field prose
-  move one call deeper. `memory_status` `view='tools'` with `tool='<name>'`
-  now serves the full, unfolded schema for the selected tool, so no detail
-  is lost — a build-time guard fails if the wire payload ever exceeds 20 KiB
-  again. Recall's investigation filters are grouped into `source` and
+- `tools/list` payloads dropped from 56 KB to 19,359 bytes on the 4.0
+  surface (#212): discriminator enums and types stay on the wire, deep
+  variant trees and per-field prose move one call deeper. `memory_status`
+  `view='tools'` with `tool='<name>'` serves the full schema for the selected
+  tool, so no detail is lost, and a build-time guard fails if the wire
+  payload ever exceeds 20 KiB again. Recall's investigation filters are grouped into `source` and
   `filters` objects in the compact form; the full schema keeps them flat.
 
 ## [3.1.1] - 2026-09-28
