@@ -72,6 +72,11 @@ back), `maintain` `export` format `portable`, and `memory_status`
 - The upgrade runs before the first MCP handshake. It took about 16 seconds
   on a 297 MB store. A much larger store could exceed an MCP client's
   startup timeout on that first launch.
+- Memory PR review modes (`risk_gated`, `paranoid`) are not available on a
+  Strata log. A review setting carried over from v3 reads as `fast` (logged
+  once, the file is left as written), and the dashboard's Memory PR list
+  says review is unavailable. Every write still passes the log's gate and
+  leaves a receipt.
 - After the upgrade, scheduling follows Strata's fixed forgetting curve, not
   the personal curve v3 had fitted, so retention drifts slightly from what
   v3 would have shown (about 0.06 lower after a week).

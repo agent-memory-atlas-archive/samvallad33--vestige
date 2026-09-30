@@ -240,12 +240,42 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         file.read_exact_at(buf, offset)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = offset;
+        // seek_read moves the file cursor on Windows (pread does not), and
+        // appends write at the cursor, so put it back where it was.
+        use std::os::windows::fs::FileExt;
         let mut handle: &File = file;
-        handle.seek(SeekFrom::Start(0))?; // offset applied by callers below
-        handle.read_exact(buf)
+        let resume = handle.stream_position()?;
+        let mut done = 0usize;
+        let read = loop {
+            if done == buf.len() {
+                break Ok(());
+            }
+            match file.seek_read(&mut buf[done..], offset + done as u64) {
+                Ok(0) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "positioned read reached the end of the segment",
+                    ));
+                }
+                Ok(n) => done += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => break Err(e),
+            }
+        };
+        handle.seek(SeekFrom::Start(resume))?;
+        read
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::Read;
+        let mut handle: &File = file;
+        let resume = handle.stream_position()?;
+        handle.seek(SeekFrom::Start(offset))?;
+        let read = handle.read_exact(buf);
+        handle.seek(SeekFrom::Start(resume))?;
+        read
     }
 }
 
