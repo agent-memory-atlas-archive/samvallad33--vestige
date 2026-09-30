@@ -638,6 +638,10 @@ fn replay_store_and_migration_frames_do_not_cross_classify() {
                 // This fixture writes no intention batch. The arm keeps the
                 // match exhaustive after UpsertIntentions landed.
                 StoreOp::UpsertIntentions { .. } => {}
+                // Nor any code anchors.
+                StoreOp::RecordAnchors { .. }
+                | StoreOp::ReplaceAnchors { .. }
+                | StoreOp::RecordAnchorVerdict { .. } => {}
             }
         } else if frame.kind == KIND_STORE_CHECKPOINT {
             store_checkpoints += 1;
@@ -1903,5 +1907,464 @@ fn imported_scope_suppression_and_supersession_survive_replay() {
     let reopened = StrataStore::open(&dir).expect("reopen");
     assert!(reopened.prove_effects().is_ok());
     assert!(!reopened.get_node(suppressed).expect("suppressed").is_live());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ----------------------------------------------------------------------
+// Code anchors
+// ----------------------------------------------------------------------
+
+fn anchor(id: &str, node_id: &str, file_path: &str, start_line: u32) -> crate::AnchorRecord {
+    crate::AnchorRecord {
+        id: id.to_string(),
+        node_id: node_id.to_string(),
+        file_path: file_path.to_string(),
+        symbol: Some("load_config".into()),
+        symbol_kind: Some("fn".into()),
+        start_line: Some(start_line),
+        end_line: Some(start_line + 3),
+        span_lines: Some(4),
+        content_hash: Some("v2:0123456789abcdef0123456789abcdef".into()),
+        captured_at_ms: 1_700_000_000_000,
+        last_verified_at_ms: None,
+        last_status: None,
+    }
+}
+
+fn anchor_ids(rows: &[crate::AnchorRecord]) -> Vec<&str> {
+    rows.iter().map(|row| row.id.as_str()).collect()
+}
+
+#[test]
+fn anchor_ops_append_discriminants_after_every_existing_op() {
+    // Borsh discriminants are positional. The five pre-anchor ops keep 0..=4,
+    // so every log written before anchors existed decodes to the same ops.
+    let existing: [(StoreOp, u8); 2] = [
+        (
+            StoreOp::SupersedeNode {
+                id: "a".into(),
+                superseded_by: "b".into(),
+            },
+            2,
+        ),
+        (
+            StoreOp::UpsertIntentions {
+                records: vec![intention("i", "x")],
+            },
+            4,
+        ),
+    ];
+    for (op, tag) in existing {
+        assert_eq!(borsh::to_vec(&op).expect("encode")[0], tag);
+    }
+    let appended = [
+        (
+            StoreOp::RecordAnchors {
+                anchors: vec![anchor("anchor-1", "mem-1", "src/a.rs", 1)],
+            },
+            5u8,
+        ),
+        (
+            StoreOp::ReplaceAnchors {
+                node_id: "mem-1".into(),
+                anchors: vec![anchor("anchor-2", "mem-1", "src/a.rs", 1)],
+            },
+            6,
+        ),
+        (
+            StoreOp::RecordAnchorVerdict {
+                anchor_id: "anchor-1".into(),
+                status: "drifted".into(),
+                checked_at_ms: 1_700_000_000_001,
+            },
+            7,
+        ),
+    ];
+    for (op, tag) in appended {
+        let bytes = borsh::to_vec(&op).expect("encode");
+        assert_eq!(bytes[0], tag);
+        assert_eq!(decode_exact::<StoreOp>(&bytes), Some(op));
+        assert!(matches!(
+            classify_write_payload(&bytes),
+            WritePayload::StoreOp(_)
+        ));
+    }
+}
+
+#[test]
+fn a_log_written_before_anchors_replays_with_no_anchors() {
+    let dir = temp_dir("anchor-old-log");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let a = store.ingest(input("pre-anchor memory", &["t"])).expect("a");
+    let b = store
+        .ingest(input("second pre-anchor memory", &[]))
+        .expect("b");
+    store
+        .save_connection(&ConnectionRecord {
+            source_id: a.clone(),
+            target_id: b.clone(),
+            ..ConnectionRecord::default()
+        })
+        .expect("edge");
+    store.review(&a, 4).expect("review");
+    store
+        .upsert_intentions(vec![intention("int-old", "old reminder")])
+        .expect("intention");
+    let digest = store.state_digest();
+    drop(store);
+
+    // Every data frame is one of the five ops that predate anchors.
+    for frame in log_frames(&dir) {
+        if frame.kind == KIND_STORE_WRITE {
+            assert!(
+                frame.payload[0] <= 4,
+                "pre-anchor op tag {}",
+                frame.payload[0]
+            );
+        }
+    }
+    let reopened = StrataStore::open(&dir).expect("replay the old log");
+    assert_eq!(reopened.state_digest(), digest);
+    assert_eq!(reopened.orphan_write_count(), 0);
+    assert_eq!(reopened.node_count(), 2);
+    assert_eq!(reopened.edge_count(), 1);
+    assert!(reopened.get_intention("int-old").is_some());
+    assert!(reopened.anchors_for(&a).is_empty());
+    assert!(reopened.prove_effects().is_ok());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn anchors_record_through_one_admitted_write_and_replay() {
+    let dir = temp_dir("anchor-record");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let node = store.ingest(input("pattern memory", &[])).expect("node");
+    let before = store.log().head().frames_total;
+    let effect = store
+        .record_anchors(vec![
+            anchor("anchor-b", &node, "src/z.rs", 10),
+            anchor("anchor-a", &node, "src/a.rs", 40),
+            anchor("anchor-c", &node, "src/a.rs", 2),
+        ])
+        .expect("admit");
+    assert!(effect > 0);
+    assert_eq!(
+        store.log().head().frames_total - before,
+        4,
+        "propose, gate, effect, one data frame"
+    );
+    // SQLite order: file path, then start line.
+    let rows = store.anchors_for(&node);
+    assert_eq!(anchor_ids(&rows), vec!["anchor-c", "anchor-a", "anchor-b"]);
+    assert_eq!(rows[0], anchor("anchor-c", &node, "src/a.rs", 2));
+    // Anchors are not memories: no card, no origin, no node.
+    assert_eq!(store.review_event_count(), 1);
+    assert_eq!(store.origin_seq("anchor-a"), None);
+    assert_eq!(store.node_count(), 1);
+
+    // Insert-or-replace by id, like the SQLite `INSERT OR REPLACE`.
+    let mut moved = anchor("anchor-a", &node, "src/a.rs", 41);
+    moved.symbol = Some("renamed".into());
+    store
+        .record_anchors(vec![moved.clone()])
+        .expect("replace row");
+    assert_eq!(store.anchor("anchor-a"), Some(moved.clone()));
+    assert_eq!(store.anchors_for(&node).len(), 3);
+    let digest = store.state_digest();
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    assert_eq!(reopened.state_digest(), digest);
+    assert_eq!(
+        anchor_ids(&reopened.anchors_for(&node)),
+        vec!["anchor-c", "anchor-a", "anchor-b"]
+    );
+    assert_eq!(reopened.anchor("anchor-a"), Some(moved));
+    assert_eq!(reopened.orphan_write_count(), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_bad_anchor_batch_writes_nothing() {
+    let dir = temp_dir("anchor-refuse");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let node = store.ingest(input("pattern memory", &[])).expect("node");
+    let head = store.log().head().frames_total;
+    let digest = store.state_digest();
+
+    let empty = store.record_anchors(Vec::new()).expect_err("empty batch");
+    assert!(empty.to_string().contains("empty"), "{empty}");
+    let dup = store
+        .record_anchors(vec![
+            anchor("same", &node, "src/a.rs", 1),
+            anchor("same", &node, "src/b.rs", 1),
+        ])
+        .expect_err("duplicate id");
+    assert!(dup.to_string().contains("duplicate"), "{dup}");
+    let unknown = store
+        .record_anchors(vec![anchor("x", "mem-ffffffffffffffff", "src/a.rs", 1)])
+        .expect_err("unknown node");
+    assert!(matches!(unknown, StoreError::NotFound(_)), "{unknown}");
+    let blank = store
+        .record_anchors(vec![anchor("y", &node, "", 1)])
+        .expect_err("blank path");
+    assert!(blank.to_string().contains("must not be empty"), "{blank}");
+    let replace_blank = store
+        .replace_anchors(&node, Vec::new())
+        .expect_err("empty replacement");
+    assert!(
+        replace_blank.to_string().contains("empty"),
+        "{replace_blank}"
+    );
+
+    assert_eq!(store.log().head().frames_total, head);
+    assert_eq!(store.state_digest(), digest);
+    assert!(store.anchors_for(&node).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn replace_anchors_swaps_one_nodes_rows_and_keeps_the_memory() {
+    let dir = temp_dir("anchor-replace");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let node = store.ingest(input("pattern memory", &[])).expect("node");
+    let other = store.ingest(input("other memory", &[])).expect("other");
+    store
+        .record_anchors(vec![
+            anchor("old-1", &node, "src/a.rs", 1),
+            anchor("old-2", &node, "src/b.rs", 1),
+            anchor("keep", &other, "src/c.rs", 1),
+        ])
+        .expect("record");
+    store
+        .record_anchor_verdict("old-1", "drifted", 1_700_000_000_500)
+        .expect("verdict");
+    let node_before = store.get_node(&node).expect("node");
+    let reviews = store.review_event_count();
+
+    let head = store.log().head().frames_total;
+    let wrong = store
+        .replace_anchors(&node, vec![anchor("new-1", &other, "src/a.rs", 1)])
+        .expect_err("row names another node");
+    assert!(wrong.to_string().contains("must name"), "{wrong}");
+    assert_eq!(store.log().head().frames_total, head);
+
+    let fresh = anchor("new-1", &node, "src/a.rs", 3);
+    store
+        .replace_anchors(&node, vec![fresh.clone()])
+        .expect("replace");
+    assert_eq!(store.anchors_for(&node), vec![fresh.clone()]);
+    assert_eq!(store.anchor("old-1"), None);
+    assert_eq!(store.anchor("old-2"), None);
+    // The other memory's anchors and the memory itself are untouched.
+    assert_eq!(anchor_ids(&store.anchors_for(&other)), vec!["keep"]);
+    assert_eq!(store.get_node(&node), Some(node_before.clone()));
+    assert_eq!(store.review_event_count(), reviews);
+    // A verdict for a replaced anchor is a no-op now.
+    let head = store.log().head().frames_total;
+    assert_eq!(
+        store
+            .record_anchor_verdict("old-1", "verified", 1_700_000_000_600)
+            .expect("no-op"),
+        None
+    );
+    assert_eq!(store.log().head().frames_total, head);
+    let digest = store.state_digest();
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    assert_eq!(reopened.state_digest(), digest);
+    assert_eq!(reopened.anchors_for(&node), vec![fresh]);
+    assert_eq!(anchor_ids(&reopened.anchors_for(&other)), vec!["keep"]);
+    assert_eq!(reopened.get_node(&node), Some(node_before));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn anchor_verdicts_update_the_row_and_the_latest_wins_across_reopen() {
+    let dir = temp_dir("anchor-verdict");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let node = store.ingest(input("pattern memory", &[])).expect("node");
+    store
+        .record_anchors(vec![
+            anchor("a1", &node, "src/a.rs", 1),
+            anchor("a2", &node, "src/b.rs", 1),
+        ])
+        .expect("record");
+
+    let head = store.log().head().frames_total;
+    let first = store
+        .record_anchor_verdict("a1", "verified", 1_700_000_001_000)
+        .expect("admit")
+        .expect("known anchor");
+    assert_eq!(store.log().head().frames_total - head, 4);
+    let second = store
+        .record_anchor_verdict("a1", "drifted", 1_700_000_002_000)
+        .expect("admit")
+        .expect("known anchor");
+    assert!(second > first);
+    let row = store.anchor("a1").expect("a1");
+    assert_eq!(row.last_status.as_deref(), Some("drifted"));
+    assert_eq!(row.last_verified_at_ms, Some(1_700_000_002_000));
+    // The capture fields are untouched by a verdict.
+    assert_eq!(
+        row.content_hash,
+        anchor("a1", &node, "src/a.rs", 1).content_hash
+    );
+    assert_eq!(store.anchor("a2").expect("a2").last_status, None);
+
+    let head = store.log().head().frames_total;
+    assert_eq!(
+        store
+            .record_anchor_verdict("anchor-unknown", "verified", 1)
+            .expect("unknown id is a no-op"),
+        None
+    );
+    let blank = store
+        .record_anchor_verdict("a1", "", 1)
+        .expect_err("blank verdict");
+    assert!(blank.to_string().contains("empty"), "{blank}");
+    assert_eq!(store.log().head().frames_total, head);
+    let digest = store.state_digest();
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    assert_eq!(reopened.state_digest(), digest);
+    let row = reopened.anchor("a1").expect("a1");
+    assert_eq!(row.last_status.as_deref(), Some("drifted"));
+    assert_eq!(row.last_verified_at_ms, Some(1_700_000_002_000));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn anchors_of_a_retired_node_are_not_returned_or_written() {
+    let dir = temp_dir("anchor-retired");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let doomed = store.ingest(input("retired pattern", &[])).expect("doomed");
+    let kept = store.ingest(input("kept pattern", &[])).expect("kept");
+    store
+        .record_anchors(vec![
+            anchor("doomed-1", &doomed, "src/a.rs", 1),
+            anchor("kept-1", &kept, "src/a.rs", 1),
+        ])
+        .expect("record");
+    store
+        .retire(
+            &doomed,
+            &kept,
+            &AdmissionContext {
+                rule_id: Some(RULE_SUPPRESS.to_string()),
+                confirm: false,
+            },
+        )
+        .expect("retire");
+
+    assert!(store.anchors_for(&doomed).is_empty());
+    assert_eq!(store.anchor("doomed-1"), None);
+    assert_eq!(anchor_ids(&store.anchors_for(&kept)), vec!["kept-1"]);
+
+    let head = store.log().head().frames_total;
+    let record = store
+        .record_anchors(vec![anchor("doomed-2", &doomed, "src/b.rs", 1)])
+        .expect_err("retired node");
+    assert!(record.to_string().contains("retired"), "{record}");
+    let replace = store
+        .replace_anchors(&doomed, vec![anchor("doomed-3", &doomed, "src/b.rs", 1)])
+        .expect_err("retired node");
+    assert!(replace.to_string().contains("retired"), "{replace}");
+    assert_eq!(
+        store
+            .record_anchor_verdict("doomed-1", "verified", 1)
+            .expect("no-op"),
+        None
+    );
+    assert_eq!(store.log().head().frames_total, head);
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    assert!(reopened.anchors_for(&doomed).is_empty());
+    assert_eq!(reopened.anchor("doomed-1"), None);
+    assert_eq!(anchor_ids(&reopened.anchors_for(&kept)), vec!["kept-1"]);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn anchor_effects_prove_and_the_memory_receipt_keeps_proving() {
+    let dir = temp_dir("anchor-proof");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let node = store.ingest(input("pattern memory", &[])).expect("node");
+    let created = store
+        .latest_effect(&node)
+        .expect("prove")
+        .expect("create effect");
+    assert_eq!(created.action, EffectAction::Create);
+    let recorded = store
+        .record_anchors(vec![
+            anchor("p1", &node, "src/a.rs", 1),
+            anchor("p2", &node, "src/b.rs", 1),
+        ])
+        .expect("record");
+    let checked = store
+        .record_anchor_verdict("p1", "verified", 1_700_000_003_000)
+        .expect("admit")
+        .expect("known");
+    let replaced = store
+        .replace_anchors(&node, vec![anchor("p3", &node, "src/a.rs", 5)])
+        .expect("replace");
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    let proofs = reopened.prove_effects().expect("every effect still proves");
+    // The memory's own receipt is still its create; anchors never shadow it.
+    assert_eq!(reopened.latest_effect(&node).expect("prove"), Some(created));
+    let batch: Vec<_> = proofs
+        .iter()
+        .filter(|proof| proof.effect_seq == recorded)
+        .collect();
+    assert_eq!(batch.len(), 2, "one proof per anchor row");
+    assert!(batch
+        .iter()
+        .all(|proof| proof.action == EffectAction::Anchor && proof.rating.is_none()));
+    assert_eq!(
+        batch.iter().map(|p| p.node_id.as_str()).collect::<Vec<_>>(),
+        vec!["p1", "p2"]
+    );
+    let verdict = reopened
+        .effect_by_seq(checked)
+        .expect("prove")
+        .expect("verdict effect");
+    assert_eq!(verdict.action, EffectAction::AnchorVerdict);
+    assert_eq!(verdict.node_id, "p1");
+    let swap = reopened
+        .effect_by_seq(replaced)
+        .expect("prove")
+        .expect("replace effect");
+    assert_eq!(swap.action, EffectAction::Anchor);
+    assert_eq!(swap.node_id, "p3");
+    // A fresh fold of the log lands on the live digest.
+    assert_eq!(
+        reopened.refold().expect("refold").state_digest,
+        reopened.state_digest()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn an_unadmitted_anchor_frame_is_an_orphan() {
+    let dir = temp_dir("anchor-orphan");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let node = store.ingest(input("pattern memory", &[])).expect("node");
+    drop(store);
+    // A data frame with no admitting EFFECT: replay must ignore it.
+    let forged = borsh::to_vec(&StoreOp::RecordAnchors {
+        anchors: vec![anchor("forged", &node, "src/a.rs", 1)],
+    })
+    .expect("encode");
+    append_payload(&dir, KIND_STORE_WRITE, &forged);
+
+    let reopened = StrataStore::open(&dir).expect("replay");
+    assert_eq!(reopened.orphan_write_count(), 1);
+    assert!(reopened.anchors_for(&node).is_empty());
+    assert_eq!(reopened.anchor("forged"), None);
     std::fs::remove_dir_all(&dir).ok();
 }

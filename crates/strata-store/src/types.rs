@@ -284,6 +284,41 @@ impl IntentionRecord {
     }
 }
 
+/// One code anchor: a pointer from a memory into source, plus the
+/// fingerprint a later check compares against the working tree.
+///
+/// Mirror of vestige-core's `CodeAnchor` with integer times (unix ms). The
+/// store never hashes source and never reads a clock: every field is the
+/// caller's. `last_status` is the persisted verdict string (`verified`,
+/// `moved`, `drifted`, `missing`, `unverifiable`); `None` means never checked.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct AnchorRecord {
+    /// Anchor id (the registry key). Unique across nodes.
+    pub id: String,
+    /// The memory this anchor belongs to.
+    pub node_id: String,
+    /// Repository-relative (or absolute) path of the anchored file.
+    pub file_path: String,
+    /// Symbol the memory is about, if any.
+    pub symbol: Option<String>,
+    /// Display kind of the symbol (`fn`, `class`, ...).
+    pub symbol_kind: Option<String>,
+    /// Capture-time first line of the span (1-based). A reporting hint.
+    pub start_line: Option<u32>,
+    /// Capture-time last line of the span (1-based, inclusive).
+    pub end_line: Option<u32>,
+    /// Lines the hash covers. `None` means the anchor cannot be checked.
+    pub span_lines: Option<u32>,
+    /// Versioned content fingerprint. `None` means the anchor cannot be checked.
+    pub content_hash: Option<String>,
+    /// Capture time (unix ms).
+    pub captured_at_ms: i64,
+    /// Time of the latest recorded verification (unix ms).
+    pub last_verified_at_ms: Option<i64>,
+    /// Latest recorded verdict.
+    pub last_status: Option<String>,
+}
+
 /// Whole-word failure markers, ported from vestige-core's
 /// `advanced::retroactive_backfill::FAILURE_MARKERS` (same list, same
 /// semantics: bare "500" and bare "pinned" stay removed).

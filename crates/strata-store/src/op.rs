@@ -3,7 +3,7 @@
 //! frame whose payload is `borsh(StoreOp)` and whose blake3 digest equals the
 //! admitting `EFFECT.payload_digest`.
 
-use crate::types::{ConnectionRecord, IntentionRecord, NodeRecord};
+use crate::types::{AnchorRecord, ConnectionRecord, IntentionRecord, NodeRecord};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 /// Frame kind: a store data frame (payload = `borsh(StoreOp)`).
@@ -61,5 +61,33 @@ pub enum StoreOp {
     UpsertIntentions {
         /// Records keyed by `id`.
         records: Vec<IntentionRecord>,
+    },
+    // Variants below were appended for code anchors. Borsh discriminants are
+    // positional: never reorder, only append, or old logs stop replaying.
+    /// Insert or replace code anchors by anchor id (discriminant `5`). One
+    /// admitted effect covers the batch. Anchors are not memory cards:
+    /// applying this op folds no review.
+    RecordAnchors {
+        /// Anchors keyed by `id`; each names its own `node_id`.
+        anchors: Vec<AnchorRecord>,
+    },
+    /// Drop every anchor of `node_id`, then insert `anchors` (discriminant
+    /// `6`). The memory itself is not touched.
+    ReplaceAnchors {
+        /// The memory whose anchors are replaced.
+        node_id: String,
+        /// The replacement set; every row names `node_id`.
+        anchors: Vec<AnchorRecord>,
+    },
+    /// Cache one anchor's latest verification verdict (discriminant `7`).
+    /// Informational: readers re-verify against the live tree.
+    RecordAnchorVerdict {
+        /// The anchor checked.
+        anchor_id: String,
+        /// Verdict string (`verified`, `moved`, `drifted`, `missing`,
+        /// `unverifiable`).
+        status: String,
+        /// Check time (unix ms), supplied by the caller.
+        checked_at_ms: i64,
     },
 }

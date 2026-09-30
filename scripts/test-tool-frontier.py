@@ -335,6 +335,57 @@ def run(binary, output):
             kept_suppress = tool("memory", {"action": "get", "id": suppress_id})
             assert "STRATA_SUPPRESS_DOOMED" in json.dumps(kept_suppress)
             passed("purge, delete and suppress are withheld on Strata and change nothing")
+            anchored_repo = root / "anchored-repo"
+            (anchored_repo / "src").mkdir(parents=True)
+            anchored_source = anchored_repo / "src" / "state.rs"
+            anchored_source.write_text(
+                "use std::fs;\n\npub fn load_config(path: &str) -> Config {\n"
+                "    let raw = fs::read_to_string(path).unwrap();\n    parse(&raw)\n}\n"
+            )
+            anchored_files = ["src/state.rs#load_config"]
+            saved_pattern = tool("codebase", {
+                "action": "remember_pattern", "name": "Eager config read",
+                "description": "load_config reads the whole file eagerly",
+                "files": anchored_files, "repoPath": str(anchored_repo), "codebase": "anchored",
+            })
+            saved_anchors = saved_pattern["anchors"]
+            assert saved_anchors["count"] == 1 and saved_anchors["verifiable"] == 1, saved_pattern
+            assert saved_anchors["recorded"] == 1 and saved_anchors.get("error") is None, saved_pattern
+            pattern_id = saved_pattern["nodeId"]
+            verify_args = {"action": "verify", "codebase": "anchored", "repoPath": str(anchored_repo)}
+            context_args = {"action": "get_context", "codebase": "anchored", "repoPath": str(anchored_repo)}
+            fresh_report = tool("codebase", verify_args)
+            assert fresh_report["checked"] == 1 and fresh_report["fresh"] == 1, fresh_report
+            assert fresh_report["stale"] == 0, fresh_report
+            current = tool("codebase", context_args)
+            assert current["patterns"]["items"][0]["anchorStatus"] == "verified", current
+            assert current["staleMemories"] == [], current
+            anchored_source.write_text("pub fn load_config(path: &str) -> Config {\n    Config::from_env()\n}\n")
+            drift_report = tool("codebase", verify_args)
+            assert drift_report["stale"] == 1 and drift_report["fresh"] == 0, drift_report
+            assert drift_report["staleMemories"][0]["id"] == pattern_id, drift_report
+            assert drift_report["staleMemories"][0]["status"] == "drifted", drift_report
+            stale_context = tool("codebase", context_args)
+            assert stale_context["staleMemories"] == [pattern_id], stale_context
+            assert stale_context["patterns"]["items"][0]["stale"] is True, stale_context
+            reanchored = tool("codebase", {
+                "action": "reanchor", "memoryId": pattern_id,
+                "repoPath": str(anchored_repo), "files": anchored_files,
+            })
+            assert reanchored["anchorsReplaced"] == 1, reanchored
+            assert reanchored["memoryContentChanged"] is False, reanchored
+            reanchored_report = tool("codebase", verify_args)
+            assert reanchored_report["fresh"] == 1 and reanchored_report["stale"] == 0, reanchored_report
+            pattern_receipt = tool("receipt", {"action": "get", "receipt_id": pattern_id})
+            assert pattern_receipt["receipt"]["mutations"][0]["kind"] == "created", pattern_receipt
+            proc.terminate()
+            proc.wait(timeout=10)
+            spawn()
+            handshake()
+            replayed_report = tool("codebase", verify_args)
+            assert replayed_report["fresh"] == 1 and replayed_report["stale"] == 0, replayed_report
+            assert_no_sqlite()
+            passed("codebase anchors record, verify fresh, flag drift, reanchor, and replay after restart")
             unanchored = tool("causal_walk", {"scope": "user"})
             assert unanchored["status"] == "completed" and unanchored["causes"] == []
             assert unanchored["needs_report"]["missing"] == ["node_id"], unanchored

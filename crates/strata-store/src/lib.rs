@@ -59,6 +59,7 @@
 #![warn(missing_docs)]
 
 mod card;
+mod anchor;
 mod error;
 mod gate_log;
 mod op;
@@ -79,6 +80,6 @@ pub use store::{
     RULE_EDIT, RULE_INTENTIONS, RULE_PURGE, RULE_SUPPRESS,
 };
 pub use types::{
-    looks_like_failure, ConnectionRecord, EdgeDirection, EdgeKind, IngestInput, IntentionRecord,
-    NodeRecord, SourceKey, TYPED_EDGE_VOCABULARY, VALID_FOREVER_MS,
+    looks_like_failure, AnchorRecord, ConnectionRecord, EdgeDirection, EdgeKind, IngestInput,
+    IntentionRecord, NodeRecord, SourceKey, TYPED_EDGE_VOCABULARY, VALID_FOREVER_MS,
 };

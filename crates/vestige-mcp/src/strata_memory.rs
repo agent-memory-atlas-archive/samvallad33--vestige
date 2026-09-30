@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, Weak};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use strata_store::VALID_FOREVER_MS;
+use vestige_core::codebase::{AnchorStatus, CodeAnchor};
 use vestige_core::intention_graph::Command;
 use vestige_core::storage::{
     CompositionEventRecord, ConnectionRecord as VestigeEdge, ConsolidationHistoryRecord,
@@ -425,6 +426,46 @@ fn core_intention(
     })
 }
 
+/// A code anchor as the log stores it: integer times, verdict as its string.
+fn stored_anchor(anchor: &CodeAnchor) -> strata_store::AnchorRecord {
+    strata_store::AnchorRecord {
+        id: anchor.id.clone(),
+        node_id: anchor.node_id.clone(),
+        file_path: anchor.file_path.clone(),
+        symbol: anchor.symbol.clone(),
+        symbol_kind: anchor.symbol_kind.clone(),
+        start_line: anchor.start_line,
+        end_line: anchor.end_line,
+        span_lines: anchor.span_lines,
+        content_hash: anchor.content_hash.clone(),
+        captured_at_ms: anchor.captured_at.timestamp_millis(),
+        last_verified_at_ms: anchor.last_verified_at.map(|at| at.timestamp_millis()),
+        last_status: anchor.last_status.map(|status| status.as_str().to_string()),
+    }
+}
+
+/// A stored anchor back as the tool surface reads it. An unknown verdict
+/// string reads as never checked, never as stale.
+fn core_anchor(record: &strata_store::AnchorRecord) -> CodeAnchor {
+    CodeAnchor {
+        id: record.id.clone(),
+        node_id: record.node_id.clone(),
+        file_path: record.file_path.clone(),
+        symbol: record.symbol.clone(),
+        symbol_kind: record.symbol_kind.clone(),
+        start_line: record.start_line,
+        end_line: record.end_line,
+        span_lines: record.span_lines,
+        content_hash: record.content_hash.clone(),
+        captured_at: ms_to_dt(record.captured_at_ms),
+        last_verified_at: record.last_verified_at_ms.map(ms_to_dt),
+        last_status: record
+            .last_status
+            .as_deref()
+            .and_then(AnchorStatus::parse_status),
+    }
+}
+
 fn is_prospective(row: &vestige_core::storage::IntentionRecord) -> bool {
     row.source_type != crate::intention_graph_log::SOURCE
 }
@@ -500,6 +541,8 @@ fn mutation_kind(proof: &strata_store::EffectProof) -> &'static str {
         (strata_store::EffectAction::Review, Some(DEMOTE_RATING)) => "demoted",
         (strata_store::EffectAction::Review, _) => "reviewed",
         (strata_store::EffectAction::Intention, _) => "intention_upserted",
+        (strata_store::EffectAction::Anchor, _) => "anchor_recorded",
+        (strata_store::EffectAction::AnchorVerdict, _) => "anchor_verified",
     }
 }
 
@@ -1603,15 +1646,100 @@ impl MemoryStoreSend for StrataMemory {
         Ok(out)
     }
 
+    fn code_anchors_for_node(&self, node_id: &str) -> Result<Vec<CodeAnchor>, StorageError> {
+        Ok(self
+            .lock()
+            .anchors_for(node_id)
+            .iter()
+            .map(core_anchor)
+            .collect())
+    }
+
     fn code_anchors_for_nodes(
         &self,
-        _node_ids: &[String],
-    ) -> Result<
-        std::collections::HashMap<String, Vec<vestige_core::codebase::CodeAnchor>>,
-        StorageError,
-    > {
-        // Anchors are not admitted on this log, so the recorded set is empty.
-        Ok(std::collections::HashMap::new())
+        node_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<CodeAnchor>>, StorageError> {
+        // A memory with no anchors (or a retired one) is absent from the map;
+        // the retrieval path reports that as unverifiable, never as stale.
+        let store = self.lock();
+        let mut out = std::collections::HashMap::new();
+        for node_id in node_ids {
+            let rows = store.anchors_for(node_id);
+            if !rows.is_empty() {
+                out.insert(node_id.clone(), rows.iter().map(core_anchor).collect());
+            }
+        }
+        Ok(out)
+    }
+
+    fn record_code_anchors(&self, anchors: &[CodeAnchor]) -> Result<usize, StorageError> {
+        if anchors.is_empty() {
+            return Ok(0);
+        }
+        // SQLite's INSERT OR REPLACE keeps the last row for a repeated id.
+        // The log admits one row per id, so fold repeats the same way.
+        let mut rows: Vec<strata_store::AnchorRecord> = Vec::with_capacity(anchors.len());
+        for anchor in anchors {
+            let row = stored_anchor(anchor);
+            match rows.iter_mut().find(|kept| kept.id == row.id) {
+                Some(kept) => *kept = row,
+                None => rows.push(row),
+            }
+        }
+        self.lock().record_anchors(rows).map_err(map_store)?;
+        Ok(anchors.len())
+    }
+
+    fn replace_code_anchors(
+        &self,
+        node_id: &str,
+        scope: &str,
+        anchors: &[CodeAnchor],
+    ) -> Result<usize, StorageError> {
+        if anchors.is_empty()
+            || anchors
+                .iter()
+                .any(|anchor| anchor.node_id != node_id || !anchor.is_verifiable())
+        {
+            return Err(StorageError::Init(
+                "Replacement requires complete verifiable anchors for this memory".into(),
+            ));
+        }
+        let mut store = self.lock();
+        let is_code_memory = store.get_node(node_id).is_some_and(|record| {
+            retrievable(&record)
+                && record.scope == scope.trim()
+                && matches!(record.node_type.as_str(), "pattern" | "decision")
+        });
+        if !is_code_memory {
+            return Err(StorageError::Init(
+                "Code memory not found in requested scope".into(),
+            ));
+        }
+        // Replaced evidence has not been checked yet, same as the SQLite path.
+        let rows = anchors
+            .iter()
+            .map(|anchor| strata_store::AnchorRecord {
+                last_verified_at_ms: None,
+                last_status: None,
+                ..stored_anchor(anchor)
+            })
+            .collect();
+        store.replace_anchors(node_id, rows).map_err(map_store)?;
+        Ok(anchors.len())
+    }
+
+    fn record_anchor_verification(
+        &self,
+        anchor_id: &str,
+        status: AnchorStatus,
+        checked_at: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        // An unknown anchor, or one whose memory is retired, appends nothing.
+        self.lock()
+            .record_anchor_verdict(anchor_id, status.as_str(), checked_at.timestamp_millis())
+            .map_err(map_store)?;
+        Ok(())
     }
 
     fn projection_candidates(

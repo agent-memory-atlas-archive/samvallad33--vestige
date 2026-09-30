@@ -21,12 +21,13 @@ use strata_kernel::state::State;
 use strata_kernel::verify::verify_with_head;
 
 use crate::card::{CardEvent, ImportedCard};
+use crate::anchor::AnchorIndex;
 use crate::error::StoreError;
 use crate::gate_log::StrataEventLog;
 use crate::op::{StoreOp, KIND_STORE_CHECKPOINT, KIND_STORE_WRITE};
 use crate::types::{
-    ConnectionRecord, EdgeDirection, EdgeKind, IngestInput, IntentionRecord, NodeRecord,
-    VALID_FOREVER_MS,
+    AnchorRecord, ConnectionRecord, EdgeDirection, EdgeKind, IngestInput, IntentionRecord,
+    NodeRecord, VALID_FOREVER_MS,
 };
 
 /// Subdirectory holding the durable log.
@@ -202,17 +203,26 @@ pub enum EffectAction {
     /// Intention row inserted or replaced by `UpsertIntentions`. A batch
     /// proves one effect per row, all citing the same EFFECT. Not a card.
     Intention,
+    /// Code anchor recorded by `RecordAnchors` or `ReplaceAnchors`. One
+    /// effect per anchor row, named by the anchor id. Not a card.
+    Anchor,
+    /// Verification verdict cached by `RecordAnchorVerdict`, named by the
+    /// anchor id. Not a card.
+    AnchorVerdict,
 }
 
-/// One node or intention effect proved from the log: covering propose, Allow
-/// gate, and a data frame whose blake3 matches the effect's payload digest.
+/// One node, intention or anchor effect proved from the log: covering
+/// propose, Allow gate, and a data frame whose blake3 matches the effect's
+/// payload digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectProof {
     /// Gate-space seq of the EFFECT record (`eff-` receipt id).
     pub effect_seq: u64,
     /// Log seq of the STORE_WRITE frame (FSRS `event_seq` for reviews).
     pub data_seq: u64,
-    /// Node (or intention, for [`EffectAction::Intention`]) the effect names.
+    /// Node the effect names. An intention id for [`EffectAction::Intention`];
+    /// an anchor id for [`EffectAction::Anchor`] and
+    /// [`EffectAction::AnchorVerdict`].
     pub node_id: String,
     /// Which mutation landed.
     pub action: EffectAction,
@@ -261,6 +271,8 @@ struct StateDigest<'a> {
     /// card handle → latest explicit `reviewed_at_ms`.
     reviewed_at: Vec<(u64, i64)>,
     intentions: Vec<(&'a str, &'a IntentionRecord)>,
+    /// Code anchors in (node id, anchor id) order.
+    anchors: Vec<&'a AnchorRecord>,
 }
 
 /// A payload is this type only when borsh consumes it exactly. Kind bytes
@@ -416,6 +428,9 @@ pub struct StrataStore {
     /// rebuilds it. Undo reads it to append a compensating record; it never
     /// rewrites or truncates the log.
     upserts: BTreeMap<String, Vec<(u64, NodeRecord)>>,
+    /// Code anchors (derived). Rows of a retired node stay here; reads
+    /// filter them out.
+    anchors: AnchorIndex,
 }
 
 impl StrataStore {
@@ -473,6 +488,7 @@ impl StrataStore {
             call_admitted: BTreeSet::new(),
             retire_rules: BTreeMap::new(),
             upserts: BTreeMap::new(),
+            anchors: AnchorIndex::default(),
         };
         store.replay()?;
         store.verify_checkpoint_chain()?;
@@ -653,6 +669,17 @@ impl StrataStore {
                     self.intentions.insert(record.id.clone(), record.clone());
                 }
             }
+            // Anchors are not origins: a receipt replay of a memory resolves
+            // through the node's own write, never through its anchors.
+            StoreOp::RecordAnchors { anchors } => self.anchors.record(anchors),
+            StoreOp::ReplaceAnchors { node_id, anchors } => {
+                self.anchors.replace(node_id, anchors);
+            }
+            StoreOp::RecordAnchorVerdict {
+                anchor_id,
+                status,
+                checked_at_ms,
+            } => self.anchors.verdict(anchor_id, status, *checked_at_ms),
         }
         Ok(())
     }
@@ -1036,6 +1063,138 @@ impl StrataStore {
     /// Every intention, in id order.
     pub fn intentions(&self) -> Vec<IntentionRecord> {
         self.intentions.values().cloned().collect()
+    }
+
+    /// A node that exists and is not retired, or why not.
+    fn require_live_node(&self, id: &str) -> Result<&NodeRecord, StoreError> {
+        let record = self.require_node(id)?;
+        if !record.is_live() {
+            return Err(StoreError::InvalidInput(format!("node {id} is retired")));
+        }
+        Ok(record)
+    }
+
+    /// Shape checks shared by record and replace. Writes nothing.
+    fn check_anchor_batch(&self, anchors: &[AnchorRecord]) -> Result<(), StoreError> {
+        if anchors.is_empty() {
+            return Err(StoreError::InvalidInput("anchor batch is empty".into()));
+        }
+        let mut seen = BTreeSet::new();
+        for anchor in anchors {
+            if anchor.id.is_empty() || anchor.node_id.is_empty() || anchor.file_path.is_empty() {
+                return Err(StoreError::InvalidInput(
+                    "anchor id, node id and file path must not be empty".into(),
+                ));
+            }
+            if !seen.insert(anchor.id.as_str()) {
+                let id = &anchor.id;
+                return Err(StoreError::InvalidInput(format!(
+                    "duplicate anchor id {id}"
+                )));
+            }
+            self.require_live_node(&anchor.node_id)?;
+        }
+        Ok(())
+    }
+
+    /// Insert or replace code anchors by anchor id through one admitted
+    /// write. Every anchor must name a live node. Returns the gate-space
+    /// effect seq; a refused batch appends nothing.
+    pub fn record_anchors(&mut self, anchors: Vec<AnchorRecord>) -> Result<u64, StoreError> {
+        self.check_anchor_batch(&anchors)?;
+        let nodes: BTreeSet<&str> = anchors
+            .iter()
+            .map(|anchor| anchor.node_id.as_str())
+            .collect();
+        let context = self.context_for(&nodes.into_iter().collect::<Vec<_>>());
+        let (effect_seq, _) = self.admit_write(
+            StoreOp::RecordAnchors { anchors },
+            action_kind::WRITE,
+            context,
+        )?;
+        Ok(effect_seq)
+    }
+
+    /// Replace every anchor of `node_id` with `anchors` through one admitted
+    /// write. The memory itself is not rewritten. Every row must name
+    /// `node_id`, and the node must be live.
+    pub fn replace_anchors(
+        &mut self,
+        node_id: &str,
+        anchors: Vec<AnchorRecord>,
+    ) -> Result<u64, StoreError> {
+        self.require_live_node(node_id)?;
+        self.check_anchor_batch(&anchors)?;
+        if anchors.iter().any(|anchor| anchor.node_id != node_id) {
+            return Err(StoreError::InvalidInput(format!(
+                "every replacement anchor must name node {node_id}"
+            )));
+        }
+        let context = self.context_for(&[node_id]);
+        let (effect_seq, _) = self.admit_write(
+            StoreOp::ReplaceAnchors {
+                node_id: node_id.to_string(),
+                anchors,
+            },
+            action_kind::WRITE,
+            context,
+        )?;
+        Ok(effect_seq)
+    }
+
+    /// Cache one anchor's latest verdict. `Ok(None)` and nothing appended
+    /// when the anchor is unknown or its node is retired (the SQLite store's
+    /// `UPDATE` of zero rows).
+    pub fn record_anchor_verdict(
+        &mut self,
+        anchor_id: &str,
+        status: &str,
+        checked_at_ms: i64,
+    ) -> Result<Option<u64>, StoreError> {
+        if status.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "anchor verdict must not be empty".into(),
+            ));
+        }
+        let Some(node_id) = self.anchor(anchor_id).map(|anchor| anchor.node_id) else {
+            return Ok(None);
+        };
+        let context = self.context_for(&[node_id.as_str()]);
+        let (effect_seq, _) = self.admit_write(
+            StoreOp::RecordAnchorVerdict {
+                anchor_id: anchor_id.to_string(),
+                status: status.to_string(),
+                checked_at_ms,
+            },
+            action_kind::WRITE,
+            context,
+        )?;
+        Ok(Some(effect_seq))
+    }
+
+    /// Anchors of a live node, ordered by file path, start line, then id.
+    /// A retired or unknown node has none.
+    pub fn anchors_for(&self, node_id: &str) -> Vec<AnchorRecord> {
+        if !self.nodes.get(node_id).is_some_and(NodeRecord::is_live) {
+            return Vec::new();
+        }
+        let mut rows = self.anchors.rows_of(node_id);
+        rows.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.start_line.cmp(&b.start_line))
+                .then(a.id.cmp(&b.id))
+        });
+        rows
+    }
+
+    /// One anchor by id, when its node is live.
+    pub fn anchor(&self, anchor_id: &str) -> Option<AnchorRecord> {
+        let row = self.anchors.get(anchor_id)?;
+        self.nodes
+            .get(&row.node_id)
+            .is_some_and(NodeRecord::is_live)
+            .then(|| row.clone())
     }
 
     /// Gate-space effect seq of the write that created `id`, if it exists.
@@ -1468,7 +1627,8 @@ impl StrataStore {
             .collect()
     }
 
-    /// Every node and intention effect proved from the log, in effect-seq order.
+    /// Every node, intention and code-anchor effect proved from the log, in
+    /// effect-seq order.
     ///
     /// `verify_tail` checks the active segment's hash chain (and the trailer
     /// signature when the segment is sealed). Each effect must cite an Allow
@@ -1609,6 +1769,27 @@ impl StrataStore {
                         }));
                         continue;
                     }
+                    StoreOp::RecordAnchors { anchors }
+                    | StoreOp::ReplaceAnchors { anchors, .. } => {
+                        // One admitted batch: every anchor row cites this effect.
+                        proofs.extend(anchors.into_iter().map(|anchor| EffectProof {
+                            effect_seq,
+                            data_seq: frame.seq,
+                            node_id: anchor.id,
+                            action: EffectAction::Anchor,
+                            payload_digest: digest,
+                            rating: None,
+                        }));
+                        continue;
+                    }
+                    StoreOp::RecordAnchorVerdict { anchor_id, .. } => EffectProof {
+                        effect_seq,
+                        data_seq: frame.seq,
+                        node_id: anchor_id,
+                        action: EffectAction::AnchorVerdict,
+                        payload_digest: digest,
+                        rating: None,
+                    },
                     StoreOp::SaveEdge { .. } | StoreOp::SupersedeNode { .. } => continue,
                 };
                 proofs.push(proof);
@@ -1841,8 +2022,8 @@ impl StrataStore {
 
     /// blake3 digest over the canonical projection of every derived map
     /// (nodes, origins, edges, FSRS state root, checkpoint hashes, orphan
-    /// count, explicit review clocks, intentions). Two stores replaying the
-    /// same log produce the same digest.
+    /// count, explicit review clocks, intentions, code anchors). Two stores
+    /// replaying the same log produce the same digest.
     pub fn state_digest(&self) -> [u8; 32] {
         let digest = StateDigest {
             nodes: self.nodes.iter().map(|(k, v)| (k.as_str(), v)).collect(),
@@ -1857,6 +2038,7 @@ impl StrataStore {
                 .iter()
                 .map(|(id, record)| (id.as_str(), record))
                 .collect(),
+            anchors: self.anchors.iter().collect(),
         };
         hash32(&borsh_vec(&digest).expect("state digest serialization is infallible"))
     }
@@ -1892,6 +2074,7 @@ impl StrataStore {
             call_admitted: BTreeSet::new(),
             retire_rules: BTreeMap::new(),
             upserts: BTreeMap::new(),
+            anchors: AnchorIndex::default(),
         };
         scratch.replay()?;
         let mut retrievability = BTreeMap::new();
