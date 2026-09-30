@@ -259,29 +259,76 @@ pub fn project(storage: &Arc<Storage>, opts: &ProjectionOptions) -> Result<Proje
     })
 }
 
+/// Byte range of the first well-formed fence in `text`: a begin-marker line
+/// and a later end-marker line, both starting at column 0 and outside any
+/// fenced code block. The range runs from the start of the begin line to the
+/// end of the end line, including its line terminator.
+fn find_fence(text: &str) -> Option<(usize, usize)> {
+    let mut code_fence: Option<(char, usize)> = None;
+    let mut begin: Option<usize> = None;
+    let mut offset = 0;
+    for raw in text.split_inclusive('\n') {
+        let line_start = offset;
+        offset += raw.len();
+        let line = raw.trim_end_matches(['\n', '\r']);
+
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let body = &line[indent..];
+        if indent <= 3 {
+            let fence_char = body.chars().next().filter(|c| matches!(c, '`' | '~'));
+            if let Some(c) = fence_char {
+                let run = body.chars().take_while(|&x| x == c).count();
+                match code_fence {
+                    None if run >= 3 && !(c == '`' && body[run..].contains('`')) => {
+                        code_fence = Some((c, run));
+                        continue;
+                    }
+                    Some((open_c, open_run))
+                        if c == open_c && run >= open_run && body[run..].trim().is_empty() =>
+                    {
+                        code_fence = None;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if code_fence.is_some() {
+            continue;
+        }
+        match begin {
+            None => {
+                let is_begin = line.strip_prefix(BEGIN_MARKER).is_some_and(|rest| {
+                    rest.starts_with(char::is_whitespace) && line.trim_end().ends_with("-->")
+                });
+                if is_begin {
+                    begin = Some(line_start);
+                }
+            }
+            Some(start) => {
+                if line.trim_end() == END_MARKER {
+                    return Some((start, offset));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Replace the fenced region inside `existing` with `region`, or append it
-/// when the file has none. Text outside the fence is returned byte for byte.
+/// when the file has no well-formed fence. A begin marker that appears in
+/// prose, in a code block, or without a matching end marker is ordinary text
+/// and is left alone. Text outside the fence is returned byte for byte.
 /// Applying the same region twice yields the same file.
 pub fn splice(existing: &str, region: &str) -> String {
     let region = region.strip_suffix('\n').unwrap_or(region);
-    if let Some(begin) = existing.find(BEGIN_MARKER) {
-        let line_start = existing[..begin].rfind('\n').map_or(0, |i| i + 1);
-        if let Some(end_rel) = existing[begin..].find(END_MARKER) {
-            let end = begin + end_rel + END_MARKER.len();
-            // Swallow the newline that closed the old end marker so the new
-            // region's own terminator does not double it.
-            let end = if existing[end..].starts_with('\n') {
-                end + 1
-            } else {
-                end
-            };
-            let mut out = String::with_capacity(existing.len() + region.len());
-            out.push_str(&existing[..line_start]);
-            out.push_str(region);
-            out.push('\n');
-            out.push_str(&existing[end..]);
-            return out;
-        }
+    if let Some((start, end)) = find_fence(existing) {
+        let mut out = String::with_capacity(existing.len() + region.len());
+        out.push_str(&existing[..start]);
+        out.push_str(region);
+        out.push('\n');
+        out.push_str(&existing[end..]);
+        return out;
     }
     let mut out = existing.to_string();
     if !out.is_empty() && !out.ends_with('\n') {
@@ -685,5 +732,82 @@ mod tests {
         )
         .unwrap();
         assert!(other_scope.is_empty(), "scope isolation holds");
+    }
+}
+
+#[cfg(test)]
+mod splice_fence_tests {
+    use super::*;
+
+    const REGION: &str = "<!-- vestige:projection:begin scope=user format=claude-md -->\n## Vestige memory (projected)\n- new <!-- vestige:d2 -->\n<!-- vestige:projection:end -->\n";
+
+    fn old_block() -> String {
+        "<!-- vestige:projection:begin scope=user format=claude-md -->\n- old <!-- vestige:d1 -->\n<!-- vestige:projection:end -->\n".to_string()
+    }
+
+    #[test]
+    fn begin_marker_in_prose_without_end_keeps_all_text() {
+        let existing = "# Notes\n\nThe fence starts with <!-- vestige:projection:begin in a file.\n\nImportant paragraph one.\n\nImportant paragraph two.\n";
+        let out = splice(existing, REGION);
+        assert!(out.starts_with(existing), "text lost:\n{out}");
+        assert!(out.ends_with(REGION), "{out}");
+    }
+
+    #[test]
+    fn begin_marker_in_prose_before_real_fence_keeps_text_between() {
+        let existing = format!(
+            "Intro mentions <!-- vestige:projection:begin here.\n\nKeep this middle section.\n\n{}\nTail.\n",
+            old_block()
+        );
+        let out = splice(&existing, REGION);
+        assert!(out.contains("Intro mentions <!-- vestige:projection:begin here."));
+        assert!(out.contains("Keep this middle section."), "{out}");
+        assert!(
+            out.contains("vestige:d2") && !out.contains("vestige:d1"),
+            "{out}"
+        );
+        assert!(out.ends_with("Tail.\n"), "{out}");
+    }
+
+    #[test]
+    fn markers_inside_a_code_block_are_not_a_fence() {
+        let existing = format!(
+            "# Docs\n\n```html\n<!-- vestige:projection:begin scope=x format=claude-md -->\nexample\n<!-- vestige:projection:end -->\n```\n\nKeep me.\n\n{}",
+            old_block()
+        );
+        let out = splice(&existing, REGION);
+        assert!(out.contains("```html\n<!-- vestige:projection:begin scope=x format=claude-md -->\nexample\n<!-- vestige:projection:end -->\n```"), "{out}");
+        assert!(out.contains("Keep me."), "{out}");
+        assert!(
+            out.contains("vestige:d2") && !out.contains("vestige:d1"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn only_marker_pair_inside_code_block_appends_instead_of_replacing() {
+        let existing = "```\n<!-- vestige:projection:begin scope=x format=claude-md -->\nexample\n<!-- vestige:projection:end -->\n```\n";
+        let out = splice(existing, REGION);
+        assert!(out.starts_with(existing), "{out}");
+        assert!(out.ends_with(REGION), "{out}");
+    }
+
+    #[test]
+    fn begin_without_end_before_later_text_keeps_later_text() {
+        let existing = "<!-- vestige:projection:begin scope=user format=claude-md -->\nhand written after a truncated fence\n";
+        let out = splice(existing, REGION);
+        assert!(
+            out.contains("hand written after a truncated fence"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn well_formed_fence_is_still_replaced_and_idempotent() {
+        let existing = format!("Head.\n\n{}\nTail.\n", old_block());
+        let once = splice(&existing, REGION);
+        assert!(once.starts_with("Head.\n\n") && once.ends_with("Tail.\n"));
+        assert!(!once.contains("vestige:d1"));
+        assert_eq!(splice(&once, REGION), once);
     }
 }
