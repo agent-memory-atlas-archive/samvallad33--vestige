@@ -87,7 +87,7 @@ pub fn upgrade_or_refuse(db_path: &Path) -> Result<(), LaunchError> {
 /// upgrade publishes by renaming a verified staging directory onto `log/`,
 /// so a present log means the upgrade completed. Stat and directory reads
 /// only; the v3 file is never opened.
-fn strata_log_published(db_path: &Path) -> bool {
+pub fn strata_log_published(db_path: &Path) -> bool {
     let data_dir = db_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
