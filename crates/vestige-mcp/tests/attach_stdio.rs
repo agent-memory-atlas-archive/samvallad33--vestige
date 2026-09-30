@@ -346,7 +346,15 @@ fn an_attached_client_survives_its_owner_being_killed() {
     owner.child.wait().expect("reap the owner");
 
     // The same session, no new handshake from the client: the survivor
-    // takes the lock and serves itself.
+    // takes the lock and serves itself. A request sent in the instant before
+    // the relay notices the owner is gone is answered with the lost-owner
+    // error by design (it may have reached the owner), so the next call
+    // waits for the takeover.
+    assert!(
+        survivor.wait_stderr("now serves", Duration::from_secs(30)),
+        "{}",
+        survivor.stderr()
+    );
     let after = survivor.remember("attach test: written after the owner died");
     assert!(
         survivor.sees(&before),

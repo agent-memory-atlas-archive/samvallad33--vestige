@@ -151,6 +151,16 @@ back), `maintain` `export` format `portable`, and `memory_status`
   grouped or flat. On Strata, `recall`, `smart_ingest` and `receipt` describe
   what 4.0 does instead of v3's similarity search and walk receipts. The
   catalog budget is 22 KiB (it was 20 KiB while fields were missing).
+- A store opens after a crash at the worst moment. Recovery halted, with a
+  message that acked history was damaged, on tails that were never acked: a
+  complete frame that failed its hash above the recorded watermark (power
+  lost inside a group commit), a trailer cut off while sealing, and an
+  unacked tear that happened to be exactly trailer-sized. Those tails are now
+  truncated; damage at or below the watermark, or with no watermark on disk,
+  still halts, and the message says which. A frame with a 35-byte payload,
+  which is exactly as long as a trailer, is read as a frame. A seal that
+  cannot create the next segment fails stop instead of leaving every later
+  write waiting forever.
 - `vestige-restore` honors `VESTIGE_DATA_DIR`, upgrades a v3 store before
   touching it, and refuses while a Vestige server holds the store. It used to
   open the log as a second writer beside a running server, which lost

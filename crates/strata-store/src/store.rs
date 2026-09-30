@@ -2385,6 +2385,26 @@ fn scan_segment(bytes: &[u8], name: &str) -> Result<ScannedSegment, StoreError> 
             });
         }
         if rem == strata::TRAILER_WIRE_SIZE {
+            // A 35-byte-payload frame is also 104 bytes; a frame that parses,
+            // hashes and chains is a frame, as in strata's own recovery.
+            let chained = match strata::parse_frame(&bytes[off..]) {
+                Ok((frame, used))
+                    if used == rem
+                        && frame.payload_blake3
+                            == strata::payload_blake3(frame.kind, &frame.payload)
+                        && frame.prev_frame_hash == prev =>
+                {
+                    Some((frame, used))
+                }
+                _ => None,
+            };
+            if let Some((frame, used)) = chained {
+                prev = strata::frame_hash(&frame);
+                leaves.push(frame.payload_blake3);
+                frames += 1;
+                off += used;
+                continue;
+            }
             let trailer: strata::SegmentTrailer =
                 borsh::from_slice(&bytes[off..]).map_err(|_| {
                     StoreError::Verify(format!("{name}: trailer-sized tail failed to parse"))
