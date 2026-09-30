@@ -16,6 +16,40 @@ It keeps the decisions a project already made, and it can walk a failure backwar
 [Install](#install) · [Upgrading from v3](#upgrading-from-v3) · [Recall by handle](#recall-by-handle-not-resemblance) · [The tools](#the-tools) · [Backups](#backups-and-export) · [Science](#the-science) · [Docs](#go-deeper)
 
 <a id="getting-started"></a>
+## 🛡️ Operator Lite — your agent's commands, enforced on the metal
+
+Ships in this repo under [`operator-lite/`](operator-lite/): a one-file, stdlib-only,
+dependency-free gate that sits between your AI agent and your machine as a
+PreToolUse hook (Claude Code, Codex, OpenClaw — any host with command hooks), and
+**blocks destructive, polluting and exfiltrating commands before they run.**
+
+```bash
+mkdir -p ~/.operator/gate
+curl -sL https://raw.githubusercontent.com/samvallad33/vestige/main/operator-lite/operator-gate.py -o ~/.operator/gate/operator-gate.py
+chmod 755 ~/.operator/gate/operator-gate.py
+echo shadow > ~/.operator/mode        # shadow-first: log everything, block nothing, then flip
+```
+
+- **27 deterministic rules** — workspace armor, memory-store protection, destructive
+  SQL, force-push, unreviewed publishes, paid deploys, reverse shells, cloud-metadata
+  endpoints, shell-init poisoning, MCP argument exfil
+- **Sees through shell obfuscation** — quote reassembly (`r''m`), `$IFS` expansion,
+  `$(echo rm)` as program, ANSI-C `$'\x72m'`, base64-decoded pipelines, brace/glob
+  expansion against the live filesystem, subshell time-bombs, session variables, cd
+  tracking, heredocs, fork bombs (10 of 11 vendor gates failed these classes)
+- **Every verdict gets a hash-chained receipt** — and `verify` walks the chain
+- **Shadow-first**: install logs everything and blocks nothing until you flip
+
+```bash
+python3 ~/.operator/gate/operator-gate.py corpus guardfall   # 43/43 bypass cases
+python3 ~/.operator/gate/operator-gate.py verify             # receipt chain check
+```
+
+Full details in [operator-lite/README.md](operator-lite/README.md). The free tier
+blocks. Operator — the same kernel extended with owner-authored commitments
+enforced as law, deterministic compliant rewrites, law-version-pinned receipt
+replay, and memory integration — is where the governance loop becomes a product.
+
 ## The cause never looks like the bug
 
 Agents re-learn the same lessons. They recommend a change you already tested and rejected, re-derive a fix that was already written down, and treat every session as if the last one never happened. Vestige is the local memory an MCP client calls while you work: `smart_ingest` stores, `recall` finds a memory by an exact handle, and `causal_walk` walks a failure backward along edges the log recorded. Memory strength follows FSRS scheduling, and every write comes back with a receipt you can replay against the log.
