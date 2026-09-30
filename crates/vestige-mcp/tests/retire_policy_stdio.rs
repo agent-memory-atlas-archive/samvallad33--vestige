@@ -411,10 +411,11 @@ fn log_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// 4.0 withholds erasure on Strata. Over real stdio: purge, suppress, the
-/// memory purge/delete actions and the hidden delete_knowledge alias all
-/// refuse, none of them is advertised, the log is byte-identical afterwards,
-/// and the memory is still readable after a restart.
+/// 4.0 withholds erasure on Strata. Over real stdio: purge, the memory
+/// purge/delete actions and the hidden delete_knowledge alias all refuse,
+/// purge is not advertised, the log is byte-identical afterwards, and the
+/// memory is still readable after a restart. Suppress stays advertised as a
+/// destructive hide (it never erased).
 #[test]
 fn stdio_erasure_is_withheld_and_writes_nothing() {
     let dir = std::env::temp_dir().join(format!("vestige-withheld-stdio-{}", std::process::id()));
@@ -441,9 +442,17 @@ fn stdio_erasure_is_withheld_and_writes_nothing() {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
-        assert!(
-            !names.contains(&"purge") && !names.contains(&"suppress"),
-            "{names:?}"
+        assert!(!names.contains(&"purge"), "{names:?}");
+        let suppress = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "suppress")
+            .expect("suppress stays advertised: it hides, it never erased");
+        assert_eq!(
+            suppress["annotations"]["destructiveHint"],
+            serde_json::json!(true),
+            "{suppress}"
         );
         let memory = listed["tools"]
             .as_array()
@@ -461,10 +470,6 @@ fn stdio_erasure_is_withheld_and_writes_nothing() {
             (
                 "purge",
                 serde_json::json!({ "id": node_id, "confirm": true }),
-            ),
-            (
-                "suppress",
-                serde_json::json!({ "id": node_id, "reason": "fixture" }),
             ),
             (
                 "memory",

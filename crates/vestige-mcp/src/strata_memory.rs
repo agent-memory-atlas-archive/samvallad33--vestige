@@ -482,6 +482,51 @@ fn sort_intentions(
     rows
 }
 
+/// RETIRE `id` under an existing named rule, then RETIRE the successor anchor
+/// so the anchor stays out of reads. No new op. The log keeps both records.
+fn retire_live(
+    store: &mut strata_store::StrataStore,
+    id: &str,
+    rule: &'static str,
+    confirm: bool,
+) -> Result<strata_store::RetireReceipt, StorageError> {
+    let Some(record) = store.get_node(id) else {
+        return Err(StorageError::NotFound(id.to_string()));
+    };
+    if !record.is_live() {
+        return Err(StorageError::NotFound(format!("{id} is already retired")));
+    }
+    let scope = record.scope.clone();
+    // SupersedeNode needs a successor. This anchor is retired in the same call.
+    let anchor = store
+        .ingest_in_scope(
+            strata_store::IngestInput {
+                content: ".".into(),
+                source: None,
+                source_updated_at_ms: None,
+                node_type: "fact".into(),
+                tags: Vec::new(),
+                created_at_ms: Some(0),
+                valid_from_ms: None,
+                valid_until_ms: None,
+            },
+            &scope,
+        )
+        .map_err(map_store)?;
+    let ctx = strata_store::AdmissionContext {
+        rule_id: Some(rule.to_string()),
+        confirm,
+    };
+    let receipt = store.retire(id, &anchor, &ctx).map_err(map_store)?;
+    if receipt.rule_id != Some(rule) {
+        return Err(StorageError::Init(format!(
+            "{rule} retire was not admitted under {rule}"
+        )));
+    }
+    store.retire(&anchor, id, &ctx).map_err(map_store)?;
+    Ok(receipt)
+}
+
 fn is_mem_id(id: &str) -> bool {
     let Some(rest) = id.strip_prefix("mem-") else {
         return false;
@@ -2438,8 +2483,19 @@ impl MemoryStoreSend for StrataMemory {
         crate::intention_graph_log::memory_snapshot(&self.lock(), scope, memory_id, now)
     }
 
-    fn suppress_memory(&self, _id: &str) -> Result<KnowledgeNode, StorageError> {
-        Err(withheld("suppress"))
+    fn suppress_memory(&self, id: &str) -> Result<KnowledgeNode, StorageError> {
+        // A Strata suppression hides the memory from every read. The log
+        // keeps its bytes, which is what suppress has always meant (it never
+        // deleted); on Strata it cannot be reversed.
+        let mut store = self.lock();
+        let receipt = retire_live(&mut store, id, strata_store::RULE_SUPPRESS, false)?;
+        // The trait returns a node, not a receipt. `source` carries the eff-
+        // id for this call only; the log record is unchanged.
+        let mut node = KnowledgeNode::default();
+        node.id = id.to_string();
+        node.source = Some(receipt.receipt_id);
+        node.suppression_count = 1;
+        Ok(node)
     }
 
     fn update_node_content(&self, id: &str, new_content: &str) -> Result<(), StorageError> {
@@ -3119,11 +3175,12 @@ mod tests {
         out
     }
 
-    /// 4.0 withholds erasure on Strata: purge and suppress refuse through the
-    /// tools and the store, write nothing to the log, and leave the node
-    /// readable. Real erasure replaces this in a later release.
+    /// 4.0 withholds erasure on Strata: purge refuses through the tool and
+    /// the store and writes nothing. Suppress works as an honest hide: the
+    /// memory leaves every read, the log keeps its bytes, and reverse is
+    /// refused.
     #[tokio::test]
-    async fn purge_and_suppress_are_withheld_and_write_nothing() {
+    async fn purge_is_withheld_and_suppress_hides_without_erasing() {
         let dir = tempfile::TempDir::new().unwrap();
         let storage = open(dir.path()).unwrap();
         let marker = "WITHHELD_MARKER_STAYS";
@@ -3149,23 +3206,42 @@ mod tests {
         .await
         .unwrap_err();
         assert!(purged.contains("unavailable_in_4_0"), "{purged}");
+        let store_purge = storage.purge_node(&node.id, None).unwrap_err().to_string();
+        assert!(store_purge.contains("unavailable_in_4_0"), "{store_purge}");
+        assert_eq!(
+            log_files(dir.path()),
+            before,
+            "a withheld purge wrote to the log"
+        );
+        assert_eq!(storage.get_node(&node.id).unwrap().unwrap().content, marker);
+
         let suppressed = crate::tools::suppress::execute(
             &storage,
             Some(serde_json::json!({ "id": node.id, "reason": "fixture" })),
         )
         .await
-        .unwrap_err();
-        assert!(suppressed.contains("unavailable_in_4_0"), "{suppressed}");
-        let store_purge = storage.purge_node(&node.id, None).unwrap_err().to_string();
-        assert!(store_purge.contains("unavailable_in_4_0"), "{store_purge}");
-        let store_suppress = storage.suppress_memory(&node.id).unwrap_err().to_string();
+        .unwrap();
+        assert_eq!(suppressed["success"], true, "{suppressed}");
+        assert!(!suppressed.to_string().contains(marker));
+        assert!(storage.get_node(&node.id).unwrap().is_none());
+        assert!(storage.resolve_handle(&node.id).ids.is_empty());
+        // Not erasure: the bytes are still on the log.
+        let raw: Vec<u8> = log_files(dir.path())
+            .into_iter()
+            .flat_map(|(_, bytes)| bytes)
+            .collect();
         assert!(
-            store_suppress.contains("unavailable_in_4_0"),
-            "{store_suppress}"
+            raw.windows(marker.len())
+                .any(|window| window == marker.as_bytes()),
+            "suppress must not claim erasure; the log keeps the bytes"
         );
-
-        assert_eq!(log_files(dir.path()), before);
-        assert_eq!(storage.get_node(&node.id).unwrap().unwrap().content, marker);
+        let reversed = crate::tools::suppress::execute(
+            &storage,
+            Some(serde_json::json!({ "id": node.id, "reverse": true })),
+        )
+        .await
+        .unwrap_err();
+        assert!(reversed.contains("unavailable_in_4_0"), "{reversed}");
     }
 
     #[tokio::test]

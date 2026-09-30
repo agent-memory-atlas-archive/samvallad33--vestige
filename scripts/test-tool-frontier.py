@@ -95,9 +95,9 @@ def run(binary, output):
             handshake()
             catalog = rpc("tools/list", {})["tools"]
             names = [x["name"] for x in catalog]
-            assert len(names) == 15, names
+            assert len(names) == 16, names
             assert "source_sync" not in names, names
-            assert "purge" not in names and "suppress" not in names, names
+            assert "purge" not in names and "suppress" in names, names
             memory_actions = next(x for x in catalog if x["name"] == "memory")["inputSchema"]["properties"]["action"]["enum"]
             assert "purge" not in memory_actions and "delete" not in memory_actions, memory_actions
             guide = tool("memory_status", {"view": "tools"})["tools"]
@@ -330,11 +330,20 @@ def run(binary, output):
             typed("session_start", {"queries": [marker], "include_predictions": False, "include_intentions": False}, "similarity_disabled")
             doomed_suppress = tool("smart_ingest", {"content": "STRATA_SUPPRESS_DOOMED", "forceCreate": True})
             suppress_id = doomed_suppress["nodeId"]
-            typed("suppress", {"id": suppress_id, "reason": "fixture"}, "unavailable_in_4_0")
             typed("blast_radius", {"action": "retire", "ids": [suppress_id], "reason": "fixture"}, "unavailable_in_4_0")
-            kept_suppress = tool("memory", {"action": "get", "id": suppress_id})
-            assert "STRATA_SUPPRESS_DOOMED" in json.dumps(kept_suppress)
-            passed("purge, delete and suppress are withheld on Strata and change nothing")
+            passed("purge and delete are withheld on Strata and change nothing")
+            assert annotations["suppress"]["destructiveHint"] is True
+            suppressed = tool("suppress", {"id": suppress_id, "reason": "fixture"})
+            assert suppressed["success"] is True and suppressed["rule"] == "suppress"
+            assert str(suppressed["receiptId"]).startswith("eff-")
+            assert "STRATA_SUPPRESS_DOOMED" not in json.dumps(suppressed)
+            hidden_suppress = tool("memory", {"action": "get", "id": suppress_id})
+            assert hidden_suppress["message"] == "retired, can't be retrieved"
+            assert "STRATA_SUPPRESS_DOOMED" not in json.dumps(hidden_suppress)
+            hidden_recall = tool("recall", {"handle": suppress_id})
+            assert "STRATA_SUPPRESS_DOOMED" not in json.dumps(hidden_recall)
+            typed("suppress", {"id": suppress_id, "reverse": True}, "unavailable_in_4_0")
+            passed("suppress hides a memory from every read; reverse is refused on Strata")
             anchored_repo = root / "anchored-repo"
             (anchored_repo / "src").mkdir(parents=True)
             anchored_source = anchored_repo / "src" / "state.rs"

@@ -254,7 +254,7 @@ const DISCOVER_TTL_MS: u64 = 3_600_000;
 /// the field is not punished for a cursor it never really set.
 /// Tools a Strata log withholds in 4.0, with every hidden alias. Erasure:
 /// the log is append-only, so these would hide a memory but keep its bytes.
-const STRATA_WITHHELD_TOOLS: &[&str] = &["purge", "suppress", "delete_knowledge"];
+const STRATA_WITHHELD_TOOLS: &[&str] = &["purge", "delete_knowledge"];
 
 /// `(tool, action, why)` a Strata log cannot honor in 4.0. `None` is erasure
 /// (shared wording with the store). Each is dropped from the advertised
@@ -363,7 +363,14 @@ fn withhold_on_strata(tools: &mut Vec<ToolDescription>) {
     tools.retain(|tool| !STRATA_WITHHELD_TOOLS.contains(&tool.name.as_str()));
     for tool in tools.iter_mut() {
         let removed = strip_withheld_actions(&tool.name, &mut tool.input_schema);
-        if tool.name == "memory" {
+        if tool.name == "suppress" {
+            // On Strata a suppression hides a memory for good (the log keeps
+            // the bytes), so the host should prompt, and reverse is refused.
+            if let Some(annotations) = tool.annotations.as_mut() {
+                annotations.destructive_hint = true;
+            }
+            tool.description = Some("Hide a memory from every read without deleting it: the Strata log keeps its bytes. On Strata in 4.0 this cannot be undone (reverse=true is refused). It is not erasure.".to_string());
+        } else if tool.name == "memory" {
             tool.description = Some("Manage one memory: 'get', 'get_batch', 'state', 'promote' / 'demote' (demote never deletes), 'edit' (admit a successor, retire the previous node). Erasure is withheld on Strata in 4.0.".to_string());
         } else if !removed.is_empty() {
             let note = format!(" Withheld on Strata in 4.0: {}.", removed.join(", "));
