@@ -351,6 +351,15 @@ fn linked_replay_receipt(
 fn execute_strata_replay(storage: &Arc<Storage>, receipt_id: &str) -> Result<Value, String> {
     match storage.replay_receipt(receipt_id) {
         Ok(report) => Ok(report),
+        // A memory imported by the v3 upgrade exists but has no admitted
+        // write on this log to replay; say so instead of "not found".
+        Err(vestige_core::StorageError::NotFound(_))
+            if storage.get_node(receipt_id).ok().flatten().is_some() =>
+        {
+            Err(format!(
+                "imported_from_v3: memory '{receipt_id}' was imported by the upgrade and has no admitted write on this log to replay. The signed migration receipt covers it; `vestige strata-verify` checks that receipt."
+            ))
+        }
         Err(vestige_core::StorageError::NotFound(message)) => Err(message),
         Err(error) => {
             let owned = error.to_string();
