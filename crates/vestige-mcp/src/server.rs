@@ -372,6 +372,14 @@ fn withhold_on_strata(tools: &mut Vec<ToolDescription>) {
             tool.description = Some("Hide a memory from every read without deleting it: the Strata log keeps its bytes. On Strata in 4.0 this cannot be undone (reverse=true is refused). It is not erasure.".to_string());
         } else if tool.name == "memory" {
             tool.description = Some("Manage one memory: 'get', 'get_batch', 'state', 'promote' / 'demote' (demote never deletes), 'edit' (admit a successor, retire the previous node). Erasure is withheld on Strata in 4.0.".to_string());
+        } else if tool.name == "recall" {
+            // The v3 text sold keyword search and similarity modes, which a
+            // Strata log answers with similarity_disabled.
+            tool.description = Some("Find memories by exact handle: pass 'handle' as a memory id, a unique id prefix of 8+ characters, or an exact tag. In 4.0 a free-text 'query' and the 'reason' and 'contradictions' modes return similarity_disabled.".to_string());
+        } else if tool.name == "smart_ingest" {
+            tool.description = Some("Save one memory ('content') or up to 20 ('items'). Each write passes the log's gate and returns a receipt. Content that looks like a secret is refused unless allowSecrets is set.".to_string());
+        } else if tool.name == "receipt" {
+            tool.description = Some("'get' shows what a write did from its receipt id; 'replay' re-derives that state from the log and reports any mismatch.".to_string());
         } else if !removed.is_empty() {
             let note = format!(" Withheld on Strata in 4.0: {}.", removed.join(", "));
             tool.description = tool.description.take().map(|text| text + &note);
@@ -401,6 +409,13 @@ fn strip_withheld_actions(tool: &str, schema: &mut serde_json::Value) -> Vec<&'s
     {
         *description = serde_json::json!(
             "'get', 'get_batch' (ids), 'state', 'promote' / 'demote' (retrieval strength; demote never deletes), 'edit' (admit a successor under rule edit, then retire the previous node). Erasure is withheld on Strata in 4.0."
+        );
+    }
+    if tool == "recall"
+        && let Some(description) = schema.pointer_mut("/properties/mode/description")
+    {
+        *description = serde_json::json!(
+            "'lookup' (default): by handle. 'reason' and 'contradictions' return similarity_disabled in 4.0."
         );
     }
     if tool == "maintain"
@@ -1370,7 +1385,7 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
         &self,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, JsonRpcError> {
-        let request: CallToolRequest = match params {
+        let mut request: CallToolRequest = match params {
             Some(p) => serde_json::from_value(p)
                 .map_err(|e| JsonRpcError::invalid_params(&e.to_string()))?,
             None => return Err(JsonRpcError::invalid_params("Missing tool call parameters")),
@@ -1381,6 +1396,11 @@ description: Some("Decayed fix/lesson memories sharing an exact anchor with a fa
             return Err(JsonRpcError::invalid_params(
                 "tools/call arguments must be an object",
             ));
+        }
+        // `tools/list` advertises filter fields grouped under `filters` and
+        // `source`; the handlers read them at the top level.
+        if let Some(arguments) = request.arguments.as_mut() {
+            tools::compact::unfold_arguments(&request.name, arguments);
         }
 
         // 4.0: erasure-class calls are withheld on a Strata log. Refuse before
@@ -4422,17 +4442,22 @@ mod tests {
         }
     }
 
-    /// #212: the wire budget. tools/list must stay under 20 KiB no matter
+    /// #212: the wire budget. tools/list must stay under 22 KiB no matter
     /// how schemas grow; new surface goes through tools::compact or shrinks.
+    /// It was 20 KiB while compaction replaced a union's fields with one
+    /// `action`, which left smart_ingest without `content` on the wire. Every
+    /// field a call may send is on the wire now (see
+    /// `every_root_and_variant_field_reaches_the_wire`), and that costs
+    /// about 1.3 KiB.
     #[test]
-    fn tools_list_wire_payload_stays_under_20_kib() {
+    fn tools_list_wire_payload_stays_under_22_kib() {
         let catalog = McpServer::tool_catalog();
         let payload = serde_json::to_string(&catalog).unwrap();
         assert!(
-            payload.len() <= 20 * 1024,
+            payload.len() <= 22 * 1024,
             "tools/list payload is {} bytes (budget {}); compact the schema or shrink it",
             payload.len(),
-            20 * 1024
+            22 * 1024
         );
     }
 

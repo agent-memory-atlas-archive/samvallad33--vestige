@@ -180,7 +180,7 @@ Write-up: [docs/SCIENCE.md](docs/SCIENCE.md).
 
 ## The tools
 
-`tools/list` advertises these 16 tools, sorted by name. The list is compact: discriminator enums stay on the wire, and deep fields move one call deeper. The serialized catalog is under 20 KiB. `memory_status` with `view=tools` lists every tool; set `tool` to a name for that tool's full input schema. Actions a Strata log cannot honor are left out of the schema and refused with the reason.
+`tools/list` advertises these 16 tools, sorted by name. The list is compact: every field a call can send is on the wire with its type, prose and deep structure move one call deeper, and filter fields are grouped under `filters` and `source` (sent either grouped or flat). The serialized catalog is about 21 KiB. `memory_status` with `view=tools` lists every tool; set `tool` to a name for that tool's full input schema. Actions a Strata log cannot honor are left out of the schema and refused with the reason.
 
 | Tool | Purpose |
 |---|---|

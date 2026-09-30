@@ -110,6 +110,17 @@ back), `maintain` `export` format `portable`, and `memory_status`
   with `File::open`, which Windows refuses (os error 5), so no log could be
   created or opened there. Directory fsync is Unix-only now; CI runs the
   log, store, upgrade and multi-agent suites on Windows.
+- `tools/list` advertises every field a call can send. A schema with a
+  `oneOf` was compacted to a single invented `action` field, so
+  `smart_ingest` went out without `content`, `items` or `tags`, `maintain`
+  and `receipt` without any parameter, and `causal_walk` start points without
+  `kind`; a client that drops undeclared fields could not make those calls.
+  Unions now keep their own and every variant's fields, with each `const`
+  discriminator as an enum. Filter fields advertised inside `filters` and
+  `source` were ignored when sent that way; the server now accepts them
+  grouped or flat. On Strata, `recall`, `smart_ingest` and `receipt` describe
+  what 4.0 does instead of v3's similarity search and walk receipts. The
+  catalog budget is 22 KiB (it was 20 KiB while fields were missing).
 - `strata-verify <data-dir>`, the documented form, verifies an upgraded
   store's migration receipt. It used to scan only the chain, so a swapped
   receipt-signing key still printed OK unless `<data-dir>/log` was passed.
