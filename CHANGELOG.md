@@ -52,9 +52,11 @@ default binaries.
   export` writes JSON or JSONL.
 - Every agent on a machine can use Vestige at once. The log has one writer:
   the first `vestige-mcp` to start takes `.serve.lock` and serves the store,
-  and every later one connects to it over a loopback endpoint (a 0600
-  `.serve.endpoint` file holds its port and a random token) and relays its
-  client's stdio there. When the serving process exits, another takes the
+  and every later one connects to it and relays its client's stdio there.
+  The connection is `.serve.sock`, an owner-only Unix socket in the data
+  directory (loopback TCP on Windows, or when the path is too long for a
+  socket), and it takes a random token from the 0600 `.serve.endpoint`
+  file. Nothing listens beyond the machine. When the serving process exits, another takes the
   lock and serves in place, replaying its client's MCP handshake so the
   session continues. Before this, a second `vestige-mcp` on the same data
   directory waited on the lock until the first one exited.

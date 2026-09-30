@@ -246,6 +246,19 @@ fn three_clients_share_one_store_through_one_owner() {
         third.stderr()
     );
 
+    // Unix listens on a socket in the data directory; only Windows (or a
+    // path too long for a socket address) uses loopback TCP.
+    let endpoint = std::fs::read_to_string(dir.path().join(".serve.endpoint")).unwrap();
+    if cfg!(unix) {
+        assert!(endpoint.starts_with("unix "), "{endpoint}");
+        assert!(dir.path().join(".serve.sock").exists());
+    } else {
+        assert!(
+            endpoint.split(' ').next().unwrap().parse::<u16>().is_ok(),
+            "{endpoint}"
+        );
+    }
+
     let by_owner = owner.remember("attach test: written by the owning process");
     let by_second = second.remember("attach test: written by the second client");
     let by_third = third.remember("attach test: written by the third client");
@@ -273,6 +286,10 @@ fn three_clients_share_one_store_through_one_owner() {
     assert!(
         !dir.path().join(".serve.endpoint").exists(),
         "a clean exit retires the endpoint file"
+    );
+    assert!(
+        !dir.path().join(".serve.sock").exists(),
+        "a clean exit removes the socket"
     );
 
     // Everything any client wrote is in the log a fresh process opens.
@@ -473,4 +490,30 @@ fn dashboard_command_is_served_by_the_running_server() {
     dashboard.kill().unwrap();
     dashboard.wait().unwrap();
     assert!(server.wait_exit(Duration::from_secs(30)).success());
+}
+
+#[test]
+fn a_data_dir_too_long_for_a_socket_attaches_over_loopback_tcp() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("a".repeat(60)).join("b".repeat(60));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut owner = Client::spawn("owner", &dir);
+    owner.initialize();
+    let mut second = Client::spawn("second", &dir);
+    second.initialize();
+
+    let endpoint = std::fs::read_to_string(dir.join(".serve.endpoint")).unwrap();
+    let port = endpoint.split(' ').next().unwrap();
+    assert!(
+        port.parse::<u16>().is_ok(),
+        "expected a TCP port: {endpoint}"
+    );
+    assert!(!dir.join(".serve.sock").exists());
+
+    let id = second.remember("attach test: over loopback TCP");
+    assert!(owner.sees(&id));
+    second.close_stdin();
+    owner.close_stdin();
+    assert!(second.wait_exit(Duration::from_secs(30)).success());
+    assert!(owner.wait_exit(Duration::from_secs(30)).success());
 }

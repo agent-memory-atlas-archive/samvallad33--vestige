@@ -3,17 +3,23 @@
 //! The Strata log has exactly one writer. `.serve.lock` is an OS file lock
 //! (`File::try_lock`) that the kernel releases when its holder dies, SIGKILL
 //! included, so holding it is what makes a process the OWNER. The owner opens
-//! the log, serves its own client, and listens on a loopback TCP port. A
-//! `vestige-mcp` that finds the lock taken becomes a PROXY: it connects to
-//! that port, presents the token from the endpoint file, and from then on
-//! copies JSON-RPC lines between its own stdio and the owner. The owner runs
-//! one MCP session per attached connection over the same storage, so every
-//! agent on a machine shares one store and one writer.
+//! the log, serves its own client, and listens for other local processes on
+//! `.serve.sock`, a Unix socket in the data directory. A `vestige-mcp` that
+//! finds the lock taken becomes a PROXY: it connects there, presents the
+//! token from the endpoint file, and from then on copies JSON-RPC lines
+//! between its own stdio and the owner. The owner runs one MCP session per
+//! attached connection over the same storage, so every agent on a machine
+//! shares one store and one writer.
 //!
-//! `.serve.endpoint` holds `port token pid`. It is created 0600 and replaced
-//! by rename. Whoever can read it can already read the log, so the token adds
-//! no access beyond that; it keeps other local users, and local processes
-//! that merely find the port, from speaking MCP to the store.
+//! Windows, and a data directory whose path is too long for a socket
+//! address, listen on a loopback TCP port instead. No transport ever leaves
+//! the machine.
+//!
+//! `.serve.endpoint` holds `unix|<port> token pid`. It is created 0600 and
+//! replaced by rename; the socket is 0600 too. Whoever can read the endpoint
+//! file can already read the log, so the token adds no access beyond that;
+//! it keeps other local users, and local processes that merely find the
+//! port, from speaking MCP to the store.
 //!
 //! FAILOVER. The owner is usually some agent's own server process, and that
 //! agent's client kills it when the agent exits. Each proxy then answers the
@@ -35,10 +41,12 @@ use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tokio::io::{
-    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines,
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+    Lines,
 };
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -48,8 +56,14 @@ use crate::server::McpServer;
 
 /// The OS lock that elects the owner. `vestige-upgrade` holds it too.
 pub const LOCK_FILE: &str = ".serve.lock";
-/// `port token pid` of the owner's attach listener.
+/// `unix|<port> token pid` of the owner's attach listener.
 pub const ENDPOINT_FILE: &str = ".serve.endpoint";
+/// The owner's Unix socket, in the data directory.
+pub const SOCKET_FILE: &str = ".serve.sock";
+/// A socket address holds 104 bytes on macOS and 108 on Linux, NUL
+/// included. A longer socket path falls back to loopback TCP.
+#[cfg(unix)]
+const SOCKET_PATH_MAX: usize = 100;
 
 const HELLO: &str = "vestige-attach/1";
 const WELCOME: &str = "vestige-attached/1";
@@ -151,32 +165,136 @@ pub async fn elect(data_dir: &Path, wait: Duration) -> io::Result<Role> {
 }
 
 // ============================================================================
+// Transport
+// ============================================================================
+
+/// One side of an attach connection, over a Unix socket or loopback TCP.
+type ReadHalf = Box<dyn AsyncRead + Send + Unpin>;
+type WriteHalf = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// How the owner is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Addr {
+    /// `.serve.sock` in the data directory.
+    Unix,
+    /// 127.0.0.1 on this port.
+    Tcp(u16),
+}
+
+/// The socket path, when this platform has Unix sockets and it fits.
+fn socket_path(data_dir: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        let path = data_dir.join(SOCKET_FILE);
+        (path.as_os_str().len() <= SOCKET_PATH_MAX).then_some(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = data_dir;
+        None
+    }
+}
+
+enum Listener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(UnixListener),
+}
+
+impl Listener {
+    /// Listen on the data directory's socket, else on a free loopback port.
+    /// Called only while holding the serve lock, so a socket file already
+    /// there belongs to a dead owner.
+    async fn bind(data_dir: &Path) -> io::Result<(Self, Addr)> {
+        #[cfg(unix)]
+        if let Some(path) = socket_path(data_dir) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::remove_file(&path);
+            let listener = UnixListener::bind(&path)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            return Ok((Self::Unix(listener), Addr::Unix));
+        }
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let port = listener.local_addr()?.port();
+        Ok((Self::Tcp(listener), Addr::Tcp(port)))
+    }
+
+    async fn accept(&self) -> io::Result<(ReadHalf, WriteHalf)> {
+        match self {
+            Self::Tcp(listener) => {
+                let (stream, _) = listener.accept().await?;
+                stream.set_nodelay(true)?;
+                let (read, write) = stream.into_split();
+                Ok((Box::new(read), Box::new(write)))
+            }
+            #[cfg(unix)]
+            Self::Unix(listener) => {
+                let (stream, _) = listener.accept().await?;
+                let (read, write) = stream.into_split();
+                Ok((Box::new(read), Box::new(write)))
+            }
+        }
+    }
+}
+
+async fn connect(data_dir: &Path, addr: Addr) -> io::Result<(ReadHalf, WriteHalf)> {
+    match addr {
+        Addr::Tcp(port) => {
+            let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
+            stream.set_nodelay(true)?;
+            let (read, write) = stream.into_split();
+            Ok((Box::new(read), Box::new(write)))
+        }
+        #[cfg(unix)]
+        Addr::Unix => {
+            let stream = UnixStream::connect(data_dir.join(SOCKET_FILE)).await?;
+            let (read, write) = stream.into_split();
+            Ok((Box::new(read), Box::new(write)))
+        }
+        #[cfg(not(unix))]
+        Addr::Unix => {
+            let _ = data_dir;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the endpoint names a Unix socket, which this platform does not have",
+            ))
+        }
+    }
+}
+
+// ============================================================================
 // Endpoint file
 // ============================================================================
 
 /// Where the owner accepts attached sessions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
-    pub port: u16,
+    addr: Addr,
     token: String,
     pub pid: u32,
 }
 
 impl Endpoint {
     fn render(&self) -> String {
-        format!("{} {} {}\n", self.port, self.token, self.pid)
+        let addr = match self.addr {
+            Addr::Unix => "unix".to_string(),
+            Addr::Tcp(port) => port.to_string(),
+        };
+        format!("{addr} {} {}\n", self.token, self.pid)
     }
 
     fn parse(text: &str) -> Option<Self> {
         let mut parts = text.split_whitespace();
-        let port: u16 = parts.next()?.parse().ok()?;
+        let addr = match parts.next()? {
+            "unix" => Addr::Unix,
+            port => Addr::Tcp(port.parse().ok().filter(|port: &u16| *port != 0)?),
+        };
         let token = parts.next()?.to_string();
         let pid = parts.next()?.parse().ok()?;
         let well_formed = parts.next().is_none()
-            && port != 0
             && token.len() == 64
             && token.bytes().all(|byte| byte.is_ascii_hexdigit());
-        well_formed.then_some(Self { port, token, pid })
+        well_formed.then_some(Self { addr, token, pid })
     }
 }
 
@@ -219,11 +337,15 @@ fn publish_endpoint(data_dir: &Path, endpoint: &Endpoint) -> io::Result<()> {
     written
 }
 
-/// Remove the endpoint file while it still names `endpoint`. The caller holds
-/// the lock, so no other owner can have published in between.
+/// Remove the endpoint file while it still names `endpoint`, and this
+/// owner's socket. The caller holds the lock, so no other owner can have
+/// published in between.
 fn retire_endpoint(data_dir: &Path, endpoint: &Endpoint) {
     if read_endpoint(data_dir).as_ref() == Some(endpoint) {
         let _ = fs::remove_file(data_dir.join(ENDPOINT_FILE));
+    }
+    if endpoint.addr == Addr::Unix {
+        let _ = fs::remove_file(data_dir.join(SOCKET_FILE));
     }
 }
 
@@ -341,9 +463,9 @@ impl AttachPoint {
     where
         F: Fn() -> McpServer + Send + Sync + 'static,
     {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let (listener, addr) = Listener::bind(data_dir).await?;
         let endpoint = Endpoint {
-            port: listener.local_addr()?.port(),
+            addr,
             token: new_token()?,
             pid: std::process::id(),
         };
@@ -359,7 +481,7 @@ impl AttachPoint {
             }),
         ));
         info!(
-            port = endpoint.port,
+            endpoint = ?endpoint.addr,
             "other Vestige clients on this machine attach to this server"
         );
         Ok(Self {
@@ -394,15 +516,15 @@ impl AttachPoint {
 }
 
 async fn accept_loop(
-    listener: TcpListener,
+    listener: Listener,
     token: Arc<str>,
     gate: Arc<Gate>,
     services: Arc<Services>,
 ) {
     let handshakes = Arc::new(Semaphore::new(MAX_HANDSHAKES));
     loop {
-        let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
+        let (read, write) = match listener.accept().await {
+            Ok(halves) => halves,
             Err(err) => {
                 warn!("attach listener could not accept a connection: {err}");
                 tokio::time::sleep(ELECTION_POLL).await;
@@ -417,7 +539,7 @@ async fn accept_loop(
         let gate = Arc::clone(&gate);
         let services = Arc::clone(&services);
         tokio::spawn(async move {
-            let Some(admitted) = admit(stream, &token, &gate, permit).await else {
+            let Some(admitted) = admit(read, write, &token, &gate, permit).await else {
                 return;
             };
             let pid = std::process::id();
@@ -476,20 +598,19 @@ enum Request {
 
 struct Admitted {
     request: Request,
-    reader: BufReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
+    reader: BufReader<ReadHalf>,
+    writer: WriteHalf,
     guard: SessionGuard,
 }
 
 /// Check the token, read what the connection wants, and count it.
 async fn admit(
-    stream: TcpStream,
+    read: ReadHalf,
+    writer: WriteHalf,
     token: &str,
     gate: &Arc<Gate>,
     permit: OwnedSemaphorePermit,
 ) -> Option<Admitted> {
-    stream.set_nodelay(true).ok()?;
-    let (read, writer) = stream.into_split();
     let mut reader = BufReader::new(read);
     let hello = read_handshake_line(&mut reader).await?;
     let mut words = hello
@@ -528,8 +649,8 @@ async fn admit(
 
 /// A connection to the owner whose handshake has completed.
 pub struct Attachment {
-    lines: Lines<BufReader<OwnedReadHalf>>,
-    writer: OwnedWriteHalf,
+    lines: Lines<BufReader<ReadHalf>>,
+    writer: WriteHalf,
     /// The owner's process id, from its handshake answer.
     pub owner_pid: u32,
 }
@@ -540,17 +661,13 @@ async fn greet(
     data_dir: &Path,
     request: &str,
     answer_within: Duration,
-) -> Option<(BufReader<OwnedReadHalf>, OwnedWriteHalf, String)> {
+) -> Option<(BufReader<ReadHalf>, WriteHalf, String)> {
     let endpoint = read_endpoint(data_dir)?;
-    let stream = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        TcpStream::connect((Ipv4Addr::LOCALHOST, endpoint.port)),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    stream.set_nodelay(true).ok()?;
-    let (read, mut writer) = stream.into_split();
+    let (read, mut writer) =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, connect(data_dir, endpoint.addr))
+            .await
+            .ok()?
+            .ok()?;
     let hello = format!("{HELLO} {}{request}\n", endpoint.token);
     writer.write_all(hello.as_bytes()).await.ok()?;
     writer.flush().await.ok()?;
@@ -947,8 +1064,8 @@ pub struct DashboardLease {
     pub url: String,
     /// The process serving it.
     pub owner_pid: u32,
-    reader: BufReader<OwnedReadHalf>,
-    _writer: OwnedWriteHalf,
+    reader: BufReader<ReadHalf>,
+    _writer: WriteHalf,
 }
 
 impl DashboardLease {
@@ -1108,12 +1225,14 @@ mod tests {
 
     #[test]
     fn endpoint_round_trips_and_rejects_malformed_text() {
-        let endpoint = Endpoint {
-            port: 43_210,
-            token: token(),
-            pid: 77,
-        };
-        assert_eq!(Endpoint::parse(&endpoint.render()), Some(endpoint));
+        for addr in [Addr::Tcp(43_210), Addr::Unix] {
+            let endpoint = Endpoint {
+                addr,
+                token: token(),
+                pid: 77,
+            };
+            assert_eq!(Endpoint::parse(&endpoint.render()), Some(endpoint));
+        }
         for bad in [
             "",
             "0 {t} 1",
@@ -1134,7 +1253,7 @@ mod tests {
     fn endpoint_file_is_published_owner_only_and_retired_only_while_it_is_ours() {
         let dir = tempfile::tempdir().unwrap();
         let ours = Endpoint {
-            port: 1234,
+            addr: Addr::Tcp(1234),
             token: token(),
             pid: 1,
         };
@@ -1151,7 +1270,7 @@ mod tests {
         }
 
         let theirs = Endpoint {
-            port: 4321,
+            addr: Addr::Tcp(4321),
             token: "cd".repeat(32),
             pid: 2,
         };
