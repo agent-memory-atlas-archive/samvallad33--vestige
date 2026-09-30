@@ -8,13 +8,14 @@
 //! previews ride along as reading material only. Every write goes through
 //! the store's PROPOSE -> GATE -> EFFECT path and reports its receipt.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
 use serde_json::{Value, json};
 use strata_store::{
-    BridgeCandidate, CompositionRecord, DivergentEval, GhostSnapshot, Lane, PathStep, PoolFilter,
-    StrataStore,
+    BridgeCandidate, BridgeReport, CompositionRecord, DivergentEval, GhostSnapshot, Lane, PathStep,
+    PoolFilter, StrataStore,
 };
 use vestige_core::Storage;
 use vestige_core::composition::{
@@ -200,23 +201,57 @@ struct ScoredBridge {
     prior_outcomes: Vec<String>,
 }
 
-fn score_bridges(
+/// The best `limit` bridge pairs with their score parts, best first, plus
+/// the walk's report and how many pairs it admitted. Pairs are scored as
+/// the bounded walk finds them (`GhostSnapshot::bridge_top`), with
+/// retention read at the log's head clock, so a page is a function of the
+/// log head and memory stays bounded by the page however many pairs a hub
+/// admits.
+fn rank_bridges(
     store: &StrataStore,
     snapshot: &GhostSnapshot<'_>,
-    candidates: Vec<BridgeCandidate>,
     limit: usize,
-) -> Vec<ScoredBridge> {
-    let retention = |id: &str| store.retrievability(id).ok().flatten().unwrap_or(0.0);
-    let mut scored: Vec<ScoredBridge> = candidates
-        .into_iter()
+) -> (BridgeReport, usize, Vec<ScoredBridge>) {
+    let clock = store.head_clock_ms();
+    let retention_of = |id: &str| {
+        store
+            .retrievability_at(id, clock)
+            .ok()
+            .flatten()
+            .unwrap_or(0.0)
+    };
+    let mut retention: HashMap<String, f64> = HashMap::new();
+    let mut outcomes: HashMap<String, Vec<String>> = HashMap::new();
+    let (report, admitted) = snapshot.bridge_top(limit, |first, second, hops| {
+        let mut member = |id: &str| {
+            if !retention.contains_key(id) {
+                retention.insert(id.to_string(), retention_of(id));
+                outcomes.insert(id.to_string(), snapshot.prior_outcomes(id, id));
+            }
+            retention[id]
+        };
+        let trust = composition_trust(member(first), member(second));
+        let novelty =
+            composition_novelty(snapshot.weave_degree(first), snapshot.weave_degree(second));
+        let adjustment = if outcomes[first].is_empty() && outcomes[second].is_empty() {
+            0.0
+        } else {
+            outcome_score_adjustment(&snapshot.prior_outcomes(first, second))
+        };
+        bridge_score(hops, novelty, trust, adjustment).score
+    });
+    let scored = report
+        .candidates
+        .iter()
+        .cloned()
         .map(|candidate| {
             let novelty = composition_novelty(
                 snapshot.weave_degree(&candidate.first_id),
                 snapshot.weave_degree(&candidate.second_id),
             );
             let trust = composition_trust(
-                retention(&candidate.first_id),
-                retention(&candidate.second_id),
+                retention_of(&candidate.first_id),
+                retention_of(&candidate.second_id),
             );
             let prior_outcomes = snapshot.prior_outcomes(&candidate.first_id, &candidate.second_id);
             let adjustment = outcome_score_adjustment(&prior_outcomes);
@@ -231,15 +266,7 @@ fn score_bridges(
             }
         })
         .collect();
-    scored.sort_by(|a, b| {
-        b.score
-            .score
-            .total_cmp(&a.score.score)
-            .then_with(|| a.candidate.first_id.cmp(&b.candidate.first_id))
-            .then_with(|| a.candidate.second_id.cmp(&b.candidate.second_id))
-    });
-    scored.truncate(limit);
-    scored
+    (report, admitted, scored)
 }
 
 fn bridge_question(store: &StrataStore, candidate: &BridgeCandidate) -> String {
@@ -279,8 +306,8 @@ pub(super) fn bridge_trait_candidates(
         scope: scope.map(str::to_string),
         tags: tags.map(<[String]>::to_vec).unwrap_or_default(),
     });
-    let report = snapshot.bridge();
-    score_bridges(&store, &snapshot, report.candidates, limit)
+    let (_, _, scored) = rank_bridges(&store, &snapshot, limit);
+    scored
         .into_iter()
         .map(|item| {
             let first = store.get_node(&item.candidate.first_id);
@@ -334,7 +361,7 @@ fn pool_json(request: &ProposeRequest, size: usize) -> Value {
 fn propose_bridge(memory: &StrataMemory, request: &ProposeRequest) -> Value {
     let store = memory.lock();
     let snapshot = store.ghost_snapshot(filter_of(request));
-    let report = snapshot.bridge();
+    let (report, admitted, scored) = rank_bridges(&store, &snapshot, request.limit);
     let head = report.head_seq;
     let (pool_size, with_edges, touching, woven) = (
         report.pool_size,
@@ -342,8 +369,6 @@ fn propose_bridge(memory: &StrataMemory, request: &ProposeRequest) -> Value {
         report.admitting_edges_touching_pool,
         report.woven_pairs_excluded,
     );
-    let admitted = report.candidates.len();
-    let scored = score_bridges(&store, &snapshot, report.candidates, request.limit);
     let candidates: Vec<Value> = scored
         .iter()
         .map(|item| {

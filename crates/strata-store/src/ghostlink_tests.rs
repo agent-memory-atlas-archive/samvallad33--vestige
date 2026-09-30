@@ -362,6 +362,67 @@ fn a_scoped_proposal_never_walks_or_names_another_scope() {
 }
 
 #[test]
+fn bridge_top_keeps_exactly_the_best_k_of_the_full_ranking() {
+    let dir = temp_dir("bridge-top");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let ids: Vec<String> = (0..9)
+        .map(|at| node(&mut store, &format!("n{at}"), &[], "fact"))
+        .collect();
+    for at in 0..8 {
+        edge(&mut store, &ids[at], &ids[at + 1], "derived_from");
+    }
+    edge(&mut store, &ids[0], "file:src/hub.rs", "touched");
+    edge(&mut store, &ids[5], "file:src/hub.rs", "touched");
+    let snapshot = store.ghost_snapshot(user());
+    // A deterministic score with ties, so the id tie-break is exercised.
+    let score = |a: &str, b: &str, hops: u32| {
+        f64::from(hops % 2) + f64::from((a.len() + b.len()) as u32 % 3)
+    };
+    let full = snapshot.bridge();
+    let mut ranked: Vec<(f64, String, String)> = full
+        .candidates
+        .iter()
+        .map(|c| {
+            (
+                score(&c.first_id, &c.second_id, c.hops),
+                c.first_id.clone(),
+                c.second_id.clone(),
+            )
+        })
+        .collect();
+    ranked.sort_by(|x, y| {
+        y.0.total_cmp(&x.0)
+            .then_with(|| (&x.1, &x.2).cmp(&(&y.1, &y.2)))
+    });
+    for k in [0, 1, 3, 7, ranked.len(), ranked.len() + 5] {
+        let (top, admitted) = snapshot.bridge_top(k, score);
+        assert_eq!(admitted, full.candidates.len(), "k={k}");
+        let got: Vec<(String, String)> = top
+            .candidates
+            .iter()
+            .map(|c| (c.first_id.clone(), c.second_id.clone()))
+            .collect();
+        let want: Vec<(String, String)> = ranked
+            .iter()
+            .take(k)
+            .map(|(_, a, b)| (a.clone(), b.clone()))
+            .collect();
+        assert_eq!(got, want, "k={k}");
+        // Each kept pair carries the same proof the full walk found.
+        for c in &top.candidates {
+            let same = full
+                .candidates
+                .iter()
+                .find(|f| f.first_id == c.first_id && f.second_id == c.second_id)
+                .expect("kept pair is admitted");
+            assert_eq!(c.path, same.path);
+            assert_eq!(c.hops, same.hops);
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn bridge_excludes_woven_pairs_and_records_leave_the_pool() {
     let dir = temp_dir("bridge-woven");
     let mut store = StrataStore::open(&dir).expect("open");
@@ -1073,6 +1134,75 @@ fn owner_scale_store(dir: &Path) {
     for chunk in frames.chunks(4_096) {
         log.append_batch(chunk.to_vec()).expect("append");
     }
+}
+
+/// One hub memory with `spokes` memories each `touched` to it, written as
+/// imported frames (fast): every spoke pair is two hops apart.
+fn hub_store(dir: &Path, spokes: usize) {
+    let log = strata::StrataLog::open(dir.join("log")).expect("log");
+    let id = |at: usize| format!("00000000-0000-4000-8000-{at:012}");
+    let mut frames = Vec::with_capacity(2 * spokes + 1);
+    for at in 0..=spokes {
+        let payload = borsh::to_vec(&strata_migrate::NodeRecord {
+            record_version: strata_migrate::RECORD_VERSION,
+            legacy_id: id(at),
+            kernel_id: at as u64 + 1,
+            content: format!("hub-scale memory {at}"),
+            node_type: "fact".to_string(),
+            tags: Vec::new(),
+            created_ms: BASE_MS,
+            updated_ms: BASE_MS,
+            last_accessed_ms: BASE_MS,
+            legacy: Vec::new(),
+            source: None,
+            source_updated_at_ms: None,
+        })
+        .expect("node");
+        frames.push((KIND_STORE_WRITE, payload));
+    }
+    for at in 1..=spokes {
+        let payload = borsh::to_vec(&strata_migrate::EdgeRecord {
+            record_version: strata_migrate::RECORD_VERSION,
+            source_kernel_id: at as u64 + 1,
+            target_kernel_id: 1,
+            source_legacy_id: id(at),
+            target_legacy_id: id(0),
+            link_type: "touched".to_string(),
+            legacy_inferred: false,
+            legacy_link_type: "touched".into(),
+            strength_q32: 0,
+            created_ms: 0,
+            last_activated_ms: 0,
+            activation_count: 0,
+            legacy: Vec::new(),
+        })
+        .expect("edge");
+        frames.push((KIND_STORE_CHECKPOINT, payload));
+    }
+    for chunk in frames.chunks(4_096) {
+        log.append_batch(chunk.to_vec()).expect("append");
+    }
+}
+
+#[test]
+fn a_hub_admits_millions_of_pairs_but_holds_only_the_page() {
+    let dir = temp_dir("bridge-hub");
+    let spokes = 2_000usize;
+    hub_store(&dir, spokes);
+    let store = StrataStore::open(&dir).expect("open");
+    let snapshot = store.ghost_snapshot(user());
+    let started = Instant::now();
+    let (report, admitted) = snapshot.bridge_top(10, |_, _, hops| 1.0 / f64::from(hops));
+    let elapsed = started.elapsed();
+    eprintln!("hub-scale: {admitted} admitted pairs, top 10 in {elapsed:?}");
+    // Hub-spoke pairs are one hop, spoke-spoke pairs two.
+    assert_eq!(admitted, spokes + spokes * (spokes - 1) / 2);
+    assert_eq!(report.candidates.len(), 10);
+    assert!(
+        report.candidates.iter().all(|c| c.hops == 1),
+        "one-hop pairs rank first"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

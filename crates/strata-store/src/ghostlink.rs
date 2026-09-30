@@ -174,6 +174,42 @@ pub struct BridgeReport {
     pub candidates: Vec<BridgeCandidate>,
 }
 
+/// One scored bridge pair in [`GhostSnapshot::bridge_top`]'s bounded heap.
+/// Ordered so that a *worse* pair compares greater: the max-heap's top is
+/// the pair to drop, and `into_sorted_vec` yields best first.
+#[derive(Debug, Clone, Copy)]
+struct Kept {
+    score: f64,
+    a: u32,
+    b: u32,
+    hops: u32,
+}
+
+impl PartialEq for Kept {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Kept {}
+
+impl PartialOrd for Kept {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Kept {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Lower score is worse; on a tie the larger id pair is worse (ids
+        // are indexed in id order).
+        other
+            .score
+            .total_cmp(&self.score)
+            .then((self.a, self.b).cmp(&(other.a, other.b)))
+    }
+}
+
 /// Divergent lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
@@ -1025,79 +1061,132 @@ impl<'s> GhostSnapshot<'s> {
     // ------------------------------------------------------------------
 
     /// Every pool pair within [`BRIDGE_MAX_HOPS`] admitting-edge hops that
-    /// no live record wove. BFS runs only from pool members that have an
-    /// admitting edge, over admitting edges only.
+    /// no live record wove, in `(first_id, second_id)` order. Unbounded:
+    /// propose ranks through [`Self::bridge_top`], which never holds more
+    /// than the page it returns.
     pub fn bridge(&self) -> BridgeReport {
+        let (report, _) = self.bridge_top(usize::MAX, |_, _, _| 0.0);
+        report
+    }
+
+    /// The `k` best bridge pairs by `score(first_id, second_id, hops)`,
+    /// best first, ties by `(first_id, second_id)`, plus how many pairs the
+    /// walk admitted. BFS runs only from pool members that have an
+    /// admitting edge, over admitting edges only. Each admitted pair is
+    /// scored as the walk finds it and only the best `k` are kept, so a hub
+    /// that admits millions of pairs costs `k` candidates of memory; proof
+    /// paths are built for the kept pairs alone.
+    pub fn bridge_top(
+        &self,
+        k: usize,
+        mut score: impl FnMut(&str, &str, u32) -> f64,
+    ) -> (BridgeReport, usize) {
         let admitting = &self.kind_admitting;
         let edge_ok = |kind: u16| admitting[kind as usize];
-        let mut scratch = self.scratch.borrow_mut();
-        let mut candidates = Vec::new();
+        let mut kept: BinaryHeap<Kept> = BinaryHeap::new();
+        let mut admitted = 0usize;
         let mut woven_pairs_excluded = 0;
         let mut with_edges = 0;
         let mut touching: HashSet<(u32, u32, u16, bool)> = HashSet::new();
-        for &a in &self.pool {
-            if !self.typed_profile[a as usize] {
-                continue;
-            }
-            with_edges += 1;
-            for edge in &self.adj[a as usize] {
-                if admitting[edge.kind as usize] {
-                    let key = if edge.forward {
-                        (a, edge.to, edge.kind, true)
-                    } else {
-                        (edge.to, a, edge.kind, true)
-                    };
-                    touching.insert(key);
+        {
+            let mut scratch = self.scratch.borrow_mut();
+            for &a in &self.pool {
+                if !self.typed_profile[a as usize] {
+                    continue;
                 }
-            }
-            scratch.reset();
-            scratch.visit(a, 0, (NO_PARENT, 0, true));
-            let mut frontier = vec![a];
-            for depth in 1..=BRIDGE_MAX_HOPS {
-                let mut next = Vec::new();
-                for &node in &frontier {
-                    for edge in &self.adj[node as usize] {
-                        if !edge_ok(edge.kind) || scratch.seen(edge.to) {
+                with_edges += 1;
+                for edge in &self.adj[a as usize] {
+                    if admitting[edge.kind as usize] {
+                        let key = if edge.forward {
+                            (a, edge.to, edge.kind, true)
+                        } else {
+                            (edge.to, a, edge.kind, true)
+                        };
+                        touching.insert(key);
+                    }
+                }
+                scratch.reset();
+                scratch.visit(a, 0, (NO_PARENT, 0, true));
+                let mut frontier = vec![a];
+                for depth in 1..=BRIDGE_MAX_HOPS {
+                    let mut next = Vec::new();
+                    for &node in &frontier {
+                        for edge in &self.adj[node as usize] {
+                            if !edge_ok(edge.kind) || scratch.seen(edge.to) {
+                                continue;
+                            }
+                            scratch.visit(edge.to, depth, (node, edge.kind, edge.forward));
+                            next.push(edge.to);
+                        }
+                    }
+                    if next.is_empty() {
+                        break;
+                    }
+                    next.sort_unstable();
+                    for &b in &next {
+                        if b <= a || !self.in_pool[b as usize] {
                             continue;
                         }
-                        scratch.visit(edge.to, depth, (node, edge.kind, edge.forward));
-                        next.push(edge.to);
+                        if self.woven_idx(a, b) {
+                            woven_pairs_excluded += 1;
+                            continue;
+                        }
+                        admitted += 1;
+                        if k == 0 {
+                            continue;
+                        }
+                        kept.push(Kept {
+                            score: score(self.ids[a as usize], self.ids[b as usize], depth),
+                            a,
+                            b,
+                            hops: depth,
+                        });
+                        if kept.len() > k {
+                            kept.pop();
+                        }
                     }
+                    frontier = next;
                 }
-                if next.is_empty() {
-                    break;
-                }
-                next.sort_unstable();
-                for &b in &next {
-                    if b <= a || !self.in_pool[b as usize] {
-                        continue;
-                    }
-                    if self.woven_idx(a, b) {
-                        woven_pairs_excluded += 1;
-                        continue;
-                    }
-                    candidates.push(BridgeCandidate {
-                        first_id: self.ids[a as usize].to_string(),
-                        second_id: self.ids[b as usize].to_string(),
-                        hops: depth,
-                        path: self.path_from(&scratch, a, b),
-                    });
-                }
-                frontier = next;
             }
         }
-        candidates.sort_by(|x, y| {
-            (x.first_id.as_str(), x.second_id.as_str())
-                .cmp(&(y.first_id.as_str(), y.second_id.as_str()))
-        });
-        BridgeReport {
-            head_seq: self.head_seq,
-            pool_size: self.pool.len(),
-            pool_nodes_with_admitting_edges: with_edges,
-            admitting_edges_touching_pool: touching.len(),
-            woven_pairs_excluded,
-            candidates,
+        let kept = kept.into_sorted_vec();
+        // Proof paths for the kept pairs only: one BFS per distinct source,
+        // the same walk (level-synchronous, first discoverer, id order) that
+        // admitted them.
+        let mut targets: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for pair in &kept {
+            targets.entry(pair.a).or_default().push(pair.b);
         }
+        let mut paths: HashMap<(u32, u32), Vec<PathStep>> = HashMap::new();
+        {
+            let mut scratch = self.scratch.borrow_mut();
+            for (a, bs) in targets {
+                self.bfs(&mut scratch, a, BRIDGE_MAX_HOPS, &edge_ok, None);
+                for b in bs {
+                    paths.insert((a, b), self.path_from(&scratch, a, b));
+                }
+            }
+        }
+        let candidates = kept
+            .into_iter()
+            .map(|pair| BridgeCandidate {
+                first_id: self.ids[pair.a as usize].to_string(),
+                second_id: self.ids[pair.b as usize].to_string(),
+                hops: pair.hops,
+                path: paths.remove(&(pair.a, pair.b)).unwrap_or_default(),
+            })
+            .collect();
+        (
+            BridgeReport {
+                head_seq: self.head_seq,
+                pool_size: self.pool.len(),
+                pool_nodes_with_admitting_edges: with_edges,
+                admitting_edges_touching_pool: touching.len(),
+                woven_pairs_excluded,
+                candidates,
+            },
+            admitted,
+        )
     }
 
     // ------------------------------------------------------------------
