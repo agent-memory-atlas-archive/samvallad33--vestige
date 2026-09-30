@@ -296,20 +296,17 @@ fn find_fence(text: &str) -> Option<(usize, usize)> {
         if code_fence.is_some() {
             continue;
         }
-        match begin {
-            None => {
-                let is_begin = line.strip_prefix(BEGIN_MARKER).is_some_and(|rest| {
-                    rest.starts_with(char::is_whitespace) && line.trim_end().ends_with("-->")
-                });
-                if is_begin {
-                    begin = Some(line_start);
-                }
-            }
-            Some(start) => {
-                if line.trim_end() == END_MARKER {
-                    return Some((start, offset));
-                }
-            }
+        let is_begin = line.strip_prefix(BEGIN_MARKER).is_some_and(|rest| {
+            rest.starts_with(char::is_whitespace) && line.trim_end().ends_with("-->")
+        });
+        if is_begin {
+            // The fence starts at the last begin line before the first end
+            // line, so an earlier begin line without an end stays ordinary text.
+            begin = Some(line_start);
+        } else if let Some(start) = begin
+            && line.trim_end() == END_MARKER
+        {
+            return Some((start, offset));
         }
     }
     None
@@ -751,6 +748,40 @@ mod splice_fence_tests {
         let out = splice(existing, REGION);
         assert!(out.starts_with(existing), "text lost:\n{out}");
         assert!(out.ends_with(REGION), "{out}");
+    }
+
+    const BEGIN_LINE: &str = "<!-- vestige:projection:begin scope=user format=claude-md -->\n";
+
+    #[test]
+    fn truncated_fence_survives_repeated_splices() {
+        let existing = format!("{BEGIN_LINE}hand written after a truncated fence\n");
+        let once = splice(&existing, REGION);
+        assert!(
+            once.contains("hand written after a truncated fence"),
+            "{once}"
+        );
+        let twice = splice(&once, REGION);
+        assert!(
+            twice.contains("hand written after a truncated fence"),
+            "text lost on second write:\n{twice}"
+        );
+        assert_eq!(splice(&twice, REGION), twice, "not idempotent");
+    }
+
+    #[test]
+    fn column_zero_begin_line_in_prose_before_real_fence_keeps_text() {
+        let existing = format!(
+            "{BEGIN_LINE}prose after a stray begin line\n\n{}\nTail.\n",
+            old_block()
+        );
+        let out = splice(&existing, REGION);
+        assert!(out.contains("prose after a stray begin line"), "{out}");
+        assert!(
+            out.contains("vestige:d2") && !out.contains("vestige:d1"),
+            "{out}"
+        );
+        assert!(out.ends_with("Tail.\n"), "{out}");
+        assert_eq!(splice(&out, REGION), out, "not idempotent");
     }
 
     #[test]
