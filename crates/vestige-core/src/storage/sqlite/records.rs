@@ -924,7 +924,8 @@ impl SqliteMemoryStore {
             .lock()
             .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
         let rows = writer.execute(
-            "UPDATE intentions SET status = 'snoozed', snoozed_until = ?1 WHERE id = ?2",
+            "UPDATE intentions SET status = 'snoozed', snoozed_until = ?1 \
+             WHERE id = ?2 AND status NOT IN ('fulfilled', 'cancelled')",
             params![until.to_rfc3339(), id],
         )?;
         Ok(rows > 0)

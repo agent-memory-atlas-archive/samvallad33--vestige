@@ -2632,6 +2632,9 @@ impl MemoryStoreSend for StrataMemory {
             return Ok(false);
         }
         let mut record = core_intention(&current)?;
+        if matches!(record.status.as_str(), "fulfilled" | "cancelled") {
+            return Ok(false);
+        }
         record.status = "snoozed".to_string();
         record.snoozed_until = Some(until);
         store
