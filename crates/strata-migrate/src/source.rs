@@ -661,9 +661,18 @@ pub fn is_sqlite_file(path: &Path) -> Result<bool, MigrationError> {
 
 /// Percent-encode a path for use inside a `file:` URI.
 fn uri_encode_path(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    let mut out = String::with_capacity(text.len());
-    for byte in text.as_bytes() {
+    // Raw OS bytes on Unix: a path need not be valid UTF-8, and a lossy
+    // conversion would name a different file.
+    #[cfg(unix)]
+    let bytes: std::borrow::Cow<'_, [u8]> = {
+        use std::os::unix::ffi::OsStrExt;
+        std::borrow::Cow::Borrowed(path.as_os_str().as_bytes())
+    };
+    #[cfg(not(unix))]
+    let bytes: std::borrow::Cow<'_, [u8]> =
+        std::borrow::Cow::Owned(path.to_string_lossy().into_owned().into_bytes());
+    let mut out = String::with_capacity(bytes.len());
+    for byte in bytes.iter() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b'~' => {
                 out.push(*byte as char)
@@ -833,5 +842,19 @@ mod timestamp_tests {
         ] {
             assert!(timestamp_ms(raw).is_err(), "{raw:?} must not parse");
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod uri_path_tests {
+    use super::uri_encode_path;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    #[test]
+    fn a_non_utf8_path_is_encoded_from_its_raw_bytes() {
+        let path = Path::new(OsStr::from_bytes(b"/data/d-\xff\xfe/vestige.db"));
+        assert_eq!(uri_encode_path(path), "/data/d-%FF%FE/vestige.db");
     }
 }

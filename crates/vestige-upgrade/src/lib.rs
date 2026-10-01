@@ -600,9 +600,17 @@ fn free_bytes(_dir: &Path) -> Option<u64> {
     None
 }
 
+/// Write one line to stderr. A closed or broken stderr is ignored: the
+/// upgrade record in `upgrade.log` is the durable copy, and a reader that
+/// went away must not stop the import.
+pub fn write_stderr(line: &str) {
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(stderr, "{line}");
+    let _ = stderr.flush();
+}
+
 fn note(log_path: &Path, line: &str) {
-    eprintln!("{line}");
-    let _ = io::stderr().flush();
+    write_stderr(line);
     append_log(log_path, line);
 }
 
