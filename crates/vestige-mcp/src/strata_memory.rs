@@ -277,6 +277,46 @@ pub struct StrataMemory {
     merge_policy: Mutex<Option<vestige_core::MergePolicy>>,
 }
 
+/// File in the data directory recording when maintenance last completed:
+/// `{"lastBackupMs": .., "lastDreamMs": ..}`. It holds timestamps only, never
+/// memory content, and is read by `session_start` for `needsBackup` and
+/// `needsDream`.
+const MAINTENANCE_STAMPS: &str = "maintenance-stamps.json";
+
+impl StrataMemory {
+    /// When `key` last completed, or `None` when it never has or the stamp
+    /// file is missing or unreadable.
+    fn maintenance_stamp(&self, key: &str) -> Option<DateTime<Utc>> {
+        let raw = std::fs::read(self.data_dir.join(MAINTENANCE_STAMPS)).ok()?;
+        let stamps: Value = serde_json::from_slice(&raw).ok()?;
+        DateTime::from_timestamp_millis(stamps.get(key)?.as_i64()?)
+    }
+
+    /// Record that `key` completed at `at`. A stamp only moves forward, the
+    /// other stamps are kept, and the file is replaced by rename so a crash
+    /// never leaves it torn.
+    fn record_maintenance_stamp(&self, key: &str, at: DateTime<Utc>) -> std::io::Result<()> {
+        let path = self.data_dir.join(MAINTENANCE_STAMPS);
+        let mut stamps = std::fs::read(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        let at_ms = at.timestamp_millis();
+        if stamps
+            .get(key)
+            .and_then(Value::as_i64)
+            .is_some_and(|prev| prev >= at_ms)
+        {
+            return Ok(());
+        }
+        stamps[key] = json!(at_ms);
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&stamps)?)?;
+        std::fs::rename(&tmp, &path)
+    }
+}
+
 impl StrataMemory {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StorageError> {
         Self::open_with_policy(dir, strata_store::default_policy())
@@ -1186,7 +1226,31 @@ impl MemoryStoreSend for StrataMemory {
     }
 
     fn last_backup_timestamp(&self) -> Option<DateTime<Utc>> {
-        None
+        self.maintenance_stamp("lastBackupMs")
+    }
+
+    fn get_last_dream(&self) -> Result<Option<DateTime<Utc>>, StorageError> {
+        Ok(self.maintenance_stamp("lastDreamMs"))
+    }
+
+    fn save_dream_history(
+        &self,
+        record: &vestige_core::DreamHistoryRecord,
+    ) -> Result<i64, StorageError> {
+        self.record_maintenance_stamp("lastDreamMs", record.dreamed_at)
+            .map_err(|err| StorageError::Init(format!("dream stamp not recorded: {err}")))?;
+        Ok(0)
+    }
+
+    fn count_memories_since(&self, since: DateTime<Utc>) -> Result<i64, StorageError> {
+        let since_ms = since.timestamp_millis();
+        let store = self.lock();
+        Ok(store
+            .nodes()
+            .into_iter()
+            .filter(retrievable)
+            .filter(|record| record.created_at_ms > since_ms)
+            .count() as i64)
     }
 
     fn process_actor_did(&self) -> Option<String> {
@@ -1335,7 +1399,11 @@ impl MemoryStoreSend for StrataMemory {
     }
 
     fn backup_to(&self, path: &Path) -> Result<(), StorageError> {
-        self.lock().backup_to(path).map_err(map_store)
+        self.lock().backup_to(path).map_err(map_store)?;
+        // The backup is complete; a stamp that fails to write only leaves
+        // `needsBackup` set, it never fails the backup.
+        let _ = self.record_maintenance_stamp("lastBackupMs", Utc::now());
+        Ok(())
     }
 
     fn checkpoint_wal(

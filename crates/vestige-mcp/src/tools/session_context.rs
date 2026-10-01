@@ -134,11 +134,13 @@ pub async fn execute(
     let include_status = args.include_status.unwrap_or(true);
     let include_intentions = args.include_intentions.unwrap_or(true);
     let include_predictions = args.include_predictions.unwrap_or(true);
-    // Strata has no query search (explicit queries are refused below), so a
-    // bare session_start on a Strata store opens the session without the
-    // default "user preferences" search instead of failing.
+    // Strata finds memories by exact handle only. A bare session_start opens
+    // without the default "user preferences" search, and explicit queries are
+    // dropped with a notice instead of failing the whole call.
+    let is_strata = crate::strata_memory::is_strata_backend(storage.as_ref());
+    let mut notices: Vec<String> = Vec::new();
     let queries = args.queries.unwrap_or_else(|| {
-        if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        if is_strata {
             Vec::new()
         } else {
             vec!["user preferences".to_string()]
@@ -147,6 +149,23 @@ pub async fn execute(
 
     if queries.len() > 16 {
         return Err("At most 16 startup queries are supported per call".into());
+    }
+    let queries = if is_strata && !queries.is_empty() {
+        notices.push(format!(
+            "queries ignored ({}): Strata finds memories by exact handle only. Call recall with a full memory id or an exact tag instead.",
+            queries.len()
+        ));
+        Vec::new()
+    } else {
+        queries
+    };
+    if is_strata && args.changed_files.is_some() {
+        notices.push(
+            "changed_files ignored: open-failure matching is not available on Strata.".to_string(),
+        );
+    }
+    if is_strata && args.include_predictions == Some(true) {
+        notices.push("predictions are not available on Strata.".to_string());
     }
     let scope = args.scope.as_deref().unwrap_or("user").trim();
     if scope.is_empty() || scope.len() > 200 || scope.chars().any(char::is_control) {
@@ -222,7 +241,7 @@ pub async fn execute(
     //     `changed_files`; absent arg = section skipped, no matches = no
     //     section — silence, never an empty header).
     // ====================================================================
-    if let Some(changed) = args.changed_files.as_deref() {
+    if !is_strata && let Some(changed) = args.changed_files.as_deref() {
         // Purely additive: a query failure degrades to "no section" rather
         // than failing the whole session start.
         if let Ok(failures) = storage.open_failures_touching(changed)
@@ -253,7 +272,7 @@ pub async fn execute(
     //     trace payload has no `success: false` are not failed calls, so an
     //     ordinary recorder that never records outcomes stays silent here.
     // ====================================================================
-    if let Ok(failed_calls) = storage.last_session_failed_calls(None)
+    if !is_strata && let Ok(failed_calls) = storage.last_session_failed_calls(None)
         && !failed_calls.is_empty()
     {
         let run_id = failed_calls[0].run_id.clone();
@@ -284,7 +303,13 @@ pub async fn execute(
     // 2. Intentions — find triggered + pending high-priority
     // ====================================================================
     if include_intentions {
-        let intentions = storage.get_active_intentions().map_err(|e| e.to_string())?;
+        // On Strata, intentions are scoped like memories.
+        let intentions = if is_strata {
+            storage.get_active_intentions_in_scope(scope)
+        } else {
+            storage.get_active_intentions()
+        }
+        .map_err(|e| e.to_string())?;
         let now = Utc::now();
         let mut triggered_lines: Vec<String> = Vec::new();
 
@@ -307,13 +332,16 @@ pub async fn execute(
                 };
                 let deadline_str = intention
                     .deadline
-                    .map(|d| format!(" [due {}]", d.format("%b %d")))
+                    .map(|d| format!(" [due {}]", d.format("%b %d, %Y")))
                     .unwrap_or_default();
+                let overdue_str = if is_overdue { " OVERDUE" } else { "" };
                 let line = format!(
-                    "- {}{}{}",
+                    "- [{}] {}{}{}{}",
+                    intention.id,
                     first_sentence(&intention.content),
                     priority_str,
-                    deadline_str
+                    deadline_str,
+                    overdue_str
                 );
                 let line_len = line.len() + 1;
                 if char_count + line_len <= budget_chars {
@@ -365,10 +393,15 @@ pub async fn execute(
         } else {
             0.0
         };
-        let status_line = format!(
-            "**Status:** {} memories | {} | {:.0}% embeddings",
-            stats.total_nodes, status, embedding_pct
-        );
+        // Strata stores no embeddings, so the percentage would always read 0.
+        let status_line = if is_strata {
+            format!("**Status:** {} memories | {}", stats.total_nodes, status)
+        } else {
+            format!(
+                "**Status:** {} memories | {} | {:.0}% embeddings",
+                stats.total_nodes, status, embedding_pct
+            )
+        };
         let status_len = status_line.len() + 1;
         if char_count + status_len <= budget_chars {
             context_parts.push(status_line);
@@ -399,7 +432,7 @@ pub async fn execute(
     // ====================================================================
     // 4. Predictions — top 3 with content preview
     // ====================================================================
-    if include_predictions {
+    if include_predictions && !is_strata {
         let cog = cognitive.lock().await;
 
         let session_ctx =
@@ -505,7 +538,9 @@ pub async fn execute(
         }
     }
     let repo_path = args.context.as_ref().and_then(|c| c.repo_path.as_deref());
-    let verification = code_context::annotate(storage, &mut code_items, repo_path, true)?;
+    // session_start is annotated read-only: report live verdicts, write none.
+    let verification =
+        code_context::annotate_with(storage, &mut code_items, repo_path, true, false)?;
     let header = format!("## Session ({} memories, {})", stats.total_nodes, status);
     let initially_omitted = expandable_ids.len();
     let mut result = serde_json::json!({
@@ -519,6 +554,9 @@ pub async fn execute(
         "codeContext": {"scope":scope,"codebase":args.context.as_ref().and_then(|c| c.codebase.as_deref()),"verification":verification,"items":code_items},
         "automationTriggers": {"needsDream":needs_dream,"needsBackup":needs_backup,"needsGc":needs_gc},
     });
+    if !notices.is_empty() {
+        result["notices"] = serde_json::json!(notices);
+    }
     // Reserve evidence as an atomic item: never retain a summary but trim off
     // its warning. Drop other sections first, then whole code items. Expansion
     // hints are bounded too. The final count includes the serialized envelope.
@@ -1262,5 +1300,199 @@ mod tests {
             !ctx.contains("storage benchmark"),
             "partial context match must not fire a conjunctive trigger: {ctx}"
         );
+    }
+}
+
+#[cfg(test)]
+mod strata_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cognitive() -> Arc<Mutex<CognitiveEngine>> {
+        Arc::new(Mutex::new(CognitiveEngine::new()))
+    }
+
+    fn strata() -> (Arc<Storage>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
+        (storage, dir)
+    }
+
+    async fn start(storage: &Arc<Storage>, args: Value) -> Value {
+        execute(storage, &cognitive(), &OutputConfig::default(), Some(args))
+            .await
+            .expect("session_start must answer on Strata")
+    }
+
+    async fn set_intention(storage: &Arc<Storage>, args: Value) -> String {
+        let set = crate::tools::intention_unified::execute(storage, &cognitive(), Some(args))
+            .await
+            .unwrap();
+        set["intentionId"].as_str().expect("intention id").to_string()
+    }
+
+    #[tokio::test]
+    async fn a_bare_start_carries_no_notice() {
+        let (storage, _dir) = strata();
+        let out = start(&storage, json!({})).await;
+        assert!(out.get("notices").is_none(), "{out}");
+        assert!(out["context"].as_str().unwrap().starts_with("## Session"));
+    }
+
+    #[tokio::test]
+    async fn explicit_queries_are_dropped_with_a_notice_not_an_error() {
+        let (storage, _dir) = strata();
+        let out = start(&storage, json!({"queries": ["user preferences", "release"]})).await;
+        let notices = out["notices"].as_array().expect("notice for dropped queries");
+        assert!(
+            notices[0].as_str().unwrap().starts_with("queries ignored (2)"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_files_and_requested_predictions_are_noted_as_unused() {
+        let (storage, _dir) = strata();
+        let out = start(
+            &storage,
+            json!({"changed_files": ["src/lib.rs"], "include_predictions": true}),
+        )
+        .await;
+        let notices = out["notices"].to_string();
+        assert!(notices.contains("changed_files ignored"), "{out}");
+        assert!(notices.contains("predictions are not available"), "{out}");
+        let context = out["context"].as_str().unwrap();
+        assert!(!context.contains("embeddings"), "{context}");
+        assert!(!context.contains("**Predicted:**"), "{context}");
+    }
+
+    #[tokio::test]
+    async fn intentions_follow_scope_carry_ids_and_date_with_the_year() {
+        let (storage, _dir) = strata();
+        let mine = set_intention(
+            &storage,
+            json!({"action": "set", "description": "Rotate the signing key",
+                   "deadline": "2020-01-02T00:00:00Z", "priority": "high", "scope": "user"}),
+        )
+        .await;
+        let theirs = set_intention(
+            &storage,
+            json!({"action": "set", "description": "Other project chore",
+                   "priority": "high", "scope": "other-project"}),
+        )
+        .await;
+        let out = start(&storage, json!({"scope": "user"})).await;
+        let context = out["context"].as_str().unwrap();
+        assert!(context.contains(&format!("[{mine}]")), "{context}");
+        assert!(context.contains("2020"), "the due date carries its year: {context}");
+        assert!(context.contains("OVERDUE"), "{context}");
+        assert!(!context.contains(&theirs), "another scope's intention leaked: {context}");
+        assert!(!context.contains("Other project chore"), "{context}");
+    }
+
+    #[tokio::test]
+    async fn needs_backup_and_needs_dream_follow_the_real_stamps() {
+        let (storage, dir) = strata();
+        let before = start(&storage, json!({})).await;
+        assert_eq!(before["automationTriggers"]["needsBackup"], json!(true));
+        assert_eq!(before["automationTriggers"]["needsDream"], json!(true));
+
+        let backup = tempfile::tempdir().unwrap();
+        storage.backup_to(&backup.path().join("snap")).unwrap();
+        let record = vestige_core::DreamHistoryRecord {
+            dreamed_at: Utc::now(),
+            duration_ms: 1,
+            memories_replayed: 0,
+            connections_found: 0,
+            insights_generated: 0,
+            memories_strengthened: 0,
+            memories_compressed: 0,
+            phase_nrem1_ms: None,
+            phase_nrem3_ms: None,
+            phase_rem_ms: None,
+            phase_integration_ms: None,
+            summaries_generated: None,
+            emotional_memories_processed: None,
+            creative_connections_found: None,
+        };
+        storage.save_dream_history(&record).unwrap();
+
+        let after = start(&storage, json!({})).await;
+        assert_eq!(after["automationTriggers"]["needsBackup"], json!(false), "{after}");
+        assert_eq!(after["automationTriggers"]["needsDream"], json!(false), "{after}");
+        let stamps = std::fs::read_to_string(dir.path().join("maintenance-stamps.json")).unwrap();
+        assert!(stamps.contains("lastBackupMs") && stamps.contains("lastDreamMs"), "{stamps}");
+    }
+
+    #[tokio::test]
+    async fn maintenance_stamps_keep_each_other_and_never_move_back() {
+        let (storage, _dir) = strata();
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        let dream = |when| vestige_core::DreamHistoryRecord {
+            dreamed_at: when,
+            duration_ms: 1,
+            memories_replayed: 0,
+            connections_found: 0,
+            insights_generated: 0,
+            memories_strengthened: 0,
+            memories_compressed: 0,
+            phase_nrem1_ms: None,
+            phase_nrem3_ms: None,
+            phase_rem_ms: None,
+            phase_integration_ms: None,
+            summaries_generated: None,
+            emotional_memories_processed: None,
+            creative_connections_found: None,
+        };
+        storage.save_dream_history(&dream(at("2026-09-02T00:00:00Z"))).unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        storage.backup_to(&backup.path().join("snap")).unwrap();
+        storage.save_dream_history(&dream(at("2026-09-01T00:00:00Z"))).unwrap();
+        assert_eq!(
+            storage.get_last_dream().unwrap(),
+            Some(at("2026-09-02T00:00:00Z")),
+            "an older dream must not move the stamp back"
+        );
+        assert!(storage.last_backup_timestamp().is_some(), "the dream write dropped the backup stamp");
+    }
+
+    #[tokio::test]
+    async fn session_start_reports_live_verdicts_and_writes_none() {
+        let (storage, _dir) = strata();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        let source = repo.path().join("src/state.rs");
+        std::fs::write(
+            &source,
+            "pub fn load_config(path: &str) -> String {\n    std::fs::read_to_string(path).unwrap()\n}\n",
+        )
+        .unwrap();
+        let saved = crate::tools::codebase_unified::execute(
+            &storage,
+            &cognitive(),
+            &OutputConfig::default(),
+            Some(json!({"action": "remember_pattern", "codebase": "anchored",
+                        "repoPath": repo.path(), "name": "Eager config read",
+                        "description": "load_config reads the whole file eagerly",
+                        "files": ["src/state.rs#load_config"]})),
+        )
+        .await
+        .unwrap();
+        let id = saved["nodeId"].as_str().unwrap().to_string();
+        let recorded = |storage: &Arc<Storage>| {
+            storage.code_anchors_for_nodes(std::slice::from_ref(&id)).unwrap()[&id][0].last_status
+        };
+        let before = recorded(&storage);
+
+        // The symbol disappears, so a live check now reports it missing.
+        std::fs::write(&source, "pub fn other() {}\n").unwrap();
+        let out = start(
+            &storage,
+            json!({"context": {"codebase": "anchored", "repoPath": repo.path()}}),
+        )
+        .await;
+        assert_eq!(out["codeContext"]["verification"]["enabled"], json!(true), "{out}");
+        assert_eq!(out["codeContext"]["verification"]["stale"], json!(1), "{out}");
+        assert_eq!(recorded(&storage), before, "a read-only session_start persisted a verdict");
     }
 }

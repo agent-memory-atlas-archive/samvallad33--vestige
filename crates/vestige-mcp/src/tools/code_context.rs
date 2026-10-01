@@ -48,6 +48,19 @@ pub(super) fn annotate(
     repo_path: Option<&str>,
     enabled: bool,
 ) -> Result<Value, String> {
+    annotate_with(storage, items, repo_path, enabled, true)
+}
+
+/// [`annotate`], choosing whether fresh verdicts are persisted. A read-only
+/// tool (`session_start`) passes `persist: false`: it reports the live
+/// verdicts and writes nothing.
+pub(super) fn annotate_with(
+    storage: &Arc<Storage>,
+    items: &mut [Value],
+    repo_path: Option<&str>,
+    enabled: bool,
+    persist: bool,
+) -> Result<Value, String> {
     let root = repo_path
         .filter(|s| !s.trim().is_empty())
         .and_then(|s| std::fs::canonicalize(s.trim()).ok())
@@ -69,7 +82,7 @@ pub(super) fn annotate(
         .iter()
         .filter_map(|v| v["id"].as_str().map(str::to_owned))
         .collect();
-    let verified = verify_nodes(storage, &root, &ids)?;
+    let verified = verify_nodes_with(storage, &root, &ids, persist)?;
     annotate_items(items, &verified);
     let fresh = verified.values().filter(|(s, _)| s.is_fresh()).count();
     let stale = verified.values().filter(|(s, _)| s.is_stale()).count();
@@ -142,6 +155,16 @@ pub(super) fn verify_nodes(
     repo_root: &std::path::Path,
     node_ids: &[String],
 ) -> Result<std::collections::HashMap<String, (AnchorStatus, Vec<AnchorVerification>)>, String> {
+    verify_nodes_with(storage, repo_root, node_ids, true)
+}
+
+/// [`verify_nodes`], choosing whether changed verdicts are persisted.
+pub(super) fn verify_nodes_with(
+    storage: &Arc<Storage>,
+    repo_root: &std::path::Path,
+    node_ids: &[String],
+    persist: bool,
+) -> Result<std::collections::HashMap<String, (AnchorStatus, Vec<AnchorVerification>)>, String> {
     let mut out = std::collections::HashMap::new();
     let by_node = storage
         .code_anchors_for_nodes(node_ids)
@@ -150,7 +173,7 @@ pub(super) fn verify_nodes(
         let mut verdicts: Vec<AnchorVerification> = Vec::with_capacity(anchors.len());
         for anchor in &anchors {
             let v = verify_anchor(anchor, repo_root);
-            if anchor.last_status != Some(v.status) || anchor.last_verified_at.is_none() {
+            if persist && (anchor.last_status != Some(v.status) || anchor.last_verified_at.is_none()) {
                 let _ = storage.record_anchor_verification(&anchor.id, v.status, v.checked_at);
             }
             verdicts.push(v);

@@ -371,12 +371,33 @@ async fn execute_strata(
             .map_err(|e| e.to_string())?;
     }
 
+    // Record the completed pass so session_start's needsDream reads the real
+    // last dream instead of always asking for one.
+    let dream_record = vestige_core::DreamHistoryRecord {
+        dreamed_at: chrono::Utc::now(),
+        duration_ms: started.elapsed().as_millis() as i64,
+        memories_replayed: live.len() as i32,
+        connections_found: pairs.len() as i32,
+        insights_generated: 0,
+        memories_strengthened: reviews.len() as i32,
+        memories_compressed: 0,
+        phase_nrem1_ms: None,
+        phase_nrem3_ms: None,
+        phase_rem_ms: None,
+        phase_integration_ms: None,
+        summaries_generated: None,
+        emotional_memories_processed: None,
+        creative_connections_found: None,
+    };
+    let dream_recorded = storage.save_dream_history(&dream_record).is_ok();
+
     Ok(serde_json::json!({
         "hasMore": has_more,
         "nextCursor": next_cursor,
         "scope": args.scope,
         "maxPairs": args.max_pairs,
         "status": "completed",
+        "dreamRecorded": dream_recorded,
         "basis": "recorded_edges_fsrs",
         "selection": "recorded_edges_fsrs",
         "edgeStrengthFloor": args.edge_strength_floor,
