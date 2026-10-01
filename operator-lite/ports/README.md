@@ -25,6 +25,7 @@ corpus, everywhere.
 | OpenCode | `.opencode/plugins/` `tool.execute.before` | [opencode/](opencode/) | gate-tested, corpus 43/43 via adapter, boots in opencode CLI |
 | Cline | file hooks `~/.cline/hooks/PreToolUse` (fires before approval policies — covers YOLO) + SDK plugin | [cline/](cline/) | gate-tested, suite PASS, receipt chain OK |
 | Goose | lifecycle hooks `PreToolUse` (exit-2 block, goose v1.41.0+) | [goose/](goose/) | gate-tested, 29/29 |
+| Crush | `hooks.PreToolUse[]` in crush.json — flat `{name, matcher?, command, timeout}` entries; payload is the gate's contract verbatim (exit-2 block, stderr reason) | [crush/](crush/) | gate-tested, suite 40/40 |
 | Gemini CLI | `BeforeTool` hook in `~/.gemini/settings.json` (exit-2 deny) | [gemini-cli/](gemini-cli/) | gate-tested, suite PASS, corpus 43/43 |
 | Aider | no hook API — terminal wrapper | [aider/](aider/) | see port README |
 
