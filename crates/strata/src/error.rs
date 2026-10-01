@@ -49,6 +49,11 @@ impl fmt::Display for StrataError {
                  — damage at/below the acked watermark, refusing to truncate history",
                 d.reason, d.segment, d.offset, d.last_acked_seq
             ),
+            // 0: the holder's pid could not be read (Windows will not let a
+            // second handle read a locked file).
+            StrataError::Locked { pid: 0 } => {
+                write!(f, "strata directory locked by another process")
+            }
             StrataError::Locked { pid } => {
                 write!(f, "strata directory locked by pid {pid}")
             }

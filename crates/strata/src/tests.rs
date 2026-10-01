@@ -426,7 +426,8 @@ fn single_writer_lock_and_stale_takeover() {
     let dir = test_dir("lock");
     let log = StrataLog::open(&dir).unwrap();
     match StrataLog::open(&dir) {
-        Err(StrataError::Locked { pid }) => assert!(pid > 0),
+        // Windows cannot read a locked file's pid, so it may be unknown (0).
+        Err(StrataError::Locked { pid }) => assert!(pid > 0 || cfg!(windows)),
         other => panic!("expected Locked, got {other:?}"),
     }
     drop(log); // releases strata.lock
@@ -484,7 +485,10 @@ fn lock_file_stays_in_place_while_a_writer_holds_the_log() {
     assert!(lock_path.exists(), "the lock file must outlive open");
     log.append(1, b"x").unwrap();
     match StrataLog::open(&dir) {
-        Err(StrataError::Locked { pid }) => assert_eq!(pid, u64::from(std::process::id())),
+        Err(StrataError::Locked { pid }) => assert!(
+            pid == u64::from(std::process::id()) || (cfg!(windows) && pid == 0),
+            "unexpected holder pid {pid}"
+        ),
         other => panic!("expected Locked, got {other:?}"),
     }
     // Still refused after the failed attempt: a refused opener must not

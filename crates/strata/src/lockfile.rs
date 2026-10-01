@@ -102,8 +102,21 @@ fn parse_pid(bytes: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod contention_tests {
     use super::*;
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(unix)]
     use std::sync::Arc;
+
+    /// The refusal names this process as the holder. On Windows a second
+    /// handle cannot read a locked file, so the pid may be unknown (0).
+    fn assert_holder(pid: u64) {
+        let me = u64::from(std::process::id());
+        if cfg!(windows) {
+            assert!(pid == me || pid == 0, "unexpected holder pid {pid}");
+        } else {
+            assert_eq!(pid, me);
+        }
+    }
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("strata-lock-{name}-{}", std::process::id()));
@@ -135,9 +148,7 @@ mod contention_tests {
         let _holder = DirLock::acquire(&dir).expect("holder");
         let started = Instant::now();
         match DirLock::acquire(&dir) {
-            Err(StrataError::Locked { pid }) => {
-                assert_eq!(pid, u64::from(std::process::id()));
-            }
+            Err(StrataError::Locked { pid }) => assert_holder(pid),
             other => panic!("a held lock must refuse, got {:?}", other.err()),
         }
         assert!(
