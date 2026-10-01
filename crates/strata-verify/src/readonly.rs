@@ -35,8 +35,8 @@ pub(crate) fn dir_has_segments(dir: &Path) -> bool {
 }
 
 /// Walk every segment in `dir`, checking the hash chain, payload hashes,
-/// and sealed-trailer signatures. A torn tail is an error: this scanner
-/// does not truncate it.
+/// sealed-trailer signatures, and the `head.state` acked watermark. A torn
+/// tail is an error: this scanner does not truncate it.
 pub(crate) fn scan_log(dir: &Path) -> Result<Scan, String> {
     if !dir.is_dir() {
         return Err(format!("not a directory: {}", dir.display()));
@@ -80,6 +80,20 @@ pub(crate) fn scan_log(dir: &Path) -> Result<Scan, String> {
                 ));
             }
         }
+    }
+
+    // The log refuses to open when frames the watermark records as acked are
+    // gone, or when head.state cannot be read. Report the same.
+    match strata::read_head_state(dir) {
+        Ok(Some(acked)) if (frames.len() as u64) < acked => {
+            return Err(format!(
+                "head.state records {acked} acked frames but only {} are present: \
+                 acked history is missing",
+                frames.len()
+            ));
+        }
+        Ok(_) => {}
+        Err(err) => return Err(format!("head.state: {err}")),
     }
 
     Ok(Scan {

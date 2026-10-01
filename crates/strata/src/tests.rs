@@ -672,3 +672,174 @@ fn a_seal_that_cannot_roll_the_segment_does_not_hang_appends() {
     assert_eq!(reopened.read_frames(1).unwrap().len(), 2);
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Flip one payload byte of the second frame of the only segment.
+fn flip_second_frame(dir: &Path) {
+    let seg = only_segment(dir);
+    let mut bytes = fs::read(&seg).unwrap();
+    let (_f1, n1) = format::parse_frame(&bytes[HEADER_WIRE_SIZE..]).unwrap();
+    bytes[HEADER_WIRE_SIZE + n1 + 5] ^= 0xff;
+    fs::write(&seg, &bytes).unwrap();
+}
+
+#[test]
+fn seal_refuses_to_sign_over_a_damaged_active_segment() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("seal-damaged");
+    let log = StrataLog::open(&dir).unwrap();
+    append_many(&log, 3);
+    flip_second_frame(&dir);
+    let seg = only_segment(&dir);
+    let before = fs::read(&seg).unwrap();
+
+    let err = log.seal().expect_err("seal must not sign damaged bytes");
+    assert!(matches!(err, StrataError::Halt(_)), "got {err:?}");
+    assert_eq!(
+        fs::read(&seg).unwrap(),
+        before,
+        "a refused seal must leave the segment bytes untouched"
+    );
+    assert_eq!(
+        crate::log::list_segments(&dir).unwrap().len(),
+        1,
+        "a refused seal must not roll a new segment"
+    );
+    drop(log);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn damage_found_on_read_stops_further_appends() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("read-damaged");
+    let log = StrataLog::open(&dir).unwrap();
+    append_many(&log, 3);
+    flip_second_frame(&dir);
+
+    let err = log
+        .read_frames(1)
+        .expect_err("a read over acked damage must fail, not return a prefix");
+    assert!(matches!(err, StrataError::Halt(_)), "got {err:?}");
+
+    let err = log
+        .append(1, b"after-damage")
+        .expect_err("a log that found acked damage must refuse writes");
+    assert!(matches!(err, StrataError::Halt(_)), "got {err:?}");
+    let err = log
+        .append_batch(vec![(1, b"x".to_vec())])
+        .expect_err("batch appends are refused too");
+    assert!(matches!(err, StrataError::Halt(_)), "got {err:?}");
+    assert_eq!(log.head().last_acked_seq, 3, "no new frame was acked");
+    drop(log);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn damage_found_by_verify_tail_stops_further_appends() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("tail-damaged");
+    let log = StrataLog::open(&dir).unwrap();
+    append_many(&log, 3);
+    flip_second_frame(&dir);
+
+    assert!(log.verify_tail().is_err());
+    let err = log
+        .append(1, b"after-damage")
+        .expect_err("a log that found acked damage must refuse writes");
+    assert!(matches!(err, StrataError::Halt(_)), "got {err:?}");
+    drop(log);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_healthy_log_keeps_accepting_writes_after_reads_and_checks() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("healthy-reads");
+    let log = StrataLog::open(&dir).unwrap();
+    append_many(&log, 3);
+    log.seal().unwrap();
+    append_many(&log, 2);
+    assert_eq!(log.read_frames(1).unwrap().len(), 5);
+    log.verify_tail().unwrap();
+    assert_eq!(log.append(1, b"more").unwrap().seq, 6);
+    drop(log);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn damage_in_a_sealed_segment_fails_reads_and_stops_appends() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("sealed-damaged");
+    let log = StrataLog::open(&dir).unwrap();
+    append_many(&log, 3);
+    log.seal().unwrap();
+    append_many(&log, 2);
+    let report = log.verify_log().unwrap();
+    assert_eq!(
+        (report.segments, report.sealed_segments, report.frames),
+        (2, 1, 5)
+    );
+
+    // Flip a payload byte of frame 2 inside the sealed segment.
+    let sealed = crate::log::list_segments(&dir).unwrap()[0].1.clone();
+    let mut bytes = fs::read(&sealed).unwrap();
+    let (_f1, n1) = format::parse_frame(&bytes[HEADER_WIRE_SIZE..]).unwrap();
+    bytes[HEADER_WIRE_SIZE + n1 + 5] ^= 0xff;
+    fs::write(&sealed, &bytes).unwrap();
+
+    assert!(matches!(log.verify_log(), Err(StrataError::Halt(_))));
+    assert!(matches!(log.read_frames(1), Err(StrataError::Halt(_))));
+    assert!(matches!(log.append(1, b"x"), Err(StrataError::Halt(_))));
+    drop(log);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_forged_sealed_trailer_fails_verification() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("sealed-trailer");
+    let log = StrataLog::open(&dir).unwrap();
+    append_many(&log, 3);
+    log.seal().unwrap();
+
+    // Zero the trailer signature: frames and merkle root still agree, the
+    // signature does not.
+    let sealed = crate::log::list_segments(&dir).unwrap()[0].1.clone();
+    let mut bytes = fs::read(&sealed).unwrap();
+    let n = bytes.len();
+    for b in &mut bytes[n - 8..] {
+        *b ^= 0xff;
+    }
+    fs::write(&sealed, &bytes).unwrap();
+
+    assert!(matches!(log.verify_log(), Err(StrataError::Halt(_))));
+    assert!(matches!(log.append(1, b"x"), Err(StrataError::Halt(_))));
+    drop(log);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn frames_missing_from_disk_fail_verification() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("frames-missing");
+    let log = StrataLog::open(&dir).unwrap();
+    append_many(&log, 3);
+    // Cut the active segment back to frame 2, on a frame boundary.
+    let seg = only_segment(&dir);
+    let bytes = fs::read(&seg).unwrap();
+    let (_f1, n1) = format::parse_frame(&bytes[HEADER_WIRE_SIZE..]).unwrap();
+    let (_f2, n2) = format::parse_frame(&bytes[HEADER_WIRE_SIZE + n1..]).unwrap();
+    fs::write(&seg, &bytes[..HEADER_WIRE_SIZE + n1 + n2]).unwrap();
+
+    assert!(matches!(log.verify_log(), Err(StrataError::Halt(_))));
+    assert!(matches!(log.append(1, b"x"), Err(StrataError::Halt(_))));
+    drop(log);
+    fs::remove_dir_all(&dir).unwrap();
+}

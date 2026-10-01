@@ -93,6 +93,17 @@ pub struct TailReport {
     pub trailer: Option<TrailerCheck>,
 }
 
+/// Result of [`StrataLog::verify_log`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogReport {
+    /// Segments scanned, sealed and active.
+    pub segments: u32,
+    /// Sealed segments whose signed trailer was checked.
+    pub sealed_segments: u32,
+    /// Frames read back and re-hashed across every segment.
+    pub frames: u64,
+}
+
 pub struct StrataLog {
     inner: Arc<Inner>,
 }
@@ -165,6 +176,10 @@ struct Group {
     flushing: bool,
     /// Fail-stop latch set when a commit panicked; later appends also panic.
     poisoned: Option<String>,
+    /// Set when a read of durable history found damage. Later appends and
+    /// seals return the halt instead of extending a log that no longer
+    /// verifies.
+    halted: Option<HaltDetail>,
 }
 
 struct PendingFrame {
@@ -341,7 +356,9 @@ struct HeadState {
     last_acked_seq: u64,
 }
 
-fn read_head_state(dir: &Path) -> Result<Option<u64>, StrataError> {
+/// The recorded acked watermark in `dir`, or `None` when `head.state` does
+/// not exist. An unreadable file is [`StrataError::Corrupt`].
+pub fn read_head_state(dir: &Path) -> Result<Option<u64>, StrataError> {
     match fs::read(dir.join(HEAD_STATE)) {
         Ok(b) => {
             let s: HeadState = borsh::from_slice(&b)
@@ -644,6 +661,171 @@ fn validate_trailer(
     let sig = Signature::from_bytes(&trailer.signature);
     if signing.verifying_key().verify(&msg, &sig).is_err() {
         return Err("trailer signature invalid".into());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Whole-log verification
+// ---------------------------------------------------------------------------
+
+fn halted_for_writes(detail: HaltDetail) -> StrataError {
+    StrataError::Halt(HaltDetail {
+        reason: format!(
+            "writes are refused after damage was found in the durable log: {}",
+            detail.reason
+        ),
+        ..detail
+    })
+}
+
+/// Walk every segment in order, verifying as it goes, and hand each frame to
+/// `on_frame`. Damage anywhere, in a sealed segment or the active one, is a
+/// halt. `expected_frames` is the writer's own frame count.
+fn walk_segments(
+    dir: &Path,
+    signing: &SigningKey,
+    expected_frames: u64,
+    wm: u64,
+    mut on_frame: impl FnMut(FrameRecord),
+) -> Result<LogReport, StrataError> {
+    let segs = list_segments(dir)?;
+    if segs.is_empty() {
+        return Err(halt_err(wm, 0, 0, "log has no segments"));
+    }
+    let last_idx = segs.len() - 1;
+    let mut prev_hash_expected = GENESIS_PREV_SEGMENT_HASH;
+    let mut seq: u64 = 0;
+    let mut sealed_segments = 0u32;
+    for (idx, (no, path)) in segs.iter().enumerate() {
+        let is_last = idx == last_idx;
+        let bytes = fs::read(path)?;
+        let Some(header) = parse_header(&bytes) else {
+            return Err(halt_err(
+                wm,
+                *no,
+                0,
+                "segment header unreadable (bad magic/version/length)",
+            ));
+        };
+        if header.prev_segment_hash != prev_hash_expected {
+            return Err(halt_err(
+                wm,
+                *no,
+                0,
+                format!("segment chain: prev_segment_hash does not match segment {no}'s hash"),
+            ));
+        }
+        let (stop, st) = scan_frames(&bytes, format::header_hash(&header));
+        match stop {
+            TailStop::Trailer { trailer, offset } => {
+                if let Err(reason) = validate_trailer(&trailer, &st, &header, signing) {
+                    return Err(halt_err(
+                        wm,
+                        *no,
+                        offset as u64,
+                        format!("segment trailer: {reason}"),
+                    ));
+                }
+                sealed_segments += 1;
+                prev_hash_expected = format::hash_slice(&bytes);
+            }
+            TailStop::Clean if is_last => {}
+            TailStop::Clean => {
+                return Err(halt_err(
+                    wm,
+                    *no,
+                    bytes.len() as u64,
+                    "sealed segment is missing its trailer",
+                ));
+            }
+            TailStop::Torn { offset, reason } => {
+                return Err(halt_err(
+                    wm,
+                    *no,
+                    offset as u64,
+                    format!(
+                        "segment damaged at frame {}: {reason}",
+                        seq + st.frame_count + 1
+                    ),
+                ));
+            }
+        }
+        let mut off = HEADER_WIRE_SIZE;
+        while off < st.end_offset {
+            let (frame, used) = format::parse_frame(&bytes[off..])
+                .map_err(|e| StrataError::Corrupt(format!("frame decode: {e}")))?;
+            seq += 1;
+            let fh = format::frame_hash(&frame);
+            on_frame(FrameRecord {
+                seq,
+                kind: frame.kind,
+                payload: frame.payload,
+                payload_blake3: frame.payload_blake3,
+                prev_frame_hash: frame.prev_frame_hash,
+                frame_hash: fh,
+            });
+            off += used;
+        }
+    }
+    if seq != expected_frames {
+        return Err(halt_err(
+            wm,
+            0,
+            0,
+            format!("log holds {seq} frames on disk but {expected_frames} were committed"),
+        ));
+    }
+    Ok(LogReport {
+        segments: segs.len() as u32,
+        sealed_segments,
+        frames: seq,
+    })
+}
+
+/// The active segment on disk must hold exactly the frames the writer
+/// committed, with no trailer and no stray bytes.
+fn check_active_segment_on_disk(w: &WriterState, wm: u64) -> Result<(), StrataError> {
+    let bytes = fs::read(&w.path)?;
+    let Some(header) = parse_header(&bytes) else {
+        return Err(halt_err(
+            wm,
+            w.segment_no,
+            0,
+            "seal: active segment header unreadable",
+        ));
+    };
+    let (stop, st) = scan_frames(&bytes, format::header_hash(&header));
+    match stop {
+        TailStop::Clean => {}
+        TailStop::Trailer { offset, .. } => {
+            return Err(halt_err(
+                wm,
+                w.segment_no,
+                offset as u64,
+                "seal: active segment already ends in a trailer",
+            ));
+        }
+        TailStop::Torn { offset, reason } => {
+            return Err(halt_err(
+                wm,
+                w.segment_no,
+                offset as u64,
+                format!("seal: active segment damaged: {reason}"),
+            ));
+        }
+    }
+    if st.frame_count != w.frame_count
+        || st.leaves != w.leaves
+        || st.last_frame_hash != w.last_frame_hash
+        || st.end_offset as u64 != w.offset
+    {
+        return Err(halt_err(
+            wm,
+            w.segment_no,
+            st.end_offset as u64,
+            "seal: active segment on disk differs from the frames committed to it",
+        ));
     }
     Ok(())
 }
@@ -1067,6 +1249,7 @@ impl StrataLog {
             completed: Vec::new(),
             flushing: false,
             poisoned: None,
+            halted: None,
         };
         Ok(StrataLog {
             inner: Arc::new(Inner {
@@ -1094,6 +1277,9 @@ impl StrataLog {
             return Ok(Vec::new());
         }
         let mut g = self.inner.lock_group();
+        if let Some(detail) = g.halted.clone() {
+            return Err(halted_for_writes(detail));
+        }
         let mut mine: Vec<u64> = Vec::with_capacity(frames.len());
         for (kind, payload) in frames {
             let seq = g.next_seq;
@@ -1195,6 +1381,9 @@ impl StrataLog {
         if let Some(reason) = g.poisoned.clone() {
             poisoned_panic(&reason, g.last_acked_seq);
         }
+        if let Some(detail) = g.halted.clone() {
+            return Err(halted_for_writes(detail));
+        }
         while g.flushing {
             g = self.inner.wait_for_flush(g);
         }
@@ -1237,6 +1426,18 @@ impl StrataLog {
 
         // Trailer phase — files lock only (all appenders are parked on the cv).
         let mut files = self.inner.lock_files();
+        // The trailer signs the in-memory merkle root. Sign it only over bytes
+        // that still match: a segment altered since its frames were acked is
+        // history that no longer verifies, and a fresh signature must not
+        // vouch for it.
+        if let Err(err) = check_active_segment_on_disk(&files, wm) {
+            drop(files);
+            self.latch_halt(&err);
+            let mut g = self.inner.lock_group();
+            g.flushing = false;
+            self.inner.cv.notify_all();
+            return Err(err);
+        }
         let merkle = format::merkle_root(&files.leaves);
         let msg = format::signature_message(&files.segment_id, &files.prev_segment_hash, &merkle);
         let signature: Signature = self.inner.signing.sign(&msg);
@@ -1333,41 +1534,79 @@ impl StrataLog {
 
     /// Read frames with `seq >= from_seq`, oldest first, from the durable log.
     /// Holds the writer lock, so it sees a consistent snapshot.
+    ///
+    /// Every segment is checked on the way: frame hashes, the frame chain,
+    /// the segment chain, and each sealed segment's signed trailer. Damage
+    /// anywhere is a [`StrataError::Halt`] and also stops further appends;
+    /// a damaged log never yields a shorter prefix.
     pub fn read_frames(&self, from_seq: u64) -> Result<Vec<FrameRecord>, StrataError> {
-        let _guard = self.inner.lock_files();
-        let segs = list_segments(&self.inner.dir)?;
+        let wm = self.inner.lock_group().last_acked_seq;
         let mut out = Vec::new();
-        let mut seq: u64 = 1;
-        for (_no, path) in &segs {
-            let bytes = fs::read(path)?;
-            let Some(header) = parse_header(&bytes) else {
-                return Err(StrataError::Corrupt(format!(
-                    "unreadable segment header in {}",
-                    path.display()
-                )));
-            };
-            let hh = format::header_hash(&header);
-            let (_stop, st) = scan_frames(&bytes, hh);
-            let mut off = HEADER_WIRE_SIZE;
-            while off < st.end_offset {
-                let (frame, used) = format::parse_frame(&bytes[off..])
-                    .map_err(|e| StrataError::Corrupt(format!("frame decode: {e}")))?;
-                let fh = format::frame_hash(&frame);
-                if seq >= from_seq {
-                    out.push(FrameRecord {
-                        seq,
-                        kind: frame.kind,
-                        payload: frame.payload,
-                        payload_blake3: frame.payload_blake3,
-                        prev_frame_hash: frame.prev_frame_hash,
-                        frame_hash: fh,
-                    });
-                }
-                seq += 1;
-                off += used;
+        let result = {
+            let files = self.inner.lock_files();
+            walk_segments(
+                &self.inner.dir,
+                &self.inner.signing,
+                files.frames_total,
+                wm,
+                |record| {
+                    if record.seq >= from_seq {
+                        out.push(record);
+                    }
+                },
+            )
+        };
+        match result {
+            Ok(_) => Ok(out),
+            Err(err) => {
+                self.latch_halt(&err);
+                Err(err)
             }
         }
-        Ok(out)
+    }
+
+    /// Re-verify every segment from disk against this process's view of the
+    /// log: header and frame chains, payload hashes, each sealed segment's
+    /// signed trailer, and the frame count. Read-only. Damage returns
+    /// [`StrataError::Halt`] and stops further appends.
+    pub fn verify_log(&self) -> Result<LogReport, StrataError> {
+        let wm = self.inner.lock_group().last_acked_seq;
+        let result = {
+            let files = self.inner.lock_files();
+            walk_segments(
+                &self.inner.dir,
+                &self.inner.signing,
+                files.frames_total,
+                wm,
+                |_| {},
+            )
+        };
+        if let Err(err) = &result {
+            self.latch_halt(err);
+        }
+        result
+    }
+
+    /// `Ok` while the log accepts writes; the recorded halt once a check has
+    /// found damage in durable history. Callers whose write path has no error
+    /// channel of its own use this to refuse before starting.
+    pub fn ensure_writable(&self) -> Result<(), StrataError> {
+        match self.inner.lock_group().halted.clone() {
+            Some(detail) => Err(halted_for_writes(detail)),
+            None => Ok(()),
+        }
+    }
+
+    /// Remember that durable history no longer verifies, so appends and seals
+    /// are refused. Only [`StrataError::Halt`] latches; an I/O error reading
+    /// the files says nothing about the bytes.
+    fn latch_halt(&self, err: &StrataError) {
+        if let StrataError::Halt(detail) = err {
+            let mut g = self.inner.lock_group();
+            if g.halted.is_none() {
+                g.halted = Some(detail.clone());
+            }
+        }
     }
 
     /// Advisory point-in-time head snapshot.
@@ -1395,6 +1634,14 @@ impl StrataLog {
     /// Read-only — never truncates. Returns [`StrataError::Halt`] on any
     /// damage found.
     pub fn verify_tail(&self) -> Result<TailReport, StrataError> {
+        let result = self.verify_tail_inner();
+        if let Err(err) = &result {
+            self.latch_halt(err);
+        }
+        result
+    }
+
+    fn verify_tail_inner(&self) -> Result<TailReport, StrataError> {
         let wm = self.inner.lock_group().last_acked_seq;
         let f = self.inner.lock_files();
         let bytes = fs::read(&f.path)?;

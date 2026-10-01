@@ -1421,6 +1421,9 @@ mod strata_tests {
     fn open() -> (Arc<StrataMemory>, Arc<Storage>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let mem = Arc::new(StrataMemory::open(dir.path()).unwrap());
+        // Registered like the server's own open, so receipt checks can
+        // re-verify the log.
+        crate::strata_memory::register_open(&mem);
         let storage: Arc<Storage> = mem.clone();
         (mem, storage, dir)
     }
@@ -1495,6 +1498,7 @@ mod strata_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (receipts, cards) = {
             let mem = Arc::new(StrataMemory::open(dir.path()).unwrap());
+            crate::strata_memory::register_open(&mem);
             mem.set_process_actor("did:key:z6Mkstratafixture").unwrap();
             let storage: Arc<Storage> = mem.clone();
             let id = ingest(&storage, "original cause text");
@@ -1620,6 +1624,7 @@ mod strata_tests {
         };
 
         let reopened = Arc::new(StrataMemory::open(dir.path()).unwrap());
+        crate::strata_memory::register_open(&reopened);
         let storage: Arc<Storage> = reopened.clone();
         let (promote_receipt, demote_receipt, edit_receipt, id, successor) = receipts;
         proved(&storage, &promote_receipt, &id, "promoted").await;

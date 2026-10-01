@@ -2408,3 +2408,113 @@ fn an_unadmitted_anchor_frame_is_an_orphan() {
     assert_eq!(reopened.anchor("forged"), None);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Segment files of a store's log, in numeric order.
+fn segment_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut segs: Vec<PathBuf> = std::fs::read_dir(dir.join("log"))
+        .expect("read log dir")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("seg"))
+        .collect();
+    segs.sort();
+    segs
+}
+
+/// Flip one payload byte of the first frame in `seg`.
+fn flip_first_frame(seg: &std::path::Path) {
+    let mut bytes = std::fs::read(seg).expect("read segment");
+    let (_frame, used) = strata::parse_frame(&bytes[strata::HEADER_WIRE_SIZE..]).expect("frame");
+    assert!(used > 8);
+    bytes[strata::HEADER_WIRE_SIZE + 8] ^= 0xff;
+    std::fs::write(seg, &bytes).expect("write segment");
+}
+
+#[test]
+fn backup_of_a_log_with_a_damaged_sealed_segment_fails() {
+    let dir = temp_dir("backup-sealed-damage");
+    let first = temp_dir("backup-sealed-damage-first");
+    let second = temp_dir("backup-sealed-damage-second");
+    std::fs::remove_dir_all(&second).ok();
+    let mut store = StrataStore::open(&dir).expect("open");
+    store.ingest(input("first fact", &[])).expect("first");
+    store
+        .backup_to(&first)
+        .expect("healthy backup seals segment 0");
+    store.ingest(input("second fact", &[])).expect("second");
+
+    flip_first_frame(&segment_files(&dir)[0]);
+    let err = store
+        .backup_to(&second)
+        .expect_err("a backup must not copy a log that fails verification");
+    assert!(matches!(err, StoreError::Log(_)), "got {err}");
+    assert!(
+        !second.join("log").exists(),
+        "a refused backup must not leave a partial copy"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&first).ok();
+}
+
+#[test]
+fn backup_of_a_log_with_a_damaged_active_segment_fails() {
+    let dir = temp_dir("backup-active-damage");
+    let dest = temp_dir("backup-active-damage-dest");
+    std::fs::remove_dir_all(&dest).ok();
+    let mut store = StrataStore::open(&dir).expect("open");
+    store.ingest(input("first fact", &[])).expect("first");
+    store.ingest(input("second fact", &[])).expect("second");
+
+    flip_first_frame(&segment_files(&dir)[0]);
+    let before: Vec<Vec<u8>> = segment_files(&dir)
+        .iter()
+        .map(|seg| std::fs::read(seg).expect("read"))
+        .collect();
+    store
+        .backup_to(&dest)
+        .expect_err("a backup must not seal and copy a damaged log");
+    let after: Vec<Vec<u8>> = segment_files(&dir)
+        .iter()
+        .map(|seg| std::fs::read(seg).expect("read"))
+        .collect();
+    assert_eq!(before, after, "a refused backup must not seal the segment");
+    assert!(!dest.join("log").exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_store_that_found_damage_in_acked_history_refuses_writes() {
+    let dir = temp_dir("damage-stops-writes");
+    let mut store = StrataStore::open(&dir).expect("open");
+    store.ingest(input("first fact", &[])).expect("first");
+    store.ingest(input("second fact", &[])).expect("second");
+
+    flip_first_frame(&segment_files(&dir)[0]);
+    assert!(
+        store.refold().is_err(),
+        "a refold over damaged history must fail"
+    );
+    let err = store
+        .ingest(input("written after the damage was found", &[]))
+        .expect_err("a store that found acked damage must stop accepting writes");
+    assert!(matches!(err, StoreError::Log(_)), "got {err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn proving_effects_over_a_damaged_sealed_segment_fails_instead_of_hiding_later_ones() {
+    let dir = temp_dir("prove-sealed-damage");
+    let dest = temp_dir("prove-sealed-damage-dest");
+    let mut store = StrataStore::open(&dir).expect("open");
+    store.ingest(input("first fact", &[])).expect("first");
+    store.backup_to(&dest).expect("seal segment 0");
+    let second = store.ingest(input("second fact", &[])).expect("second");
+
+    flip_first_frame(&segment_files(&dir)[0]);
+    // The second fact's effect lives in the intact active segment. It must
+    // not be reported as simply absent: the log as a whole no longer verifies.
+    store
+        .latest_effect(&second)
+        .expect_err("a damaged log must not answer lookups");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dest).ok();
+}
