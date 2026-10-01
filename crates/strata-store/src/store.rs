@@ -918,10 +918,14 @@ impl StrataStore {
             params_hash,
             context,
         };
+        // A full volume refuses a frame instead of aborting; each gate step
+        // is checked so a refused write stops here with the error.
+        let _ = self.gate_log.take_refusal();
         let propose_ack = runtime.commit_propose(propose);
-        let gate_ack = runtime
-            .commit_gate(propose_ack.seq)
-            .map_err(|e| StoreError::Gate(e.to_string()))?;
+        self.refused_append()?;
+        let gate_ack = runtime.commit_gate(propose_ack.seq);
+        self.refused_append()?;
+        let gate_ack = gate_ack.map_err(|e| StoreError::Gate(e.to_string()))?;
         let (_, verdict) = runtime
             .latest_gate(propose_ack.seq)
             .expect("commit_gate just appended the gate");
@@ -945,9 +949,9 @@ impl StrataStore {
             action_hash,
             payload_digest: hash32(&op_bytes),
         };
-        let effect_ack: SeqAck = runtime
-            .commit_effect(effect)
-            .map_err(|r| StoreError::Rejected(r.to_string()))?;
+        let effect_ack = runtime.commit_effect(effect);
+        self.refused_append()?;
+        let effect_ack: SeqAck = effect_ack.map_err(|r| StoreError::Rejected(r.to_string()))?;
         if let Some(rule) = retire_rule_id(&params_hash) {
             self.retire_rules.insert(effect_ack.seq, rule);
         }
@@ -961,6 +965,14 @@ impl StrataStore {
             self.call_admitted.insert(id);
         }
         Ok((effect_ack.seq, data_seq))
+    }
+
+    /// Surface a gate frame the log refused for lack of space.
+    fn refused_append(&self) -> Result<(), StoreError> {
+        match self.gate_log.take_refusal() {
+            Some(e) => Err(StoreError::Log(e)),
+            None => Ok(()),
+        }
     }
 
     fn context_for(&self, ids: &[&str]) -> Vec<u64> {

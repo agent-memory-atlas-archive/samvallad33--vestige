@@ -21,7 +21,7 @@ use crate::format::{
     HEADER_WIRE_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION, TRAILER_WIRE_SIZE,
 };
 use crate::lockfile::DirLock;
-use crate::sync::{self, SyncPurpose};
+use crate::sync::{self, Site, SyncPurpose};
 
 /// Maximum frames sharing one sync (group-commit upper bound).
 pub const MAX_BATCH_FRAMES: usize = 64;
@@ -139,6 +139,19 @@ impl Inner {
             Err(_) => panic!("strata: writer lock poisoned after a fail-stop abort"),
         }
     }
+    /// A commit was refused because the volume is full and its writes were
+    /// rolled back. Discard every queued frame (their seqs would otherwise
+    /// leave a hole), reopen the seq space at the log tail, and wake the
+    /// parked appenders so each sees the refusal.
+    fn refuse_queued(&self, g: &mut Group, err: &io::Error, next_seq: u64) {
+        g.queued.clear();
+        g.epoch += 1;
+        g.next_seq = next_seq;
+        g.refusal = Some((err.kind(), err.to_string()));
+        g.flushing = false;
+        self.cv.notify_all();
+    }
+
     fn wait_for_flush<'a>(&self, g: MutexGuard<'a, Group>) -> MutexGuard<'a, Group> {
         match self.cv.wait(g) {
             Ok(g) => g,
@@ -165,6 +178,12 @@ struct Group {
     flushing: bool,
     /// Fail-stop latch set when a commit panicked; later appends also panic.
     poisoned: Option<String>,
+    /// Bumped each time a commit is refused for lack of space. An appender
+    /// whose frames were queued under an older epoch and were not acked had
+    /// them discarded with the refused commit.
+    epoch: u64,
+    /// The most recent refusal, reported to the appenders it discarded.
+    refusal: Option<(io::ErrorKind, String)>,
 }
 
 struct PendingFrame {
@@ -329,9 +348,16 @@ fn load_or_create_key(dir: &Path, log_seed: Option<&[u8; 32]>) -> Result<Signing
             .write(true)
             .create_new(true)
             .open(&path)?;
-        f.write_all(&seed)?;
-        sync::sync_file(&f, SyncPurpose::Metadata)?;
-        sync::sync_dir(dir)?;
+        let written = sync::guard_space(Site::Key)
+            .and_then(|_| f.write_all(&seed))
+            .and_then(|_| sync::sync_file(&f, SyncPurpose::Metadata))
+            .and_then(|_| sync::sync_dir(dir));
+        if let Err(e) = written {
+            // A key file that is empty or short would fail every later open.
+            drop(f);
+            let _ = fs::remove_file(&path);
+            return Err(e.into());
+        }
         Ok(SigningKey::from_bytes(&seed))
     }
 }
@@ -356,17 +382,43 @@ fn read_head_state(dir: &Path) -> Result<Option<u64>, StrataError> {
 /// Atomic watermark replace: temp file + fsync + rename + dir fsync. The temp
 /// path is exclusive to the single writer; a leftover `head.state.tmp` after
 /// a crash is simply overwritten next time and ignored on open.
+#[cfg(test)]
 pub(crate) fn write_head_state(dir: &Path, seq: u64) -> io::Result<()> {
+    stage_head_state(dir, seq)?;
+    publish_head_state(dir)
+}
+
+/// Write and sync the replacement watermark beside the live one. On failure
+/// the temp file is removed and the live watermark is untouched.
+fn stage_head_state(dir: &Path, seq: u64) -> io::Result<()> {
     let tmp = dir.join(HEAD_STATE_TMP);
-    let mut f = File::create(&tmp)?;
-    f.write_all(&borsh::to_vec(&HeadState {
-        last_acked_seq: seq,
-    })?)?;
-    sync::sync_file(&f, SyncPurpose::Metadata)?;
-    drop(f);
-    fs::rename(&tmp, dir.join(HEAD_STATE))?;
+    let staged = (|| {
+        sync::guard_space(Site::HeadState)?;
+        let mut f = File::create(&tmp)?;
+        f.write_all(&borsh::to_vec(&HeadState {
+            last_acked_seq: seq,
+        })?)?;
+        sync::sync_file(&f, SyncPurpose::Metadata)
+    })();
+    if staged.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    staged
+}
+
+/// Atomically replace the live watermark with the staged one.
+fn publish_head_state(dir: &Path) -> io::Result<()> {
+    fs::rename(dir.join(HEAD_STATE_TMP), dir.join(HEAD_STATE))?;
     sync::sync_dir(dir)?;
     Ok(())
+}
+
+/// True when the volume (or the user's quota on it) has no room left.
+pub(crate) fn is_storage_full(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded
+    )
 }
 
 fn hex32(bytes: &[u8; 16]) -> String {
@@ -452,9 +504,17 @@ fn create_segment(
         .write(true)
         .create_new(true)
         .open(&path)?;
-    f.write_all(&borsh::to_vec(&header)?)?;
-    sync::sync_file(&f, SyncPurpose::Segment)?;
-    sync::sync_dir(dir)?;
+    let wire = borsh::to_vec(&header)?;
+    let written = sync::guard_space(Site::SegmentHeader)
+        .and_then(|_| f.write_all(&wire))
+        .and_then(|_| sync::sync_file(&f, SyncPurpose::Segment))
+        .and_then(|_| sync::sync_dir(dir));
+    if let Err(e) = written {
+        // A segment without a complete header is not part of the log.
+        drop(f);
+        let _ = fs::remove_file(&path);
+        return Err(e.into());
+    }
     Ok((path, header, f))
 }
 
@@ -659,12 +719,57 @@ struct WrittenFrame {
     frame_hash: [u8; 32],
 }
 
+/// Writer state at the start of a commit, kept so a refused commit can be
+/// undone exactly.
+struct WriterSnapshot {
+    offset: u64,
+    frame_count: u64,
+    frames_total: u64,
+    leaves_len: usize,
+    last_frame_hash: [u8; 32],
+}
+
+impl WriterSnapshot {
+    fn take(w: &WriterState) -> Self {
+        WriterSnapshot {
+            offset: w.offset,
+            frame_count: w.frame_count,
+            frames_total: w.frames_total,
+            leaves_len: w.leaves.len(),
+            last_frame_hash: w.last_frame_hash,
+        }
+    }
+
+    /// Cut the segment back to the snapshot. Nothing in the undone range was
+    /// acked, and shrinking a file needs no free space. If the cut itself
+    /// fails the segment's state is unknown: fail-stop.
+    fn restore(&self, w: &mut WriterState, last_acked_seq: u64) {
+        w.offset = self.offset;
+        w.frame_count = self.frame_count;
+        w.frames_total = self.frames_total;
+        w.leaves.truncate(self.leaves_len);
+        w.last_frame_hash = self.last_frame_hash;
+        let cut = w
+            .file
+            .set_len(self.offset)
+            .and_then(|_| w.file.seek(SeekFrom::Start(self.offset)).map(|_| ()))
+            .and_then(|_| sync::sync_file(&w.file, SyncPurpose::Segment));
+        if let Err(e) = cut {
+            fail_stop_io(last_acked_seq, "rollback", &e);
+        }
+    }
+}
+
+/// Run one commit group. A full volume before the group is durable is
+/// returned as `Err` after the segment is restored; every other failure is
+/// fail-stop.
 fn commit_batch(
     dir: &Path,
     w: &mut WriterState,
     batch: Vec<PendingFrame>,
     watermark_before: u64,
-) -> Vec<SeqAck> {
+) -> Result<Vec<SeqAck>, io::Error> {
+    let snapshot = WriterSnapshot::take(w);
     let mut written: Vec<WrittenFrame> = Vec::with_capacity(batch.len());
 
     // WRITING: serialize and append each frame at the end of the segment.
@@ -680,7 +785,11 @@ fn commit_batch(
             Ok(b) => b,
             Err(e) => fail_stop_io(watermark_before, "serialize", &e),
         };
-        if let Err(e) = w.file.write_all(&wire) {
+        if let Err(e) = sync::guard_space(Site::Frame).and_then(|_| w.file.write_all(&wire)) {
+            if is_storage_full(&e) {
+                snapshot.restore(w, watermark_before);
+                return Err(e);
+            }
             fail_stop_io(watermark_before, "write", &e);
         }
         let frame_hash = format::hash_slice(&wire);
@@ -743,18 +852,27 @@ fn commit_batch(
 
     // DURABLE: atomically replace the acked watermark.
     let new_watermark = written.last().expect("non-empty batch").seq;
-    if let Err(e) = write_head_state(dir, new_watermark) {
+    if let Err(e) = stage_head_state(dir, new_watermark) {
+        if is_storage_full(&e) {
+            // Nothing is published yet: the group was never acked, so it is
+            // undone like a refused write.
+            snapshot.restore(w, watermark_before);
+            return Err(e);
+        }
+        fail_stop_io(watermark_before, "watermark", &e);
+    }
+    if let Err(e) = publish_head_state(dir) {
         fail_stop_io(watermark_before, "watermark", &e);
     }
 
     // ACK (returned to callers only after verify + watermark).
-    written
+    Ok(written
         .into_iter()
         .map(|wr| SeqAck {
             seq: wr.seq,
             frame_hash: wr.frame_hash,
         })
-        .collect()
+        .collect())
 }
 
 fn take_completed(completed: &mut Vec<SeqAck>, mine: &[u64]) -> Option<Vec<SeqAck>> {
@@ -768,6 +886,14 @@ fn take_completed(completed: &mut Vec<SeqAck>, mine: &[u64]) -> Option<Vec<SeqAc
         Some(out)
     } else {
         None
+    }
+}
+
+/// The error handed to an appender whose frames a refused commit discarded.
+fn refusal_error(g: &Group) -> StrataError {
+    match &g.refusal {
+        Some((kind, msg)) => StrataError::Io(io::Error::new(*kind, msg.clone())),
+        None => StrataError::Io(io::Error::from(io::ErrorKind::StorageFull)),
     }
 }
 
@@ -1067,6 +1193,8 @@ impl StrataLog {
             completed: Vec::new(),
             flushing: false,
             poisoned: None,
+            epoch: 0,
+            refusal: None,
         };
         Ok(StrataLog {
             inner: Arc::new(Inner {
@@ -1094,6 +1222,7 @@ impl StrataLog {
             return Ok(Vec::new());
         }
         let mut g = self.inner.lock_group();
+        let my_epoch = g.epoch;
         let mut mine: Vec<u64> = Vec::with_capacity(frames.len());
         for (kind, payload) in frames {
             let seq = g.next_seq;
@@ -1113,6 +1242,12 @@ impl StrataLog {
                 }
                 if let Some(acks) = take_completed(&mut g.completed, &mine) {
                     return Ok(acks);
+                }
+                if g.epoch != my_epoch {
+                    // A commit was refused for lack of space and took this
+                    // call's unacked frames with it.
+                    g.completed.retain(|a| !mine.contains(&a.seq));
+                    return Err(refusal_error(&g));
                 }
                 if g.flushing {
                     g = self.inner.wait_for_flush(g);
@@ -1151,15 +1286,24 @@ impl StrataLog {
             let watermark_before = g.last_acked_seq;
             drop(g); // followers may queue while the pipeline runs
 
-            let result = {
+            let (result, tail_seq) = {
                 let mut files = self.inner.lock_files();
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     commit_batch(&self.inner.dir, &mut files, batch, watermark_before)
-                }))
+                }));
+                (result, files.frames_total + 1)
             };
 
             let acks = match result {
-                Ok(acks) => acks,
+                Ok(Ok(acks)) => acks,
+                Ok(Err(refused)) => {
+                    let mut g = self.inner.lock_group();
+                    self.inner.refuse_queued(&mut g, &refused, tail_seq);
+                    // Earlier chunks of this call were acked and stay durable;
+                    // their acks are not handed back for a failed call.
+                    g.completed.retain(|a| !mine.contains(&a.seq));
+                    return Err(refused.into());
+                }
                 Err(payload) => {
                     // Latch the failure for followers, then keep panicking.
                     let mut g = self.inner.lock_group();
@@ -1207,13 +1351,19 @@ impl StrataLog {
             let batch: Vec<PendingFrame> = g.queued.drain(..n).collect();
             let watermark_before = g.last_acked_seq;
             drop(g);
-            let result = {
+            let (result, tail_seq) = {
                 let mut files = self.inner.lock_files();
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     commit_batch(&self.inner.dir, &mut files, batch, watermark_before)
-                }))
+                }));
+                (result, files.frames_total + 1)
             };
             match result {
+                Ok(Err(refused)) => {
+                    let mut g = self.inner.lock_group();
+                    self.inner.refuse_queued(&mut g, &refused, tail_seq);
+                    return Err(refused.into());
+                }
                 Err(payload) => {
                     let mut g = self.inner.lock_group();
                     g.flushing = false;
@@ -1222,7 +1372,7 @@ impl StrataLog {
                     self.inner.cv.notify_all();
                     std::panic::resume_unwind(payload);
                 }
-                Ok(acks) => {
+                Ok(Ok(acks)) => {
                     g = self.inner.lock_group();
                     let last = acks.last().map(|a| a.seq).unwrap_or(g.last_acked_seq);
                     if last > g.last_acked_seq {
@@ -1257,7 +1407,23 @@ impl StrataLog {
             }
         };
         let trailer_at = files.offset;
-        if let Err(e) = files.file.write_all(&wire) {
+        if let Err(e) = sync::guard_space(Site::Trailer).and_then(|_| files.file.write_all(&wire)) {
+            if is_storage_full(&e) {
+                // Cut the partial trailer off and leave the segment open.
+                let cut = files
+                    .file
+                    .set_len(trailer_at)
+                    .and_then(|_| files.file.seek(SeekFrom::Start(trailer_at)).map(|_| ()))
+                    .and_then(|_| sync::sync_file(&files.file, SyncPurpose::Segment));
+                if let Err(cut_err) = cut {
+                    fail_stop_io(wm, "seal-rollback", &cut_err);
+                }
+                drop(files);
+                let mut g = self.inner.lock_group();
+                g.flushing = false;
+                self.inner.cv.notify_all();
+                return Err(e.into());
+            }
             fail_stop_io(wm, "seal-write", &e);
         }
         if let Err(e) = sync::sync_file(&files.file, SyncPurpose::Segment) {

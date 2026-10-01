@@ -14,7 +14,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::error::StrataError;
-use crate::sync::{self, SyncPurpose};
+use crate::sync::{self, Site, SyncPurpose};
 
 pub(crate) const LOCK_NAME: &str = "strata.lock";
 
@@ -58,9 +58,17 @@ impl DirLock {
 
 fn write_pid_and_sync(mut f: std::fs::File, path: PathBuf) -> Result<DirLock, StrataError> {
     let pid = std::process::id() as u64;
-    f.write_all(&pid.to_le_bytes())?;
-    f.flush()?;
-    sync::sync_file(&f, SyncPurpose::Metadata)?;
+    let written = sync::guard_space(Site::Lock)
+        .and_then(|_| f.write_all(&pid.to_le_bytes()))
+        .and_then(|_| f.flush())
+        .and_then(|_| sync::sync_file(&f, SyncPurpose::Metadata));
+    if let Err(e) = written {
+        // An empty lock file reads as held by an unknown writer and would
+        // block every later open until it is deleted by hand.
+        drop(f);
+        let _ = fs::remove_file(&path);
+        return Err(e.into());
+    }
     Ok(DirLock { path })
 }
 

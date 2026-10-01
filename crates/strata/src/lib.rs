@@ -23,6 +23,15 @@
 //!   atomically (temp file + fsync + rename + directory fsync).
 //! * **ACK**: [`SeqAck`] is returned only after verify + watermark.
 //!
+//! A full volume is the one I/O failure that is not fail-stop. If writing a
+//! frame, the head watermark, or a seal trailer fails with a storage-full
+//! error, nothing of the commit has been acked: the segment is cut back to
+//! its state before the commit, every queued appender gets the error
+//! ([`StrataError::is_storage_full`]), the seq space is unchanged, and the
+//! log stays usable once space is freed. Sync, verify, and every other I/O
+//! error stay fail-stop. Opening also leaves no half-written lock, key, or
+//! segment file behind when space runs out.
+//!
 //! In production binaries, build with `panic = "abort"` so a fail-stop panic
 //! takes the process down; the library uses `panic!` (not a hard `abort`) so
 //! tests can exercise the path with `catch_unwind`.
@@ -76,3 +85,5 @@ pub use log::{
     HeadInfo, SealInfo, SeqAck, StrataLog, TailReport, TrailerCheck, GROUP_COMMIT_WINDOW_MS,
     MAX_BATCH_FRAMES,
 };
+#[cfg(feature = "failpoints")]
+pub use sync::failpoints;
