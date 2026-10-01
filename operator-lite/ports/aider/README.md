@@ -127,8 +127,11 @@ Stated plainly, because a half-honest security claim is worse than none:
   the gate is unreachable (missing python3/gate, crash, 8s timeout) a shim
   fails open *unless* the command matches the reference adapter's
   `DESTRUCTIVE_LIKE` regex (`rm -r`, force-push, `DROP TABLE`, `mkfs`,
-  `dd if=`, ...), in which case it fails closed. That filter is the last line,
-  not the first — the gate always wins when reachable.
+  `dd if=`, ...), in which case it fails closed. This port extends that filter
+  with one extra class — shell-rc writes (`tee ~/.zshrc`, `>> ~/.bashrc`) fail
+  closed even with the gate away, because a truncated rc file is code
+  execution by install. That filter is the last line, not the first — the
+  gate always wins when reachable.
 - **Latency**: each shimmed call costs two Python startups (~0.1s on an M-series
   Mac). Fine for agent sessions; you will feel it if you `export PATH` in your
   own interactive shell.
@@ -160,8 +163,17 @@ the gate exempts scratch dirs from OP-003), then proves: benign `ls` passes
 and really executes; enforce-mode `rm -rf ~/demo-factory/canary` and the
 quote-obfuscated `r''m -rf` are blocked at exit 126 with the real binary never
 executed; shadow mode passes through with a receipt; gate-unreachable fails
-open for benign text and closed for destructive text. Nothing real is ever
-deleted — every canary path is nonexistent and a keeper marker must survive.
+open for benign text, closed for destructive text and closed for shell-rc
+writes. Nothing real is ever deleted — every canary path is nonexistent and a
+keeper marker must survive.
+
+Live check (aider 0.86.2 on the machine that authored this port): launched
+under the shim PATH, aider's own startup commands — `ls`, `git version`,
+`ls ~/.operator` — landed on the shims and receipted with `source=aider`,
+`tool=shim:ls` / `shim:git`. What is **not** yet exercised: an LLM-suggested
+shell command mid-session (that flow needs an API key on this machine) —
+mechanically it is the same `run_cmd` → inherited-PATH path the startup
+commands already proved.
 
 ## Links
 
@@ -169,5 +181,5 @@ deleted — every canary path is nonexistent and a keeper marker must survive.
 - The gate: [`../../operator-gate.py`](../../operator-gate.py) — storage, rules,
   receipts: [`../../../docs/STORAGE.md`](../../../docs/STORAGE.md)
 - Port matrix: [`../README.md`](../README.md) — one gate, every host
-- Reference adapter (fail-open policy source):
-  [`../../../vestige-operator/openclaw-plugin/index.js`](../../../vestige-operator/openclaw-plugin/index.js)
+- Reference adapter (fail-open policy source): `openclaw-plugin/index.js` in
+  the sibling repo `vestige-operator` (not part of this repository)

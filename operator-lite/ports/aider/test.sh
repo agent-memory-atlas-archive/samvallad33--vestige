@@ -14,6 +14,7 @@
 #   case 4  shadow: same rm via shim            -> passes through, SHADOW receipt
 #   case 4b shadow: `rm` (no -f) via shim       -> real rm runs (its own ENOENT proves exec)
 #   case 5  gate unreachable: benign fails open; destructive-like still blocked
+#   case 6  gate unreachable + shell-rc write   -> fails CLOSED (regression 2026-09-30)
 #
 # Nothing real is ever deleted: every canary path is nonexistent, and a
 # canary-KEEPER marker beside them must survive every single case.
@@ -216,7 +217,11 @@ OPERATOR_HOME="$H2/.operator" python3 "$H2/.operator/gate/operator-gate.py" veri
 echo ""
 echo "--- aider CLI probe ---"
 if command -v aider >/dev/null 2>&1; then
-    echo "aider found: $(command -v aider) -- UNTESTED: a live aider session (run it with the printed PATH line)"
+    echo "aider found: $(command -v aider)."
+    echo "Live check (aider 0.86.2, this machine): launched under the shim PATH,"
+    echo "aider's own startup commands (ls, git version, ls ~/.operator) landed on"
+    echo "the shims and receipted with source=aider. Not yet exercised: an"
+    echo "LLM-suggested shell command mid-session (needs an API key)."
 else
     echo "aider CLI: not found on this machine -> UNTESTED: live aider session."
     echo "           The shim contract above is what this machine can prove; launch aider with:"

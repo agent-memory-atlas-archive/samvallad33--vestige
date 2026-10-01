@@ -19,9 +19,10 @@ right away. It:
          other   -> gate unreachable: fail-open UNLESS the command plainly
                     looks destructive (DESTRUCTIVE_LIKE below), then block.
 
-DESTRUCTIVE_LIKE is a verbatim mirror of the OpenClaw reference adapter's
-fail-open filter (openclaw-plugin/index.js). The POSIX-sh copy baked into
-every shim is the ERE translation of the same regex (POSIX ERE has no \\b).
+DESTRUCTIVE_LIKE mirrors the OpenClaw reference adapter's fail-open filter
+(openclaw-plugin/index.js), extended with shell-init writes. The POSIX-sh copy
+baked into every shim is the ERE translation of the same regex (POSIX ERE has
+no \\b).
 
 This file transports; the gate judges. No rule logic lives here, the gate
 file is never modified, and shadow vs enforce is the gate's own ~/.operator/mode.
@@ -38,10 +39,6 @@ SOURCE = os.environ.get("OPERATOR_SHIM_SOURCE", "aider")
 OP_HOME = os.environ.get("OPERATOR_HOME", os.path.join(os.path.expanduser("~"), ".operator"))
 GATE = os.path.join(OP_HOME, "gate", "operator-gate.py")
 
-# Mirror of openclaw-plugin/index.js DESTRUCTIVE_LIKE, extended with
-# shell-init writes (OP-008 class). Lesson from the 2026-09-30 incident: a
-# truncated ~/.zshrc must never ride the fail-open path, even when the gate
-# itself is unreachable. Shell rc files fail closed, always.
 # Mirror of openclaw-plugin/index.js DESTRUCTIVE_LIKE, extended with
 # shell-init writes (OP-008 class). Lesson from the 2026-09-30 incident: a
 # truncated ~/.zshrc must never ride the fail-open path, even when the gate
