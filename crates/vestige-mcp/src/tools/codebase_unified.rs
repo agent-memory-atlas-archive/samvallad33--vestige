@@ -74,7 +74,7 @@ pub fn schema() -> Value {
             "scope": {"type":"string", "description":"Memory namespace (default: user)"},
             "repoPath": {
                 "type": "string",
-                "description": "Explicit checkout for get_context evidence. Remember/verify actions retain the server working-directory fallback."
+                "description": "Checkout for code evidence. Required for verify and reanchor; get_context uses it for evidence; remember actions fall back to the server working directory when it is omitted."
             },
             "verify": {
                 "type": "boolean",
@@ -415,6 +415,15 @@ fn resolve_repo_root(args: &CodebaseArgs) -> Option<PathBuf> {
     }
 }
 
+/// The checkout named by the caller, if any. Blank values count as absent.
+fn explicit_repo_root(args: &CodebaseArgs) -> Option<PathBuf> {
+    args.repo_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(PathBuf::from)
+}
+
 /// Collect anchor drafts from both input shapes: the structured `anchors`
 /// array and the existing `files` array (which now also understands the
 /// compact `path#symbol` and `path:start-end` forms).
@@ -642,8 +651,8 @@ async fn execute_get_context(
 /// their source, which have drifted, and which cannot be checked at all -
 /// without changing or removing any of them.
 async fn execute_verify(storage: &Arc<Storage>, args: &CodebaseArgs) -> Result<Value, String> {
-    let repo_root = resolve_repo_root(args).ok_or(
-        "Could not resolve a repository root. Pass `repoPath` pointing at the checkout to verify against.",
+    let repo_root = explicit_repo_root(args).ok_or(
+        "verify requires an explicit `repoPath` pointing at the checkout to verify against; it does not fall back to the server working directory.",
     )?;
 
     let limit = args.limit.unwrap_or(200).clamp(1, 1000);
@@ -1777,6 +1786,37 @@ pub fn load_config(path: &str) -> Config {
             report["stale"], 1,
             "the reanchored hash is the drifted body: {report}"
         );
+    }
+
+    #[tokio::test]
+    async fn verify_without_an_explicit_repo_refuses_and_persists_nothing() {
+        let data = tempfile::TempDir::new().unwrap();
+        let storage = strata(data.path());
+        let cog = cognitive();
+        let repo = repo_with_source(SOURCE);
+        let saved = save_anchored(&storage, &cog, &repo).await;
+        let id = saved["nodeId"].as_str().unwrap().to_string();
+
+        for repo_path in [None, Some(""), Some("   ")] {
+            let mut args = serde_json::json!({"action": "verify", "codebase": "anchored"});
+            if let Some(raw) = repo_path {
+                args["repoPath"] = serde_json::json!(raw);
+            }
+            let err = execute(&storage, &cog, &OutputConfig::default(), Some(args))
+                .await
+                .expect_err("verify must not fall back to the server working directory");
+            assert!(err.contains("repoPath"), "error: {err}");
+        }
+        assert_eq!(
+            status_of(&storage, &id),
+            None,
+            "a refused verify must not persist any verdict"
+        );
+
+        // The same memory still verifies against its real checkout.
+        let report = verify(&storage, &cog, &repo).await;
+        assert_eq!(report["fresh"], 1, "report: {report}");
+        assert_eq!(status_of(&storage, &id), Some(AnchorStatus::Verified));
     }
 
     #[tokio::test]

@@ -52,7 +52,9 @@ no persistent latest-verdict cache is written by these context reads.
 
 A missing or omitted `repoPath` on context reads produces unavailable evidence.
 This deliberately replaces the implicit working-directory fallback for
-`get_context`. Remember and verify actions retain their existing fallback.
+`get_context`. The verify action likewise requires an explicit `repoPath` and
+refuses without one, so no verdict is persisted against the server's working
+directory. Remember actions retain their existing fallback.
 Existing callers should pass the checkout they intend to inspect.
 `verify: false` returns explicit unavailable evidence rather than silently
 omitting evidence fields. Anchor-storage errors fail the tool call instead of
