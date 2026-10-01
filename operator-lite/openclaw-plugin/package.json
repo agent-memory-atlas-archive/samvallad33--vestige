@@ -1,9 +1,9 @@
 {
   "name": "vestige-operator-lite",
-  "version": "0.3.2",
-  "description": "Operator Lite pre-tool gate for OpenClaw — deterministic shell verdicts, GuardFall-proof analysis, hash-chained receipts. Gate bundled, works out of the box.",
+  "version": "0.3.3",
+  "description": "Operator Lite pre-tool gate for OpenClaw \u2014 deterministic shell verdicts, GuardFall-proof analysis, hash-chained receipts. Gate bundled, works out of the box.",
   "type": "module",
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "author": "Sam Valladares",
   "repository": {
     "type": "git",
@@ -19,7 +19,9 @@
     "vestige"
   ],
   "openclaw": {
-    "extensions": ["./index.js"],
+    "extensions": [
+      "./index.js"
+    ],
     "compat": {
       "pluginApi": ">=2026.1.0"
     },

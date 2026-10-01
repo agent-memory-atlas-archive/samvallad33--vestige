@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "operator-lite"
+version = "0.3.2"
+description = "One pip install that gates LangChain, CrewAI and OpenAI Agents SDK shell tool calls through the Operator Lite pre-tool gate (gate installed/downloaded separately -- not bundled)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "AGPL-3.0-only"
+authors = [{ name = "Sam Valladares" }]
+keywords = ["ai-agents", "security", "safety", "guardrails", "langchain", "crewai", "openai-agents", "pre-tool-gate"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = []
+
+[project.optional-dependencies]
+langchain = ["langchain>=1.0"]
+crewai = ["crewai>=1.0"]
+openai-agents = ["openai-agents"]
+dev = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/samvallad33/vestige"
+Repository = "https://github.com/samvallad33/vestige"
+Issues = "https://github.com/samvallad33/vestige/issues"
+
+[tool.setuptools]
+packages = ["operator_lite", "operator_lite.adapters"]
