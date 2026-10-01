@@ -608,7 +608,13 @@ fn scan_frames(bytes: &[u8], header_hash: [u8; 32]) -> (TailStop, ScanState) {
 
 /// A torn final write ends mid-frame. A complete frame that fails blake3
 /// or the chain link is corruption, not a tear, and must not be truncated.
-fn is_torn_final_write(tail: &[u8]) -> bool {
+///
+/// A damaged length prefix makes an intact frame look cut off. `chain_tip` is
+/// the hash the next frame must link to: when the tail holds a complete frame
+/// that hashes and links under some other length, the declared length is the
+/// damage, the frame (and anything after it) may have been acked, and the tail
+/// is not a tear.
+fn is_torn_final_write(tail: &[u8], chain_tip: &[u8; 32]) -> bool {
     if tail.len() < format::FRAME_FIXED_WIRE_SIZE {
         return !tail.is_empty();
     }
@@ -617,7 +623,28 @@ fn is_torn_final_write(tail: &[u8]) -> bool {
     };
     let declared = u32::from_le_bytes(prefix) as u64;
     let need = 4u64 + 1 + declared + 32 + 32;
-    (tail.len() as u64) < need
+    if (tail.len() as u64) >= need {
+        return false;
+    }
+    !holds_intact_frame(tail, chain_tip)
+}
+
+/// True when `tail` begins with a complete frame, of any declared length,
+/// whose payload hash verifies and whose link is `chain_tip`. Frames end with
+/// `payload_blake3 || prev_frame_hash`, so candidate ends are found by looking
+/// for the chain tip in the link position and hashing only on a match.
+fn holds_intact_frame(tail: &[u8], chain_tip: &[u8; 32]) -> bool {
+    let kind = tail[4];
+    for end in format::FRAME_FIXED_WIRE_SIZE..=tail.len() {
+        if tail[end - 32..end] != chain_tip[..] {
+            continue;
+        }
+        let payload = &tail[5..end - 64];
+        if tail[end - 64..end - 32] == format::payload_blake3(kind, payload)[..] {
+            return true;
+        }
+    }
+    false
 }
 
 fn validate_trailer(
@@ -850,9 +877,14 @@ impl StrataLog {
             let header = match parse_header(&bytes) {
                 Some(h) => h,
                 None => {
-                    if is_last && frames_total >= last_acked_seq {
-                        // No acked frame lives in this segment; all of it is
-                        // expendable. Recreate it in place.
+                    if is_last && frames_total >= last_acked_seq && bytes.len() <= HEADER_WIRE_SIZE
+                    {
+                        // Creation was cut off before any frame could follow
+                        // the header: no acked frame lives in this segment
+                        // and none of it is worth keeping. A file that holds
+                        // bytes beyond a header-sized prefix may hold acked
+                        // frames behind a damaged header, so it halts below
+                        // whatever the watermark says.
                         let _ = fs::remove_file(path);
                         active = Some(ActiveSetup::New {
                             no: *no,
@@ -975,7 +1007,7 @@ impl StrataLog {
                     // sync. At or below it, or with no watermark to trust,
                     // halt and do not rebuild a shorter log.
                     let unacked = watermark_known && bad_seq > last_acked_seq;
-                    if !is_torn_final_write(&bytes[offset..]) && !unacked {
+                    if !is_torn_final_write(&bytes[offset..], &st.last_frame_hash) && !unacked {
                         return Err(halt_err(
                             last_acked_seq,
                             *no,
