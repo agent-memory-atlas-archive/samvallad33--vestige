@@ -940,3 +940,52 @@ fn v3_code_anchors_survive_the_upgrade() {
     let logged = fs::read_to_string(dir.path().join(UPGRADE_LOG_NAME)).unwrap();
     assert!(logged.contains("carried 2 code anchors"), "{logged}");
 }
+
+/// A `vestige.db` that is a symlink resolves to the real file: the `-wal`
+/// beside the real file is imported and backed up with it.
+#[cfg(unix)]
+#[test]
+fn symlinked_db_imports_and_backs_up_the_wal_beside_the_real_file() {
+    let real_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let real = plant(real_dir.path());
+    let conn = rusqlite::Connection::open(&real).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute(
+        "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, tags)
+         VALUES ('55555555-5555-4555-8555-555555555555', 'WAL_ONLY_ROW_NOT_IN_MAIN', 'fact',
+                 '2026-03-03T00:00:00+00:00', '2026-03-03T00:00:00+00:00',
+                 '2026-03-03T00:00:00+00:00', '[]')",
+        [],
+    )
+    .unwrap();
+    let wal = real_dir.path().join("vestige.db-wal");
+    assert!(
+        fs::metadata(&wal).unwrap().len() > 0,
+        "row must sit in the wal"
+    );
+
+    let link = data_dir.path().join("vestige.db");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let status = vestige_upgrade::upgrade_if_needed(&link).unwrap();
+    let UpgradeStatus::StrataReady { log_dir } = status else {
+        panic!("expected a ready log, got {status:?}");
+    };
+
+    let snap = snapshot(&log_dir);
+    assert!(
+        snap.nodes
+            .iter()
+            .any(|node| node.content == "WAL_ONLY_ROW_NOT_IN_MAIN"),
+        "the row that lives only in the real file's wal was dropped"
+    );
+    let has_backup = |name: &str| {
+        fs::read_dir(real_dir.path()).unwrap().flatten().any(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with(name) && n.contains(".v3-backup-") && !n.ends_with(".partial")
+        })
+    };
+    assert!(has_backup("vestige.db-wal"), "backup lacks the wal");
+    assert!(has_backup("vestige.db.v3-backup-"), "backup lacks the db");
+    drop(conn);
+}

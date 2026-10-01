@@ -679,3 +679,61 @@ fn migrate_wal_snapshot_includes_wal_only_rows() {
     );
     drop(conn);
 }
+
+// ---------------------------------------------------------------------------
+// The source-change guard covers the original files, not the snapshot copy
+// ---------------------------------------------------------------------------
+
+/// A commit that lands in the original `-wal` while the import runs must be
+/// detected: the run fails and publishes nothing, instead of sealing a log
+/// that lacks the new row.
+#[test]
+fn wal_snapshot_detects_a_write_to_the_original_during_import() {
+    let (dir, db) = copy_fixture("walguard");
+    let dest = dir.path().join("strata");
+
+    // Hold a connection open so the commits stay in the -wal.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute(
+        "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, tags)
+         VALUES ('55555555-5555-4555-8555-555555555555', 'BEFORE_SNAPSHOT', 'fact',
+                 '2026-03-03T00:00:00+00:00', '2026-03-03T00:00:00+00:00',
+                 '2026-03-03T00:00:00+00:00', '[]')",
+        [],
+    )
+    .unwrap();
+
+    let writer_db = db.clone();
+    let err = migrate_with_options(
+        &db,
+        &dest,
+        MigrateOptions {
+            accept_wal_snapshot: true,
+            seed: Some(seed()),
+            before_import: Some(Box::new(move |_staging| {
+                let late = rusqlite::Connection::open(&writer_db).map_err(|e| e.to_string())?;
+                late.execute(
+                    "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, tags)
+                     VALUES ('66666666-6666-4666-8666-666666666666', 'DURING_IMPORT', 'fact',
+                             '2026-03-04T00:00:00+00:00', '2026-03-04T00:00:00+00:00',
+                             '2026-03-04T00:00:00+00:00', '[]')",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(())
+            })),
+            ..Default::default()
+        },
+    )
+    .expect_err("a write to the source during the import must be detected");
+    assert!(
+        matches!(err, MigrationError::SourceTampered { .. }),
+        "{err:?}"
+    );
+    assert!(
+        !dest.exists() || !dest.join("strata.key").exists(),
+        "nothing may be published"
+    );
+    drop(conn);
+}
