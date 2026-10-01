@@ -38,9 +38,17 @@ SOURCE = os.environ.get("OPERATOR_SHIM_SOURCE", "aider")
 OP_HOME = os.environ.get("OPERATOR_HOME", os.path.join(os.path.expanduser("~"), ".operator"))
 GATE = os.path.join(OP_HOME, "gate", "operator-gate.py")
 
-# Verbatim mirror of openclaw-plugin/index.js DESTRUCTIVE_LIKE.
+# Mirror of openclaw-plugin/index.js DESTRUCTIVE_LIKE, extended with
+# shell-init writes (OP-008 class). Lesson from the 2026-09-30 incident: a
+# truncated ~/.zshrc must never ride the fail-open path, even when the gate
+# itself is unreachable. Shell rc files fail closed, always.
+# Mirror of openclaw-plugin/index.js DESTRUCTIVE_LIKE, extended with
+# shell-init writes (OP-008 class). Lesson from the 2026-09-30 incident: a
+# truncated ~/.zshrc must never ride the fail-open path, even when the gate
+# itself is unreachable. Shell rc files fail closed, always.
 DESTRUCTIVE_LIKE = re.compile(
-    r"\brm\s+-[a-zA-Z]*[rR]|\bpush\s+.*--force|\bDROP\s+TABLE|vestige\.db|fly\s+deploy|mkfs|\bdd\s+if=",
+    r"\brm\s+-[a-zA-Z]*[rR]|\bpush\s+.*--force|\bDROP\s+TABLE|vestige\.db|fly\s+deploy|mkfs|\bdd\s+if="
+    r"|(^|[\s;|&])(>>|\btee\s)[^|;&]*/\.(?:zshrc|zprofile|zshenv|zlogin|bashrc|bash_profile|profile)\b",
     re.I,
 )
 
@@ -107,7 +115,12 @@ def main():
         sys.exit(0)
     if proc.returncode == 2:
         reason = proc.stderr.decode("utf-8", "replace").strip() or "OPERATOR: STOPPED"
-        sys.stderr.write("Operator Lite blocked:\n%s\n" % reason)
+        lines = reason.splitlines()
+        # "Operator Lite blocked: <reason>" -- the gate's verdict on the same
+        # line, the Why/Compliant-path/permit lines following verbatim.
+        sys.stderr.write("Operator Lite blocked: %s\n" % lines[0])
+        for ln in lines[1:]:
+            sys.stderr.write("%s\n" % ln)
         sys.exit(126)
     unreachable("gate exited %s" % proc.returncode)
 

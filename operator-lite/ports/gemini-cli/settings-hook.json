@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "name": "operator-lite",
+            "command": "python3 ~/.operator/gate/gemini-wrapper.py",
+            "timeout": 10000
+          }
+        ]
+      }
+    ]
+  }
+}

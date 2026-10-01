@@ -46,7 +46,7 @@ SHIM_BINS="ls rm rmdir unlink shred srm mv cp ln install rsync scp dd truncate c
 
 # ERE translation of openclaw-plugin/index.js DESTRUCTIVE_LIKE (POSIX ERE
 # has no \b). Baked into every shim as the unreachable-gate fallback filter.
-OP_DESTRUCTIVE_ERE='(^|[^A-Za-z0-9_])rm[[:space:]]+-[a-zA-Z]*[rR]|(^|[^A-Za-z0-9_])push[[:space:]].*--force|DROP[[:space:]]+TABLE|vestige\.db|fly[[:space:]]+deploy|mkfs|(^|[^A-Za-z0-9_])dd[[:space:]]+if='
+OP_DESTRUCTIVE_ERE='(^|[^A-Za-z0-9_])rm[[:space:]]+-[a-zA-Z]*[rR]|(^|[^A-Za-z0-9_])push[[:space:]].*--force|DROP[[:space:]]+TABLE|vestige\.db|fly[[:space:]]+deploy|mkfs|(^|[^A-Za-z0-9_])dd[[:space:]]+if=|(^|[;|&[:space:]])(>>|tee[[:space:]])[^|;&]*/\.(zshrc|zprofile|zshenv|zlogin|bashrc|bash_profile|profile)([^A-Za-z0-9_]|$)'
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
