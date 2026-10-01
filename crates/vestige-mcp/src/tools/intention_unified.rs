@@ -206,7 +206,7 @@ pub fn schema() -> Value {
             "scope": {
                 "type": "string",
                 "maxLength": 200,
-                "description": "[set] Project namespace for the intention (default 'user'). Prospective resurfacing in recall never crosses scopes."
+                "description": "[set] Project namespace for the intention (default 'user'). [list/check] Restrict to one namespace; omit for all namespaces. Prospective resurfacing in recall never crosses scopes."
             }
         },
         "required": ["action"]
@@ -804,6 +804,19 @@ pub async fn execute(
     }
 }
 
+/// Requested namespace for `list` and `check`. `None` keeps the compatible
+/// all-namespaces view when the caller names no scope.
+fn requested_scope(args: &UnifiedIntentionArgs) -> Option<&str> {
+    args.scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+}
+
+fn in_requested_scope(intention: &IntentionRecord, scope: Option<&str>) -> bool {
+    scope.is_none_or(|scope| intention.effective_scope() == scope)
+}
+
 fn timestamp(value: &str, field: &str) -> Result<DateTime<Utc>, String> {
     DateTime::parse_from_rfc3339(value)
         .map(|time| time.with_timezone(&Utc))
@@ -1156,13 +1169,18 @@ async fn execute_check(
     // Always inspect snoozed records so an expired snooze can wake on this
     // check. `include_snoozed` controls only whether records whose snooze is
     // still in force are returned as pending.
+    let scope = requested_scope(args);
     let mut intentions = storage.get_active_intentions().map_err(|e| e.to_string())?;
+    intentions.retain(|intention| in_requested_scope(intention, scope));
     let snoozed = storage
         .get_intentions_by_status("snoozed")
         .map_err(|e| e.to_string())?;
     use std::collections::HashSet;
     let seen: HashSet<String> = intentions.iter().map(|i| i.id.clone()).collect();
-    for intention in snoozed {
+    for intention in snoozed
+        .into_iter()
+        .filter(|intention| in_requested_scope(intention, scope))
+    {
         let expired = intention
             .snoozed_until
             .map(|until| now >= until)
@@ -1359,6 +1377,18 @@ async fn execute_update(
             }
             let snooze_until = Utc::now() + Duration::minutes(minutes);
 
+            // Only a live intention can be snoozed; a finished one stays finished.
+            if let Some(current) = storage
+                .get_intention(intention_id)
+                .map_err(|e| e.to_string())?
+                && matches!(current.status.as_str(), "fulfilled" | "cancelled")
+            {
+                return Err(format!(
+                    "Intention {} is already {} and cannot be snoozed",
+                    intention_id, current.status
+                ));
+            }
+
             let updated = storage
                 .snooze_intention(intention_id, snooze_until)
                 .map_err(|e| e.to_string())?;
@@ -1438,6 +1468,12 @@ async fn execute_list(
             .get_intentions_by_status(filter_status)
             .map_err(|e| e.to_string())?
     };
+
+    let scope = requested_scope(args);
+    let intentions: Vec<_> = intentions
+        .into_iter()
+        .filter(|intention| in_requested_scope(intention, scope))
+        .collect();
 
     let requested_limit = args.limit.unwrap_or(20);
     if !(1..=MAX_LIST_LIMIT).contains(&requested_limit) {
@@ -3722,5 +3758,151 @@ mod strata_log_tests {
             .expect("receipt survived");
         assert_eq!(receipt.retrieved, vec![id]);
         assert!(no_sqlite(dir.path()));
+    }
+
+    async fn run(storage: &Arc<Storage>, args: Value) -> Result<Value, String> {
+        execute(storage, &cognitive(), Some(args)).await
+    }
+
+    async fn set_in_scope(storage: &Arc<Storage>, description: &str, scope: &str) -> String {
+        let set = run(
+            storage,
+            serde_json::json!({
+                "action": "set",
+                "description": description,
+                "trigger": {"type": "event", "condition": "deploy_done"},
+                "scope": scope
+            }),
+        )
+        .await
+        .expect("set");
+        set["intentionId"].as_str().unwrap().to_string()
+    }
+
+    fn ids(value: &Value, key: &str) -> Vec<String> {
+        value[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn list_honors_the_requested_scope() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_dir(dir.path());
+        let alpha = set_in_scope(&storage, "Alpha item", "alpha").await;
+        let beta = set_in_scope(&storage, "Beta item", "beta").await;
+
+        for status in ["active", "all"] {
+            let listed = run(
+                &storage,
+                serde_json::json!({"action": "list", "scope": "alpha", "filter_status": status}),
+            )
+            .await
+            .expect("scoped list");
+            let found = ids(&listed, "intentions");
+            assert!(found.contains(&alpha), "{status}: {listed}");
+            assert!(!found.contains(&beta), "{status}: {listed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn check_only_delivers_intentions_of_the_requested_scope() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_dir(dir.path());
+        let alpha = set_in_scope(&storage, "Alpha item", "alpha").await;
+        let beta = set_in_scope(&storage, "Beta item", "beta").await;
+
+        let checked = run(
+            &storage,
+            serde_json::json!({
+                "action": "check",
+                "scope": "alpha",
+                "context": {"events": ["deploy_done"], "current_time": "2026-01-02T00:00:00Z"}
+            }),
+        )
+        .await
+        .expect("scoped check");
+        let triggered = ids(&checked, "triggered");
+        assert!(triggered.contains(&alpha), "{checked}");
+        assert!(!triggered.contains(&beta), "{checked}");
+        assert!(!ids(&checked, "pending").contains(&beta), "{checked}");
+        let untouched = storage.get_intention(&beta).unwrap().unwrap();
+        assert_eq!(
+            untouched.reminder_count, 0,
+            "other scope must not be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_does_not_wake_a_snooze_from_another_scope() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_dir(dir.path());
+        let beta = set_in_scope(&storage, "Beta item", "beta").await;
+        run(
+            &storage,
+            serde_json::json!({"action": "update", "id": beta, "status": "snooze", "snooze_minutes": 1}),
+        )
+        .await
+        .expect("snooze");
+
+        let checked = run(
+            &storage,
+            serde_json::json!({
+                "action": "check",
+                "scope": "alpha",
+                "context": {"events": ["deploy_done"], "current_time": "2030-01-01T00:00:00Z"}
+            }),
+        )
+        .await
+        .expect("scoped check");
+        assert!(
+            checked["triggered"].as_array().unwrap().is_empty(),
+            "{checked}"
+        );
+        let still = storage.get_intention(&beta).unwrap().unwrap();
+        assert_eq!(still.status, "snoozed");
+    }
+
+    #[tokio::test]
+    async fn finished_intentions_cannot_be_snoozed_back_to_active() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_dir(dir.path());
+        for terminal in ["complete", "cancel"] {
+            let id = set_in_scope(&storage, "Terminal item", "user").await;
+            run(
+                &storage,
+                serde_json::json!({"action": "update", "id": id, "status": terminal}),
+            )
+            .await
+            .expect("finish");
+            let before = storage.get_intention(&id).unwrap().unwrap().status;
+            let rejected = run(
+                &storage,
+                serde_json::json!({"action": "update", "id": id, "status": "snooze", "snooze_minutes": 1}),
+            )
+            .await;
+            assert!(rejected.is_err(), "{terminal}: snooze must be refused");
+            let after = storage.get_intention(&id).unwrap().unwrap();
+            assert_eq!(after.status, before, "{terminal}");
+            assert!(after.snoozed_until.is_none(), "{terminal}");
+
+            let checked = run(
+                &storage,
+                serde_json::json!({
+                    "action": "check",
+                    "context": {"events": ["deploy_done"], "current_time": "2030-01-01T00:00:00Z"}
+                }),
+            )
+            .await
+            .expect("check");
+            assert!(
+                !ids(&checked, "triggered").contains(&id)
+                    && !ids(&checked, "pending").contains(&id),
+                "{terminal}: finished intention resurfaced: {checked}"
+            );
+        }
     }
 }

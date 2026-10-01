@@ -2,11 +2,16 @@
 //! by the caller. This module does not fetch URLs, execute tools, or send alerts.
 
 use crate::cognitive::CognitiveEngine;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use vestige_core::{Storage, intention_graph::Command};
+
+/// How far ahead of the wall clock a caller-supplied evaluation clock may be.
+/// Committed graph state never accepts an earlier clock afterwards, so an
+/// unbounded value would freeze the scope against every later command.
+const MAX_CLOCK_AHEAD_HOURS: i64 = 24;
 
 /// Extend the compatible intention interface without adding another MCP tool.
 pub fn schema() -> Value {
@@ -16,9 +21,9 @@ pub fn schema() -> Value {
         .expect("action enum")
         .push(json!("graph"));
     schema["properties"]["scope"] = json!({"type":"string","default":"user","maxLength":128,
-        "description":"[set] Project namespace for the intention; recall resurfacing never crosses scopes. [graph] Local intention namespace, not an authorization boundary."});
+        "description":"[set] Project namespace for the intention; recall resurfacing never crosses scopes. [list/check] Restrict to one namespace; omit for all namespaces. [graph] Local intention namespace, not an authorization boundary."});
     schema["properties"]["at"] = json!({"type":"string","format":"date-time",
-        "description":"[graph] Explicit evaluation clock for reproducible fixtures; defaults to now."});
+        "description":"[graph] Explicit evaluation clock for reproducible fixtures; defaults to now. Must not be more than 24 hours ahead of the current time."});
     schema["properties"]["command"] = vestige_core::intention_graph::schema();
     schema["properties"]["command"]["description"] = json!(
         "[graph] Evidence-aware plan/revise/observe/evaluate/explain/portfolio/complete/cancel/acknowledge. replay checks committed history. memory_snapshot reads a scoped content digest; refresh_memory observes it using memory_id,event_id,source_revision. No external actions or fact verification."
@@ -69,9 +74,18 @@ fn execute_graph(storage: &Arc<Storage>, args: &Value) -> Result<Value, String> 
     };
     let now = match args.get("at") {
         None => Utc::now(),
-        Some(v) => DateTime::parse_from_rfc3339(v.as_str().ok_or("at must be an RFC3339 string")?)
-            .map_err(|_| "at must be an RFC3339 timestamp")?
-            .with_timezone(&Utc),
+        Some(v) => {
+            let at =
+                DateTime::parse_from_rfc3339(v.as_str().ok_or("at must be an RFC3339 string")?)
+                    .map_err(|_| "at must be an RFC3339 timestamp")?
+                    .with_timezone(&Utc);
+            if at > Utc::now() + Duration::hours(MAX_CLOCK_AHEAD_HOURS) {
+                return Err(format!(
+                    "at must not be more than {MAX_CLOCK_AHEAD_HOURS} hours ahead of the current time"
+                ));
+            }
+            at
+        }
     };
     let raw = args.get("command").ok_or("Missing graph command")?;
     let action = field(raw, "action")?;
@@ -233,5 +247,45 @@ mod tests {
         )
         .unwrap();
         assert!(result.to_string().contains("Buy the selected projector"));
+    }
+}
+
+#[cfg(test)]
+mod clock_bound_tests {
+    use super::*;
+
+    fn plan(id: &str) -> Value {
+        json!({"id": id, "description": "Synthetic plan", "requirements": [], "conflict_keys": []})
+    }
+
+    #[test]
+    fn graph_rejects_an_evaluation_clock_far_ahead_and_stays_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::strata_memory::open(dir.path()).expect("strata log");
+        let mut far = plan("far");
+        far["action"] = json!("plan");
+        let rejected = execute_graph(
+            &storage,
+            &json!({"action":"graph","at":"2999-01-01T00:00:00Z","command":far}),
+        );
+        assert!(rejected.is_err(), "far-future clock must be refused");
+
+        let mut near = plan("near");
+        near["action"] = json!("plan");
+        let ok = execute_graph(&storage, &json!({"action":"graph","command":near}));
+        assert!(ok.is_ok(), "later calls must keep working: {ok:?}");
+        let replay = execute_graph(
+            &storage,
+            &json!({"action":"graph","command":{"action":"replay"}}),
+        )
+        .unwrap();
+        assert_eq!(replay["matched"], true);
+
+        drop(storage);
+        let reopened = crate::strata_memory::open(dir.path()).expect("reopen");
+        let mut after = plan("after");
+        after["action"] = json!("plan");
+        let ok = execute_graph(&reopened, &json!({"action":"graph","command":after}));
+        assert!(ok.is_ok(), "state must stay usable after restart: {ok:?}");
     }
 }
