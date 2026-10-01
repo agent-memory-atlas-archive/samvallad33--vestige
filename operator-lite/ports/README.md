@@ -30,6 +30,7 @@ corpus, everywhere.
 | Amazon Q CLI | `preToolUse` hook in `~/.aws/amazonq/cli-agents/q_cli_default.json` (exit-2 block, stderr to model) | [amazon-q/](amazon-q/) | gate-tested, suite PASS, corpus 43/43 via adapter |
 | Cursor | agent hooks in `~/.cursor/hooks.json` — `beforeShellExecution` + `beforeMCPExecution` + `preToolUse` (disjoint matchers); deny is stdout JSON `{"permission":"deny"}` at exit 0 (invalid output blocks too); `failClosed: true` shipped | [cursor/](cursor/) | gate-tested, suite 44/44 |
 | Windsurf (Cascade) | `pre_run_command` / `pre_write_code` / `pre_mcp_tool_use` hooks in `~/.codeium/windsurf/hooks.json` (workspace `.windsurf/hooks.json` / `.devin/hooks.json` optional) — payload reshaped by a shim (`tool_info.command_line` → `tool_input.command`; exit-2 block, stderr reason) | [windsurf/](windsurf/) | gate-tested, suite 57/57 PASS, corpus 43/43 via adapter |
+| CrewAI | execution hooks — global `register_hook(PRE_TOOL_CALL, fn)`; block is `HookAborted(reason, source)` (special-cased; other hook exceptions fail open), LLM sees CrewAI's generic blocked message | [crewai/](crewai/) | gate-tested, suite PASS incl. real crewai 1.15.23 dispatch |
 | Aider | no hook API — terminal wrapper | [aider/](aider/) | see port README |
 
 Status values: `shipped` (tested end-to-end) · `gate-tested` (gate contract
