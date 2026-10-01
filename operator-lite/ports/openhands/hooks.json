@@ -1,0 +1,14 @@
+{
+  "pre_tool_use": [
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 ~/.operator/gate/openhands-wrapper.py",
+          "timeout": 10
+        }
+      ]
+    }
+  ]
+}

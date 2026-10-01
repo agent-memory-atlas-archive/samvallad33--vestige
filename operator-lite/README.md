@@ -26,6 +26,9 @@ copy one file, wire one hook, and your agent has a deterministic gate.
 
     clawhub install vestige-operator-lite
 
+**Cline**: file-based `PreToolUse` hook + SDK plugin — `sh operator-lite/ports/cline/install.sh`
+(2 commands + 1 settings toggle; see [ports/cline/README.md](ports/cline/README.md)).
+
 (Or any `before_tool_call` plugin that pipes the command through the hook
 binary: gate exit 0 = allow, exit 2 = block with the reason.)
 
