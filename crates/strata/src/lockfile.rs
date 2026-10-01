@@ -22,7 +22,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::error::StrataError;
-use crate::sync::{self, SyncPurpose};
+use crate::sync::{self, Site, SyncPurpose};
 
 pub(crate) const LOCK_NAME: &str = "strata.lock";
 
@@ -73,6 +73,9 @@ impl DirLock {
 }
 
 fn write_pid_and_sync(f: &mut File) -> Result<(), StrataError> {
+    // A full volume refuses the lock write; dropping the handle releases
+    // the OS lock, so nothing is left that blocks the next open.
+    sync::guard_space(Site::Lock)?;
     let pid = u64::from(std::process::id());
     f.set_len(0)?;
     f.seek(SeekFrom::Start(0))?;

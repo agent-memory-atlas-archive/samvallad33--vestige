@@ -31,6 +31,15 @@ pub enum StrataError {
     Io(io::Error),
 }
 
+impl StrataError {
+    /// True when the write was refused because the volume (or the caller's
+    /// quota on it) is full. Nothing of the refused write was kept, the log
+    /// is unchanged, and the same call can succeed once space is freed.
+    pub fn is_storage_full(&self) -> bool {
+        matches!(self, StrataError::Io(e) if crate::log::is_storage_full(e))
+    }
+}
+
 impl fmt::Display for StrataError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

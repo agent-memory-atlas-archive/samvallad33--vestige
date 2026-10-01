@@ -15,7 +15,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use strata::StrataLog;
+use strata::{StrataError, StrataLog};
 use strata_gate::record::{GateEvent, RecordKind};
 use strata_gate::{EventLog, SeqAck};
 
@@ -25,6 +25,10 @@ pub struct StrataEventLog {
     log: StrataLog,
     /// Gate frames only, in append order; index == gate seq.
     cache: Arc<Mutex<Vec<GateEvent>>>,
+    /// The first append refused for lack of space since the last
+    /// [`Self::take_refusal`]. `EventLog::append` cannot return an error, so
+    /// a refusal is parked here and the store checks it after each gate step.
+    refusal: Arc<Mutex<Option<StrataError>>>,
 }
 
 impl StrataEventLog {
@@ -52,6 +56,7 @@ impl StrataEventLog {
         Ok(Self {
             log,
             cache: Arc::new(Mutex::new(cache)),
+            refusal: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -59,6 +64,15 @@ impl StrataEventLog {
         self.cache
             .lock()
             .unwrap_or_else(|e| panic!("strata-store: gate cache poisoned: {e}"))
+    }
+
+    /// Take the pending storage-full refusal, if an append was refused since
+    /// the last call. A refused append leaves no frame and no cache entry.
+    pub fn take_refusal(&self) -> Option<StrataError> {
+        self.refusal
+            .lock()
+            .unwrap_or_else(|e| panic!("strata-store: gate refusal slot poisoned: {e}"))
+            .take()
     }
 
     /// The underlying durable log (shared handle).
@@ -82,10 +96,24 @@ impl EventLog for StrataEventLog {
     }
 
     fn append(&mut self, kind: RecordKind, payload: Vec<u8>) -> SeqAck {
-        let ack = self
-            .log
-            .append(kind.to_u8(), &payload)
-            .unwrap_or_else(|e| panic!("strata-store: durable append failed (fail-stop): {e}"));
+        let ack = match self.log.append(kind.to_u8(), &payload) {
+            Ok(ack) => ack,
+            Err(e) if e.is_storage_full() => {
+                // The log refused the frame and kept nothing of it. Park the
+                // error for the store, which stops the write before it uses
+                // this placeholder ack.
+                let mut slot = self
+                    .refusal
+                    .lock()
+                    .unwrap_or_else(|p| panic!("strata-store: gate refusal slot poisoned: {p}"));
+                slot.get_or_insert(e);
+                return SeqAck {
+                    seq: self.gate_frame_count(),
+                    frame_hash: [0u8; 32],
+                };
+            }
+            Err(e) => panic!("strata-store: durable append failed (fail-stop): {e}"),
+        };
         let mut cache = self.cache();
         let gate_seq = cache.len() as u64;
         cache.push(GateEvent {

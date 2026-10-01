@@ -26,5 +26,7 @@ borsh = { version = "1", features = ["derive"] }
 blake3 = "1"
 
 [dev-dependencies]
+# Fault injection for the full-disk tests (a simulated ENOSPC on log writes).
+strata = { path = "../strata", features = ["failpoints"] }
 # The replay tests import a v3 fixture through the real importer.
 strata-migrate = { path = "../strata-migrate", features = ["sqlite-reader"] }

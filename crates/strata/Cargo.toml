@@ -22,5 +22,10 @@ getrandom = "0.4"
 
 # Unix-only: libc provides fcntl(F_FULLFSYNC) on macOS and kill(pid, 0) for the
 # stale single-writer lock probe; neither is reachable from std.
+[features]
+# Test-only fault injection (simulated full disk). Off by default; the store's
+# integration tests enable it through a dev-dependency.
+failpoints = []
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

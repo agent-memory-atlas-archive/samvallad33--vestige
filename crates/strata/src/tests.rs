@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
 use crate::format::{self, SegmentHeader, HEADER_WIRE_SIZE};
-use crate::sync::{reset_failpoints, FAIL_ON_SYNC_N, SYNC_COUNT};
+use crate::sync::{
+    reset_failpoints, set_frame_write_budget, set_site_full, Site, FAIL_ON_SYNC_N, SYNC_COUNT,
+};
 use crate::{SeqAck, StrataError, StrataLog};
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -900,6 +902,43 @@ fn seal_refuses_to_sign_over_a_damaged_active_segment() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+// Full disk: a failed write is an error to the caller, not a process abort
+// ---------------------------------------------------------------------------
+
+fn is_full(e: &StrataError) -> bool {
+    matches!(e, StrataError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull)
+}
+
+#[test]
+fn full_disk_frame_write_is_an_error_and_the_log_stays_usable() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("full-write");
+    let log = StrataLog::open(&dir).unwrap();
+    log.append(1, b"one").unwrap();
+    log.append(2, b"two").unwrap();
+
+    // The second frame of the batch hits the full disk after the first was
+    // already written: the whole batch is refused and nothing of it remains.
+    set_frame_write_budget(Some(1));
+    let err = log
+        .append_batch(vec![(3, b"three".to_vec()), (4, b"four".to_vec())])
+        .expect_err("a full disk refuses the write");
+    assert!(is_full(&err), "{err:?}");
+    assert_eq!(log.head().last_acked_seq, 2);
+    assert_eq!(log.head().next_seq, 3, "refused frames free their seqs");
+
+    set_frame_write_budget(None);
+    assert_eq!(log.append(5, b"five").unwrap().seq, 3);
+    assert_eq!(log.read_frames(1).unwrap().len(), 3);
+    drop(log);
+    let log = StrataLog::open(&dir).unwrap();
+    let kinds: Vec<u8> = log.read_frames(1).unwrap().iter().map(|f| f.kind).collect();
+    assert_eq!(kinds, vec![1, 2, 5]);
+    assert_eq!(log.head().last_acked_seq, 3);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn damage_found_on_read_stops_further_appends() {
     let _serial = serialize();
@@ -927,6 +966,30 @@ fn damage_found_on_read_stops_further_appends() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+fn full_disk_watermark_write_is_an_error_and_the_frames_are_not_kept() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("full-watermark");
+    let log = StrataLog::open(&dir).unwrap();
+    log.append(1, b"one").unwrap();
+
+    set_site_full(Site::HeadState, true);
+    let err = log
+        .append(2, b"two")
+        .expect_err("watermark cannot be written");
+    assert!(is_full(&err), "{err:?}");
+    assert_eq!(log.head().last_acked_seq, 1);
+
+    set_site_full(Site::HeadState, false);
+    assert_eq!(log.append(3, b"three").unwrap().seq, 2);
+    drop(log);
+    let log = StrataLog::open(&dir).unwrap();
+    let kinds: Vec<u8> = log.read_frames(1).unwrap().iter().map(|f| f.kind).collect();
+    assert_eq!(kinds, vec![1, 3]);
+    assert!(!dir.join("head.state.tmp").exists());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn damage_found_by_verify_tail_stops_further_appends() {
     let _serial = serialize();
@@ -945,6 +1008,43 @@ fn damage_found_by_verify_tail_stops_further_appends() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+fn full_disk_fails_every_queued_appender_and_keeps_seqs_dense() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("full-concurrent");
+    let log = StrataLog::open(&dir).unwrap();
+    log.append(1, b"seed").unwrap();
+
+    set_frame_write_budget(Some(0));
+    let barrier = Arc::new(Barrier::new(8));
+    let handles: Vec<_> = (0..8u8)
+        .map(|i| {
+            let log = log.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                log.append(10 + i, b"x").map(|a| a.seq)
+            })
+        })
+        .collect();
+    for h in handles {
+        let res = h.join().expect("no appender may panic on a full disk");
+        let err = res.expect_err("every appender is refused");
+        assert!(is_full(&err), "{err:?}");
+    }
+    assert_eq!(log.head().next_seq, 2);
+
+    set_frame_write_budget(None);
+    let seqs: Vec<u64> = (0..3)
+        .map(|i| log.append(20 + i, b"y").unwrap().seq)
+        .collect();
+    assert_eq!(seqs, vec![2, 3, 4]);
+    drop(log);
+    let log = StrataLog::open(&dir).unwrap();
+    assert_eq!(log.read_frames(1).unwrap().len(), 4);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn a_healthy_log_keeps_accepting_writes_after_reads_and_checks() {
     let _serial = serialize();
@@ -958,6 +1058,26 @@ fn a_healthy_log_keeps_accepting_writes_after_reads_and_checks() {
     log.verify_tail().unwrap();
     assert_eq!(log.append(1, b"more").unwrap().seq, 6);
     drop(log);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+fn full_disk_seal_trailer_write_is_an_error_and_the_segment_stays_open() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("full-seal");
+    let log = StrataLog::open(&dir).unwrap();
+    log.append(1, b"one").unwrap();
+
+    set_site_full(Site::Trailer, true);
+    let err = log.seal().expect_err("trailer cannot be written");
+    assert!(is_full(&err), "{err:?}");
+
+    set_site_full(Site::Trailer, false);
+    assert_eq!(log.append(2, b"two").unwrap().seq, 2);
+    log.seal().unwrap();
+    drop(log);
+    let log = StrataLog::open(&dir).unwrap();
+    assert_eq!(log.read_frames(1).unwrap().len(), 2);
     fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -1032,5 +1152,38 @@ fn frames_missing_from_disk_fail_verification() {
     assert!(matches!(log.verify_log(), Err(StrataError::Halt(_))));
     assert!(matches!(log.append(1, b"x"), Err(StrataError::Halt(_))));
     drop(log);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+fn full_disk_during_open_leaves_no_residue_that_blocks_the_next_open() {
+    let _serial = serialize();
+    reset_failpoints();
+
+    // Lock pid cannot be written: the half-made lock file must not remain.
+    let dir = test_dir("full-open-lock");
+    set_site_full(Site::Lock, true);
+    let err = StrataLog::open(&dir).expect_err("no room for the lock");
+    assert!(is_full(&err), "{err:?}");
+    set_site_full(Site::Lock, false);
+    StrataLog::open(&dir).expect("space is back: the log opens");
+    fs::remove_dir_all(&dir).unwrap();
+
+    // Signing key cannot be written.
+    let dir = test_dir("full-open-key");
+    set_site_full(Site::Key, true);
+    let err = StrataLog::open(&dir).expect_err("no room for the key");
+    assert!(is_full(&err), "{err:?}");
+    set_site_full(Site::Key, false);
+    StrataLog::open(&dir).expect("space is back: the log opens");
+    fs::remove_dir_all(&dir).unwrap();
+
+    // First segment header cannot be written.
+    let dir = test_dir("full-open-segment");
+    set_site_full(Site::SegmentHeader, true);
+    let err = StrataLog::open(&dir).expect_err("no room for the segment");
+    assert!(is_full(&err), "{err:?}");
+    set_site_full(Site::SegmentHeader, false);
+    let log = StrataLog::open(&dir).expect("space is back: the log opens");
+    assert_eq!(log.append(1, b"one").unwrap().seq, 1);
     fs::remove_dir_all(&dir).unwrap();
 }
