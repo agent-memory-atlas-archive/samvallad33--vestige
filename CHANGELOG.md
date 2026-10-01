@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.0] - 2026-10-01
+
 ### Added
 
 - **GhostLink on the Strata log.** `ghostlink` replaces `graph` in `tools/list` (the catalog stays at 16 tools; `graph` still answers as a hidden alias). It proposes memory pairs that were never composed, and every pair carries its proof from recorded structure only: no text, tag-name or vector similarity is used to admit, rank or explain anything.
@@ -21,14 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI runs an admission sweep over stdio: every tool action the server advertises must be admitted, or the build fails.
 - On a Strata log, `graph` (and `explore`) `chain`, `associations` and `bridges` walk recorded typed edges only. `connection_type` names the recorded edge kind (for example `derived_from`) instead of a similarity class, and `connection_strength`, `strength` and `confidence` are the recorded edges' own strengths. `chain` steps list every memory, origin first, and a missing chain keeps the message `No chain found between these memories` with a `reason`. `bridges` stays a list of memory ids, with each bridge described in `bridgeDetails`.
 - On a Strata log, `predict` refuses free-text `current_topics` with `similarity_disabled`; `current_file` is an exact handle.
-
-### Fixed
-
-- On a Strata log, `graph never_composed` listed unlinked pairs in memory-id order with every score at 0. It now runs the GhostLink bridge lens.
-
-## [4.0.1] - Unreleased
 
 ### Security
 
@@ -47,8 +44,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without that header now gets `401 auth_required`, and a foreign page or
   Host gets `403`.
 
+- The credential gate covers every stored field of a memory (content, type,
+  tags, source and provenance) and of an intention, under every secret
+  policy. Refusals name the credential kind and never echo the value, and a
+  refused request writes nothing. `vestige scan-secrets` audits the whole
+  log, including retired memories, scopes and intentions.
+- Strata backups are owner-only: folders `0700` and files `0600` whatever the
+  umask, including the CLI's copy of a backup the server made.
+- `project` reads an existing target only when it is a regular file of at
+  most 2 MiB, checked on the opened handle, so a pipe or special file can no
+  longer stall it. A filesystem-root `root` is refused.
+- The upgrade's snapshot copy of a v3 store with a live WAL is made in the
+  data directory, owner-only, and removed when the run ends (or by the next
+  run after a kill), instead of in the shared temp directory.
+
 ### Fixed
 
+- Recovery of a Strata log with no `head.state` fails closed. An unreadable
+  segment header or a damaged length prefix halts instead of truncating
+  acknowledged frames. Torn final writes still recover.
+- A full volume (or quota) is an error to the caller, not a process abort. The
+  commit is undone, every queued writer gets the error, sequence numbers stay
+  dense, and the log takes writes again once space is freed. Opening no
+  longer leaves a half-written lock file, key or segment header behind.
+- The single-writer lock is an OS lock that the kernel releases when its
+  holder exits, crashes included. A leftover file, a recycled pid or a crashed
+  owner no longer blocks the store, and the lock file is never deleted under
+  a live server. Where a locked file's pid cannot be read (Windows), the
+  refusal says another process holds the store.
+- Verification, receipts and backup agree with the log about damage.
+  `strata-verify` checks `head.state`. A read or verification over a damaged
+  segment halts instead of answering short, and once damage is found the log
+  refuses appends and seals. `seal` signs only bytes that match the committed
+  frames, `backup` verifies the whole log before copying anything, and
+  `receipt get` verifies the log before it attests a receipt.
+- Undoing an edit leaves the pre-edit memory live, with its code anchors, and
+  retires only the edit. Undoing a logged write needs `confirm=true`.
+- Projection replaces only a well-formed fence: real marker lines outside
+  code blocks. A stray or unclosed marker leaves the text untouched.
+- A symlinked `vestige.db` is followed to the real file before the upgrade
+  looks for its WAL and writes the backup, so memories that live only in the
+  WAL come across and the backup holds the db, WAL and shm files. The
+  source-change guard hashes the original files.
+- A `vestige.db` that is unreadable, empty or not plain SQLite is refused by
+  name instead of being read as "no v3 store".
+- `vestige-upgrade` waits for `.serve.lock` at most `VESTIGE_ATTACH_WAIT_SECS`
+  (default 120 s), keeps going when stderr is closed, and accepts a data
+  directory that is not valid UTF-8. `vestige-mcp` finds the helper beside a
+  symlinked binary.
+- The upgrade's FSRS fit clock is clamped to the import time, so one
+  future-stamped memory no longer moves every card. Link and card rows whose
+  memory is gone are skipped and counted instead of aborting the import.
+- `session_start` on a Strata log: queries and `changed_files` get a notice
+  instead of failing the call; intentions are filtered by scope and show
+  their id, their due date with the year and an `OVERDUE` mark;
+  `needsBackup` and `needsDream` come from the last backup and dream that
+  completed; sections that were always empty are skipped; and it no longer
+  persists anchor verdicts, so its read-only annotation holds.
+- Retention of a memory that has only its ingest review decays with the time
+  elapsed since it was created, not with the number of unrelated log writes.
+- Receipt and latest-effect lookups are served from an effect index instead
+  of re-reading the whole log under the store lock.
+- `intention graph` rejects an `at` more than 24 hours ahead. `list` and
+  `check` honor `scope`, including the snooze wake pass, and a completed or
+  cancelled intention can no longer be snoozed back to active.
+- `codebase verify` refuses without an explicit `repoPath` instead of
+  checking the server's working directory.
+- `vestige sandwich install` stops on a settings file that is not a JSON
+  object and leaves it untouched, and backs up a parseable file before
+  rewriting it.
+- On a Strata log, `graph never_composed` listed unlinked pairs in memory-id order with every score at 0. It now runs the GhostLink bridge lens.
 - `vestige dashboard` run against a store that an agent's `vestige-mcp`
   holds now stops the dashboard when you press Ctrl+C. Before, that server
   kept serving the dashboard, unauthenticated, until the agent exited. The
