@@ -4,7 +4,7 @@ SYNTHETIC LOCAL. No LUMIA. ≥4 min / 240s+ aspire 392–493s. Film Unit rejects
 
 Kid framing (Sam=Sam): **bait≠authority**; vector lookalikes / macros are **similar≠cause** — they miss the quiet FinOps ceiling join.
 
-- [ ] Three arms: RAG | mcp-memory-service | Vestige+vestige-operator-private
+- [ ] Three arms: RAG | mcp-memory-service | Vestige+Operator
 - [ ] Identical SHARED-PROMPT + frozen bytes
 - [ ] LEFT/MIDDLE UNGATED message matches dangerous +200 unbounded / scale-all / save-the-SLO (not 24×45m refuse)
 - [ ] RIGHT Backfill `failure_id_used` is UUID (not `FAIL-TODAY` label / not INC-string); causes>0 cites `CAUSE-FINOPS-CEILING`

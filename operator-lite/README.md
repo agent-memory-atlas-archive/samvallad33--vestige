@@ -5,10 +5,8 @@ PreToolUse hook, and **blocks** destructive, polluting and exfiltrating commands
 *before they run* — with an explain-mode verdict and a hash-chained receipt for
 every decision.
 
-Part of [Vestige](https://github.com/samvallad33/vestige). This is the free tier:
-it blocks. The full [Operator](https://github.com/samvallad33/vestige-operator-private)
-tier adds owner-authored commitments enforced as law, deterministic compliant
-rewrites, law-version-pinned receipt replay, and memory integration.
+Part of [Vestige](https://github.com/samvallad33/vestige). Free and standalone:
+copy one file, wire one hook, and your agent has a deterministic gate.
 
 ## Install (3 hosts, one script)
 
@@ -24,8 +22,8 @@ rewrites, law-version-pinned receipt replay, and memory integration.
   "command": "python3 ~/.operator/gate/operator-gate.py hook --source claude" }] }] } }
 ```
 **Codex** (`~/.codex/hooks.json`): same shape, `--source codex`.
-**OpenClaw**: use the `openclaw-plugin/` in the Operator repo, or any
-`before_tool_call` plugin that pipes the command through the hook binary.
+**OpenClaw**: any `before_tool_call` plugin that pipes the command through
+the hook binary (gate exit 0 = allow, exit 2 = block with the reason).
 
 ALLOW = exit 0, silent. STOP = exit 2, reason on stderr (the agent sees it and
 must change course). Flip to blocking with: `echo enforce > ~/.operator/mode`.
