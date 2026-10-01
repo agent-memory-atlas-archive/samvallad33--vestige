@@ -2957,16 +2957,37 @@ fn run_backup_through_server(data_dir: &Path, output: &Path) -> anyhow::Result<(
 }
 
 /// Copy a directory tree (a Strata backup: plain files in plain directories).
+///
+/// The copy is owner-only on unix (directories 0700, files 0600), like the
+/// backup it is copied from.
 fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::create_dir_all(to)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(to, fs::Permissions::from_mode(0o700))?;
+    }
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let target = to.join(entry.file_name());
         if entry.file_type()?.is_dir() {
             copy_dir_all(&entry.path(), &target)?;
         } else {
-            fs::copy(entry.path(), &target)?;
-            fs::File::open(&target)?.sync_all()?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut out = options.open(&target)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                out.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+            std::io::copy(&mut fs::File::open(entry.path())?, &mut out)?;
+            out.sync_all()?;
         }
     }
     Ok(())
@@ -5691,6 +5712,25 @@ mod strata_cli_tests {
             !dir.path().join("backups").exists(),
             "resolving created a directory"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_backup_tree_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("made");
+        std::fs::create_dir_all(from.join("log")).unwrap();
+        std::fs::write(from.join("log").join("a.seg"), [1u8; 4]).unwrap();
+        std::fs::write(from.join("store.meta"), [2u8; 4]).unwrap();
+        let to = dir.path().join("copy");
+        copy_dir_all(&from, &to).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&to), 0o700);
+        assert_eq!(mode(&to.join("log")), 0o700);
+        assert_eq!(mode(&to.join("log").join("a.seg")), 0o600);
+        assert_eq!(mode(&to.join("store.meta")), 0o600);
+        assert_eq!(std::fs::read(to.join("store.meta")).unwrap(), [2u8; 4]);
     }
 
     #[test]

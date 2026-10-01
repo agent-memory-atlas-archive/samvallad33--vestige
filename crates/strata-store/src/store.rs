@@ -32,6 +32,59 @@ use crate::types::{
 
 /// Subdirectory holding the durable log.
 const LOG_DIR: &str = "log";
+
+/// Create `path` and any missing parents; directories made here are owner-only
+/// (0700) on unix.
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        set_private_dir(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
+/// Restrict an existing directory to its owner (0700) on unix.
+fn set_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Copy a file, creating the destination owner-only (0600) on unix so the
+/// copy is never readable by others, even briefly.
+fn copy_private_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut source = std::fs::File::open(from)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut target = options.open(to)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        target.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::io::copy(&mut source, &mut target)?;
+    Ok(())
+}
 /// Anchor file: hash of the head checkpoint (tamper-evidence for the
 /// successor-less head, per the strata-kernel verify contract).
 const META_NAME: &str = "store.meta";
@@ -2106,7 +2159,8 @@ impl StrataStore {
         let dest = dest.as_ref();
         self.log.seal()?;
         let dest_log = dest.join(LOG_DIR);
-        std::fs::create_dir_all(&dest_log)?;
+        create_private_dir_all(&dest_log)?;
+        set_private_dir(dest)?;
         for entry in std::fs::read_dir(&self.log_dir)? {
             let path = entry?.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -2115,10 +2169,10 @@ impl StrataStore {
             if name == "strata.lock" {
                 continue;
             }
-            std::fs::copy(&path, dest_log.join(name))?;
+            copy_private_file(&path, &dest_log.join(name))?;
         }
         if self.meta_path().exists() {
-            std::fs::copy(self.meta_path(), dest.join(META_NAME))?;
+            copy_private_file(&self.meta_path(), &dest.join(META_NAME))?;
         }
         Ok(())
     }

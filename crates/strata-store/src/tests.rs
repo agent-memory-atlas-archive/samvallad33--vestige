@@ -415,6 +415,47 @@ fn missing_store_meta_on_populated_store_fails_open() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Every directory and file of a backup is owner-only on unix, whatever the
+/// process umask is.
+#[cfg(unix)]
+#[test]
+fn backup_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn walk(path: &std::path::Path, bad: &mut Vec<String>) {
+        let meta = std::fs::metadata(path).expect("stat");
+        let mode = meta.permissions().mode() & 0o777;
+        let want = if meta.is_dir() { 0o700 } else { 0o600 };
+        if mode != want {
+            bad.push(format!("{} is {mode:o}, want {want:o}", path.display()));
+        }
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(path).expect("read_dir") {
+                walk(&entry.expect("entry").path(), bad);
+            }
+        }
+    }
+
+    let dir = temp_dir("backup-perm-src");
+    let parent = temp_dir("backup-perm-parent");
+    let dest = parent.join("nested").join("copy");
+    {
+        let mut store = StrataStore::open(&dir).expect("open");
+        store.ingest(input("private fact", &[])).expect("ingest");
+        store.seal_checkpoint().expect("seal");
+        store.backup_to(&dest).expect("backup");
+    }
+    let mut bad = Vec::new();
+    walk(&dest, &mut bad);
+    assert!(
+        std::fs::metadata(dest.join("log")).is_ok(),
+        "backup has a log dir"
+    );
+    assert!(bad.is_empty(), "backup is not owner-only: {bad:?}");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
 #[test]
 fn backup_roundtrip_opens_and_matches() {
     let dir = temp_dir("backup-src");
