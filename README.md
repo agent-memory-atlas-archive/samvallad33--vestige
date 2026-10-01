@@ -46,9 +46,8 @@ python3 ~/.operator/gate/operator-gate.py verify             # receipt chain che
 ```
 
 Full details in [operator-lite/README.md](operator-lite/README.md). The free tier
-blocks. Operator — the same kernel extended with owner-authored commitments
-enforced as law, deterministic compliant rewrites, law-version-pinned receipt
-replay, and memory integration — is where the governance loop becomes a product.
+blocks. Operator — the same kernel extended with a full governance loop — is where
+the product lives.
 
 ## The cause never looks like the bug
 
