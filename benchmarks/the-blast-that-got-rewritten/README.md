@@ -15,7 +15,7 @@ This is the **second** deep Impossible Approval film (run `film-20260914T092544Z
 
 The first sellable GLM film proved the trap: LEFT/MIDDLE **UNGATED**-publish the VIP blast; RIGHT **STOP**s.
 
-This second run proves the full Operator story buyers asked for next:
+This second run proves the full Operator loop:
 
 1. **Phase 1 — GATE:** dangerous twin proposal → Operator **STOP**, zero effects, ledger pristine  
 2. **Phase 2 — HEAL:** catch STOP → Backfill the failure → isolate quiet cause → rewrite safe subset → **ALLOW** + **one-use permit**
