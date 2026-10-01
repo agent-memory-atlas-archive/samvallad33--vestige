@@ -193,8 +193,20 @@ fn dream_compile_stdio_completes_from_recorded_edges() {
     }
 
     {
+        // The first ingest was written a month ago, so it has decayed with
+        // elapsed time and has the lowest retrievability.
+        let mut store = strata_store::StrataStore::open(dir.path()).unwrap();
+        let month_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 30 * 86_400_000;
+        store.set_created_at(&ids[0], month_ago).unwrap();
+    }
+
+    {
         let storage = vestige_mcp::strata_memory::open(dir.path()).unwrap();
-        // First ingest has the lowest retrievability. The other five are the replay set.
+        // The other five are the replay set.
         link(storage.as_ref(), &ids[4], &ids[5], "derived_from", 600);
         link(storage.as_ref(), &ids[1], &ids[0], "derived_from", 400);
         link(storage.as_ref(), &ids[2], &ids[3], "corrects", 800);

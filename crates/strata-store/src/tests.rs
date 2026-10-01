@@ -995,6 +995,55 @@ fn retrievability_uses_review_time_not_import_seq() {
 }
 
 #[test]
+fn retention_of_unreviewed_node_ignores_unrelated_writes() {
+    let dir = temp_dir("retention-clock");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let id = store
+        .ingest(input("a decision written at the ingest clock", &[]))
+        .expect("ingest");
+    let created = store.get_node(&id).expect("node").created_at_ms;
+    let day = 86_400_000i64;
+
+    // Right after the write nothing has decayed.
+    let fresh = store.retrievability_at(&id, created).unwrap().unwrap();
+    assert_eq!(fresh, 1.0);
+
+    // Unrelated writes advance the log, not the clock.
+    for n in 0..40 {
+        store
+            .ingest(input(&format!("unrelated note {n}"), &[]))
+            .expect("ingest other");
+    }
+    let after_writes = store.retrievability_at(&id, created).unwrap().unwrap();
+    assert_eq!(
+        after_writes, 1.0,
+        "log writes must not decay retention: {after_writes}"
+    );
+
+    // Elapsed time does decay it, by the derived formula over whole days.
+    let card = store.card_state(&id).expect("card");
+    let later = created + 30 * day;
+    let got = store.retrievability_at(&id, later).unwrap().unwrap();
+    let expected = FsrsFold::retrievability(&card, card.last_seq + 30, ALGO_V2).expect("formula");
+    assert_eq!(got, expected);
+    assert!(got < 1.0, "thirty days must decay: {got}");
+    let much_later = store
+        .retrievability_at(&id, created + 90 * day)
+        .unwrap()
+        .unwrap();
+    assert!(much_later < got, "monotone in elapsed time");
+
+    // Reopen derives the same value from the log alone.
+    drop(store);
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    assert_eq!(
+        reopened.retrievability_at(&id, later).unwrap().unwrap(),
+        got
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn review_without_clock_replays_as_unset() {
     let dir = temp_dir("review-unset");
     let mut store = StrataStore::open(&dir).expect("open");
