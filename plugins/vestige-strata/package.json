@@ -1,0 +1,33 @@
+{
+  "name": "vestige-strata",
+  "version": "4.0.0",
+  "description": "Vestige Strata memory for OpenClaw — signed append-only causal log, gated writes with replayable receipts, FSRS retention, exact-handle recall, causal root-cause walks. Local-first.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Sam Valladares",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/samvallad33/vestige.git"
+  },
+  "keywords": [
+    "openclaw",
+    "memory",
+    "strata",
+    "agents",
+    "local-first",
+    "causal",
+    "vestige"
+  ],
+  "dependencies": {
+    "typebox": "^1.0.0"
+  },
+  "openclaw": {
+    "extensions": ["./index.js"],
+    "compat": {
+      "pluginApi": ">=2026.1.0"
+    },
+    "build": {
+      "openclawVersion": "2026.2.3"
+    }
+  }
+}
