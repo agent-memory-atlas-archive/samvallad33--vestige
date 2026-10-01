@@ -27,6 +27,7 @@ corpus, everywhere.
 | Goose | lifecycle hooks `PreToolUse` (exit-2 block, goose v1.41.0+) | [goose/](goose/) | gate-tested, 29/29 |
 | Crush | `hooks.PreToolUse[]` in crush.json — flat `{name, matcher?, command, timeout}` entries; payload is the gate's contract verbatim (exit-2 block, stderr reason) | [crush/](crush/) | gate-tested, suite 40/40 |
 | Gemini CLI | `BeforeTool` hook in `~/.gemini/settings.json` (exit-2 deny) | [gemini-cli/](gemini-cli/) | gate-tested, suite PASS, corpus 43/43 |
+| Cursor | agent hooks in `~/.cursor/hooks.json` — `beforeShellExecution` + `beforeMCPExecution` + `preToolUse` (disjoint matchers); deny is stdout JSON `{"permission":"deny"}` at exit 0 (invalid output blocks too); `failClosed: true` shipped | [cursor/](cursor/) | gate-tested, suite 44/44 |
 | Windsurf (Cascade) | `pre_run_command` / `pre_write_code` / `pre_mcp_tool_use` hooks in `~/.codeium/windsurf/hooks.json` (workspace `.windsurf/hooks.json` / `.devin/hooks.json` optional) — payload reshaped by a shim (`tool_info.command_line` → `tool_input.command`; exit-2 block, stderr reason) | [windsurf/](windsurf/) | gate-tested, suite 57/57 PASS, corpus 43/43 via adapter |
 | Aider | no hook API — terminal wrapper | [aider/](aider/) | see port README |
 
