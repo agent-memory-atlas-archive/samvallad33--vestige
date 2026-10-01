@@ -272,7 +272,8 @@ pub async fn execute(
     //     trace payload has no `success: false` are not failed calls, so an
     //     ordinary recorder that never records outcomes stays silent here.
     // ====================================================================
-    if !is_strata && let Ok(failed_calls) = storage.last_session_failed_calls(None)
+    if !is_strata
+        && let Ok(failed_calls) = storage.last_session_failed_calls(None)
         && !failed_calls.is_empty()
     {
         let run_id = failed_calls[0].run_id.clone();
@@ -1328,7 +1329,10 @@ mod strata_tests {
         let set = crate::tools::intention_unified::execute(storage, &cognitive(), Some(args))
             .await
             .unwrap();
-        set["intentionId"].as_str().expect("intention id").to_string()
+        set["intentionId"]
+            .as_str()
+            .expect("intention id")
+            .to_string()
     }
 
     #[tokio::test]
@@ -1342,10 +1346,19 @@ mod strata_tests {
     #[tokio::test]
     async fn explicit_queries_are_dropped_with_a_notice_not_an_error() {
         let (storage, _dir) = strata();
-        let out = start(&storage, json!({"queries": ["user preferences", "release"]})).await;
-        let notices = out["notices"].as_array().expect("notice for dropped queries");
+        let out = start(
+            &storage,
+            json!({"queries": ["user preferences", "release"]}),
+        )
+        .await;
+        let notices = out["notices"]
+            .as_array()
+            .expect("notice for dropped queries");
         assert!(
-            notices[0].as_str().unwrap().starts_with("queries ignored (2)"),
+            notices[0]
+                .as_str()
+                .unwrap()
+                .starts_with("queries ignored (2)"),
             "{out}"
         );
     }
@@ -1384,9 +1397,15 @@ mod strata_tests {
         let out = start(&storage, json!({"scope": "user"})).await;
         let context = out["context"].as_str().unwrap();
         assert!(context.contains(&format!("[{mine}]")), "{context}");
-        assert!(context.contains("2020"), "the due date carries its year: {context}");
+        assert!(
+            context.contains("2020"),
+            "the due date carries its year: {context}"
+        );
         assert!(context.contains("OVERDUE"), "{context}");
-        assert!(!context.contains(&theirs), "another scope's intention leaked: {context}");
+        assert!(
+            !context.contains(&theirs),
+            "another scope's intention leaked: {context}"
+        );
         assert!(!context.contains("Other project chore"), "{context}");
     }
 
@@ -1418,10 +1437,21 @@ mod strata_tests {
         storage.save_dream_history(&record).unwrap();
 
         let after = start(&storage, json!({})).await;
-        assert_eq!(after["automationTriggers"]["needsBackup"], json!(false), "{after}");
-        assert_eq!(after["automationTriggers"]["needsDream"], json!(false), "{after}");
+        assert_eq!(
+            after["automationTriggers"]["needsBackup"],
+            json!(false),
+            "{after}"
+        );
+        assert_eq!(
+            after["automationTriggers"]["needsDream"],
+            json!(false),
+            "{after}"
+        );
         let stamps = std::fs::read_to_string(dir.path().join("maintenance-stamps.json")).unwrap();
-        assert!(stamps.contains("lastBackupMs") && stamps.contains("lastDreamMs"), "{stamps}");
+        assert!(
+            stamps.contains("lastBackupMs") && stamps.contains("lastDreamMs"),
+            "{stamps}"
+        );
     }
 
     #[tokio::test]
@@ -1444,16 +1474,23 @@ mod strata_tests {
             emotional_memories_processed: None,
             creative_connections_found: None,
         };
-        storage.save_dream_history(&dream(at("2026-09-02T00:00:00Z"))).unwrap();
+        storage
+            .save_dream_history(&dream(at("2026-09-02T00:00:00Z")))
+            .unwrap();
         let backup = tempfile::tempdir().unwrap();
         storage.backup_to(&backup.path().join("snap")).unwrap();
-        storage.save_dream_history(&dream(at("2026-09-01T00:00:00Z"))).unwrap();
+        storage
+            .save_dream_history(&dream(at("2026-09-01T00:00:00Z")))
+            .unwrap();
         assert_eq!(
             storage.get_last_dream().unwrap(),
             Some(at("2026-09-02T00:00:00Z")),
             "an older dream must not move the stamp back"
         );
-        assert!(storage.last_backup_timestamp().is_some(), "the dream write dropped the backup stamp");
+        assert!(
+            storage.last_backup_timestamp().is_some(),
+            "the dream write dropped the backup stamp"
+        );
     }
 
     #[tokio::test]
@@ -1480,7 +1517,10 @@ mod strata_tests {
         .unwrap();
         let id = saved["nodeId"].as_str().unwrap().to_string();
         let recorded = |storage: &Arc<Storage>| {
-            storage.code_anchors_for_nodes(std::slice::from_ref(&id)).unwrap()[&id][0].last_status
+            storage
+                .code_anchors_for_nodes(std::slice::from_ref(&id))
+                .unwrap()[&id][0]
+                .last_status
         };
         let before = recorded(&storage);
 
@@ -1491,8 +1531,20 @@ mod strata_tests {
             json!({"context": {"codebase": "anchored", "repoPath": repo.path()}}),
         )
         .await;
-        assert_eq!(out["codeContext"]["verification"]["enabled"], json!(true), "{out}");
-        assert_eq!(out["codeContext"]["verification"]["stale"], json!(1), "{out}");
-        assert_eq!(recorded(&storage), before, "a read-only session_start persisted a verdict");
+        assert_eq!(
+            out["codeContext"]["verification"]["enabled"],
+            json!(true),
+            "{out}"
+        );
+        assert_eq!(
+            out["codeContext"]["verification"]["stale"],
+            json!(1),
+            "{out}"
+        );
+        assert_eq!(
+            recorded(&storage),
+            before,
+            "a read-only session_start persisted a verdict"
+        );
     }
 }

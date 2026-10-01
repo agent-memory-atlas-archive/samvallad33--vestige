@@ -36,7 +36,9 @@ Add this to the agent's global or project instruction file:
 ```text
 Use Vestige as durable local memory.
 
-At session start, call `session_start` with queries and current project context.
+At session start, call `session_start` with the current project context, then
+`recall` the task's topic tag. On Strata, memories are found by exact handle, so
+`session_start` ignores queries and says so in its notices.
 Use an explicit scope for project memories. For source-aware code context, pass
 context.codebase and context.repoPath for the checkout you are actually editing.
 

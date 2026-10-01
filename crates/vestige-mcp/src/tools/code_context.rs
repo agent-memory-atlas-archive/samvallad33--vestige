@@ -173,7 +173,9 @@ pub(super) fn verify_nodes_with(
         let mut verdicts: Vec<AnchorVerification> = Vec::with_capacity(anchors.len());
         for anchor in &anchors {
             let v = verify_anchor(anchor, repo_root);
-            if persist && (anchor.last_status != Some(v.status) || anchor.last_verified_at.is_none()) {
+            if persist
+                && (anchor.last_status != Some(v.status) || anchor.last_verified_at.is_none())
+            {
                 let _ = storage.record_anchor_verification(&anchor.id, v.status, v.checked_at);
             }
             verdicts.push(v);

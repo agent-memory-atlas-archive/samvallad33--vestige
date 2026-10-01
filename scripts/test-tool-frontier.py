@@ -275,6 +275,9 @@ def handler_extras(tool, action, ctx):
         ("graph", "memory"): {"memory_id": mem},
         ("graph", "neighbors"): {"memory_id": mem},
         ("graph", "never_composed"): {"scope": "user", "limit": 5},
+        ("ghostlink", "weave"): {"first_id": mem, "second_id": mem2, "outcome_type": "helpful"},
+        ("ghostlink", "inspect"): {"view": "recent"},
+        ("ghostlink", "explore"): {"kind": "associations", "from": mem},
         ("graph", "label"): {"event_id": "evt-fixture", "outcome_type": "helpful"},
         ("session_start", "default"): {
             "queries": ["fixture"], "include_predictions": False, "include_intentions": False,
@@ -858,7 +861,9 @@ def run(binary, output):
             assert "admission" in bridge, bridge
             divergent = tool("ghostlink", {"mode": "propose", "lens": "divergent", "limit": 5})
             assert all(c["proof"]["noEdgeVerified"] is True for c in divergent["candidates"]), divergent
-            typed("session_start", {"queries": [marker], "include_predictions": False, "include_intentions": False}, "similarity_disabled")
+            started = tool("session_start", {"queries": [marker], "include_predictions": False, "include_intentions": False})
+            assert started["notices"][0].startswith("queries ignored (1)"), started
+            assert marker not in started["context"], started
             doomed_suppress = tool("smart_ingest", {"content": "STRATA_SUPPRESS_DOOMED", "forceCreate": True})
             suppress_id = doomed_suppress["nodeId"]
             typed("blast_radius", {"action": "retire", "ids": [suppress_id], "reason": "fixture"}, "unavailable_in_4_0")
