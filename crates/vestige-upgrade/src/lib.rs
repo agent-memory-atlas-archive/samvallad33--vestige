@@ -7,7 +7,7 @@
 //! and renames. A dead owner's staging directory is wiped there, so SIGKILL
 //! recovery is the same code. This crate decides that a v3 file needs that
 //! import, copies the sqlite family, and records progress on stderr.
-//! [`upgrade_with`] is the only path that calls `vestige_core::detect_v3`.
+//! [`upgrade_with`] is the only path that calls `vestige_core::detect_v3_strict`.
 //!
 //! v3 intentions have no migration frame. After the staged log verifies,
 //! `carry_intentions` admits them into it through the store's normal
@@ -100,7 +100,7 @@ pub fn upgrade_with(
         return Ok(status);
     }
 
-    let detected = match vestige_core::detect_v3(db_path) {
+    let detected = match vestige_core::detect_v3_strict(db_path) {
         Ok(v) => v,
         Err(e) => return Err(fail(&log_path, format!("v3 detection failed: {e}"))),
     };

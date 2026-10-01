@@ -84,6 +84,50 @@ pub fn detect_v3(path: &Path) -> Result<Option<V3Info>> {
     }))
 }
 
+/// Like [`detect_v3`], for callers that must decide whether a file at `path`
+/// may be treated as "no v3 store".
+///
+/// `Ok(None)` only when nothing exists at `path`. A path that exists but
+/// cannot be read, is empty, or does not carry the plain SQLite magic (an
+/// encrypted or truncated store, for example) is an error: its contents are
+/// unknown, so it must not be skipped as if it were absent.
+pub fn detect_v3_strict(path: &Path) -> Result<Option<V3Info>> {
+    let mut header = [0u8; 100];
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unrecognised_store(path, &format!("cannot be opened: {e}"))),
+    };
+    let mut filled = 0usize;
+    while filled < header.len() {
+        match std::io::Read::read(&mut file, &mut header[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(unrecognised_store(path, &format!("cannot be read: {e}"))),
+        }
+    }
+    if filled == 0 {
+        return Err(unrecognised_store(path, "is empty"));
+    }
+    if filled < SQLITE_MAGIC.len() || &header[..16] != SQLITE_MAGIC {
+        return Err(unrecognised_store(path, "is not a plain SQLite database"));
+    }
+    let schema_version = read_schema_version(path, &header);
+    Ok(Some(V3Info {
+        path: path.to_path_buf(),
+        schema_version,
+    }))
+}
+
+fn unrecognised_store(path: &Path, what: &str) -> StorageError {
+    StorageError::Init(format!(
+        "{} exists but {what}. It was left untouched and no Strata log was created. \
+         Restore a readable copy or move the file away, then retry.",
+        path.display()
+    ))
+}
+
 /// Build the canonical refusal for a detected v3 store.
 pub fn refuse_v3(info: &V3Info) -> StorageError {
     StorageError::V3StoreNeedsMigration {
@@ -177,6 +221,28 @@ mod tests {
         let junk = dir.path().join("junk.db");
         std::fs::write(&junk, b"definitely not a database header at all").unwrap();
         assert!(detect_v3(&junk).unwrap().is_none());
+    }
+
+    #[test]
+    fn strict_detect_passes_only_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            detect_v3_strict(&dir.path().join("absent.db"))
+                .unwrap()
+                .is_none()
+        );
+        let empty = dir.path().join("empty.db");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(detect_v3_strict(&empty).is_err());
+        let junk = dir.path().join("junk.db");
+        std::fs::write(&junk, b"not a database header at all").unwrap();
+        assert!(detect_v3_strict(&junk).is_err());
+        let unreadable = dir.path().join("dir.db");
+        std::fs::create_dir(&unreadable).unwrap();
+        assert!(detect_v3_strict(&unreadable).is_err());
+        let v3 = dir.path().join("v3.db");
+        std::fs::write(&v3, b"SQLite format 3\0rest of header").unwrap();
+        assert!(detect_v3_strict(&v3).unwrap().is_some());
     }
 
     #[test]
