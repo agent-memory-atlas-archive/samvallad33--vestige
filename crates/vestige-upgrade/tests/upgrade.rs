@@ -1106,3 +1106,63 @@ fn a_non_utf8_data_dir_is_accepted() {
     assert!(data.join(LOG_DIR_NAME).exists());
     assert_eq!(before, sha256_file(&db));
 }
+
+/// A `vestige.db` that is empty, not plain SQLite (for example an encrypted
+/// store) or unreadable is not "no v3 store": the upgrade refuses, installs no
+/// log, and leaves the file as it was.
+#[test]
+fn unrecognised_vestige_db_is_refused_and_installs_no_log() {
+    let encrypted_like: Vec<u8> = (0u32..4096)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 | 0x80)
+        .collect();
+    let cases: [(&str, Vec<u8>); 3] = [
+        ("empty", Vec::new()),
+        ("short", b"SQLite".to_vec()),
+        ("not-plain-sqlite", encrypted_like),
+    ];
+    for (label, bytes) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("vestige.db");
+        fs::write(&db, &bytes).unwrap();
+
+        let err = vestige_upgrade::upgrade_if_needed(&db)
+            .expect_err(&format!("{label}: must not count as no v3 store"));
+        let text = err.to_string();
+        assert!(text.contains("vestige.db"), "{label}: {text}");
+        assert_eq!(fs::read(&db).unwrap(), bytes, "{label}: file changed");
+        assert!(
+            !dir.path().join(LOG_DIR_NAME).exists(),
+            "{label}: a log was created"
+        );
+
+        let output = run_upgrade_bin(dir.path());
+        assert!(
+            !output.status.success(),
+            "{label}: upgrade binary exited 0: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read(&db).unwrap(), bytes, "{label}: file changed");
+        assert!(!dir.path().join(LOG_DIR_NAME).exists(), "{label}: log");
+    }
+}
+
+#[test]
+fn unreadable_vestige_db_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    // A directory opens but cannot be read, like a file the process has no
+    // access to, and works whatever user runs the tests.
+    let db = dir.path().join("vestige.db");
+    fs::create_dir(&db).unwrap();
+    let err = vestige_upgrade::upgrade_if_needed(&db)
+        .expect_err("an unreadable vestige.db must not count as no v3 store");
+    assert!(err.to_string().contains("vestige.db"), "{err}");
+    assert!(!dir.path().join(LOG_DIR_NAME).exists());
+}
+
+/// Without a `vestige.db` there is nothing to refuse.
+#[test]
+fn absent_vestige_db_still_means_no_v3() {
+    let dir = tempfile::tempdir().unwrap();
+    let status = vestige_upgrade::upgrade_if_needed(&dir.path().join("vestige.db")).unwrap();
+    assert_eq!(status, UpgradeStatus::NoV3);
+}
