@@ -222,7 +222,7 @@ Write-up: [docs/SCIENCE.md](docs/SCIENCE.md).
 | `codebase` | Remember a pattern or decision with code anchors, fetch context marked current or stale, `verify` anchors against source, `reanchor` |
 | `dedup` | `scan` for duplicates, `undo` a recorded operation, `tag_rename` and `tag_merge` with a preview, `policy` |
 | `forgotten_lesson` | Faded fix or lesson memories behind a failure, over recorded edges |
-| `graph` | `chain`, `associations`, `bridges`, `predict`, `memory_graph`, `recent`, `never_composed`, `bounty_mode` |
+| `ghostlink` | Never-composed memory pairs, each with its proof from recorded edges only. `propose` with lens `bridge` (within three typed-edge hops, never woven) or `divergent` (no recorded edge at all; a forced juxtaposition when nothing can be measured), `weave` an outcome (a write with receipts), `inspect` woven compositions, `explore` typed paths, `map`, `bounty`, `predict`, and `harden` to seed invariant laws once. `graph` still answers as a hidden alias |
 | `intention` | `set`, `check`, `update`, `list`. `graph` runs the evidence-aware plan |
 | `maintain` | `consolidate`, `dream`, `dream_compile`, `gc` (dry run unless you turn it off), `importance_score`, `backup`, `export` |
 | `memory` | `get`, `get_batch`, `state`, `promote`, `demote`, `edit`. Demote does not delete. An edit admits a successor and keeps its code anchors |

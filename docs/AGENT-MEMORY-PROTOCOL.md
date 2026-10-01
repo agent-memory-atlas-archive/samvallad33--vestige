@@ -77,7 +77,7 @@ call `memory` with `action="purge"` and `confirm=true`.
 | Set, check, list, complete, snooze or cancel future intentions | `intention` |
 | Inspect health, retention, timeline, audit trail or hygiene | `memory_status` |
 | Inspect duplicate candidates, plan/review/apply/undo merges, maintain tags | `dedup` |
-| Inspect connections, predictions, recorded compositions and uncombined candidates | `graph` |
+| Propose never-composed pairs with proofs, weave what a tested pair showed, inspect woven compositions | `ghostlink` (`graph` is a hidden alias) |
 | Inspect a retrieval receipt or ablate its frozen evidence | `receipt` |
 | Temporarily inhibit a memory or reverse within its supported window | `suppress` |
 | Investigate earlier candidates related to a recorded failure | `backfill(promote=false)` first; investigate before promotion |
@@ -87,7 +87,7 @@ Tool annotations apply to the entire tool, including tools mixing read and write
 actions. Inspect the specific action's schema and required confirmation. A guide
 entry is neither an execution request nor permission. Prefer previews for merge,
 tag, garbage-collection and backfill investigations; review before applying.
-Never interpret `never_composed` as worldwide novelty or a causal result.
+Never interpret a `ghostlink` proposal (or `never_composed`) as worldwide novelty or a causal result.
 
 The old `search`, `deep_reference`, `session_context` and `system_status` names
 are compatibility redirects. New agents should use the advertised names above.

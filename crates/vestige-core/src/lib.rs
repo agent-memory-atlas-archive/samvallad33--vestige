@@ -81,6 +81,8 @@
 /// Actor provenance (#252 Phase A): process did:key identity, the
 /// operator-controlled versioned role policy, and neutral resolution.
 pub mod actor;
+// GhostLink composition arithmetic shared by every backend (no SQLite).
+pub mod composition;
 
 /// Optional `vestige.toml` configuration (Phase 2: Configurable Output).
 pub mod config;

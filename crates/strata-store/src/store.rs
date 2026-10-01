@@ -209,6 +209,10 @@ pub enum EffectAction {
     /// Verification verdict cached by `RecordAnchorVerdict`, named by the
     /// anchor id. Not a card.
     AnchorVerdict,
+    /// Typed edge admitted by `SaveEdge`, named by its source id; `edge`
+    /// carries the target and kind. Not a card: it never shadows the
+    /// source's own receipt in [`StrataStore::latest_effect`].
+    Edge,
 }
 
 /// One node, intention or anchor effect proved from the log: covering
@@ -230,6 +234,8 @@ pub struct EffectProof {
     pub payload_digest: [u8; 32],
     /// Review rating when `action` is [`EffectAction::Review`].
     pub rating: Option<u8>,
+    /// `(target_id, link_type)` when `action` is [`EffectAction::Edge`].
+    pub edge: Option<(String, String)>,
 }
 
 /// Stable u64 card handle for a node id: first 8 bytes of blake3(id),
@@ -987,6 +993,17 @@ impl StrataStore {
         input: IngestInput,
         scope: &str,
     ) -> Result<String, StoreError> {
+        self.ingest_in_scope_with_receipt(input, scope)
+            .map(|(id, _)| id)
+    }
+
+    /// [`Self::ingest_in_scope`], also returning the gate-space seq of the
+    /// admitting EFFECT (the `eff-` receipt id, see [`effect_receipt_id`]).
+    pub fn ingest_in_scope_with_receipt(
+        &mut self,
+        input: IngestInput,
+        scope: &str,
+    ) -> Result<(String, u64), StoreError> {
         if input.content.trim().is_empty() {
             return Err(StoreError::InvalidInput("content must not be empty".into()));
         }
@@ -1014,12 +1031,12 @@ impl StrataStore {
             source_updated_at_ms: input.source_updated_at_ms,
         };
         // A brand-new fact references nothing yet: empty context.
-        self.admit_write(
+        let (effect_seq, _) = self.admit_write(
             StoreOp::UpsertNode { record },
             action_kind::WRITE,
             Vec::new(),
         )?;
-        Ok(id)
+        Ok((id, effect_seq))
     }
 
     /// Insert or replace intentions through one admitted write.
@@ -1726,6 +1743,7 @@ impl StrataStore {
                             action,
                             payload_digest: digest,
                             rating: None,
+                            edge: None,
                         }
                     }
                     StoreOp::SupersedeNode { superseded_by, .. } if rule == Some(RULE_EDIT) => {
@@ -1736,6 +1754,7 @@ impl StrataStore {
                             action: EffectAction::Edit,
                             payload_digest: digest,
                             rating: None,
+                            edge: None,
                         }
                     }
                     StoreOp::ReviewNode {
@@ -1755,6 +1774,7 @@ impl StrataStore {
                             action: EffectAction::Review,
                             payload_digest: digest,
                             rating: Some(rating),
+                            edge: None,
                         }
                     }
                     StoreOp::UpsertIntentions { records } => {
@@ -1766,6 +1786,7 @@ impl StrataStore {
                             action: EffectAction::Intention,
                             payload_digest: digest,
                             rating: None,
+                            edge: None,
                         }));
                         continue;
                     }
@@ -1779,6 +1800,7 @@ impl StrataStore {
                             action: EffectAction::Anchor,
                             payload_digest: digest,
                             rating: None,
+                            edge: None,
                         }));
                         continue;
                     }
@@ -1789,8 +1811,18 @@ impl StrataStore {
                         action: EffectAction::AnchorVerdict,
                         payload_digest: digest,
                         rating: None,
+                        edge: None,
                     },
-                    StoreOp::SaveEdge { .. } | StoreOp::SupersedeNode { .. } => continue,
+                    StoreOp::SaveEdge { edge } => EffectProof {
+                        effect_seq,
+                        data_seq: frame.seq,
+                        node_id: edge.source_id,
+                        action: EffectAction::Edge,
+                        payload_digest: digest,
+                        rating: None,
+                        edge: Some((edge.target_id, edge.link_type)),
+                    },
+                    StoreOp::SupersedeNode { .. } => continue,
                 };
                 proofs.push(proof);
             }
@@ -1811,7 +1843,7 @@ impl StrataStore {
         Ok(self
             .prove_effects()?
             .into_iter()
-            .filter(|proof| proof.node_id == node_id)
+            .filter(|proof| proof.node_id == node_id && proof.action != EffectAction::Edge)
             .max_by_key(|proof| proof.effect_seq))
     }
 
@@ -2166,6 +2198,28 @@ impl StrataStore {
         self.edges.clone()
     }
 
+    /// The node registry, borrowed (GhostLink reads it without cloning).
+    pub(crate) fn node_map(&self) -> &BTreeMap<String, NodeRecord> {
+        &self.nodes
+    }
+
+    /// Every edge in landing order, borrowed.
+    pub(crate) fn edge_list(&self) -> &[ConnectionRecord] {
+        &self.edges
+    }
+
+    /// The latest clock the log records: the greatest node `created_at_ms`
+    /// or explicit review clock. Derived from the log alone, so a read that
+    /// evaluates retention at this clock is deterministic for a given head.
+    pub fn head_clock_ms(&self) -> i64 {
+        self.nodes
+            .values()
+            .map(|record| record.created_at_ms)
+            .chain(self.reviewed_at.values().copied())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Number of live nodes (any scope).
     pub fn node_count(&self) -> usize {
         self.nodes.values().filter(|r| r.is_live()).count()
@@ -2345,12 +2399,19 @@ fn supersede_component(hops: &[SupersedeHop], id: &str) -> Vec<SupersedeHop> {
 
 /// Fresh fold of one log. Receipt replay compares this to the live maps.
 pub struct Refold {
+    /// Frames the refold read.
     pub frames: u64,
+    /// State digest of the refolded copy.
     pub state_digest: [u8; 32],
+    /// Refolded node registry.
     pub nodes: BTreeMap<String, NodeRecord>,
+    /// Refolded origin seq per node.
     pub origins: BTreeMap<String, u64>,
+    /// FSRS retrievability per node in the refolded copy.
     pub retrievability: BTreeMap<String, f64>,
+    /// Gate verdicts the refold could not re-derive.
     pub gate_mismatches: Vec<String>,
+    /// Admission gaps the sweep found.
     pub gaps: Vec<String>,
 }
 

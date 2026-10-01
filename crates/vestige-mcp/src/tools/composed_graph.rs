@@ -7,23 +7,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 use vestige_core::{CompositionOutcomeRecord, Storage};
 
-pub(crate) const OUTCOME_TYPES: &[&str] = &[
-    "helpful",
-    "dead_end",
-    "submitted",
-    "accepted",
-    "rejected",
-    "duplicate_risk",
-    "needs_poc",
-    "bad_severity",
-    "user_promoted",
-    "user_demoted",
-    "closed_by_scope",
-    "closed_by_duplicate",
-    "closed_by_false_assumption",
-    "closed_by_user",
-    "expired_lane",
-];
+/// Canonical outcome vocabulary (backend-neutral, in vestige-core).
+pub(crate) const OUTCOME_TYPES: &[&str] = vestige_core::composition::OUTCOME_TYPES;
 
 pub fn schema() -> Value {
     serde_json::json!({
@@ -94,6 +79,32 @@ struct ComposedGraphArgs {
 }
 
 pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
+    // 4.0: on a Strata log the hidden `composed_graph` alias runs the same
+    // GhostLink engine as `ghostlink` and `graph`.
+    if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        let action = args
+            .as_ref()
+            .and_then(|a| a.get("action"))
+            .and_then(|v| v.as_str())
+            .ok_or("Missing arguments")?
+            .to_string();
+        if !matches!(
+            action.as_str(),
+            "recent" | "get" | "memory" | "neighbors" | "never_composed" | "bounty_mode" | "label"
+        ) {
+            return Err(format!("Unknown composed_graph action: {action}"));
+        }
+        if action != "never_composed"
+            && args
+                .as_ref()
+                .is_some_and(|a| a.get("scope").is_some() || a.get("includeCrossScope").is_some())
+        {
+            return Err(
+                "scope and includeCrossScope currently apply only to never_composed".into(),
+            );
+        }
+        return super::ghostlink::execute_graph_action_on_strata(storage, &action, args).await;
+    }
     let args: ComposedGraphArgs = match args {
         Some(value) => {
             serde_json::from_value(value).map_err(|e| format!("Invalid arguments: {}", e))?

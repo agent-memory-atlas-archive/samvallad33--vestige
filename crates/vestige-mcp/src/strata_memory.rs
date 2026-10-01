@@ -27,6 +27,8 @@ use vestige_core::{
     SecretPolicy, SourceEnvelope, scan_secrets,
 };
 
+pub mod ghostlink;
+
 const Q32_SCALE: f64 = 4294967296.0;
 const RECEIPT_PREFIX: &str = "eff-";
 const STRATA_REPLAY_BOUNDARY: &str = "Replay re-derives state from the Strata log and compares it to the receipt. A match checks the log; it is not a claim about the world.";
@@ -577,6 +579,19 @@ fn resolve_proof(
     store.latest_effect(receipt_or_node)
 }
 
+/// An edge receipt names both endpoints. When either was retired, the
+/// receipt stays hidden like the retired memory itself.
+fn edge_proof_hidden(store: &strata_store::StrataStore, proof: &strata_store::EffectProof) -> bool {
+    let Some((target, _)) = &proof.edge else {
+        return false;
+    };
+    [proof.node_id.as_str(), target.as_str()].iter().any(|id| {
+        store
+            .get_node(id)
+            .is_some_and(|record| !retrievable(&record))
+    })
+}
+
 fn mutation_kind(proof: &strata_store::EffectProof) -> &'static str {
     match (proof.action, proof.rating) {
         (strata_store::EffectAction::Create, _) => "created",
@@ -588,6 +603,7 @@ fn mutation_kind(proof: &strata_store::EffectProof) -> &'static str {
         (strata_store::EffectAction::Intention, _) => "intention_upserted",
         (strata_store::EffectAction::Anchor, _) => "anchor_recorded",
         (strata_store::EffectAction::AnchorVerdict, _) => "anchor_verified",
+        (strata_store::EffectAction::Edge, _) => "edge_recorded",
     }
 }
 
@@ -603,6 +619,9 @@ fn receipt_from_proof(proof: &strata_store::EffectProof, trust: f64) -> Receipt 
     }
     if proof.action == strata_store::EffectAction::Edit {
         note.push_str(" rule=edit");
+    }
+    if let Some((target, kind)) = &proof.edge {
+        note.push_str(&format!(" edge={kind} target={target}"));
     }
     Receipt {
         receipt_id: receipt_id_for(proof.effect_seq),
@@ -1580,6 +1599,9 @@ impl MemoryStoreSend for StrataMemory {
         let Some(proof) = resolve_proof(&store, receipt_id).map_err(map_store)? else {
             return Ok(None);
         };
+        if edge_proof_hidden(&store, &proof) {
+            return Ok(None);
+        }
         let trust = store
             .retrievability(&proof.node_id)
             .ok()
@@ -1607,6 +1629,7 @@ impl MemoryStoreSend for StrataMemory {
         // only means "no DSSE envelope"; the effect itself is checked in get_receipt.
         Ok(resolve_proof(&store, receipt_id)
             .map_err(map_store)?
+            .filter(|proof| !edge_proof_hidden(&store, proof))
             .map(|_| ReceiptAttestationStatus::LegacyUnsigned))
     }
 
@@ -1621,6 +1644,15 @@ impl MemoryStoreSend for StrataMemory {
     fn replay_receipt(&self, receipt_id: &str) -> Result<Value, StorageError> {
         let store = self.lock();
         let folded = store.refold().map_err(map_store)?;
+        if let Some(edge_proof) = parse_receipt_seq(receipt_id)
+            .map(|seq| store.effect_by_seq(seq))
+            .transpose()
+            .map_err(map_store)?
+            .flatten()
+            .filter(|proof| proof.action == strata_store::EffectAction::Edge)
+        {
+            return replay_edge_receipt(&store, &folded, &edge_proof);
+        }
         let Some((node_id, seq)) = lookup_origin(&store, receipt_id) else {
             return Err(StorageError::NotFound(format!(
                 "Receipt '{receipt_id}' was not found"
@@ -2076,7 +2108,7 @@ impl MemoryStoreSend for StrataMemory {
         limit: i32,
         tag_filter: Option<&[String]>,
     ) -> Result<Vec<NeverComposedCandidate>, StorageError> {
-        self.never_composed(None, limit, tag_filter)
+        self.never_composed(Some(vestige_core::DEFAULT_MEMORY_SCOPE), limit, tag_filter)
     }
 
     fn get_never_composed_candidates_in_scope(
@@ -2489,6 +2521,22 @@ impl MemoryStoreSend for StrataMemory {
         // deleted); on Strata it cannot be reversed.
         let mut store = self.lock();
         let receipt = retire_live(&mut store, id, strata_store::RULE_SUPPRESS, false)?;
+        // A GhostLink composition record names both members in its source
+        // key. Suppression hides a memory from every read, so each live
+        // record composed from it is withdrawn with it, through the gate
+        // with its own receipt.
+        let compositions: Vec<String> = store
+            .nodes()
+            .into_iter()
+            .filter(|record| record.is_live())
+            .filter(|record| {
+                strata_store::composition_pair(record).is_some_and(|(a, b)| a == id || b == id)
+            })
+            .map(|record| record.id)
+            .collect();
+        for record in compositions {
+            retire_live(&mut store, &record, strata_store::RULE_SUPPRESS, false)?;
+        }
         // The trait returns a node, not a receipt. `source` carries the eff-
         // id for this call only; the log record is unchanged.
         let mut node = KnowledgeNode::default();
@@ -2653,6 +2701,11 @@ impl StrataMemory {
         Ok(nodes)
     }
 
+    /// GhostLink bridge lens (the owner ruling of 2026-09-28): pool pairs
+    /// within three undirected hops over recorded touched / derived_from /
+    /// closed_by edges, never woven, scored by hop proximity, composition
+    /// novelty, retention trust and prior outcomes. Tags filter by exact
+    /// identity; no content, tag-name or term overlap is computed.
     fn never_composed(
         &self,
         scope: Option<&str>,
@@ -2662,61 +2715,14 @@ impl StrataMemory {
         let Some(scope) = scope else {
             return Ok(Vec::new());
         };
-        let limit = usize::try_from(limit).unwrap_or(0);
-        let store = self.lock();
-        let records: Vec<_> = store
-            .nodes()
-            .into_iter()
-            .filter(|record| record.is_live())
-            .collect();
-        let pairs = store.get_never_composed(scope, limit.saturating_mul(4).max(limit));
-        let mut out = Vec::new();
-        for (first, second) in pairs {
-            let Some(a) = records.iter().find(|record| record.id == first) else {
-                continue;
-            };
-            let Some(b) = records.iter().find(|record| record.id == second) else {
-                continue;
-            };
-            if !retrievable(a) || !retrievable(b) {
-                continue;
-            }
-            if let Some(tags) = tag_filter.filter(|tags| !tags.is_empty()) {
-                let has = |record: &strata_store::NodeRecord| {
-                    record
-                        .tags
-                        .iter()
-                        .any(|tag| tags.iter().any(|want| want == tag))
-                };
-                if !has(a) || !has(b) {
-                    continue;
-                }
-            }
-            out.push(NeverComposedCandidate {
-                first_id: first,
-                second_id: second,
-                score: 0.0,
-                novelty_score: 0.0,
-                bridge_score: 0.0,
-                trust_score: 0.0,
-                outcome_score_adjustment: 0.0,
-                shared_tags: Vec::new(),
-                boundary_tags: Vec::new(),
-                shared_terms: Vec::new(),
-                prior_outcomes: Vec::new(),
-                outcome_signal: String::new(),
-                first_node_type: a.node_type.clone(),
-                second_node_type: b.node_type.clone(),
-                first_preview: a.content.chars().take(140).collect(),
-                second_preview: b.content.chars().take(140).collect(),
-                reason: "no recorded edge".into(),
-                composition_question: String::new(),
-            });
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
+        let scope = normalize_scope(scope)?;
+        let limit = usize::try_from(limit).unwrap_or(0).max(1);
+        Ok(ghostlink::bridge_trait_candidates(
+            self,
+            Some(scope),
+            tag_filter.filter(|tags| !tags.is_empty()),
+            limit,
+        ))
     }
 }
 
@@ -2828,6 +2834,51 @@ fn merge_operation(write: strata_store::NodeWrite) -> vestige_core::advanced::Me
         signals: None,
         reason,
     }
+}
+
+/// Replay an edge receipt: the refolded log must reach the live state, and
+/// the edge the receipt names must be in it.
+fn replay_edge_receipt(
+    store: &strata_store::StrataStore,
+    folded: &strata_store::Refold,
+    proof: &strata_store::EffectProof,
+) -> Result<Value, StorageError> {
+    let receipt_id = receipt_id_for(proof.effect_seq);
+    if edge_proof_hidden(store, proof) {
+        return Err(StorageError::NotFound(format!(
+            "Receipt '{receipt_id}' was not found"
+        )));
+    }
+    let (target, kind) = proof.edge.clone().unwrap_or_default();
+    let mut mismatches = Vec::new();
+    let live_digest = store.state_digest();
+    if live_digest != folded.state_digest {
+        mismatches.push("state_digest".to_string());
+    }
+    let present = store.edges().iter().any(|edge| {
+        edge.source_id == proof.node_id && edge.target_id == target && edge.link_type == kind
+    });
+    if !present {
+        mismatches.push(format!("edge:{}:{kind}:{target}:missing", proof.node_id));
+    }
+    mismatches.extend(folded.gate_mismatches.iter().cloned());
+    mismatches.extend(folded.gaps.iter().cloned());
+    mismatches.sort();
+    mismatches.dedup();
+    Ok(json!({
+        "action": "replay",
+        "kind": "strata",
+        "readOnly": true,
+        "receiptId": receipt_id,
+        "edge": { "source": proof.node_id, "target": target, "kind": kind },
+        "effectSeq": proof.effect_seq,
+        "matched": mismatches.is_empty(),
+        "mismatches": mismatches,
+        "stateDigest": hex32(&live_digest),
+        "replayedDigest": hex32(&folded.state_digest),
+        "frames": folded.frames,
+        "claimBoundary": STRATA_REPLAY_BOUNDARY,
+    }))
 }
 
 fn lookup_origin(
@@ -3724,5 +3775,86 @@ mod tests {
         let reopened = super::open(dir.path()).unwrap();
         assert!(reopened.get_node(&node.id).unwrap().is_none());
         assert!(no_sqlite(dir.path()));
+    }
+
+    #[test]
+    fn suppressing_a_woven_member_withdraws_its_composition_records() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = super::open(dir.path()).unwrap();
+        let ingest = |content: &str| {
+            storage
+                .ingest(vestige_core::IngestInput {
+                    content: content.into(),
+                    node_type: "fact".into(),
+                    ..vestige_core::IngestInput::default()
+                })
+                .unwrap()
+                .id
+        };
+        let kept = ingest("KEPT_WOVEN_VISIBLE");
+        let doomed = ingest("DOOMED_WOVEN_MARKER_41d9");
+        let woven =
+            super::ghostlink::weave(storage.as_ref(), &kept, &doomed, "helpful", None).unwrap();
+        let record = woven["recordId"].as_str().unwrap().to_string();
+        assert!(storage.get_node(&record).unwrap().is_some());
+
+        let suppressed = storage.suppress_memory(&doomed).unwrap();
+        assert_eq!(suppressed.id, doomed);
+
+        // Neither the suppressed member's id nor its record surfaces in any
+        // GhostLink read or in a plain read of the surviving member.
+        let hidden = |what: &str, text: String| {
+            assert!(
+                !text.contains(&doomed),
+                "{what} leaked the suppressed id: {text}"
+            );
+            assert!(
+                !text.contains(&record),
+                "{what} leaked the withdrawn record: {text}"
+            );
+        };
+        for view in ["recent", "memory"] {
+            hidden(
+                view,
+                super::ghostlink::inspect(storage.as_ref(), view, None, Some(&kept), 10)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|err| err),
+            );
+        }
+        hidden(
+            "associations",
+            super::ghostlink::explore(storage.as_ref(), "associations", &kept, None, 10)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|err| err),
+        );
+        // A chain asked for by the suppressed id echoes only the caller's own
+        // argument: no path, no record, no content.
+        let chain =
+            super::ghostlink::explore(storage.as_ref(), "chain", &kept, Some(&doomed), 10).unwrap();
+        assert_eq!(chain["steps"], json!([]), "{chain}");
+        let text = chain.to_string();
+        assert!(
+            !text.contains(&record) && !text.contains("DOOMED_WOVEN_MARKER_41d9"),
+            "{text}"
+        );
+        assert!(
+            storage.get_node(&record).unwrap().is_none(),
+            "record withdrawn"
+        );
+        let kept_node = storage.get_node(&kept).unwrap().expect("kept stays");
+        hidden(
+            "memory get kept",
+            serde_json::to_string(&kept_node).unwrap(),
+        );
+        hidden(
+            "connections of kept",
+            format!("{:?}", storage.get_connections_for_memory(&kept).unwrap()),
+        );
+
+        // The withdrawal is a gated write that survives a reopen.
+        drop(storage);
+        let reopened = super::open(dir.path()).unwrap();
+        assert!(reopened.get_node(&record).unwrap().is_none());
+        assert!(reopened.get_node(&kept).unwrap().is_some());
     }
 }

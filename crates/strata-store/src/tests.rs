@@ -2289,6 +2289,46 @@ fn anchors_of_a_retired_node_are_not_returned_or_written() {
 }
 
 #[test]
+fn edge_effects_prove_and_the_memory_receipt_keeps_proving() {
+    let dir = temp_dir("edge-proof");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let source = store.ingest(input("source memory", &[])).expect("source");
+    let target = store.ingest(input("target memory", &[])).expect("target");
+    let created = store
+        .latest_effect(&source)
+        .expect("prove")
+        .expect("create effect");
+    let saved = store
+        .save_connection(&ConnectionRecord {
+            source_id: source.clone(),
+            target_id: target.clone(),
+            link_type: EdgeKind::DerivedFrom.as_str().to_string(),
+            strength_milli: 1000,
+            ..ConnectionRecord::default()
+        })
+        .expect("edge");
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    let proof = reopened
+        .effect_by_seq(saved)
+        .expect("prove")
+        .expect("an admitted edge proves");
+    assert_eq!(proof.action, EffectAction::Edge);
+    assert_eq!(proof.node_id, source);
+    assert_eq!(
+        proof.edge,
+        Some((target.clone(), EdgeKind::DerivedFrom.as_str().to_string()))
+    );
+    // The memory's own receipt is still its create; edges never shadow it.
+    assert_eq!(
+        reopened.latest_effect(&source).expect("prove"),
+        Some(created)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn anchor_effects_prove_and_the_memory_receipt_keeps_proving() {
     let dir = temp_dir("anchor-proof");
     let mut store = StrataStore::open(&dir).expect("open");

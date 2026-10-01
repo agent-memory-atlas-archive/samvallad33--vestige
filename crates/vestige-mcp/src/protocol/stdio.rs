@@ -815,8 +815,10 @@ mod tests {
     /// the next request from being read and answered.
     ///
     /// The slow request is made slow deterministically rather than by timing:
-    /// `graph { action: "predict" }` takes the cognitive engine's mutex as its
-    /// first act, and this test holds that mutex, so request 1's handler parks
+    /// `maintain { action: "importance_score" }` takes the cognitive engine's
+    /// mutex on every backend (on a Strata log `graph predict` answers from
+    /// exact handles without it), and this test holds that mutex, so request
+    /// 1's handler parks
     /// there until the test releases it. A `ping` needs neither the engine nor
     /// storage.
     ///
@@ -846,7 +848,7 @@ mod tests {
 
         let slow = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "graph", "arguments": {"action": "predict"}}
+            "params": {"name": "maintain", "arguments": {"action": "importance_score", "content": "parked"}}
         })
         .to_string()
             + "\n";
@@ -1097,7 +1099,7 @@ mod tests {
         let held = cognitive.lock().await;
         let slow = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "graph", "arguments": {"action": "predict"}}
+            "params": {"name": "maintain", "arguments": {"action": "importance_score", "content": "parked"}}
         })
         .to_string()
             + "\n";
@@ -1230,7 +1232,7 @@ mod tests {
         for id in 1..=last_id {
             load += &(json!({
                 "jsonrpc": "2.0", "id": id, "method": "tools/call",
-                "params": {"name": "graph", "arguments": {"action": "predict"}}
+                "params": {"name": "maintain", "arguments": {"action": "importance_score", "content": "parked"}}
             })
             .to_string()
                 + "\n");
@@ -1290,7 +1292,7 @@ mod tests {
         for id in 1..=(MAX_PENDING + 1) {
             load += &(json!({
                 "jsonrpc": "2.0", "id": id, "method": "tools/call",
-                "params": {"name": "graph", "arguments": {"action": "predict"}}
+                "params": {"name": "maintain", "arguments": {"action": "importance_score", "content": "parked"}}
             })
             .to_string()
                 + "\n");

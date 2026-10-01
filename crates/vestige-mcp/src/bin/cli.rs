@@ -518,18 +518,22 @@ enum Commands {
 
     /// Compose: list NEVER-COMPOSED memory pairs as leads, not findings
     ///
-    /// On a Strata log (4.0) a pair is two live memories in one scope with no
-    /// recorded edge between them, listed in memory-id order: no ranking, zero
-    /// scores and no question.
+    /// On a Strata log (4.0) this is GhostLink `propose`. The bridge lens
+    /// (default) lists pairs within three recorded typed-edge hops (touched,
+    /// derived_from, closed_by) that were never woven, ranked by hop distance,
+    /// composition novelty and retention. The divergent lens lists pairs no
+    /// recorded edge joins. Every pair carries its proof; nothing is ranked by
+    /// text or vector similarity. When nothing qualifies, it says why.
     ///
     /// On a legacy SQLite store a pair is linked within three recorded
-    /// causal-edge hops (touched, derived_from, closed_by) but never joined by
-    /// a composition event. Pairs are ranked by hop distance, composition
-    /// novelty and retention, each with a question to test.
+    /// causal-edge hops but never joined by a composition event.
     Compose {
         /// How many pairs to list
         #[arg(long, default_value = "5")]
         limit: i32,
+        /// Strata log only: `bridge` (default) or `divergent`
+        #[arg(long)]
+        lens: Option<String>,
         /// Optional tag filter (comma-separated) to focus a domain
         #[arg(long)]
         tags: Option<String>,
@@ -756,10 +760,11 @@ fn main() -> anyhow::Result<()> {
         } => run_recall(query, handle, depth, json),
         Commands::Compose {
             limit,
+            lens,
             tags,
             scope,
             json,
-        } => run_compose(limit, tags, scope, json),
+        } => run_compose(limit, lens, tags, scope, json),
         Commands::Project {
             out,
             format,
@@ -4895,15 +4900,160 @@ fn run_project(
     Ok(())
 }
 
+/// `vestige compose` on a Strata log: GhostLink `propose`, proofs included.
+fn run_ghostlink_propose(
+    storage: &Arc<Storage>,
+    limit: i32,
+    lens: Option<String>,
+    tags: Option<String>,
+    scope: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    use vestige_mcp::strata_memory::ghostlink::{Lens, ProposeRequest, propose};
+    let lens = Lens::parse(lens.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+    let scope = scope.map(|s| s.trim().to_string());
+    if scope.as_deref().is_some_and(str::is_empty) {
+        anyhow::bail!("--scope must not be empty");
+    }
+    let tags: Vec<String> = tags
+        .map(|t| {
+            t.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let request = ProposeRequest {
+        lens,
+        scope: Some(scope.unwrap_or_else(|| vestige_core::DEFAULT_MEMORY_SCOPE.to_string())),
+        tags,
+        limit: usize::try_from(limit.clamp(1, 100)).unwrap_or(5),
+        cursor: None,
+    };
+    let answer =
+        propose(storage.as_ref(), &request).map_err(|e| anyhow::anyhow!("compose error: {e}"))?;
+    let candidates = answer["candidates"].as_array().cloned().unwrap_or_default();
+    if json {
+        // The 4.0.0 `--json` contract: an array of pairs with a_id / b_id and
+        // the legacy keys. Each pair also carries its lens, lane and proof.
+        let pairs: Vec<serde_json::Value> = candidates
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "a_id": c["firstId"],
+                    "b_id": c["secondId"],
+                    "score": c["score"],
+                    "novelty": c.get("noveltyScore").cloned().unwrap_or(serde_json::Value::Null),
+                    "bridge": c.get("bridgeScore").cloned().unwrap_or(serde_json::Value::Null),
+                    "trust": c.get("trustScore").cloned().unwrap_or(serde_json::Value::Null),
+                    "a": c["firstPreview"],
+                    "b": c["secondPreview"],
+                    "shared_tags": [],
+                    "question": c["compositionQuestion"],
+                    "reason": c["reason"],
+                    "lens": c["lens"],
+                    "lane": c.get("lane").cloned().unwrap_or(serde_json::Value::Null),
+                    "hops": c.get("hops").cloned().unwrap_or(serde_json::Value::Null),
+                    "pathMin": c.get("pathMin").cloned().unwrap_or(serde_json::Value::Null),
+                    "proof": c["proof"],
+                })
+            })
+            .collect();
+        if pairs.is_empty()
+            && let Some(why) = answer["admission"]["emptyBecause"].as_str()
+        {
+            eprintln!("compose: {why}");
+        }
+        println!("{}", serde_json::to_string_pretty(&pairs)?);
+        return Ok(());
+    }
+    let scope_label = request.scope.as_deref().unwrap_or("user");
+    if candidates.is_empty() {
+        let why = answer["admission"]["emptyBecause"]
+            .as_str()
+            .unwrap_or("nothing qualifies under this lens");
+        println!(
+            "{}  {} lens: no pairs in scope {}: {}",
+            "Compose".magenta().bold(),
+            lens.as_str(),
+            scope_label,
+            why
+        );
+        return Ok(());
+    }
+    println!(
+        "{}  {} lens: {} pair{} in scope {} (log seq {}; leads, not findings):\n",
+        "Compose".magenta().bold(),
+        lens.as_str(),
+        candidates.len(),
+        if candidates.len() == 1 { "" } else { "s" },
+        scope_label,
+        answer["headSeq"]
+    );
+    for (i, c) in candidates.iter().enumerate() {
+        let score = c["score"]
+            .as_f64()
+            .map_or_else(|| "unmeasured".to_string(), |v| format!("{v:.2}"));
+        println!(
+            "{} {} / {}  [{}]",
+            format!("{}.", i + 1).cyan().bold(),
+            c["firstId"].as_str().unwrap_or("?"),
+            c["secondId"].as_str().unwrap_or("?"),
+            score
+        );
+        println!(
+            "   A: {}",
+            truncate(c["firstPreview"].as_str().unwrap_or(""), 70)
+        );
+        println!(
+            "   B: {}",
+            truncate(c["secondPreview"].as_str().unwrap_or(""), 70)
+        );
+        println!("   why: {}", c["reason"].as_str().unwrap_or(""));
+        if let Some(path) = c["proof"]["path"]
+            .as_array()
+            .filter(|path| !path.is_empty())
+        {
+            // The proof itself: each recorded edge, in walk order.
+            let mut line = path[0]["from"].as_str().unwrap_or("?").to_string();
+            for step in path {
+                let kind = step["kind"].as_str().unwrap_or("?");
+                let arrow = if step["reversed"].as_bool().unwrap_or(false) {
+                    format!(" <-{kind}- ")
+                } else {
+                    format!(" -{kind}-> ")
+                };
+                line.push_str(&arrow);
+                line.push_str(step["to"].as_str().unwrap_or("?"));
+            }
+            println!("   path: {line}");
+        }
+        if let Some(q) = c["compositionQuestion"].as_str().filter(|q| !q.is_empty()) {
+            println!("   Q: {q}");
+        }
+        println!();
+    }
+    Ok(())
+}
+
 /// Compose: list never-composed memory pairs.
 fn run_compose(
     limit: i32,
+    lens: Option<String>,
     tags: Option<String>,
     scope: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
     let storage = open_storage()?;
     let strata = is_strata(&storage);
+    if strata {
+        return run_ghostlink_propose(&storage, limit, lens, tags, scope, json);
+    }
+    if lens.is_some() {
+        anyhow::bail!(
+            "--lens needs a Strata log (Vestige 4.0); a legacy SQLite store has one engine"
+        );
+    }
 
     let tag_vec: Option<Vec<String>> = tags.map(|t| {
         t.split(',')
@@ -4959,28 +5109,6 @@ fn run_compose(
             "Compose".magenta().bold(),
             scope_label
         );
-        return Ok(());
-    }
-
-    if strata {
-        println!(
-            "{}  {} pair{} in scope {} with no recorded edge between them (Strata log: memory-id order, unranked; leads, not findings):\n",
-            "Compose".magenta().bold(),
-            candidates.len(),
-            if candidates.len() == 1 { "" } else { "s" },
-            scope_label
-        );
-        for (i, c) in candidates.iter().enumerate() {
-            println!(
-                "{} {} / {}",
-                format!("{}.", i + 1).cyan().bold(),
-                c.first_id,
-                c.second_id
-            );
-            println!("   A: {}", truncate(&c.first_preview, 70));
-            println!("   B: {}", truncate(&c.second_preview, 70));
-            println!();
-        }
         return Ok(());
     }
 

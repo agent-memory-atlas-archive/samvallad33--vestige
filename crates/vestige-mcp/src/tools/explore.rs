@@ -52,6 +52,19 @@ pub async fn execute(
     let to = args.get("to").and_then(|v| v.as_str());
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
+    // 4.0: on a Strata log the in-process activation network and
+    // hippocampal index (text and similarity scores) are not consulted.
+    // Chain, associations and bridges walk recorded typed edges only.
+    if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        return crate::strata_memory::ghostlink::explore(
+            storage.as_ref(),
+            action,
+            from,
+            to,
+            limit.clamp(1, 100),
+        );
+    }
+
     let cog = cognitive.lock().await;
 
     match action {
