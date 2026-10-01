@@ -445,6 +445,62 @@ fn single_writer_lock_and_stale_takeover() {
 }
 
 #[test]
+fn lock_file_without_a_holder_never_blocks_open() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("lock-no-holder");
+    fs::create_dir_all(&dir).unwrap();
+    let lock_path = dir.join(crate::lockfile::LOCK_NAME);
+
+    // A process killed between creating the lock file and writing its owner
+    // bytes leaves an empty file behind.
+    fs::write(&lock_path, []).unwrap();
+    let log = StrataLog::open(&dir).expect("an empty lock file has no holder");
+    log.append(1, b"a").unwrap();
+    drop(log);
+
+    // A lock file naming a pid that now belongs to an unrelated live process.
+    fs::write(&lock_path, u64::from(std::process::id()).to_le_bytes()).unwrap();
+    let log = StrataLog::open(&dir).expect("a live pid in a leftover file is not a holder");
+    log.append(2, b"b").unwrap();
+    assert_eq!(log.read_frames(1).unwrap().len(), 2);
+    drop(log);
+
+    // Bytes that are not a pid at all.
+    fs::write(&lock_path, b"garbage").unwrap();
+    StrataLog::open(&dir).expect("an unparseable lock file is not a holder");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn lock_file_stays_in_place_while_a_writer_holds_the_log() {
+    let _serial = serialize();
+    reset_failpoints();
+    let dir = test_dir("lock-stays");
+    let lock_path = dir.join(crate::lockfile::LOCK_NAME);
+    let log = StrataLog::open(&dir).unwrap();
+    assert!(lock_path.exists(), "the lock file must outlive open");
+    log.append(1, b"x").unwrap();
+    match StrataLog::open(&dir) {
+        Err(StrataError::Locked { pid }) => assert_eq!(pid, u64::from(std::process::id())),
+        other => panic!("expected Locked, got {other:?}"),
+    }
+    // Still refused after the failed attempt: a refused opener must not
+    // disturb the lock file.
+    assert!(lock_path.exists());
+    assert!(matches!(
+        StrataLog::open(&dir),
+        Err(StrataError::Locked { .. })
+    ));
+    // Release keeps the file: removing it would let an opener that already
+    // holds the old file and one that creates a new file both succeed.
+    drop(log);
+    assert!(lock_path.exists(), "release must not unlink the lock file");
+    StrataLog::open(&dir).unwrap();
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn merkle_tree_shapes() {
     let _serial = serialize();
     // Independent reference recomputation of the RFC6962-shaped tree.
