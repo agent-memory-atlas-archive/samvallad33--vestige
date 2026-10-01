@@ -24,12 +24,13 @@ import json
 import os
 import re
 import shlex
+import stat as _stat
 import subprocess
 import sys
 import tempfile
 import time
 
-VERSION = "0.3.1"
+VERSION = "0.3.4"
 INTEGRITY = "reference_digest_not_signature"
 HOME = os.path.expanduser("~")
 OP_HOME = os.environ.get("OPERATOR_HOME", os.path.join(HOME, ".operator"))
@@ -609,6 +610,51 @@ def decode_ansi_c_quotes(cmd):
     return ANSI_C_RE.sub(rep, cmd)
 
 
+MAX_SCRIPT_BYTES = 262144
+
+SCRIPT_ARG_INTERPRETERS = ("bash", "sh", "zsh", "dash", "ksh", "fish",
+                           "python", "python3", "python2", "perl", "ruby",
+                           "node", "deno", "bun", "php", "lua", "source", ".")
+
+
+def resolve_script_arg(rest, ecwd):
+    """First plausible script-path token from interpreter args (post-expansion)."""
+    for t in rest:
+        if t.startswith("-"):
+            continue
+        if t in (".", ".."):
+            continue
+        if "/" in t or t.endswith((".sh", ".bash", ".py", ".pl", ".rb", ".js",
+                                   ".mjs", ".cjs", ".ts", ".php", ".lua", ".zsh",
+                                   ".ksh", ".fish")) or t.startswith("~"):
+            return resolve(t, ecwd) if ecwd else tilde(t)
+        # bare name: only treat as a script if the file exists beside cwd
+        cand = resolve(t, ecwd) if ecwd else None
+        if cand and os.path.isfile(cand):
+            return cand
+        return None
+    return None
+
+
+def script_body_effects(path, ecwd, depth, vars_):
+    """Analyze an existing script file's body through the same walker. Never executes it."""
+    try:
+        st = os.stat(path)
+        if not _stat.S_ISREG(st.st_mode) or st.st_size == 0 or st.st_size > MAX_SCRIPT_BYTES:
+            return []
+        with open(path, "r", errors="replace") as f:
+            body = f.read(MAX_SCRIPT_BYTES)
+    except Exception:
+        return []
+    if not body.strip() or depth + 1 > MAX_DEPTH:
+        return []
+    effs = analyze(body, ecwd, depth + 1, vars_)
+    base = os.path.basename(path)
+    for e in effs:
+        e["script_body"] = base
+    return effs
+
+
 def analyze(cmd, cwd, depth=0, vars_=None):
     """Walk a shell command tracking cd and simple VAR=value, yielding effects (never executes anything)."""
     effects = []
@@ -712,11 +758,23 @@ def analyze(cmd, cwd, depth=0, vars_=None):
                 effects += analyze(inner_cmd, ecwd, depth + 1, vars_)
             for body in my_bodies:                          # `bash <<EOF` executes its body
                 effects += analyze(body, ecwd, depth + 1, vars_)
+            # opaque-script resolution: `bash totally_harmless.sh` executes the FILE body
+            sp = resolve_script_arg(rest, ecwd)
+            if sp:
+                effects += script_body_effects(sp, ecwd, depth, vars_)
             continue
         if prog == "eval":
             if eff["writes"]:
                 effects.append(eff)
             effects += analyze(" ".join(rest), ecwd, depth + 1, vars_)
+            continue
+
+        if prog in ("source", "."):                          # `source x.sh` executes the file body
+            if eff["writes"]:
+                effects.append(eff)
+            sp = resolve_script_arg(rest, ecwd)
+            if sp:
+                effects += script_body_effects(sp, ecwd, depth, vars_)
             continue
 
         if prog in ("rm", "rmdir", "unlink", "shred", "trash", "rip", "srm") or \
@@ -764,6 +822,9 @@ def analyze(cmd, cwd, depth=0, vars_=None):
             eff["kind"] = "inline"
             if my_bodies:
                 eff["text"] = seg + "\n" + "\n".join(my_bodies)
+            sp = resolve_script_arg(rest, ecwd)
+            if sp:
+                effects += script_body_effects(sp, ecwd, depth, vars_)
         elif prog in ("psql", "sqlite3", "mysql", "mariadb", "duckdb", "mongosh", "redis-cli", "supabase"):
             eff["kind"] = "db"
             if my_bodies:
@@ -1049,6 +1110,8 @@ def classify_effect(e, cfg, cwd):
                     hits += [(rid, "inline code: " + d, h) for rid, d, h in found]
                 elif destructive:
                     hits.append(("OP-S05", "inline code deletes/moves files", ""))
+    if hits and e.get("script_body"):
+        hits = [(r, "%s -- inside script %s" % (d, e["script_body"]), a) for (r, d, a) in hits]
     return hits
 
 
@@ -1404,7 +1467,23 @@ def cmd_corpus(argv):
     passed, failed = 0, []
     for case in corpus["cases"]:
         cid, cmd, expect = case["id"], case["cmd"], case["expect"]
-        _, _, hits, _, _, _ = classify({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": "/tmp"}, cfg)
+        cwd = "/tmp"
+        tmpd = None
+        if case.get("fixtures"):                       # materialize script fixtures (never executed)
+            tmpd = tempfile.mkdtemp(prefix="opgate-fixture-")
+            for fx in case["fixtures"]:
+                fp = os.path.join(tmpd, fx["name"])
+                os.makedirs(os.path.dirname(fp), exist_ok=True)
+                with open(fp, "w") as f:
+                    f.write(fx["body"])
+            cwd = tmpd
+        _, _, hits, _, _, _ = classify({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": cwd}, cfg)
+        if tmpd:
+            try:
+                import shutil as _sh
+                _sh.rmtree(tmpd, True)
+            except Exception:
+                pass
         rids = sorted(set(h[0] for h in hits))
         if expect == "ALLOW":
             ok = not [r for r in rids if RULES.get(r, ("", "enforce", ""))[1] == "STOP"]
