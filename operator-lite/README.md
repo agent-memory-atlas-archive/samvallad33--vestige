@@ -22,8 +22,12 @@ copy one file, wire one hook, and your agent has a deterministic gate.
   "command": "python3 ~/.operator/gate/operator-gate.py hook --source claude" }] }] } }
 ```
 **Codex** (`~/.codex/hooks.json`): same shape, `--source codex`.
-**OpenClaw**: any `before_tool_call` plugin that pipes the command through
-the hook binary (gate exit 0 = allow, exit 2 = block with the reason).
+**OpenClaw**: the gate is already bundled in a ClawHub plugin — one line:
+
+    clawhub install vestige-operator-lite
+
+(Or any `before_tool_call` plugin that pipes the command through the hook
+binary: gate exit 0 = allow, exit 2 = block with the reason.)
 
 ALLOW = exit 0, silent. STOP = exit 2, reason on stderr (the agent sees it and
 must change course). Flip to blocking with: `echo enforce > ~/.operator/mode`.
