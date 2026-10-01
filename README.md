@@ -8,12 +8,14 @@
 
 It keeps the decisions a project already made, and it can walk a failure backward along the links your memory actually recorded. Every write passes a gate and leaves a receipt. The store is Strata: an append-only, signed log on your machine.
 
+**New in 4.1.0:** [GhostLink](#ghostlink-the-negative-space) proposes pairs of memories nobody has combined yet, each with its proof, and 19 hardening fixes cover data safety, upgrades from v3, the tools and the dashboard ([changelog](CHANGELOG.md)).
+
 [![Release](https://img.shields.io/github/v/release/samvallad33/vestige?color=06b6d4)](https://github.com/samvallad33/vestige/releases/latest)
 [![Tests](https://img.shields.io/github/actions/workflow/status/samvallad33/vestige/ci.yml?branch=main&label=CI)](https://github.com/samvallad33/vestige/actions)
 [![Binary](https://img.shields.io/badge/platforms-5_release_targets-informational)](https://github.com/samvallad33/vestige/releases/latest)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-3b82f6)](LICENSE)
 
-[Install](#install) · [Upgrading from v3](#upgrading-from-v3) · [Recall by handle](#recall-by-handle-not-resemblance) · [The tools](#the-tools) · [Backups](#backups-and-export) · [Science](#the-science) · [Docs](#go-deeper)
+[Install](#install) · [Upgrading from v3](#upgrading-from-v3) · [Recall by handle](#recall-by-handle-not-resemblance) · [GhostLink](#ghostlink-the-negative-space) · [The tools](#the-tools) · [Backups](#backups-and-export) · [Science](#the-science) · [Docs](#go-deeper)
 
 <a id="getting-started"></a>
 ## 🛡️ Operator Lite — your agent's commands, enforced on the metal
@@ -59,7 +61,7 @@ Agents re-learn the same lessons. They recommend a change you already tested and
   </a>
 </p>
 
-<p align="center"><sub>Recorded on v3.1 with <code>vestige backfill --contrast</code>. In 4.0 the backward walk is <code>causal_walk</code>, which follows only recorded edges from an explicit start point. <a href="https://raw.githubusercontent.com/samvallad33/vestige/media/vestige-black-box.mp4">Watch the walk</a>.</sub></p>
+<p align="center"><sub>Recorded on v3.1 with <code>vestige backfill --contrast</code>. Since 4.0 the backward walk is <code>causal_walk</code>, which follows only recorded edges from an explicit start point. <a href="https://raw.githubusercontent.com/samvallad33/vestige/media/vestige-black-box.mp4">Watch the walk</a>.</sub></p>
 
 ## Install
 
@@ -88,7 +90,7 @@ Then check it:
 vestige-mcp --version
 ```
 
-It should print `vestige-mcp 4.0.0`. If the shell says command not found, `~/.local/bin` is not on your PATH yet: add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` (or `~/.bashrc`) and open a new terminal. If it prints an older version, an older install comes first on your PATH; `which -a vestige-mcp` lists them.
+It should print `vestige-mcp 4.1.0`. If the shell says command not found, `~/.local/bin` is not on your PATH yet: add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` (or `~/.bashrc`) and open a new terminal. If it prints an older version, an older install comes first on your PATH; `which -a vestige-mcp` lists them.
 
 On a Mac, download with `curl` as above rather than a browser. A browser marks the files as quarantined and macOS then refuses to run them. If you already used a browser, clear the flag with `xattr -d com.apple.quarantine ~/.local/bin/vestige*`.
 
@@ -96,7 +98,7 @@ On a Mac, download with `curl` as above rather than a browser. A browser marks t
 
 **Homebrew** (macOS and Linux): `brew install samvallad33/tap/vestige`.
 
-Every archive has a `.sha256` file beside it on the release page. Do not install this version with npm; the npm package is not 4.0.
+Every archive has a `.sha256` file beside it on the release page. Do not install this version with npm: the npm package still serves 3.0.0.
 
 **Connect your agents.** The MCP command is `vestige-mcp`:
 
@@ -131,47 +133,62 @@ limit = 10
 
 `lean` presets brief detail and a limit of 5. `audit` presets full detail. `research` presets full detail and a limit of 25. `default` leaves the historical tool limits alone.
 
-Nothing leaves the machine by default. A default 4.0 build has no embedding model and no startup version check. `source_sync` (`--features connectors`) and `vestige sync --cloud` (`--features cloud-sync`) are the only calls that use the network, and neither feature is in a 4.0 release build. Full walkthrough: [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md).
+Nothing leaves the machine by default. A default 4.x build has no embedding model and no startup version check. `source_sync` (`--features connectors`) and `vestige sync --cloud` (`--features cloud-sync`) are the only calls that use the network, and neither feature is in a 4.x release build. Full walkthrough: [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md).
 
 `vestige --help` lists the CLI. `--data-dir` is global.
 
 <a id="upgrading-from-v3"></a>
 ## Upgrading from v3
 
-Quit every app that runs Vestige v3 (each agent, the dashboard, any background job), point all of them at the 4.0 `vestige-mcp`, and start them again. A v3 server left running keeps writing to `vestige.db`, which 4.0 no longer reads after the upgrade.
+Quit every app that runs Vestige v3 (each agent, the dashboard, any background job), point all of them at the 4.x `vestige-mcp`, and start them again. A v3 server left running keeps writing to `vestige.db`, which 4.x no longer reads after the upgrade.
 
-Point 4.0 at your existing data directory. The first launch finds `vestige.db`, builds a Strata log from it next to the file, verifies that log against a signed migration receipt, and only then publishes it as `log/`. The v3 file is never modified. A backup copy is written first, owner-only.
+Point 4.x at your existing data directory. The first launch finds `vestige.db`, builds a Strata log from it next to the file, verifies that log against a signed migration receipt, and only then publishes it as `log/`. The v3 file is never modified. A backup copy is written first, owner-only.
 
 What carries over: every memory with its scope, tags and scheduling state; links; supersession; suppression (suppressed memories stay hidden); intentions; and code anchors. Links v3 inferred by similarity come across as `legacy_inferred` history. They are kept, and they never count as recorded evidence.
 
 On a real 297 MB store with 8,902 memories in 34 scopes, the first launch took about 17 seconds before the MCP handshake answered, and average retention right after the upgrade was 0.810 against 0.8105 computed by v3 itself. Agents that start during the upgrade wait for it and then connect; there is nothing to coordinate by hand.
 
-If the upgrade fails, the v3 data is untouched and the message says so. You can keep using v3.1.1 meanwhile. `vestige strata-verify <data-dir>` checks the log and its migration receipt at any time.
+If the upgrade fails, the v3 data is untouched and the message says so. A `vestige.db` that is unreadable, empty or not plain SQLite is refused by name, never treated as an empty store, and a symlinked `vestige.db` is followed to the real file so memories that live only in its WAL come across. You can keep using v3.1.1 meanwhile. `vestige strata-verify <data-dir>` checks the log and its migration receipt at any time.
 
-If you installed v3 with npm, make sure your agents now run the 4.0 binary: `vestige-mcp --version` should print 4.0.0, and `which -a vestige-mcp` shows every copy on your PATH in the order they are found.
+If you installed v3 with npm, make sure your agents now run the 4.x binary: `vestige-mcp --version` should print 4.1.0, and `which -a vestige-mcp` shows every copy on your PATH in the order they are found.
 
 <a id="recall-by-handle-not-resemblance"></a>
 ## Recall by handle, not resemblance
 
-4.0 does not rank text that resembles your query. There are no embeddings, no BM25 and no keyword search in the default binaries. `recall` takes a handle: a memory id, a unique id prefix of 8 or more characters, or an exact tag. A free-text query returns `similarity_disabled` and asks for a handle.
+Since 4.0, Vestige does not rank text that resembles your query. There are no embeddings, no BM25 and no keyword search in the default binaries. `recall` takes a handle: a memory id, a unique id prefix of 8 or more characters, or an exact tag. A free-text query returns `similarity_disabled` and asks for a handle.
 
-| | Resemblance search | Vestige 4.0 |
+| | Resemblance search | Vestige 4.x |
 |---|---|---|
 | How a memory is found | Similarity to the query | An exact handle |
 | What counts as a link | Anything that scores close | Only an edge the log recorded. Imported v3 links are marked `legacy_inferred` |
-| Walking back from a failure | Nearest lookalikes | `causal_walk` from explicit start points (a failing test, a stack frame, a CI run, a logged write, a version range), backward over recorded edges, at most 8 hops and 500 nodes |
+| Walking back from a failure | Nearest lookalikes | `causal_walk` from an explicit logged write (a memory id), backward over recorded edges, at most 8 hops and 500 nodes by default. Failing-test, stack-frame, CI-run and version-range starts walk on a v3 store |
 | Proof of a write | None | A receipt per write. `receipt replay` re-derives the state from the log |
 | Unused memories | Persist at full weight | Fade under FSRS scheduling |
 | Your data | Often a hosted index | A signed, append-only log in the data directory |
 
 `causal_walk` never guesses. With no start point it returns `needs_report` and names what is missing. `forgotten_lesson` walks backward from a failure the same way and ranks fix or lesson memories by how far they have faded.
 
+<a id="ghostlink-the-negative-space"></a>
+## GhostLink: the negative space
+
+`ghostlink` finds pairs of memories nobody has combined yet and hands one to your agent to compose. Every pair comes with its proof, built only from what the log recorded: ids, exact tags and types, typed edges, woven outcomes and FSRS state. No text, embeddings or keyword overlap.
+
+- **Bridge lens** (the default): two memories within three hops over recorded `touched`, `derived_from` or `closed_by` edges that were never woven together. The shortest path is the proof. Pairs rank by hop proximity, how rarely each memory has been composed, retention, and the outcomes earlier pairs recorded.
+- **Divergent lens**: two memories joined by no recorded edge at all, scored `min(path length, 7) × divergence`, where divergence is how few typed neighbors they share. When a memory has no typed neighbors there is nothing to measure, so the pair is a *forced juxtaposition* picked by a deterministic sampler, with no invented score. Links imported from v3 can only lower a score, never raise one.
+- **Weave** records what came of a pair (`helpful`, `dead_end`, `accepted`, …): a composition memory plus a `derived_from` edge to each member, each with a receipt. Later proposals learn from it.
+
+```json
+{"mode": "propose", "lens": "divergent", "limit": 5}
+```
+
+`map`, `inspect`, `explore`, `bounty`, `predict` and `harden` read and seed around the same graph. Reading never writes to the log.
+
 <a id="founding-operator"></a>
 ## 🛡️ Every write is admitted
 
 On a Strata log a write is proposed, checked by the gate, and admitted as an effect, and the call returns an `eff-` receipt. `receipt get` shows what that write did. `receipt replay` rebuilds the state from the log and reports any mismatch. `selftest` plants a known cause in a throwaway copy of your store and checks that the walk finds it, without touching the live store.
 
-The Memory PR review modes from v3 (`risk_gated`, `paranoid`) are not available on a Strata log in 4.0. A review setting carried over from v3 reads as `fast`, and the dashboard's Memory PR list says review is unavailable.
+The Memory PR review modes from v3 (`risk_gated`, `paranoid`) are not available on a Strata log in 4.x. A review setting carried over from v3 reads as `fast`, and the dashboard's Memory PR list says review is unavailable.
 
 **Recorded run on v3.1: [THE LIVE GATE](https://github.com/samvallad33/vestige/releases/tag/launch-night-live-gate-20260914).**
 
@@ -179,11 +196,11 @@ The Memory PR review modes from v3 (`risk_gated`, `paranoid`) are not available 
 <a id="backups-and-export"></a>
 ## 🔄 Backups and export
 
-`maintain` action `backup` copies the whole Strata log into `<data-dir>/backups/` and reports its size. From a terminal, `vestige backup <new-folder>` does the same, and it works while your agents are running: it asks their Vestige server for the copy. To restore, stop Vestige and copy the backup's `log/` back into the data directory.
+`maintain` action `backup` copies the whole Strata log into `<data-dir>/backups/` and reports its size. From a terminal, `vestige backup <new-folder>` does the same, and it works while your agents are running: it asks their Vestige server for the copy. To restore, stop Vestige and copy the backup's `log/` back into the data directory. Backups are owner-only (folders `0700`, files `0600`), and a log that fails verification is refused rather than copied. `session_start` reports `needsBackup` and `needsDream` from the last backup and dream that actually completed.
 
 The log has one writer. CLI commands that open it directly, such as `vestige stats` or `vestige ingest`, run only while no Vestige server holds the store, and they name the process that does. `maintain` action `export` writes every live memory as JSON or JSONL into `<data-dir>/exports/`.
 
-Portable archives, file sync and hosted sync are not available on a Strata log in 4.0. The CLI says so when you call them.
+Portable archives, file sync and hosted sync are not available on a Strata log in 4.x. The CLI says so when you call them.
 
 <a id="vestige-pro"></a>
 
@@ -203,17 +220,17 @@ Outcomes come from `tests/by_model_tables.py`: a trial is correct when the tests
 
 Write-up: [docs/SCIENCE.md](docs/SCIENCE.md).
 
-| Mechanism | In 4.0 | Source in the code |
+| Mechanism | In 4.x | Source in the code |
 |---|---|---|
 | FSRS scheduling | Every card, native or imported, decays and strengthens under FSRS in the Strata kernel | `strata-kernel` `fsrs` |
 | Memory dreaming | `maintain` actions `dream` and `dream_compile` replay recorded edges and strengthen co-activated ones | `dream`, `dream_compile` |
 | Active forgetting | `suppress` takes a memory out of every read and keeps its bytes | `suppress` |
 | Causal walk | Backward over recorded edges only, bounded and deterministic | `causal_walk` |
-| Prediction-error gating, synaptic tagging, spreading activation, narrative edges, Retroactive Salience Backfill | In the v3 engine. The 4.0 default build does not use them, because each depends on similarity or inferred links | `vestige-core` (v3 engine) |
+| Prediction-error gating, synaptic tagging, spreading activation, narrative edges, Retroactive Salience Backfill | In the v3 engine. The 4.x default build does not use them, because each depends on similarity or inferred links | `vestige-core` (v3 engine) |
 
 ## The tools
 
-`tools/list` advertises these 16 tools, sorted by name. The list is compact: every field a call can send is on the wire with its type, prose and deep structure move one call deeper, and filter fields are grouped under `filters` and `source` (sent either grouped or flat). The serialized catalog is about 21 KiB. `memory_status` with `view=tools` lists every tool; set `tool` to a name for that tool's full input schema. Actions a Strata log cannot honor are left out of the schema and refused with the reason.
+`tools/list` advertises these 16 tools, sorted by name. The list is compact: every field a call can send is on the wire with its type, prose and deep structure move one call deeper, and filter fields are grouped under `filters` and `source` (sent either grouped or flat). The serialized catalog is about 20 KiB. `memory_status` with `view=tools` lists every tool; set `tool` to a name for that tool's full input schema. Actions a Strata log cannot honor are left out of the schema and refused with the reason.
 
 | Tool | Purpose |
 |---|---|
@@ -230,11 +247,11 @@ Write-up: [docs/SCIENCE.md](docs/SCIENCE.md).
 | `recall` | Find memories by exact handle: id, unique prefix, or exact tag |
 | `receipt` | `get` a receipt, or `replay` it against the log |
 | `selftest` | Plant a known cause in a throwaway copy and check the walk finds it |
-| `session_start` | Status, open intentions, predictions, and codebase context under one budget |
+| `session_start` | Status, open intentions for the scope (with id, due date and an overdue mark), backup and dream needs, and codebase context under one budget. It writes nothing. Queries are answered with a notice: memories are found by handle |
 | `smart_ingest` | Store one memory, or up to 20 with `items`. Secrets are refused unless you say otherwise |
 | `suppress` | Take a memory out of every read. The log keeps its bytes, and on Strata it cannot be undone. `destructiveHint` is true |
 
-**Withheld in 4.0.** `purge` is the one tool 4.0 does not ship. On an append-only signed log a purge could hide a memory but not erase its bytes, and a tool called purge must not pretend otherwise. `purge`, `memory` action `purge` or `delete`, and `delete_knowledge` return `unavailable_in_4_0`. Real erasure is the 4.0.x follow-up.
+**Withheld since 4.0.** `purge` is the one tool 4.x does not ship. On an append-only signed log a purge could hide a memory but not erase its bytes, and a tool called purge must not pretend otherwise. `purge`, `memory` action `purge` or `delete`, and `delete_knowledge` return `unavailable_in_4_0`. Real erasure is planned as crypto-erasure ([#402](https://github.com/samvallad33/vestige/issues/402)).
 
 Full contracts: [docs/TOOL-CONTRACTS.md](docs/TOOL-CONTRACTS.md) · Hygiene and standing habits: [docs/MEMORY_HYGIENE.md](docs/MEMORY_HYGIENE.md)
 
@@ -253,7 +270,7 @@ The server binds **http://127.0.0.1:3927** and redirects `/` to **/dashboard**. 
 | Engine | Rust 2024. Release archives ship `vestige`, `vestige-mcp`, `vestige-restore`, and `vestige-upgrade` |
 | Store | Strata: an append-only log of borsh frames, hash-chained; a sealed segment carries a signed trailer. Writes are proposed, gated and admitted; the state is re-derived by replaying the log. No SQLite is linked into the shipped binaries |
 | Recall | Exact handles only. No embeddings, BM25, FTS or keyword matching |
-| Size | `vestige-mcp` is about 7.7 MB on macOS arm64 |
+| Size | `vestige-mcp` is about 8.0 MB on macOS arm64 |
 | First run | Nothing to download. On a v3 data directory, the first launch runs the upgrade before the MCP handshake |
 
 ## Go deeper
