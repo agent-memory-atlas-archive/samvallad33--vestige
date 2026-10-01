@@ -3170,6 +3170,68 @@ mod tests {
         assert!(again.source_envelope.is_none());
     }
 
+    fn remove_segments(dir: &Path) {
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "seg") {
+                    std::fs::remove_file(&path).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn receipt_lookup_after_edit_is_served_without_rereading_the_log() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let memory = StrataMemory::open(dir.path()).unwrap();
+        let node = memory
+            .ingest_in_scope(
+                IngestInput {
+                    content: "receipt lookup fixture".into(),
+                    ..IngestInput::default()
+                },
+                "user",
+            )
+            .unwrap();
+        memory
+            .update_node_content(&node.id, "receipt lookup fixture, edited")
+            .unwrap();
+        let successor = memory
+            .lock()
+            .supersession_pairs()
+            .into_iter()
+            .find(|(old, _)| old == &node.id)
+            .map(|(_, successor)| successor)
+            .expect("edit retired the original");
+
+        // With the segment files gone, only the in-memory effect index can answer.
+        remove_segments(dir.path());
+
+        let receipt = memory
+            .get_receipt(&successor)
+            .unwrap()
+            .expect("edit receipt for the successor");
+        assert_eq!(receipt.retrieved, vec![successor.clone()]);
+        let by_id = memory
+            .get_receipt(&receipt.receipt_id)
+            .unwrap()
+            .expect("lookup by receipt id");
+        assert_eq!(by_id.receipt_id, receipt.receipt_id);
+        assert!(
+            memory
+                .receipt_attestation_status(&successor)
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[test]
     fn ingest_keeps_source_and_source_updated_at() {
         let dir = tempfile::TempDir::new().unwrap();

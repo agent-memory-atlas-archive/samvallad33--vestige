@@ -2503,3 +2503,131 @@ fn an_unadmitted_anchor_frame_is_an_orphan() {
     assert_eq!(reopened.anchor("forged"), None);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Remove every segment file under the store's log directory. A lookup that
+/// still answers afterwards was served from the in-memory effect index, not
+/// from a fresh read of the log.
+fn remove_log_segments(dir: &std::path::Path) {
+    for entry in std::fs::read_dir(dir.join("log")).expect("log dir") {
+        let path = entry.expect("entry").path();
+        if path.extension().is_some_and(|ext| ext == "seg") {
+            std::fs::remove_file(&path).expect("remove segment");
+        }
+    }
+}
+
+fn edit_ctx() -> AdmissionContext {
+    AdmissionContext {
+        rule_id: Some(RULE_EDIT.to_string()),
+        confirm: false,
+    }
+}
+
+#[test]
+fn effect_lookups_do_not_rescan_the_log_after_writes() {
+    let dir = temp_dir("effect-index-live");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let mut ids = Vec::new();
+    for n in 0..6 {
+        ids.push(
+            store
+                .ingest(input(&format!("indexed memory {n}"), &[]))
+                .expect("ingest"),
+        );
+    }
+    store.review(&ids[0], 4).expect("review");
+    let (successor, receipt) = store
+        .edit(&ids[1], "indexed memory one, edited", &edit_ctx())
+        .expect("edit");
+    let expected = store.prove_effects().expect("full scan proves");
+    assert!(expected.len() >= 8);
+
+    remove_log_segments(&dir);
+
+    for proof in &expected {
+        let by_seq = store
+            .effect_by_seq(proof.effect_seq)
+            .expect("lookup must not read the log")
+            .expect("indexed effect");
+        let first = expected
+            .iter()
+            .find(|candidate| candidate.effect_seq == proof.effect_seq)
+            .expect("first proof for seq");
+        assert_eq!(&by_seq, first);
+    }
+    let latest = store
+        .latest_effect(&successor)
+        .expect("lookup must not read the log")
+        .expect("successor has an effect");
+    assert_eq!(latest.effect_seq, receipt.effect_seq);
+    assert_eq!(latest.action, EffectAction::Edit);
+    let reviewed = store
+        .latest_effect(&ids[0])
+        .expect("lookup must not read the log")
+        .expect("reviewed node has an effect");
+    assert_eq!(reviewed.action, EffectAction::Review);
+    assert_eq!(reviewed.rating, Some(4));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn effect_index_rebuilt_on_open_matches_the_full_scan() {
+    let dir = temp_dir("effect-index-reopen");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let a = store.ingest(input("reopen memory a", &[])).expect("a");
+    let b = store.ingest(input("reopen memory b", &[])).expect("b");
+    store.review(&a, 3).expect("review");
+    store
+        .save_connection(&ConnectionRecord {
+            source_id: a.clone(),
+            target_id: b.clone(),
+            strength_milli: 500,
+            link_type: "derived_from".into(),
+            meta_sha: None,
+            created_at_ms: 1,
+            activation_count: 0,
+        })
+        .expect("edge");
+    store
+        .upsert_intentions(vec![intention("i1", "one"), intention("i2", "two")])
+        .expect("intentions");
+    store
+        .edit(&b, "reopen memory b, edited", &edit_ctx())
+        .expect("edit");
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    let expected = reopened.prove_effects().expect("full scan proves");
+    remove_log_segments(&dir);
+
+    for proof in &expected {
+        let by_seq = reopened
+            .effect_by_seq(proof.effect_seq)
+            .expect("indexed")
+            .expect("present");
+        let first = expected
+            .iter()
+            .find(|candidate| candidate.effect_seq == proof.effect_seq)
+            .expect("first proof for seq");
+        assert_eq!(&by_seq, first);
+        if proof.action != EffectAction::Edge {
+            let want = expected
+                .iter()
+                .filter(|candidate| {
+                    candidate.node_id == proof.node_id && candidate.action != EffectAction::Edge
+                })
+                .max_by_key(|candidate| candidate.effect_seq)
+                .expect("latest");
+            assert_eq!(
+                reopened.latest_effect(&proof.node_id).expect("indexed"),
+                Some(want.clone())
+            );
+        }
+    }
+    assert_eq!(reopened.effect_by_seq(u64::MAX).expect("indexed"), None);
+    assert_eq!(
+        reopened.latest_effect("no-such-node").expect("indexed"),
+        None
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

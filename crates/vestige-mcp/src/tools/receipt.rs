@@ -245,8 +245,9 @@ fn execute_get(storage: &Arc<Storage>, receipt_id: &str) -> Result<Value, String
     }))
 }
 
-/// Strata effect receipt: recomputed from the log by `get_receipt` (Allow gate,
-/// payload digest, hash chain). Not a DSSE envelope and not an external timestamp.
+/// Strata effect receipt: looked up by `get_receipt` in the index derived from
+/// the log (Allow gate, payload digest, hash chain checked when it was replayed).
+/// Not a DSSE envelope and not an external timestamp.
 fn strata_effect_attestation(storage: &Arc<Storage>, receipt_id: &str) -> Result<Value, String> {
     let receipt = storage
         .get_receipt(receipt_id)
@@ -273,7 +274,7 @@ fn strata_effect_attestation(storage: &Arc<Storage>, receipt_id: &str) -> Result
             "chainValid": true,
             "gateAllowed": true,
             "payloadDigest": digest,
-            "claimBoundary": "Recomputed from the hash-chained log: the effect cites an Allow gate and its payload digest matches the admitted frame. A sealed segment trailer signature is checked when one is present. This is not an external timestamp or a truth claim."
+            "claimBoundary": "Read from the effect index derived from the hash-chained log when it was opened and extended by each admitted write: the effect cites an Allow gate and its payload digest matches the admitted frame. The full chain and any sealed trailer signature are re-verified by action=replay and by strata-verify. This is not an external timestamp or a truth claim."
         }
     }))
 }
