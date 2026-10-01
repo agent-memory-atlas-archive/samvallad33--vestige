@@ -989,3 +989,120 @@ fn symlinked_db_imports_and_backs_up_the_wal_beside_the_real_file() {
     assert!(has_backup("vestige.db.v3-backup-"), "backup lacks the db");
     drop(conn);
 }
+
+/// Take the same exclusive lock a serving `vestige-mcp` holds.
+fn hold_serve_lock(data_dir: &Path) -> fs::File {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(data_dir.join(".serve.lock"))
+        .unwrap();
+    file.lock().unwrap();
+    file
+}
+
+#[test]
+fn a_held_serve_lock_ends_in_a_bounded_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = plant(dir.path());
+    let before = sha256_file(&db);
+    let _held = hold_serve_lock(dir.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vestige-upgrade"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .env_remove("VESTIGE_DATA_DIR")
+        .env("VESTIGE_ATTACH_WAIT_SECS", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn vestige-upgrade");
+    let mut err_pipe = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = err_pipe.read_to_string(&mut text);
+        text
+    });
+    let status = child
+        .wait_timeout_ext(Duration::from_secs(30))
+        .expect("a held serve lock must not block the upgrade forever");
+    assert_eq!(status.code(), Some(1));
+    let stderr = reader.join().unwrap();
+    assert!(stderr.contains(".serve.lock"), "{stderr}");
+    assert_eq!(before, sha256_file(&db));
+    assert!(!dir.path().join(LOG_DIR_NAME).exists());
+}
+
+#[test]
+fn a_held_serve_lock_over_a_published_log_needs_no_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = plant(dir.path());
+    let status = vestige_upgrade::upgrade_if_needed(&db).unwrap();
+    assert!(matches!(status, UpgradeStatus::StrataReady { .. }));
+    let _held = hold_serve_lock(dir.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vestige-upgrade"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .env_remove("VESTIGE_DATA_DIR")
+        .env("VESTIGE_ATTACH_WAIT_SECS", "600")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn vestige-upgrade");
+    let status = child
+        .wait_timeout_ext(Duration::from_secs(30))
+        .expect("a published log must not wait on the serve lock");
+    assert_eq!(status.code(), Some(0));
+}
+
+#[test]
+fn a_closed_stderr_does_not_abort_the_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = plant(dir.path());
+    let before = sha256_file(&db);
+    // Hold the lock so the process is still waiting when its reader goes.
+    let held = hold_serve_lock(dir.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vestige-upgrade"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .env_remove("VESTIGE_DATA_DIR")
+        .env("VESTIGE_ATTACH_WAIT_SECS", "60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn vestige-upgrade");
+    drop(child.stderr.take());
+    std::thread::sleep(Duration::from_millis(500));
+    drop(held);
+    let status = child
+        .wait_timeout_ext(Duration::from_secs(120))
+        .expect("upgrade should finish");
+    assert_eq!(status.code(), Some(0), "upgrade died with {status:?}");
+    assert!(dir.path().join(LOG_DIR_NAME).exists());
+    assert_eq!(before, sha256_file(&db));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_data_dir_is_accepted() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let parent = tempfile::tempdir().unwrap();
+    let data = parent.path().join(OsStr::from_bytes(b"data-\xff\xfe"));
+    fs::create_dir(&data).unwrap();
+    let db = plant(&data);
+    let before = sha256_file(&db);
+    let out = run_upgrade_bin(&data);
+    assert!(
+        out.status.success(),
+        "{:?} {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(data.join(LOG_DIR_NAME).exists());
+    assert_eq!(before, sha256_file(&db));
+}

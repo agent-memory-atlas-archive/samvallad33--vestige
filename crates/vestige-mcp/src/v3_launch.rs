@@ -121,16 +121,31 @@ fn upgrade_file_name() -> &'static str {
 
 /// Sibling of this executable, then each `PATH` directory.
 fn find_upgrade() -> Option<PathBuf> {
+    find_upgrade_from(
+        std::env::current_exe().ok().as_deref(),
+        std::env::var_os("PATH"),
+    )
+}
+
+fn find_upgrade_from(exe: Option<&Path>, path: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let name = upgrade_file_name();
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
+    if let Some(exe) = exe {
+        // The real binary's directory first: the executable path can be the
+        // symlink it was launched through, which has no helper beside it.
+        let resolved = exe.canonicalize().ok();
+        for dir in resolved
+            .as_deref()
+            .and_then(Path::parent)
+            .into_iter()
+            .chain(exe.parent())
+        {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
-    let path = std::env::var_os("PATH")?;
+    let path = path?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(name);
         if candidate.is_file() {
@@ -170,5 +185,37 @@ mod tests {
         std::fs::write(&db, b"SQLite format 3\0").unwrap();
         std::fs::create_dir_all(dir.path().join("log")).unwrap();
         assert!(!strata_log_published(&db));
+    }
+
+    /// A launcher symlink to the real binary must still find the helper that
+    /// ships beside the real binary (where `current_exe` reports the link).
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_launcher_finds_the_helper_beside_the_real_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let links = dir.path().join("links");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&links).unwrap();
+        std::fs::write(real.join("vestige-mcp"), b"").unwrap();
+        std::fs::write(real.join(upgrade_file_name()), b"").unwrap();
+        let link = links.join("vestige-mcp");
+        std::os::unix::fs::symlink(real.join("vestige-mcp"), &link).unwrap();
+
+        let found = find_upgrade_from(Some(&link), None).expect("helper beside the real binary");
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            real.join(upgrade_file_name()).canonicalize().unwrap()
+        );
+    }
+
+    /// A helper next to the invoked path still wins over `PATH`.
+    #[test]
+    fn a_helper_beside_the_invoked_path_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("vestige-mcp"), b"").unwrap();
+        std::fs::write(dir.path().join(upgrade_file_name()), b"").unwrap();
+        let found = find_upgrade_from(Some(&dir.path().join("vestige-mcp")), None).unwrap();
+        assert_eq!(found, dir.path().join(upgrade_file_name()));
     }
 }
