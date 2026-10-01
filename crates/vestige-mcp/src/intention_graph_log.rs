@@ -346,7 +346,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = strata_store::StrataStore::open(dir.path()).unwrap();
         let scope = format!("ghp_{}", "E".repeat(36));
-        assert!(validate_scope(&scope).is_ok(), "the shape must pass the scope charset");
+        assert!(
+            validate_scope(&scope).is_ok(),
+            "the shape must pass the scope charset"
+        );
         let errors = [
             apply(&mut store, &scope, plan("p1"), at()).unwrap_err(),
             replay(&store, &scope).unwrap_err(),
