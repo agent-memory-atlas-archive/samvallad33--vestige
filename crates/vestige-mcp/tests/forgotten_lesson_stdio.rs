@@ -195,6 +195,13 @@ fn forgotten_lesson_completes_over_stdio_from_recorded_causal_edges() {
         for _ in 0..8 {
             store.review(&lesson, 4).expect("strengthen lesson");
         }
+        // The cause was written a month ago and has decayed with elapsed time.
+        let month_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 30 * 86_400_000;
+        store.set_created_at(&cause, month_ago).expect("age cause");
     }
 
     let mut server = Server::spawn(dir.path());

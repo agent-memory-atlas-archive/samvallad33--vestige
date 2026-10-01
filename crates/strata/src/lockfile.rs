@@ -1,143 +1,192 @@
-//! Single-writer directory lock: `strata.lock`, created with `O_EXCL`,
-//! holding the owner pid as 8 little-endian bytes.
+//! Single-writer directory lock on `strata.lock`.
 //!
-//! Stale detection is best-effort: `kill(pid, 0)` — return 0 or EPERM means
-//! the pid is alive, ESRCH means it is gone. The probe/unlink pair is racy
-//! (TOCTOU): two processes can both observe a dead owner and both try to take
-//! over; the second `O_EXCL` create loses, which bounds the damage to one
-//! spurious `Locked` error. An unparseable or empty lock file is treated as
-//! held (conservative against double-writers); remove it by hand if a writer
-//! crashed between create and the pid write.
+//! The lock is an OS advisory lock (`File::try_lock`) held on an open
+//! descriptor for the life of the log. The kernel releases it when its holder
+//! exits, SIGKILL and power loss included, so a leftover file never names a
+//! holder: whether the log is held is answered by the lock itself, never by
+//! what the file contains. That removes every question a pid file leaves open
+//! (a process killed between creating the file and writing the pid, a pid
+//! recycled by an unrelated process, a crashed owner).
+//!
+//! The file also carries the holder's pid as 8 little-endian bytes, written
+//! after the lock is taken. It is informational only, used to name the holder
+//! in [`StrataError::Locked`]; it is never trusted to decide ownership.
+//!
+//! The file is never unlinked. Removing it while it is held would let a second
+//! process create a fresh file and lock that one, and two writers would then
+//! both believe they own the log. Releasing the lock is closing the file.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::error::StrataError;
-use crate::sync::{self, SyncPurpose};
+use crate::sync::{self, Site, SyncPurpose};
 
 pub(crate) const LOCK_NAME: &str = "strata.lock";
 
+/// How long a held lock is retried before the log is reported as locked.
+///
+/// A lock can look held for an instant after its holder released it: a thread
+/// that spawns a child process shares every open descriptor with the child
+/// from fork until exec, and the kernel keeps the lock until the last copy
+/// closes. A second opener that arrives in that window is not facing a second
+/// writer. Waiting a few polls tells the two apart; a real holder keeps the
+/// lock, so the refusal only arrives this much later.
+const CONTENTION_BUDGET: Duration = Duration::from_millis(500);
+const CONTENTION_POLL: Duration = Duration::from_millis(5);
+
 pub(crate) struct DirLock {
-    path: PathBuf,
+    /// Holding the open file is holding the lock.
+    _file: File,
 }
 
 impl DirLock {
     pub(crate) fn acquire(dir: &Path) -> Result<DirLock, StrataError> {
         let path = dir.join(LOCK_NAME);
-        match OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create_new(true) // O_EXCL
-            .open(&path)
-        {
-            Ok(f) => write_pid_and_sync(f, path),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let bytes = fs::read(&path)?;
-                let pid = parse_pid(&bytes).ok_or(StrataError::Locked { pid: 0 })?;
-                if pid_alive(pid) {
-                    Err(StrataError::Locked { pid })
-                } else {
-                    // Best-effort stale takeover; see the module docs for the race.
-                    let _ = fs::remove_file(&path);
-                    match OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create_new(true)
-                        .open(&path)
-                    {
-                        Ok(f) => write_pid_and_sync(f, path),
-                        Err(e) => Err(e.into()),
-                    }
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        let started = Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    write_pid_and_sync(&mut file)?;
+                    return Ok(DirLock { _file: file });
                 }
+                Err(TryLockError::WouldBlock) if started.elapsed() < CONTENTION_BUDGET => {
+                    std::thread::sleep(CONTENTION_POLL);
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(StrataError::Locked {
+                        pid: read_pid(&mut file).unwrap_or(0),
+                    });
+                }
+                Err(TryLockError::Error(e)) => return Err(e.into()),
             }
-            Err(e) => Err(e.into()),
         }
     }
 }
 
-fn write_pid_and_sync(mut f: std::fs::File, path: PathBuf) -> Result<DirLock, StrataError> {
-    let pid = std::process::id() as u64;
+fn write_pid_and_sync(f: &mut File) -> Result<(), StrataError> {
+    // A full volume refuses the lock write; dropping the handle releases
+    // the OS lock, so nothing is left that blocks the next open.
+    sync::guard_space(Site::Lock)?;
+    let pid = u64::from(std::process::id());
+    f.set_len(0)?;
+    f.seek(SeekFrom::Start(0))?;
     f.write_all(&pid.to_le_bytes())?;
     f.flush()?;
-    sync::sync_file(&f, SyncPurpose::Metadata)?;
-    Ok(DirLock { path })
+    sync::sync_file(f, SyncPurpose::Metadata)?;
+    Ok(())
+}
+
+/// The pid the holder recorded. `None` when it has not written it yet, or
+/// when the platform will not let a second handle read a locked file.
+fn read_pid(f: &mut File) -> Option<u64> {
+    let mut bytes = Vec::with_capacity(8);
+    f.seek(SeekFrom::Start(0)).ok()?;
+    f.take(9).read_to_end(&mut bytes).ok()?;
+    parse_pid(&bytes)
 }
 
 fn parse_pid(bytes: &[u8]) -> Option<u64> {
-    if bytes.len() != 8 {
-        return None;
-    }
-    let mut b = [0u8; 8];
-    b.copy_from_slice(bytes);
+    let b: [u8; 8] = bytes.try_into().ok()?;
     Some(u64::from_le_bytes(b))
 }
 
-fn pid_alive(pid: u64) -> bool {
-    if pid == 0 {
-        return true; // conservative
-    }
+#[cfg(test)]
+mod contention_tests {
+    use super::*;
     #[cfg(unix)]
-    {
-        // Safety: kill(2) with signal 0 performs the permission/existence
-        // check only; no signal is delivered.
-        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        if rc == 0 {
-            return true;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(unix)]
+    use std::sync::Arc;
+
+    /// The refusal names this process as the holder. On Windows a second
+    /// handle cannot read a locked file, so the pid may be unknown (0).
+    fn assert_holder(pid: u64) {
+        let me = u64::from(std::process::id());
+        if cfg!(windows) {
+            assert!(pid == me || pid == 0, "unexpected holder pid {pid}");
+        } else {
+            assert_eq!(pid, me);
         }
-        let err = std::io::Error::last_os_error();
-        !matches!(err.raw_os_error(), Some(libc::ESRCH))
-    }
-    #[cfg(windows)]
-    {
-        windows_pid_alive(pid)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        true // conservative on unsupported platforms
-    }
-}
-
-/// `OpenProcess` + `GetExitCodeProcess`. Answering "alive" for every pid, as
-/// this used to, left a killed process's lock in place for good: every later
-/// open failed with `Locked` until the file was deleted by hand.
-#[cfg(windows)]
-fn windows_pid_alive(pid: u64) -> bool {
-    type Handle = *mut core::ffi::c_void;
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    const STILL_ACTIVE: u32 = 259;
-    const ERROR_ACCESS_DENIED: u32 = 5;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> Handle;
-        fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
-        fn CloseHandle(object: Handle) -> i32;
-        fn GetLastError() -> u32;
     }
 
-    // Windows process ids are 32-bit; a larger value names no process.
-    let Ok(pid) = u32::try_from(pid) else {
-        return false;
-    };
-    // Safety: plain Win32 calls on values we own; the handle is closed before
-    // returning and `code` outlives the call that writes it.
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            // Access denied: the process exists and belongs to someone else.
-            return GetLastError() == ERROR_ACCESS_DENIED;
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("strata-lock-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn a_lock_released_a_moment_after_the_attempt_started_is_taken() {
+        let dir = scratch("late-release");
+        let holder = DirLock::acquire(&dir).expect("holder");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            drop(holder);
+        });
+        let taken = DirLock::acquire(&dir);
+        release.join().expect("release thread");
+        assert!(
+            taken.is_ok(),
+            "a holder that lets go within the budget must not refuse the opener"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_lock_that_stays_held_is_still_refused_with_its_holder() {
+        let dir = scratch("still-held");
+        let _holder = DirLock::acquire(&dir).expect("holder");
+        let started = Instant::now();
+        match DirLock::acquire(&dir) {
+            Err(StrataError::Locked { pid }) => assert_holder(pid),
+            other => panic!("a held lock must refuse, got {:?}", other.err()),
         }
-        let mut code = 0u32;
-        let queried = GetExitCodeProcess(handle, &mut code);
-        CloseHandle(handle);
-        // A failed query is treated as alive (conservative, like pid 0).
-        queried == 0 || code == STILL_ACTIVE
+        assert!(
+            started.elapsed() >= CONTENTION_BUDGET,
+            "the refusal waits out the budget"
+        );
+        assert!(
+            started.elapsed() < CONTENTION_BUDGET * 8,
+            "and not much longer"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
-}
 
-impl Drop for DirLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+    #[cfg(unix)]
+    #[test]
+    fn reacquiring_survives_children_spawned_by_sibling_threads() {
+        let dir = scratch("sibling-spawns");
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+        for round in 0..300 {
+            let first = DirLock::acquire(&dir).unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+            drop(first);
+            let second = DirLock::acquire(&dir).unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+            drop(second);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for t in spawners {
+            t.join().expect("spawner");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -391,6 +391,13 @@ pub struct MigrationReport {
     pub dropped_vectors: u64,
     /// FSRS_STATE frames: `knowledge_nodes` rows with no `fsrs_cards` row.
     pub fsrs_states: u64,
+    /// `memory_connections` rows whose source or target memory no longer
+    /// exists (left by older v3 builds). Skipped, not imported.
+    #[serde(default)]
+    pub skipped_dangling_edges: u64,
+    /// `fsrs_cards` rows whose memory no longer exists. Skipped, not imported.
+    #[serde(default)]
+    pub skipped_dangling_cards: u64,
     /// Last verified `receipt_envelopes` entry digest (empty = none).
     pub envelope_head: String,
     /// BLAKE3 hex of the source files (identical before and after; the run
@@ -431,9 +438,15 @@ pub fn migrate_with_options(
     options: MigrateOptions,
 ) -> Result<MigrationReport, MigrationError> {
     let started = Instant::now();
-    let scratch = tempfile::tempdir()?;
+    // Snapshot copies live in the data directory beside `strata_dir`, owner
+    // only, and are removed when this function returns.
+    let scratch_parent = match strata_dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let mut scratch = source::Scratch::new(scratch_parent);
     let (files, _snapshotted) =
-        source::prepare_source(source, options.accept_wal_snapshot, scratch.path())?;
+        source::prepare_source(source, options.accept_wal_snapshot, &mut scratch)?;
 
     if !source::is_sqlite_file(&files.db)? {
         // Portable-archive JSON path: no SQLite, no guard, no source hash.
@@ -840,15 +853,18 @@ fn idempotent_report(
     receipt: &records::MigrationReceipt,
     started: Instant,
 ) -> MigrationReport {
+    let dangling = dangling_rows(&snapshot.archive);
     MigrationReport {
         nodes: table_rows(snapshot, "knowledge_nodes"),
-        edges: table_rows(snapshot, "memory_connections"),
-        fsrs_events: table_rows(snapshot, "fsrs_cards"),
+        edges: table_rows(snapshot, "memory_connections") - dangling.edges,
+        fsrs_events: table_rows(snapshot, "fsrs_cards") - dangling.cards,
         intentions_carried: 0,
         skipped_tables: skipped_tables_for(snapshot),
         verify_passed: true,
         dropped_vectors: snapshot.dropped_vectors,
         fsrs_states: planned_fsrs_states(&snapshot.archive),
+        skipped_dangling_edges: dangling.edges,
+        skipped_dangling_cards: dangling.cards,
         envelope_head: snapshot.envelope_head.clone().unwrap_or_default(),
         source_blake3: receipt.body.source_blake3_before.clone(),
         receipt_digest: Some(hex32(&receipt.checksum)),
@@ -889,10 +905,11 @@ fn dry_run_report(
     source_blake3: &str,
     started: Instant,
 ) -> MigrationReport {
+    let dangling = dangling_rows(&snapshot.archive);
     MigrationReport {
         nodes: table_rows(snapshot, "knowledge_nodes"),
-        edges: table_rows(snapshot, "memory_connections"),
-        fsrs_events: table_rows(snapshot, "fsrs_cards"),
+        edges: table_rows(snapshot, "memory_connections") - dangling.edges,
+        fsrs_events: table_rows(snapshot, "fsrs_cards") - dangling.cards,
         intentions_carried: 0,
         skipped_tables: skipped_tables_for(snapshot),
         // A dry run writes nothing; the envelope chain is verified during
@@ -900,6 +917,8 @@ fn dry_run_report(
         verify_passed: true,
         dropped_vectors: snapshot.dropped_vectors,
         fsrs_states: planned_fsrs_states(&snapshot.archive),
+        skipped_dangling_edges: dangling.edges,
+        skipped_dangling_cards: dangling.cards,
         envelope_head: snapshot.envelope_head.clone().unwrap_or_default(),
         source_blake3: source_blake3.to_string(),
         receipt_digest: None,
@@ -907,6 +926,46 @@ fn dry_run_report(
         idempotent_reuse: false,
         duration: started.elapsed(),
     }
+}
+
+/// Rows the importer skips because the memory they point at is gone.
+#[cfg(feature = "sqlite-reader")]
+#[derive(Default)]
+struct DanglingRows {
+    edges: u64,
+    cards: u64,
+}
+
+/// Count the dangling `memory_connections` and `fsrs_cards` rows of an
+/// archive without building records (dry-run and idempotent reports).
+#[cfg(feature = "sqlite-reader")]
+fn dangling_rows(archive: &PortableArchive) -> DanglingRows {
+    let mut out = DanglingRows::default();
+    let ids: std::collections::HashSet<&str> = source::table(archive, "knowledge_nodes")
+        .map(|table| {
+            (0..table.rows.len())
+                .filter_map(|i| source::Row::new(table, i).text("id").ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(table) = source::table(archive, "memory_connections") {
+        for index in 0..table.rows.len() {
+            let row = source::Row::new(table, index);
+            let live = |column: &str| row.text(column).is_ok_and(|id| ids.contains(id));
+            if !(live("source_id") && live("target_id")) {
+                out.edges += 1;
+            }
+        }
+    }
+    if let Some(table) = source::table(archive, "fsrs_cards") {
+        for index in 0..table.rows.len() {
+            let row = source::Row::new(table, index);
+            if !row.text("memory_id").is_ok_and(|id| ids.contains(id)) {
+                out.cards += 1;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(feature = "sqlite-reader")]
@@ -935,6 +994,8 @@ struct ReplayOutcome {
     edges: u64,
     fsrs_events: u64,
     fsrs_states: u64,
+    skipped_dangling_edges: u64,
+    skipped_dangling_cards: u64,
     /// Hash of the last fold checkpoint (the replay anchor), or `[0; 32]`
     /// when the log carries no checkpoint.
     anchor: [u8; 32],
@@ -954,7 +1015,7 @@ fn migrate_snapshot_into(
     let archive = &snapshot.archive;
 
     let (mut node_records, kernel_ids, supersessions) = extract_nodes(archive)?;
-    let edge_records = extract_edges(archive, &kernel_ids)?;
+    let (edge_records, skipped_dangling_edges) = extract_edges(archive, &kernel_ids)?;
     let tombstones = extract_tombstones(archive)?;
     let walk_nodes = extract_walk_receipts(snapshot, &kernel_ids)?;
     attach_fsrs_legacy(archive, &kernel_ids, &mut node_records)?;
@@ -962,6 +1023,7 @@ fn migrate_snapshot_into(
     let mut nodes = 0u64;
     let mut edges = 0u64;
     let mut fsrs_events = 0u64;
+    let mut skipped_dangling_cards = 0u64;
 
     let mut writer = Writer::new(log);
     if log.head().frames_total == 0 {
@@ -1007,11 +1069,12 @@ fn migrate_snapshot_into(
         for index in 0..table.rows.len() {
             let row = source::Row::new(table, index);
             let memory_id = row.text("memory_id")?.to_string();
-            let kernel_id = *kernel_ids.get(&memory_id).ok_or_else(|| {
-                MigrationError::Corrupt(format!(
-                    "fsrs_cards row references unknown memory {memory_id}"
-                ))
-            })?;
+            // A card whose memory was deleted by an older v3 build has
+            // nothing to attach to: skip it and count it.
+            let Some(kernel_id) = kernel_ids.get(&memory_id).copied() else {
+                skipped_dangling_cards += 1;
+                continue;
+            };
             let reps = row.integer_or("reps", 0)?.clamp(0, u32::MAX as i64);
             let lapses = row.integer_or("lapses", 0)?.clamp(0, reps);
             let reviewed_at_ms = last_review_ms(&row)?;
@@ -1085,6 +1148,8 @@ fn migrate_snapshot_into(
         edges,
         fsrs_events,
         fsrs_states,
+        skipped_dangling_edges,
+        skipped_dangling_cards,
         anchor,
     })
 }
@@ -1155,6 +1220,8 @@ fn finish(
         verify_passed,
         dropped_vectors: snapshot.dropped_vectors,
         fsrs_states: outcome.fsrs_states,
+        skipped_dangling_edges: outcome.skipped_dangling_edges,
+        skipped_dangling_cards: outcome.skipped_dangling_cards,
         envelope_head: snapshot.envelope_head.unwrap_or_default(),
         source_blake3: source_blake3.to_string(),
         receipt_digest: Some(hex32(&receipt.checksum)),
@@ -1462,7 +1529,10 @@ fn extract_fsrs_states(
     }
     let carded = carded_memory_ids(archive)?;
     let w20 = v3_decay(archive);
-    // The source's own "now": its latest node timestamp.
+    // The source's own "now": its latest node timestamp, never later than
+    // the moment of import (a future-dated row must not move every card's
+    // fit point).
+    let import_clock_ms = chrono::Utc::now().timestamp_millis();
     let source_clock = node_records
         .iter()
         .map(|node| {
@@ -1471,7 +1541,8 @@ fn extract_fsrs_states(
                 .max(node.last_accessed_ms)
         })
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(import_clock_ms);
 
     let mut records = Vec::new();
     for (index, node) in node_records.iter().enumerate() {
@@ -1729,9 +1800,10 @@ fn extract_nodes(archive: &PortableArchive) -> Result<NodeSet, MigrationError> {
     Ok((records, kernel_ids, supersessions))
 }
 
-/// Decode `memory_connections` into edge records. FK cascades make dangling
-/// edges impossible in a consistent store; a dangling edge in an archive is
-/// corruption and stops the migration (fail-stop, never silently dropped).
+/// Decode `memory_connections` into edge records. Older v3 builds could
+/// leave rows whose source or target memory was deleted; such an edge has no
+/// node to attach to, so it is skipped and counted (returned second), and
+/// the report names the count.
 ///
 /// A v3 `link_type` in [`STRATA_EDGE_VOCABULARY`] is a declared edge and
 /// passes through. Every other type is inferred: the existing `link_type`
@@ -1742,25 +1814,23 @@ fn extract_nodes(archive: &PortableArchive) -> Result<NodeSet, MigrationError> {
 fn extract_edges(
     archive: &PortableArchive,
     kernel_ids: &HashMap<String, u64>,
-) -> Result<Vec<EdgeRecord>, MigrationError> {
+) -> Result<(Vec<EdgeRecord>, u64), MigrationError> {
     let Some(table) = source::table(archive, "memory_connections") else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     };
     let mut records = Vec::with_capacity(table.rows.len());
+    let mut skipped = 0u64;
     for index in 0..table.rows.len() {
         let row = source::Row::new(table, index);
         let source_legacy_id = row.text("source_id")?.to_string();
         let target_legacy_id = row.text("target_id")?.to_string();
-        let source_kernel_id = *kernel_ids.get(&source_legacy_id).ok_or_else(|| {
-            MigrationError::Corrupt(format!(
-                "memory_connections row references unknown source {source_legacy_id}"
-            ))
-        })?;
-        let target_kernel_id = *kernel_ids.get(&target_legacy_id).ok_or_else(|| {
-            MigrationError::Corrupt(format!(
-                "memory_connections row references unknown target {target_legacy_id}"
-            ))
-        })?;
+        let (Some(&source_kernel_id), Some(&target_kernel_id)) = (
+            kernel_ids.get(&source_legacy_id),
+            kernel_ids.get(&target_legacy_id),
+        ) else {
+            skipped += 1;
+            continue;
+        };
         let legacy_link_type = row.text("link_type")?.to_string();
         let (link_type, legacy_inferred) =
             if STRATA_EDGE_VOCABULARY.contains(&legacy_link_type.as_str()) {
@@ -1797,7 +1867,7 @@ fn extract_edges(
             target_legacy_id,
         });
     }
-    Ok(records)
+    Ok((records, skipped))
 }
 
 /// Decode `sync_tombstones` and `deletion_tombstones`.

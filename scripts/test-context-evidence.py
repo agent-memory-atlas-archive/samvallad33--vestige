@@ -75,8 +75,10 @@ def run(binary):
             assert "STRATA_CONTEXT_NODE" in json.dumps(got)
             context = tool("codebase", {"action": "get_context", "codebase": "fixture"})
             assert node_id not in json.dumps(context)
-            queried = tool("session_start", {"queries": ["STRATA_CONTEXT_NODE"], "include_predictions": False}, error=True)
-            assert "similarity_disabled" in queried["error"]
+            queried = tool("session_start", {"queries": ["STRATA_CONTEXT_NODE"], "include_predictions": False})
+            assert queried["notices"][0].startswith("queries ignored (1)"), queried
+            assert node_id not in json.dumps(queried), queried
+            assert "STRATA_CONTEXT_NODE" not in queried["context"], queried
             passed("exact get works; query startup and untagged code context do not invent a hit")
 
             bad = [

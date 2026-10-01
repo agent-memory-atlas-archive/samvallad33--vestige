@@ -415,6 +415,47 @@ fn missing_store_meta_on_populated_store_fails_open() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Every directory and file of a backup is owner-only on unix, whatever the
+/// process umask is.
+#[cfg(unix)]
+#[test]
+fn backup_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn walk(path: &std::path::Path, bad: &mut Vec<String>) {
+        let meta = std::fs::metadata(path).expect("stat");
+        let mode = meta.permissions().mode() & 0o777;
+        let want = if meta.is_dir() { 0o700 } else { 0o600 };
+        if mode != want {
+            bad.push(format!("{} is {mode:o}, want {want:o}", path.display()));
+        }
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(path).expect("read_dir") {
+                walk(&entry.expect("entry").path(), bad);
+            }
+        }
+    }
+
+    let dir = temp_dir("backup-perm-src");
+    let parent = temp_dir("backup-perm-parent");
+    let dest = parent.join("nested").join("copy");
+    {
+        let mut store = StrataStore::open(&dir).expect("open");
+        store.ingest(input("private fact", &[])).expect("ingest");
+        store.seal_checkpoint().expect("seal");
+        store.backup_to(&dest).expect("backup");
+    }
+    let mut bad = Vec::new();
+    walk(&dest, &mut bad);
+    assert!(
+        std::fs::metadata(dest.join("log")).is_ok(),
+        "backup has a log dir"
+    );
+    assert!(bad.is_empty(), "backup is not owner-only: {bad:?}");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
 #[test]
 fn backup_roundtrip_opens_and_matches() {
     let dir = temp_dir("backup-src");
@@ -989,6 +1030,55 @@ fn retrievability_uses_review_time_not_import_seq() {
     assert_eq!(reopened.reviewed_at_ms(&id), Some(reviewed_at));
     assert_eq!(
         reopened.retrievability_at(&id, as_of).unwrap().unwrap(),
+        got
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn retention_of_unreviewed_node_ignores_unrelated_writes() {
+    let dir = temp_dir("retention-clock");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let id = store
+        .ingest(input("a decision written at the ingest clock", &[]))
+        .expect("ingest");
+    let created = store.get_node(&id).expect("node").created_at_ms;
+    let day = 86_400_000i64;
+
+    // Right after the write nothing has decayed.
+    let fresh = store.retrievability_at(&id, created).unwrap().unwrap();
+    assert_eq!(fresh, 1.0);
+
+    // Unrelated writes advance the log, not the clock.
+    for n in 0..40 {
+        store
+            .ingest(input(&format!("unrelated note {n}"), &[]))
+            .expect("ingest other");
+    }
+    let after_writes = store.retrievability_at(&id, created).unwrap().unwrap();
+    assert_eq!(
+        after_writes, 1.0,
+        "log writes must not decay retention: {after_writes}"
+    );
+
+    // Elapsed time does decay it, by the derived formula over whole days.
+    let card = store.card_state(&id).expect("card");
+    let later = created + 30 * day;
+    let got = store.retrievability_at(&id, later).unwrap().unwrap();
+    let expected = FsrsFold::retrievability(&card, card.last_seq + 30, ALGO_V2).expect("formula");
+    assert_eq!(got, expected);
+    assert!(got < 1.0, "thirty days must decay: {got}");
+    let much_later = store
+        .retrievability_at(&id, created + 90 * day)
+        .unwrap()
+        .unwrap();
+    assert!(much_later < got, "monotone in elapsed time");
+
+    // Reopen derives the same value from the log alone.
+    drop(store);
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    assert_eq!(
+        reopened.retrievability_at(&id, later).unwrap().unwrap(),
         got
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -1819,6 +1909,101 @@ fn undo_restores_the_previous_upsert_without_rewriting_it() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+fn edit_ctx() -> AdmissionContext {
+    AdmissionContext {
+        rule_id: Some(RULE_EDIT.to_string()),
+        confirm: false,
+    }
+}
+
+#[test]
+fn undoing_an_edit_restores_the_previous_version_and_retires_only_the_edit() {
+    let dir = temp_dir("undo-edit-chain");
+    let (old_id, new_id, digest) = {
+        let mut store = StrataStore::open(&dir).expect("open");
+        let old_id = store.ingest(input("version one", &[])).expect("ingest");
+        let (new_id, _) = store
+            .edit(&old_id, "version two", &edit_ctx())
+            .expect("edit");
+        assert!(!store.get_node(&old_id).expect("old").is_live());
+        let successor_write = store
+            .node_writes()
+            .into_iter()
+            .find(|write| write.record.id == new_id)
+            .expect("successor write");
+        let undo_seq = store
+            .undo_node_write(successor_write.frame_seq)
+            .expect("undo edit");
+        let old = store.get_node(&old_id).expect("old node");
+        assert!(old.is_live(), "the previous version is live again");
+        assert_eq!(old.content, "version one");
+        assert!(old.superseded_by.is_none());
+        assert!(
+            !store.get_node(&new_id).expect("new node").is_live(),
+            "the edit itself is retired"
+        );
+        assert_eq!(store.node_count(), 1);
+        let undo_write = store
+            .node_writes()
+            .into_iter()
+            .find(|write| write.frame_seq == undo_seq)
+            .expect("undo write");
+        assert_eq!(undo_write.op_type, "undo");
+        assert!(
+            store.undo_node_write(undo_seq).is_err(),
+            "an undo is not itself undone"
+        );
+        let restore_write = store
+            .node_writes()
+            .into_iter()
+            .rev()
+            .find(|write| write.record.id == old_id)
+            .expect("restore write");
+        assert_eq!(restore_write.op_type, "undo");
+        assert!(store.undo_node_write(restore_write.frame_seq).is_err());
+        (old_id, new_id, store.state_digest())
+    };
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    assert_eq!(reopened.state_digest(), digest);
+    assert!(reopened.get_node(&old_id).expect("old").is_live());
+    assert!(!reopened.get_node(&new_id).expect("new").is_live());
+    assert_eq!(reopened.node_count(), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn undoing_an_edit_moves_code_anchors_back_to_the_restored_version() {
+    let dir = temp_dir("undo-edit-anchors");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let old_id = store.ingest(input("anchored one", &[])).expect("ingest");
+    let anchor = anchor("anchor-undo-1", &old_id, "src/lib.rs", 10);
+    store
+        .record_anchors(vec![anchor.clone()])
+        .expect("anchor the memory");
+    let (new_id, _) = store
+        .edit(&old_id, "anchored two", &edit_ctx())
+        .expect("edit");
+    store
+        .record_anchors(vec![crate::AnchorRecord {
+            node_id: new_id.clone(),
+            ..anchor.clone()
+        }])
+        .expect("move the anchor with the edit");
+    let successor_write = store
+        .node_writes()
+        .into_iter()
+        .find(|write| write.record.id == new_id)
+        .expect("successor write");
+    store
+        .undo_node_write(successor_write.frame_seq)
+        .expect("undo edit");
+    let rows = store.anchors_for(&old_id);
+    assert_eq!(rows.len(), 1, "the anchor follows the restored memory");
+    assert_eq!(rows[0].id, anchor.id);
+    assert!(store.anchors_for(&new_id).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 fn imported_node(id: &str, legacy: &[(&str, &str)]) -> Vec<u8> {
     borsh::to_vec(&strata_migrate::NodeRecord {
         record_version: strata_migrate::RECORD_VERSION,
@@ -2407,4 +2592,245 @@ fn an_unadmitted_anchor_frame_is_an_orphan() {
     assert!(reopened.anchors_for(&node).is_empty());
     assert_eq!(reopened.anchor("forged"), None);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Remove every segment file under the store's log directory. A lookup that
+/// still answers afterwards was served from the in-memory effect index, not
+/// from a fresh read of the log.
+fn remove_log_segments(dir: &std::path::Path) {
+    for entry in std::fs::read_dir(dir.join("log")).expect("log dir") {
+        let path = entry.expect("entry").path();
+        if path.extension().is_some_and(|ext| ext == "seg") {
+            std::fs::remove_file(&path).expect("remove segment");
+        }
+    }
+}
+
+#[test]
+fn effect_lookups_do_not_rescan_the_log_after_writes() {
+    let dir = temp_dir("effect-index-live");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let mut ids = Vec::new();
+    for n in 0..6 {
+        ids.push(
+            store
+                .ingest(input(&format!("indexed memory {n}"), &[]))
+                .expect("ingest"),
+        );
+    }
+    store.review(&ids[0], 4).expect("review");
+    let (successor, receipt) = store
+        .edit(&ids[1], "indexed memory one, edited", &edit_ctx())
+        .expect("edit");
+    let expected = store.prove_effects().expect("full scan proves");
+    assert!(expected.len() >= 8);
+
+    remove_log_segments(&dir);
+
+    for proof in &expected {
+        let by_seq = store
+            .effect_by_seq(proof.effect_seq)
+            .expect("lookup must not read the log")
+            .expect("indexed effect");
+        let first = expected
+            .iter()
+            .find(|candidate| candidate.effect_seq == proof.effect_seq)
+            .expect("first proof for seq");
+        assert_eq!(&by_seq, first);
+    }
+    let latest = store
+        .latest_effect(&successor)
+        .expect("lookup must not read the log")
+        .expect("successor has an effect");
+    assert_eq!(latest.effect_seq, receipt.effect_seq);
+    assert_eq!(latest.action, EffectAction::Edit);
+    let reviewed = store
+        .latest_effect(&ids[0])
+        .expect("lookup must not read the log")
+        .expect("reviewed node has an effect");
+    assert_eq!(reviewed.action, EffectAction::Review);
+    assert_eq!(reviewed.rating, Some(4));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn effect_index_rebuilt_on_open_matches_the_full_scan() {
+    let dir = temp_dir("effect-index-reopen");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let a = store.ingest(input("reopen memory a", &[])).expect("a");
+    let b = store.ingest(input("reopen memory b", &[])).expect("b");
+    store.review(&a, 3).expect("review");
+    store
+        .save_connection(&ConnectionRecord {
+            source_id: a.clone(),
+            target_id: b.clone(),
+            strength_milli: 500,
+            link_type: "derived_from".into(),
+            meta_sha: None,
+            created_at_ms: 1,
+            activation_count: 0,
+        })
+        .expect("edge");
+    store
+        .upsert_intentions(vec![intention("i1", "one"), intention("i2", "two")])
+        .expect("intentions");
+    store
+        .edit(&b, "reopen memory b, edited", &edit_ctx())
+        .expect("edit");
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    let expected = reopened.prove_effects().expect("full scan proves");
+    remove_log_segments(&dir);
+
+    for proof in &expected {
+        let by_seq = reopened
+            .effect_by_seq(proof.effect_seq)
+            .expect("indexed")
+            .expect("present");
+        let first = expected
+            .iter()
+            .find(|candidate| candidate.effect_seq == proof.effect_seq)
+            .expect("first proof for seq");
+        assert_eq!(&by_seq, first);
+        if proof.action != EffectAction::Edge {
+            let want = expected
+                .iter()
+                .filter(|candidate| {
+                    candidate.node_id == proof.node_id && candidate.action != EffectAction::Edge
+                })
+                .max_by_key(|candidate| candidate.effect_seq)
+                .expect("latest");
+            assert_eq!(
+                reopened.latest_effect(&proof.node_id).expect("indexed"),
+                Some(want.clone())
+            );
+        }
+    }
+    assert_eq!(reopened.effect_by_seq(u64::MAX).expect("indexed"), None);
+    assert_eq!(
+        reopened.latest_effect("no-such-node").expect("indexed"),
+        None
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Segment files of a store's log, in numeric order.
+fn segment_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut segs: Vec<PathBuf> = std::fs::read_dir(dir.join("log"))
+        .expect("read log dir")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("seg"))
+        .collect();
+    segs.sort();
+    segs
+}
+
+/// Flip one payload byte of the first frame in `seg`.
+fn flip_first_frame(seg: &std::path::Path) {
+    let mut bytes = std::fs::read(seg).expect("read segment");
+    let (_frame, used) = strata::parse_frame(&bytes[strata::HEADER_WIRE_SIZE..]).expect("frame");
+    assert!(used > 8);
+    bytes[strata::HEADER_WIRE_SIZE + 8] ^= 0xff;
+    std::fs::write(seg, &bytes).expect("write segment");
+}
+
+#[test]
+fn backup_of_a_log_with_a_damaged_sealed_segment_fails() {
+    let dir = temp_dir("backup-sealed-damage");
+    let first = temp_dir("backup-sealed-damage-first");
+    let second = temp_dir("backup-sealed-damage-second");
+    std::fs::remove_dir_all(&second).ok();
+    let mut store = StrataStore::open(&dir).expect("open");
+    store.ingest(input("first fact", &[])).expect("first");
+    store
+        .backup_to(&first)
+        .expect("healthy backup seals segment 0");
+    store.ingest(input("second fact", &[])).expect("second");
+
+    flip_first_frame(&segment_files(&dir)[0]);
+    let err = store
+        .backup_to(&second)
+        .expect_err("a backup must not copy a log that fails verification");
+    assert!(matches!(err, StoreError::Log(_)), "got {err}");
+    assert!(
+        !second.join("log").exists(),
+        "a refused backup must not leave a partial copy"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&first).ok();
+}
+
+#[test]
+fn backup_of_a_log_with_a_damaged_active_segment_fails() {
+    let dir = temp_dir("backup-active-damage");
+    let dest = temp_dir("backup-active-damage-dest");
+    std::fs::remove_dir_all(&dest).ok();
+    let mut store = StrataStore::open(&dir).expect("open");
+    store.ingest(input("first fact", &[])).expect("first");
+    store.ingest(input("second fact", &[])).expect("second");
+
+    flip_first_frame(&segment_files(&dir)[0]);
+    let before: Vec<Vec<u8>> = segment_files(&dir)
+        .iter()
+        .map(|seg| std::fs::read(seg).expect("read"))
+        .collect();
+    store
+        .backup_to(&dest)
+        .expect_err("a backup must not seal and copy a damaged log");
+    let after: Vec<Vec<u8>> = segment_files(&dir)
+        .iter()
+        .map(|seg| std::fs::read(seg).expect("read"))
+        .collect();
+    assert_eq!(before, after, "a refused backup must not seal the segment");
+    assert!(!dest.join("log").exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_store_that_found_damage_in_acked_history_refuses_writes() {
+    let dir = temp_dir("damage-stops-writes");
+    let mut store = StrataStore::open(&dir).expect("open");
+    store.ingest(input("first fact", &[])).expect("first");
+    store.ingest(input("second fact", &[])).expect("second");
+
+    flip_first_frame(&segment_files(&dir)[0]);
+    assert!(
+        store.refold().is_err(),
+        "a refold over damaged history must fail"
+    );
+    let err = store
+        .ingest(input("written after the damage was found", &[]))
+        .expect_err("a store that found acked damage must stop accepting writes");
+    assert!(matches!(err, StoreError::Log(_)), "got {err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn proving_effects_over_a_damaged_sealed_segment_fails_instead_of_hiding_later_ones() {
+    let dir = temp_dir("prove-sealed-damage");
+    let dest = temp_dir("prove-sealed-damage-dest");
+    let mut store = StrataStore::open(&dir).expect("open");
+    store.ingest(input("first fact", &[])).expect("first");
+    store.backup_to(&dest).expect("seal segment 0");
+    let second = store.ingest(input("second fact", &[])).expect("second");
+
+    flip_first_frame(&segment_files(&dir)[0]);
+    // Lookups are served from the effect index, proved when each effect was
+    // admitted, so damage found later never hides the second fact's effect.
+    // The damage itself is reported by verification, which `receipt get`
+    // runs before it attests anything.
+    assert!(
+        store
+            .latest_effect(&second)
+            .expect("an index lookup reads no segment")
+            .is_some(),
+        "the second fact's effect must not be hidden"
+    );
+    store
+        .log()
+        .verify_log()
+        .expect_err("a damaged log must not verify");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dest).ok();
 }

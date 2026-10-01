@@ -777,6 +777,18 @@ fn validity_is_empty(validity: &Value) -> bool {
             .is_some_and(Vec::is_empty)
 }
 
+/// A scope is echoed by every write and preview response and names the
+/// namespace reads are filtered by, so a credential-shaped scope is refused
+/// before anything runs, under every secret policy. Reports kinds only.
+fn scope_credential_refusal(scope: &str) -> Option<String> {
+    let kinds: Vec<String> = scan_secrets(scope)
+        .into_iter()
+        .filter(|finding| finding.blocks_ingestion())
+        .map(|finding| finding.kind.to_string())
+        .collect();
+    (!kinds.is_empty()).then(|| StorageError::SecretDetected { kinds }.to_string())
+}
+
 async fn execute_verbose(
     storage: &Arc<Storage>,
     cognitive: &Arc<Mutex<CognitiveEngine>>,
@@ -795,6 +807,9 @@ async fn execute_verbose(
     let scope = args
         .scope
         .unwrap_or_else(|| DEFAULT_MEMORY_SCOPE.to_string());
+    if let Some(refusal) = scope_credential_refusal(&scope) {
+        return Err(refusal);
+    }
     // #252 Phase A: the claimed role. Trimmed here once; it can never
     // override the process identity — the operator policy resolves it.
     let claimed_role = args
@@ -1359,6 +1374,15 @@ async fn execute_batch(
             .scope
             .clone()
             .unwrap_or_else(|| default_scope.to_string());
+        if let Some(refusal) = scope_credential_refusal(&scope) {
+            errors += 1;
+            results.push(serde_json::json!({
+                "index": i,
+                "status": "rejected",
+                "reason": refusal
+            }));
+            continue;
+        }
         let mut validity = match resolve_validity_range(
             &item.content,
             item.valid_from.as_deref(),

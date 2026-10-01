@@ -2124,9 +2124,10 @@ fn codebase_remembers_a_decision_returns_context_verifies_and_needs_its_fields()
     );
     assert_under(&context, 6_000, "codebase get_context");
 
+    let checkout = tempfile::tempdir().unwrap();
     let verify = server.call_tool_ok(
         "codebase",
-        json!({ "action": "verify", "codebase": "e2e-probe" }),
+        json!({ "action": "verify", "codebase": "e2e-probe", "repoPath": checkout.path() }),
     );
     assert_keys(
         &verify,

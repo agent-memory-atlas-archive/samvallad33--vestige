@@ -84,6 +84,50 @@ pub fn detect_v3(path: &Path) -> Result<Option<V3Info>> {
     }))
 }
 
+/// Like [`detect_v3`], for callers that must decide whether a file at `path`
+/// may be treated as "no v3 store".
+///
+/// `Ok(None)` only when nothing exists at `path`. A path that exists but
+/// cannot be read, is empty, or does not carry the plain SQLite magic (an
+/// encrypted or truncated store, for example) is an error: its contents are
+/// unknown, so it must not be skipped as if it were absent.
+pub fn detect_v3_strict(path: &Path) -> Result<Option<V3Info>> {
+    let mut header = [0u8; 100];
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unrecognised_store(path, &format!("cannot be opened: {e}"))),
+    };
+    let mut filled = 0usize;
+    while filled < header.len() {
+        match std::io::Read::read(&mut file, &mut header[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(unrecognised_store(path, &format!("cannot be read: {e}"))),
+        }
+    }
+    if filled == 0 {
+        return Err(unrecognised_store(path, "is empty"));
+    }
+    if filled < SQLITE_MAGIC.len() || &header[..16] != SQLITE_MAGIC {
+        return Err(unrecognised_store(path, "is not a plain SQLite database"));
+    }
+    let schema_version = read_schema_version(path, &header);
+    Ok(Some(V3Info {
+        path: path.to_path_buf(),
+        schema_version,
+    }))
+}
+
+fn unrecognised_store(path: &Path, what: &str) -> StorageError {
+    StorageError::Init(format!(
+        "{} exists but {what}. It was left untouched and no Strata log was created. \
+         Restore a readable copy or move the file away, then retry.",
+        path.display()
+    ))
+}
+
 /// Build the canonical refusal for a detected v3 store.
 pub fn refuse_v3(info: &V3Info) -> StorageError {
     StorageError::V3StoreNeedsMigration {
@@ -145,9 +189,18 @@ fn query_schema_version_table(path: &Path) -> Option<u32> {
 /// unreserved set is encoded so spaces and shell-hostile names survive.
 #[cfg(feature = "legacy-sqlite")]
 fn uri_encode_path(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    let mut out = String::with_capacity(text.len());
-    for byte in text.as_bytes() {
+    // Raw OS bytes on Unix: a path need not be valid UTF-8, and a lossy
+    // conversion would name a different file.
+    #[cfg(unix)]
+    let bytes: std::borrow::Cow<'_, [u8]> = {
+        use std::os::unix::ffi::OsStrExt;
+        std::borrow::Cow::Borrowed(path.as_os_str().as_bytes())
+    };
+    #[cfg(not(unix))]
+    let bytes: std::borrow::Cow<'_, [u8]> =
+        std::borrow::Cow::Owned(path.to_string_lossy().into_owned().into_bytes());
+    let mut out = String::with_capacity(bytes.len());
+    for byte in bytes.iter() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b'~' => {
                 out.push(*byte as char)
@@ -180,6 +233,28 @@ mod tests {
     }
 
     #[test]
+    fn strict_detect_passes_only_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            detect_v3_strict(&dir.path().join("absent.db"))
+                .unwrap()
+                .is_none()
+        );
+        let empty = dir.path().join("empty.db");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(detect_v3_strict(&empty).is_err());
+        let junk = dir.path().join("junk.db");
+        std::fs::write(&junk, b"not a database header at all").unwrap();
+        assert!(detect_v3_strict(&junk).is_err());
+        let unreadable = dir.path().join("dir.db");
+        std::fs::create_dir(&unreadable).unwrap();
+        assert!(detect_v3_strict(&unreadable).is_err());
+        let v3 = dir.path().join("v3.db");
+        std::fs::write(&v3, b"SQLite format 3\0rest of header").unwrap();
+        assert!(detect_v3_strict(&v3).unwrap().is_some());
+    }
+
+    #[test]
     fn refusal_error_carries_path_schema_and_hint() {
         let info = V3Info {
             path: PathBuf::from("/tmp/vestige.db"),
@@ -197,5 +272,13 @@ mod tests {
             }
             other => panic!("wrong error: {other:?}"),
         }
+    }
+
+    #[cfg(all(unix, feature = "legacy-sqlite"))]
+    #[test]
+    fn a_non_utf8_path_is_encoded_from_its_raw_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/data/d-\xff\xfe/vestige.db"));
+        assert_eq!(uri_encode_path(path), "/data/d-%FF%FE/vestige.db");
     }
 }

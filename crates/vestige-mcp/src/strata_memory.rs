@@ -93,7 +93,7 @@ pub fn open(dir: impl AsRef<Path>) -> Result<Arc<Storage>, StorageError> {
 
 static OPEN_LOGS: Mutex<Vec<(PathBuf, Weak<StrataMemory>)>> = Mutex::new(Vec::new());
 
-fn register_open(memory: &Arc<StrataMemory>) {
+pub(crate) fn register_open(memory: &Arc<StrataMemory>) {
     let mut open = OPEN_LOGS.lock().unwrap_or_else(|err| err.into_inner());
     open.retain(|(_, weak)| weak.strong_count() > 0);
     open.push((memory.log_dir.clone(), Arc::downgrade(memory)));
@@ -109,6 +109,35 @@ fn live_memory(storage: &Storage) -> Option<Arc<StrataMemory>> {
     open.iter()
         .find(|(log_dir, _)| log_dir == &path)
         .and_then(|(_, weak)| weak.upgrade())
+}
+
+/// What a whole-log verification covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogCheck {
+    /// Segments scanned, sealed and active.
+    pub segments: u32,
+    /// Sealed segments whose signed trailer was checked.
+    pub sealed_segments: u32,
+    /// Frames read back and re-hashed.
+    pub frames: u64,
+}
+
+/// Re-verify every segment of the Strata log this process has open: frame and
+/// segment hash chains, payload hashes, each sealed segment's signed trailer.
+/// Damage is an error, and the log then refuses further writes.
+pub fn verify_log(storage: &Storage) -> Result<LogCheck, String> {
+    let memory =
+        live_memory(storage).ok_or_else(|| "strata log is not open in this process".to_string())?;
+    let store = memory.lock();
+    store
+        .log()
+        .verify_log()
+        .map(|report| LogCheck {
+            segments: report.segments,
+            sealed_segments: report.sealed_segments,
+            frames: report.frames,
+        })
+        .map_err(|err| err.to_string())
 }
 
 /// `memory_status` view `provenance` on a Strata log.
@@ -248,6 +277,46 @@ pub struct StrataMemory {
     merge_policy: Mutex<Option<vestige_core::MergePolicy>>,
 }
 
+/// File in the data directory recording when maintenance last completed:
+/// `{"lastBackupMs": .., "lastDreamMs": ..}`. It holds timestamps only, never
+/// memory content, and is read by `session_start` for `needsBackup` and
+/// `needsDream`.
+const MAINTENANCE_STAMPS: &str = "maintenance-stamps.json";
+
+impl StrataMemory {
+    /// When `key` last completed, or `None` when it never has or the stamp
+    /// file is missing or unreadable.
+    fn maintenance_stamp(&self, key: &str) -> Option<DateTime<Utc>> {
+        let raw = std::fs::read(self.data_dir.join(MAINTENANCE_STAMPS)).ok()?;
+        let stamps: Value = serde_json::from_slice(&raw).ok()?;
+        DateTime::from_timestamp_millis(stamps.get(key)?.as_i64()?)
+    }
+
+    /// Record that `key` completed at `at`. A stamp only moves forward, the
+    /// other stamps are kept, and the file is replaced by rename so a crash
+    /// never leaves it torn.
+    fn record_maintenance_stamp(&self, key: &str, at: DateTime<Utc>) -> std::io::Result<()> {
+        let path = self.data_dir.join(MAINTENANCE_STAMPS);
+        let mut stamps = std::fs::read(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        let at_ms = at.timestamp_millis();
+        if stamps
+            .get(key)
+            .and_then(Value::as_i64)
+            .is_some_and(|prev| prev >= at_ms)
+        {
+            return Ok(());
+        }
+        stamps[key] = json!(at_ms);
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&stamps)?)?;
+        std::fs::rename(&tmp, &path)
+    }
+}
+
 impl StrataMemory {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StorageError> {
         Self::open_with_policy(dir, strata_store::default_policy())
@@ -282,6 +351,79 @@ impl StrataMemory {
             .into_iter()
             .filter(|record| record.is_live())
             .collect()
+    }
+}
+
+/// What kind of stored record an audit row describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditKind {
+    Memory,
+    Intention,
+}
+
+/// One stored record with every text field it carries, for the credential
+/// audit. Retired and suppressed memories are included: their bytes stay in
+/// the append-only log.
+#[derive(Debug, Clone)]
+pub struct AuditRecord {
+    pub id: String,
+    pub kind: AuditKind,
+    pub retired: bool,
+    pub created_at: DateTime<Utc>,
+    pub texts: Vec<String>,
+}
+
+/// Every record of the open Strata log, for `scan-secrets`. `None` when
+/// `storage` is not a Strata log opened in this process.
+pub fn secret_audit_records(storage: &Storage) -> Option<Vec<AuditRecord>> {
+    live_memory(storage).map(|memory| memory.audit_records())
+}
+
+impl StrataMemory {
+    fn audit_records(&self) -> Vec<AuditRecord> {
+        let store = self.lock();
+        let mut rows: Vec<AuditRecord> = store
+            .nodes()
+            .iter()
+            .map(|record| {
+                let mut texts = vec![
+                    record.content.clone(),
+                    record.node_type.clone(),
+                    record.scope.clone(),
+                ];
+                texts.extend(record.tags.iter().cloned());
+                if let Some(source) = record.source.as_ref() {
+                    texts.extend([
+                        source.system.clone(),
+                        source.project.clone(),
+                        source.id.clone(),
+                    ]);
+                }
+                AuditRecord {
+                    id: record.id.clone(),
+                    kind: AuditKind::Memory,
+                    retired: !record.is_live(),
+                    created_at: ms_to_dt(record.created_at_ms),
+                    texts,
+                }
+            })
+            .collect();
+        rows.extend(store.intentions().iter().map(|record| {
+            let mut texts = vec![record.content.clone(), record.trigger_data.clone()];
+            texts.extend(record.notes.clone());
+            texts.extend(record.source_data.clone());
+            texts.extend(record.scope.clone());
+            texts.extend(record.tags.iter().cloned());
+            AuditRecord {
+                id: record.id.clone(),
+                kind: AuditKind::Intention,
+                retired: false,
+                created_at: ms_to_dt(record.created_at_ms),
+                texts,
+            }
+        }));
+        rows.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        rows
     }
 }
 
@@ -646,6 +788,63 @@ fn blocking_secrets(text: &str) -> Vec<String> {
         .filter(|finding| finding.blocks_ingestion())
         .map(|finding| finding.kind.to_string())
         .collect()
+}
+
+/// Credential kinds found across `texts`, each kind once, in first-seen order.
+pub(crate) fn blocking_secrets_in<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut kinds: Vec<String> = Vec::new();
+    for text in texts {
+        for kind in blocking_secrets(text) {
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+    }
+    kinds
+}
+
+/// Every text field an ingest stores: content, type, tags and provenance.
+fn stored_ingest_texts(input: &IngestInput) -> Vec<&str> {
+    let mut texts = vec![input.content.as_str(), input.node_type.as_str()];
+    texts.extend(input.tags.iter().map(String::as_str));
+    texts.extend(input.source.as_deref());
+    if let Some(envelope) = input.source_envelope.as_ref() {
+        texts.extend(envelope.source_system.as_deref());
+        texts.extend(envelope.source_id.as_deref());
+        texts.extend(envelope.source_project.as_deref());
+    }
+    texts
+}
+
+/// The credential gate for one ingest. The scope is checked under every
+/// policy: it names a namespace that reads and write responses repeat, so the
+/// explicit override covers the memory's own text, never the scope.
+fn gate_ingest(input: &IngestInput, scope: &str, policy: SecretPolicy) -> Result<(), StorageError> {
+    let mut texts = vec![scope];
+    if policy != SecretPolicy::AllowExplicitly {
+        texts.extend(stored_ingest_texts(input));
+    }
+    let kinds = blocking_secrets_in(texts);
+    if kinds.is_empty() {
+        Ok(())
+    } else {
+        Err(StorageError::SecretDetected { kinds })
+    }
+}
+
+/// The credential gate for one intention: every text field it stores.
+fn gate_intention(intention: &vestige_core::storage::IntentionRecord) -> Result<(), StorageError> {
+    let mut texts = vec![intention.content.as_str(), intention.trigger_data.as_str()];
+    texts.extend(intention.notes.as_deref());
+    texts.extend(intention.source_data.as_deref());
+    texts.extend(intention.scope.as_deref());
+    texts.extend(intention.tags.iter().map(String::as_str));
+    let kinds = blocking_secrets_in(texts);
+    if kinds.is_empty() {
+        Ok(())
+    } else {
+        Err(StorageError::SecretDetected { kinds })
+    }
 }
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
@@ -1027,7 +1226,31 @@ impl MemoryStoreSend for StrataMemory {
     }
 
     fn last_backup_timestamp(&self) -> Option<DateTime<Utc>> {
-        None
+        self.maintenance_stamp("lastBackupMs")
+    }
+
+    fn get_last_dream(&self) -> Result<Option<DateTime<Utc>>, StorageError> {
+        Ok(self.maintenance_stamp("lastDreamMs"))
+    }
+
+    fn save_dream_history(
+        &self,
+        record: &vestige_core::DreamHistoryRecord,
+    ) -> Result<i64, StorageError> {
+        self.record_maintenance_stamp("lastDreamMs", record.dreamed_at)
+            .map_err(|err| StorageError::Init(format!("dream stamp not recorded: {err}")))?;
+        Ok(0)
+    }
+
+    fn count_memories_since(&self, since: DateTime<Utc>) -> Result<i64, StorageError> {
+        let since_ms = since.timestamp_millis();
+        let store = self.lock();
+        Ok(store
+            .nodes()
+            .into_iter()
+            .filter(retrievable)
+            .filter(|record| record.created_at_ms > since_ms)
+            .count() as i64)
     }
 
     fn process_actor_did(&self) -> Option<String> {
@@ -1176,7 +1399,11 @@ impl MemoryStoreSend for StrataMemory {
     }
 
     fn backup_to(&self, path: &Path) -> Result<(), StorageError> {
-        self.lock().backup_to(path).map_err(map_store)
+        self.lock().backup_to(path).map_err(map_store)?;
+        // The backup is complete; a stamp that fails to write only leaves
+        // `needsBackup` set, it never fails the backup.
+        let _ = self.record_maintenance_stamp("lastBackupMs", Utc::now());
+        Ok(())
     }
 
     fn checkpoint_wal(
@@ -1232,12 +1459,7 @@ impl MemoryStoreSend for StrataMemory {
         scope: &str,
         policy: SecretPolicy,
     ) -> Result<KnowledgeNode, StorageError> {
-        if policy != SecretPolicy::AllowExplicitly {
-            let kinds = blocking_secrets(&input.content);
-            if !kinds.is_empty() {
-                return Err(StorageError::SecretDetected { kinds });
-            }
-        }
+        gate_ingest(&input, scope, policy)?;
         if input.content.trim().is_empty() {
             return Err(StorageError::Init("content must not be empty".into()));
         }
@@ -1413,6 +1635,59 @@ impl MemoryStoreSend for StrataMemory {
     /// that trail exists, so a retired record cannot stay in the picture or
     /// bridge two live ones. Node order is BFS by hop, each hop sorted by id;
     /// edges are sorted by source, target, link type, then creation time.
+    /// The live memory with the most recorded links: a count of link records
+    /// on the log, never a similarity. Only links whose two ends are both
+    /// live count, the same test the subgraph walk applies, so the answer is
+    /// always a center that walk can open. `None` when no memory has a link.
+    /// Ties go to the newest memory, then to the smallest id.
+    fn get_most_connected_memory(&self) -> Result<Option<String>, StorageError> {
+        let store = self.lock();
+        let superseded: HashSet<String> = store
+            .supersession_pairs()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        // id -> (links, created_at_ms); `None` marks an end that is not live.
+        let mut seen: BTreeMap<String, Option<(usize, i64)>> = BTreeMap::new();
+        let mut live = |id: &str| -> bool {
+            if let Some(entry) = seen.get(id) {
+                return entry.is_some();
+            }
+            let entry = store
+                .get_node(id)
+                .filter(|record| record.is_live() && !superseded.contains(id))
+                .map(|record| (0, record.created_at_ms));
+            let is_live = entry.is_some();
+            seen.insert(id.to_string(), entry);
+            is_live
+        };
+        let mut linked = Vec::new();
+        for edge in store.edges().iter() {
+            if edge.source_id != edge.target_id && live(&edge.source_id) && live(&edge.target_id) {
+                linked.push((edge.source_id.clone(), edge.target_id.clone()));
+            }
+        }
+        for (source, target) in linked {
+            for id in [source, target] {
+                if let Some(Some((links, _))) = seen.get_mut(&id) {
+                    *links += 1;
+                }
+            }
+        }
+        Ok(seen
+            .into_iter()
+            .filter_map(|(id, entry)| entry.filter(|(links, _)| *links > 0).map(|e| (id, e)))
+            .max_by(
+                |(a_id, (a_links, a_created)), (b_id, (b_links, b_created))| {
+                    a_links
+                        .cmp(b_links)
+                        .then(a_created.cmp(b_created))
+                        .then_with(|| b_id.cmp(a_id))
+                },
+            )
+            .map(|(id, _)| id))
+    }
+
     fn get_memory_subgraph(
         &self,
         center_id: &str,
@@ -2252,13 +2527,38 @@ impl MemoryStoreSend for StrataMemory {
         let frame = parse_op_frame(op_id)
             .ok_or_else(|| StorageError::NotFound(format!("operation {op_id}")))?;
         let mut store = self.lock();
+        // Versions this write's node retired (an edit's predecessors). The
+        // undo brings them back, so the operation reports them as affected.
+        let predecessors: Vec<String> = store
+            .node_writes()
+            .into_iter()
+            .find(|write| write.frame_seq == frame)
+            .map(|write| {
+                store
+                    .supersession_pairs()
+                    .into_iter()
+                    .filter(|(_, successor)| *successor == write.record.id)
+                    .map(|(old, _)| old)
+                    .collect()
+            })
+            .unwrap_or_default();
         let new_seq = store.undo_node_write(frame).map_err(map_store)?;
-        store
+        let mut op = store
             .node_writes()
             .into_iter()
             .find(|write| write.frame_seq == new_seq)
             .map(merge_operation)
-            .ok_or_else(|| StorageError::Init("compensating record vanished after append".into()))
+            .ok_or_else(|| {
+                StorageError::Init("compensating record vanished after append".into())
+            })?;
+        for id in predecessors {
+            if store.get_node(&id).is_some_and(|node| node.is_live())
+                && !op.affected_ids.contains(&id)
+            {
+                op.affected_ids.push(id);
+            }
+        }
+        Ok(op)
     }
 
     fn get_consolidation_history(
@@ -2413,6 +2713,7 @@ impl MemoryStoreSend for StrataMemory {
         &self,
         intention: &vestige_core::storage::IntentionRecord,
     ) -> Result<(), StorageError> {
+        gate_intention(intention)?;
         self.lock()
             .upsert_intentions(vec![stored_intention(intention)])
             .map_err(map_store)
@@ -2428,6 +2729,9 @@ impl MemoryStoreSend for StrataMemory {
             return Ok(false);
         }
         let mut record = core_intention(&current)?;
+        if matches!(record.status.as_str(), "fulfilled" | "cancelled") {
+            return Ok(false);
+        }
         record.status = "snoozed".to_string();
         record.snoozed_until = Some(until);
         store
@@ -2961,6 +3265,68 @@ mod tests {
         assert!(err.contains("similarity_disabled"), "{err}");
         assert!(again.source.is_none());
         assert!(again.source_envelope.is_none());
+    }
+
+    fn remove_segments(dir: &Path) {
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "seg") {
+                    std::fs::remove_file(&path).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn receipt_lookup_after_edit_is_served_without_rereading_the_log() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let memory = StrataMemory::open(dir.path()).unwrap();
+        let node = memory
+            .ingest_in_scope(
+                IngestInput {
+                    content: "receipt lookup fixture".into(),
+                    ..IngestInput::default()
+                },
+                "user",
+            )
+            .unwrap();
+        memory
+            .update_node_content(&node.id, "receipt lookup fixture, edited")
+            .unwrap();
+        let successor = memory
+            .lock()
+            .supersession_pairs()
+            .into_iter()
+            .find(|(old, _)| old == &node.id)
+            .map(|(_, successor)| successor)
+            .expect("edit retired the original");
+
+        // With the segment files gone, only the in-memory effect index can answer.
+        remove_segments(dir.path());
+
+        let receipt = memory
+            .get_receipt(&successor)
+            .unwrap()
+            .expect("edit receipt for the successor");
+        assert_eq!(receipt.retrieved, vec![successor.clone()]);
+        let by_id = memory
+            .get_receipt(&receipt.receipt_id)
+            .unwrap()
+            .expect("lookup by receipt id");
+        assert_eq!(by_id.receipt_id, receipt.receipt_id);
+        assert!(
+            memory
+                .receipt_attestation_status(&successor)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -3856,5 +4222,186 @@ mod tests {
         let reopened = super::open(dir.path()).unwrap();
         assert!(reopened.get_node(&record).unwrap().is_none());
         assert!(reopened.get_node(&kept).unwrap().is_some());
+    }
+
+    fn token(fill: &str) -> String {
+        format!("ghp_{}", fill.repeat(36))
+    }
+
+    fn plain_input() -> IngestInput {
+        IngestInput {
+            content: "Synthetic note with no credential".into(),
+            node_type: "fact".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ingest_gate_refuses_a_credential_in_any_stored_field() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = StrataMemory::open(dir.path()).unwrap();
+        let secret = token("A");
+
+        let mut in_tag = plain_input();
+        in_tag.tags = vec!["safe".into(), secret.clone()];
+        let mut in_source = plain_input();
+        in_source.source = Some(format!("https://example.invalid/?t={secret}"));
+        let mut in_envelope = plain_input();
+        let mut envelope = SourceEnvelope::default();
+        envelope.source_system = Some("tracker".into());
+        envelope.source_id = Some(secret.clone());
+        in_envelope.source_envelope = Some(envelope);
+        let mut in_project = plain_input();
+        let mut envelope = SourceEnvelope::default();
+        envelope.source_system = Some("tracker".into());
+        envelope.source_id = Some("42".into());
+        envelope.source_project = Some(secret.clone());
+        in_project.source_envelope = Some(envelope);
+        let mut in_type = plain_input();
+        in_type.node_type = secret.clone();
+
+        for (field, input) in [
+            ("tag", in_tag),
+            ("source", in_source),
+            ("envelope id", in_envelope),
+            ("envelope project", in_project),
+            ("node type", in_type),
+        ] {
+            let err = store.ingest(input).expect_err(field);
+            assert!(
+                matches!(err, StorageError::SecretDetected { .. }),
+                "{field}: {err}"
+            );
+            assert!(
+                !err.to_string().contains(&secret),
+                "{field}: the refusal must not echo the credential"
+            );
+        }
+        let err = store
+            .ingest_in_scope(plain_input(), &secret)
+            .expect_err("scope");
+        assert!(
+            matches!(err, StorageError::SecretDetected { .. }),
+            "scope: {err}"
+        );
+        assert!(!err.to_string().contains(&secret));
+        assert!(
+            store.nodes().is_empty(),
+            "a refused write must leave nothing in the log"
+        );
+
+        // The explicit override covers the memory's own text, never a scope
+        // name, which is echoed by every read and write response.
+        let mut allowed = plain_input();
+        allowed.tags = vec![secret.clone()];
+        store
+            .ingest_with_secret_policy(allowed, SecretPolicy::AllowExplicitly)
+            .expect("explicit override keeps working for tags");
+        let err = store
+            .ingest_in_scope_with_secret_policy(
+                plain_input(),
+                &secret,
+                SecretPolicy::AllowExplicitly,
+            )
+            .expect_err("scope stays gated under the override");
+        assert!(matches!(err, StorageError::SecretDetected { .. }));
+        assert!(store.ingest(plain_input()).is_ok(), "clean input passes");
+    }
+
+    #[test]
+    fn save_intention_refuses_a_credential_in_any_stored_field() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = StrataMemory::open(dir.path()).unwrap();
+        let secret = token("B");
+
+        let mut in_content = sample_intention("int-content");
+        in_content.content = format!("rotate {secret} on Friday");
+        let mut in_tags = sample_intention("int-tags");
+        in_tags.tags = vec![secret.clone()];
+        let mut in_notes = sample_intention("int-notes");
+        in_notes.notes = Some(secret.clone());
+        let mut in_scope = sample_intention("int-scope");
+        in_scope.scope = Some(secret.clone());
+        let mut in_trigger = sample_intention("int-trigger");
+        in_trigger.trigger_data = format!("{{\"condition\":\"{secret}\"}}");
+        let mut in_source = sample_intention("int-source");
+        in_source.source_data = Some(secret.clone());
+
+        for (field, record) in [
+            ("content", in_content),
+            ("tags", in_tags),
+            ("notes", in_notes),
+            ("scope", in_scope),
+            ("trigger", in_trigger),
+            ("source data", in_source),
+        ] {
+            let err = store.save_intention(&record).expect_err(field);
+            assert!(
+                matches!(err, StorageError::SecretDetected { .. }),
+                "{field}: {err}"
+            );
+            assert!(
+                !err.to_string().contains(&secret),
+                "{field}: the refusal must not echo the credential"
+            );
+        }
+        assert!(
+            store.lock().intentions().is_empty(),
+            "a refused intention must leave nothing in the log"
+        );
+        store
+            .save_intention(&sample_intention("int-clean"))
+            .expect("clean intention passes");
+    }
+
+    #[test]
+    fn audit_records_reach_retired_memories_scopes_and_intentions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let secret = token("C");
+        // Records written before the gate covered every field still sit in
+        // the log. Seed them below the gate, as an older binary would have.
+        let (retired_id, scoped_id) = {
+            let mut raw = strata_store::StrataStore::open(dir.path()).unwrap();
+            let node = |tags: Vec<String>| strata_store::IngestInput {
+                content: "Synthetic note".into(),
+                source: None,
+                source_updated_at_ms: None,
+                node_type: "fact".into(),
+                tags,
+                created_at_ms: Some(1),
+                valid_from_ms: None,
+                valid_until_ms: None,
+            };
+            let retired = raw
+                .ingest_in_scope(node(vec![secret.clone()]), "user")
+                .unwrap();
+            let scoped = raw.ingest_in_scope(node(Vec::new()), &secret).unwrap();
+            let mut intention = stored_intention(&sample_intention("int-audit"));
+            intention.content = format!("rotate {secret}");
+            raw.upsert_intentions(vec![intention]).unwrap();
+            (retired, scoped)
+        };
+        let store = StrataMemory::open(dir.path()).unwrap();
+        store.suppress_memory(&retired_id).unwrap();
+        assert!(store.get_node(&retired_id).unwrap().is_none());
+
+        let records = store.audit_records();
+        let find = |id: &str| {
+            records
+                .iter()
+                .find(|record| record.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from the audit set"))
+        };
+        let hit = |id: &str| {
+            find(id)
+                .texts
+                .iter()
+                .any(|text| !blocking_secrets(text).is_empty())
+        };
+        assert!(find(&retired_id).retired, "suppressed memory is audited");
+        assert!(hit(&retired_id), "tag on a suppressed memory is scanned");
+        assert!(hit(&scoped_id), "a scope name is scanned");
+        assert!(hit("int-audit"), "an intention is scanned");
+        assert_eq!(find("int-audit").kind, AuditKind::Intention);
     }
 }

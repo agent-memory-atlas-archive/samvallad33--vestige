@@ -1275,6 +1275,63 @@ fn remove_legacy_launchd_job(home: &Path) {
     }
 }
 
+/// Load the Claude Code settings file for a merge. A missing or blank file is an
+/// empty object; a file that is not a JSON object is an error and is never
+/// replaced.
+fn read_settings_for_update(settings_path: &Path) -> anyhow::Result<serde_json::Value> {
+    let raw = match fs::read_to_string(settings_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(serde_json::json!({}));
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", settings_path.display()));
+        }
+    };
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let settings: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "{} is not valid JSON; fix or move it and re-run (it was left unchanged)",
+            settings_path.display()
+        )
+    })?;
+    if !settings.is_object() {
+        anyhow::bail!(
+            "{} does not hold a JSON object; fix or move it and re-run (it was left unchanged)",
+            settings_path.display()
+        );
+    }
+    Ok(settings)
+}
+
+/// Copy the current settings file aside before it is rewritten. The first
+/// backup ever taken is kept as-is; a second backup is refreshed on every run.
+fn backup_settings_before_rewrite(claude_dir: &Path, settings_path: &Path) -> anyhow::Result<()> {
+    if !settings_path.exists() {
+        return Ok(());
+    }
+    let first = claude_dir.join("settings.json.bak.pre-sandwich");
+    let latest = claude_dir.join("settings.json.bak.last-sandwich");
+    let mut targets = vec![latest];
+    if !first.exists() {
+        targets.push(first);
+    }
+    for target in targets {
+        fs::copy(settings_path, &target)
+            .with_context(|| format!("failed to back up to {}", target.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&target)?.permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(&target, perms)?;
+        }
+    }
+    Ok(())
+}
+
 fn install_sandwich_from_source(
     source_root: &Path,
     options: &SandwichInstallOptions,
@@ -1308,6 +1365,10 @@ fn install_sandwich_from_source(
         with_launchd = false;
         enable_sanhedrin = true;
     }
+
+    // Read the settings first: an unreadable or unparseable file stops the
+    // install before anything on disk has changed.
+    let mut settings = read_settings_for_update(&settings_path)?;
 
     fs::create_dir_all(&claude_dir)?;
     let (hooks_copied, hooks_skipped) = copy_companion_files(
@@ -1387,24 +1448,7 @@ fn install_sandwich_from_source(
         install_launchd_job(&source_root, &home, &model)?;
     }
 
-    if !settings_path.exists() {
-        fs::write(&settings_path, "{}\n")?;
-    }
-    let backup_path = claude_dir.join("settings.json.bak.pre-sandwich");
-    if !backup_path.exists() {
-        fs::copy(&settings_path, &backup_path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&backup_path)?.permissions();
-            perms.set_mode(0o600);
-            fs::set_permissions(&backup_path, perms)?;
-        }
-    }
-
-    let settings_file = fs::File::open(&settings_path)?;
-    let mut settings: serde_json::Value =
-        serde_json::from_reader(settings_file).unwrap_or_else(|_| serde_json::json!({}));
+    backup_settings_before_rewrite(&claude_dir, &settings_path)?;
     scrub_vestige_hooks(&mut settings);
 
     if enable_preflight {
@@ -1424,9 +1468,10 @@ fn install_sandwich_from_source(
         )?;
     }
 
-    let mut settings_file = fs::File::create(&settings_path)?;
-    serde_json::to_writer_pretty(&mut settings_file, &settings)?;
-    writeln!(settings_file)?;
+    let mut rendered = serde_json::to_vec_pretty(&settings)?;
+    rendered.push(b'\n');
+    fs::write(&settings_path, rendered)
+        .with_context(|| format!("failed to write {}", settings_path.display()))?;
 
     if enable_preflight || enable_sanhedrin {
         let mut layers = Vec::new();
@@ -2912,16 +2957,37 @@ fn run_backup_through_server(data_dir: &Path, output: &Path) -> anyhow::Result<(
 }
 
 /// Copy a directory tree (a Strata backup: plain files in plain directories).
+///
+/// The copy is owner-only on unix (directories 0700, files 0600), like the
+/// backup it is copied from.
 fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::create_dir_all(to)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(to, fs::Permissions::from_mode(0o700))?;
+    }
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let target = to.join(entry.file_name());
         if entry.file_type()?.is_dir() {
             copy_dir_all(&entry.path(), &target)?;
         } else {
-            fs::copy(entry.path(), &target)?;
-            fs::File::open(&target)?.sync_all()?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut out = options.open(&target)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                out.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+            std::io::copy(&mut fs::File::open(entry.path())?, &mut out)?;
+            out.sync_all()?;
         }
     }
     Ok(())
@@ -3809,84 +3875,126 @@ fn run_ingest(
     Ok(())
 }
 
-/// Read-only audit of already-persisted memory text for credential shapes.
+/// Findings across `texts`, each (kind, fingerprint) once.
+fn credential_findings<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+    include_suspected: bool,
+) -> Vec<vestige_core::SecretFinding> {
+    let mut findings: Vec<vestige_core::SecretFinding> = Vec::new();
+    for text in texts {
+        for finding in scan_secrets(text) {
+            if !findings.contains(&finding) {
+                findings.push(finding);
+            }
+        }
+    }
+    findings
+        .retain(|finding| include_suspected || finding.confidence == SecretConfidence::Blocking);
+    findings
+}
+
+/// Read-only audit of already-persisted text for credential shapes.
 ///
-/// Deliberately emits IDs, detector classes, and short fingerprints only. It
-/// never prints the matching content, source, or surrounding context.
+/// On a Strata log it covers every record the log holds: live, suppressed and
+/// retired memories (their bytes stay in the append-only log), scopes,
+/// provenance, tags, and intentions. Deliberately emits IDs, detector
+/// classes, and short fingerprints only. It never prints the matching
+/// content, source, or surrounding context.
 fn run_scan_secrets(
     include_suspected: bool,
     json_output: bool,
     limit: Option<usize>,
 ) -> anyhow::Result<()> {
     let storage = open_storage()?;
-    let mut offset = 0_i32;
     let mut scanned = 0_usize;
     let mut hits = Vec::new();
 
-    loop {
-        let nodes = storage.get_all_nodes(100, offset)?;
-        if nodes.is_empty() {
-            break;
-        }
-        offset += nodes.len() as i32;
+    let hit_json = |id: &str,
+                    record_kind: &str,
+                    retired: bool,
+                    created_at: chrono::DateTime<chrono::Utc>,
+                    findings: Vec<vestige_core::SecretFinding>| {
+        serde_json::json!({
+            "nodeId": id,
+            "recordKind": record_kind,
+            "retired": retired,
+            "createdAt": created_at.to_rfc3339(),
+            "findings": findings.into_iter().map(|finding| serde_json::json!({
+                "kind": finding.kind.as_str(),
+                "confidence": finding.confidence.to_string(),
+                "fingerprint": finding.fingerprint,
+            })).collect::<Vec<_>>(),
+        })
+    };
 
-        for node in nodes {
+    if let Some(records) = vestige_mcp::strata_memory::secret_audit_records(storage.as_ref()) {
+        for record in records {
             scanned += 1;
-            let mut findings = scan_secrets(&node.content);
-            if let Some(source) = node.source.as_deref() {
-                for finding in scan_secrets(source) {
-                    if !findings.contains(&finding) {
-                        findings.push(finding);
-                    }
-                }
-            }
-            for tag in &node.tags {
-                for finding in scan_secrets(tag) {
-                    if !findings.contains(&finding) {
-                        findings.push(finding);
-                    }
-                }
-            }
-            if let Some(envelope) = node.source_envelope.as_ref() {
-                for value in [
-                    envelope.source_url.as_deref(),
-                    envelope.source_project.as_deref(),
-                    envelope.source_type.as_deref(),
-                    envelope.source_author.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    for finding in scan_secrets(value) {
-                        if !findings.contains(&finding) {
-                            findings.push(finding);
-                        }
-                    }
-                }
-            }
-            findings.retain(|finding| {
-                include_suspected || finding.confidence == SecretConfidence::Blocking
-            });
+            let findings =
+                credential_findings(record.texts.iter().map(String::as_str), include_suspected);
             if findings.is_empty() {
                 continue;
             }
-
-            hits.push(serde_json::json!({
-                "nodeId": node.id,
-                "createdAt": node.created_at.to_rfc3339(),
-                "findings": findings.into_iter().map(|finding| serde_json::json!({
-                    "kind": finding.kind.as_str(),
-                    "confidence": finding.confidence.to_string(),
-                    "fingerprint": finding.fingerprint,
-                })).collect::<Vec<_>>(),
-            }));
+            let record_kind = match record.kind {
+                vestige_mcp::strata_memory::AuditKind::Memory => "memory",
+                vestige_mcp::strata_memory::AuditKind::Intention => "intention",
+            };
+            hits.push(hit_json(
+                &record.id,
+                record_kind,
+                record.retired,
+                record.created_at,
+                findings,
+            ));
             if limit.is_some_and(|max| hits.len() >= max) {
                 break;
             }
         }
+    } else {
+        let mut offset = 0_i32;
+        loop {
+            let nodes = storage.get_all_nodes(100, offset)?;
+            if nodes.is_empty() {
+                break;
+            }
+            offset += nodes.len() as i32;
 
-        if limit.is_some_and(|max| hits.len() >= max) {
-            break;
+            for node in nodes {
+                scanned += 1;
+                let mut texts: Vec<&str> = vec![node.content.as_str()];
+                texts.extend(node.source.as_deref());
+                texts.extend(node.tags.iter().map(String::as_str));
+                if let Some(envelope) = node.source_envelope.as_ref() {
+                    texts.extend(
+                        [
+                            envelope.source_url.as_deref(),
+                            envelope.source_project.as_deref(),
+                            envelope.source_type.as_deref(),
+                            envelope.source_author.as_deref(),
+                        ]
+                        .into_iter()
+                        .flatten(),
+                    );
+                }
+                let findings = credential_findings(texts, include_suspected);
+                if findings.is_empty() {
+                    continue;
+                }
+                hits.push(hit_json(
+                    &node.id,
+                    "memory",
+                    false,
+                    node.created_at,
+                    findings,
+                ));
+                if limit.is_some_and(|max| hits.len() >= max) {
+                    break;
+                }
+            }
+
+            if limit.is_some_and(|max| hits.len() >= max) {
+                break;
+            }
         }
     }
 
@@ -3900,17 +4008,22 @@ fn run_scan_secrets(
             }))?
         );
     } else if hits.is_empty() {
-        println!("No potential credentials found across {scanned} memories.");
+        println!("No potential credentials found across {scanned} records.");
     } else {
         println!(
-            "Potential credentials found in {} of {scanned} scanned memories:",
+            "Potential credentials found in {} of {scanned} scanned records:",
             hits.len()
         );
         for hit in &hits {
             let node_id = hit["nodeId"].as_str().unwrap_or("unknown");
+            let note = match (hit["recordKind"].as_str(), hit["retired"].as_bool()) {
+                (Some("intention"), _) => " | intention",
+                (_, Some(true)) => " | suppressed or retired",
+                _ => "",
+            };
             for finding in hit["findings"].as_array().into_iter().flatten() {
                 println!(
-                    "{node_id} | {} | {} | {}",
+                    "{node_id} | {} | {} | {}{note}",
                     finding["kind"].as_str().unwrap_or("unknown"),
                     finding["confidence"].as_str().unwrap_or("unknown"),
                     finding["fingerprint"].as_str().unwrap_or("unknown"),
@@ -5171,8 +5284,9 @@ fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
     let mut open_browser = open_browser;
 
     // Usually an agent's vestige-mcp holds the store. That process serves the
-    // dashboard on request, for as long as this command runs; if it exits,
-    // this process takes the store and serves the dashboard itself.
+    // dashboard on request, for as long as this command runs (it stops the
+    // dashboard when the last `vestige dashboard` using it exits); if it
+    // exits, this process takes the store and serves the dashboard itself.
     let wait = vestige_mcp::attach::election_wait();
     let mut deadline = std::time::Instant::now() + wait;
     while !take_cli_lock(&dir)? {
@@ -5184,6 +5298,16 @@ fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
                     ">".cyan(),
                     lease.owner_pid
                 );
+                // That server runs one dashboard. When it already serves one
+                // on another port, say so rather than drop --port silently.
+                if let Some(serving) = url_port(&lease.url)
+                    && serving != port
+                {
+                    println!(
+                        "  {} --port {port} was not used: that server already serves the dashboard on port {serving}",
+                        "!".yellow()
+                    );
+                }
                 if open_browser {
                     let _ = open::that(&lease.url);
                     open_browser = false;
@@ -5250,6 +5374,11 @@ fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
         tokio::signal::ctrl_c().await.ok();
         Ok(())
     })
+}
+
+/// The port in a `http://host:port` URL.
+fn url_port(url: &str) -> Option<u16> {
+    url.rsplit_once(':')?.1.trim_end_matches('/').parse().ok()
 }
 
 /// Start standalone HTTP MCP server (no stdio transport)
@@ -5583,6 +5712,25 @@ mod strata_cli_tests {
             !dir.path().join("backups").exists(),
             "resolving created a directory"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_backup_tree_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("made");
+        std::fs::create_dir_all(from.join("log")).unwrap();
+        std::fs::write(from.join("log").join("a.seg"), [1u8; 4]).unwrap();
+        std::fs::write(from.join("store.meta"), [2u8; 4]).unwrap();
+        let to = dir.path().join("copy");
+        copy_dir_all(&from, &to).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&to), 0o700);
+        assert_eq!(mode(&to.join("log")), 0o700);
+        assert_eq!(mode(&to.join("log").join("a.seg")), 0o600);
+        assert_eq!(mode(&to.join("store.meta")), 0o600);
+        assert_eq!(std::fs::read(to.join("store.meta")).unwrap(), [2u8; 4]);
     }
 
     #[test]

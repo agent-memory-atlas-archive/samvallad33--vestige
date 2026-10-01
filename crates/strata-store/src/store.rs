@@ -32,6 +32,59 @@ use crate::types::{
 
 /// Subdirectory holding the durable log.
 const LOG_DIR: &str = "log";
+
+/// Create `path` and any missing parents; directories made here are owner-only
+/// (0700) on unix.
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        set_private_dir(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
+/// Restrict an existing directory to its owner (0700) on unix.
+fn set_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Copy a file, creating the destination owner-only (0600) on unix so the
+/// copy is never readable by others, even briefly.
+fn copy_private_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut source = std::fs::File::open(from)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut target = options.open(to)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        target.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::io::copy(&mut source, &mut target)?;
+    Ok(())
+}
 /// Anchor file: hash of the head checkpoint (tamper-evidence for the
 /// successor-less head, per the strata-kernel verify contract).
 const META_NAME: &str = "store.meta";
@@ -320,6 +373,155 @@ pub(crate) fn migration_edge(payload: &[u8]) -> Option<strata_migrate::EdgeRecor
         .filter(|edge| edge.record_version == strata_migrate::RECORD_VERSION)
 }
 
+/// The proofs one admitted `StoreOp` lands. `prove_effects` (full log scan)
+/// and the incremental effect index share this, so they cannot diverge.
+/// `handles` maps card handles to node ids seen so far (admitted upserts and
+/// imported nodes).
+fn effect_proofs_for_op(
+    op: &StoreOp,
+    effect_seq: u64,
+    data_seq: u64,
+    digest: [u8; 32],
+    rule: Option<&'static str>,
+    handles: &mut HashMap<u64, String>,
+) -> Result<Vec<EffectProof>, StoreError> {
+    let single = |node_id: String, action, rating, edge| {
+        Ok(vec![EffectProof {
+            effect_seq,
+            data_seq,
+            node_id,
+            action,
+            payload_digest: digest,
+            rating,
+            edge,
+        }])
+    };
+    match op {
+        StoreOp::UpsertNode { record } => {
+            let handle = handle_of(&record.id);
+            let action = if handles.contains_key(&handle) {
+                EffectAction::Rewrite
+            } else {
+                EffectAction::Create
+            };
+            handles.insert(handle, record.id.clone());
+            single(record.id.clone(), action, None, None)
+        }
+        StoreOp::SupersedeNode { superseded_by, .. } if rule == Some(RULE_EDIT) => {
+            single(superseded_by.clone(), EffectAction::Edit, None, None)
+        }
+        StoreOp::ReviewNode {
+            card_id, rating, ..
+        } => {
+            let Some(node_id) = handles.get(card_id).cloned() else {
+                return Err(StoreError::Verify(format!(
+                    "review effect {effect_seq} names an unknown card"
+                )));
+            };
+            single(node_id, EffectAction::Review, Some(*rating), None)
+        }
+        // One admitted batch: every row cites this effect.
+        StoreOp::UpsertIntentions { records } => Ok(records
+            .iter()
+            .map(|record| EffectProof {
+                effect_seq,
+                data_seq,
+                node_id: record.id.clone(),
+                action: EffectAction::Intention,
+                payload_digest: digest,
+                rating: None,
+                edge: None,
+            })
+            .collect()),
+        StoreOp::RecordAnchors { anchors } | StoreOp::ReplaceAnchors { anchors, .. } => Ok(anchors
+            .iter()
+            .map(|anchor| EffectProof {
+                effect_seq,
+                data_seq,
+                node_id: anchor.id.clone(),
+                action: EffectAction::Anchor,
+                payload_digest: digest,
+                rating: None,
+                edge: None,
+            })
+            .collect()),
+        StoreOp::RecordAnchorVerdict { anchor_id, .. } => {
+            single(anchor_id.clone(), EffectAction::AnchorVerdict, None, None)
+        }
+        StoreOp::SaveEdge { edge } => single(
+            edge.source_id.clone(),
+            EffectAction::Edge,
+            None,
+            Some((edge.target_id.clone(), edge.link_type.clone())),
+        ),
+        StoreOp::SupersedeNode { .. } => Ok(Vec::new()),
+    }
+}
+
+/// Incremental index over the proved effects: lookups by receipt seq or by
+/// node id without re-reading the log. Derived state, rebuilt by replay and
+/// extended by every admitted write, like the other registries.
+#[derive(Default)]
+struct EffectIndex {
+    proofs: Vec<EffectProof>,
+    /// Effect seq -> first proof that cites it.
+    by_seq: BTreeMap<u64, usize>,
+    /// Node id -> latest non-edge proof (highest effect seq; later wins ties).
+    latest: BTreeMap<String, usize>,
+    /// Card handle -> node id, including imported nodes.
+    handles: HashMap<u64, String>,
+    /// First review naming a card that was never created. Lookups report it
+    /// the way a full scan would.
+    poisoned: Option<String>,
+}
+
+impl EffectIndex {
+    fn note_imported(&mut self, legacy_id: &str) {
+        self.handles
+            .insert(handle_of(legacy_id), legacy_id.to_string());
+    }
+
+    fn record(
+        &mut self,
+        op: &StoreOp,
+        effect_seq: u64,
+        data_seq: u64,
+        digest: [u8; 32],
+        rule: Option<&'static str>,
+    ) {
+        if self.poisoned.is_some() {
+            return;
+        }
+        match effect_proofs_for_op(op, effect_seq, data_seq, digest, rule, &mut self.handles) {
+            Ok(rows) => {
+                for proof in rows {
+                    let idx = self.proofs.len();
+                    self.by_seq.entry(proof.effect_seq).or_insert(idx);
+                    if proof.action != EffectAction::Edge {
+                        let newer = self
+                            .latest
+                            .get(&proof.node_id)
+                            .is_none_or(|&at| self.proofs[at].effect_seq <= proof.effect_seq);
+                        if newer {
+                            self.latest.insert(proof.node_id.clone(), idx);
+                        }
+                    }
+                    self.proofs.push(proof);
+                }
+            }
+            Err(StoreError::Verify(message)) => self.poisoned = Some(message),
+            Err(other) => self.poisoned = Some(other.to_string()),
+        }
+    }
+
+    fn check(&self) -> Result<(), StoreError> {
+        match &self.poisoned {
+            Some(message) => Err(StoreError::Verify(message.clone())),
+            None => Ok(()),
+        }
+    }
+}
+
 pub(crate) fn classify_write_payload(payload: &[u8]) -> WritePayload {
     if let Some(op) = decode_exact::<StoreOp>(payload) {
         WritePayload::StoreOp(op)
@@ -437,6 +639,9 @@ pub struct StrataStore {
     /// Code anchors (derived). Rows of a retired node stay here; reads
     /// filter them out.
     anchors: AnchorIndex,
+    /// Proved effects by receipt seq and node id (derived). Lets receipt
+    /// lookups answer without re-reading the log.
+    effect_index: EffectIndex,
 }
 
 impl StrataStore {
@@ -495,6 +700,7 @@ impl StrataStore {
             retire_rules: BTreeMap::new(),
             upserts: BTreeMap::new(),
             anchors: AnchorIndex::default(),
+            effect_index: EffectIndex::default(),
         };
         store.replay()?;
         store.verify_checkpoint_chain()?;
@@ -570,12 +776,15 @@ impl StrataStore {
                         let admitted = pending.get_mut(&digest).and_then(|queue| queue.pop_front());
                         if let Some(gseq) = admitted {
                             self.apply_op(&op, gseq, seq)?;
+                            let rule = self.retire_rules.get(&gseq).copied();
+                            self.effect_index.record(&op, gseq, seq, digest, rule);
                         } else {
                             self.orphan_writes += 1;
                         }
                     }
                     WritePayload::ImportedNode(node) => {
                         imported_ids.insert(node.kernel_id, node.legacy_id.clone());
+                        self.effect_index.note_imported(&node.legacy_id);
                         self.apply_imported_node(&node);
                     }
                     WritePayload::Neither => self.orphan_writes += 1,
@@ -899,6 +1108,9 @@ impl StrataStore {
         context: Vec<u64>,
         params_hash: Option<[u8; 32]>,
     ) -> Result<(u64, u64), StoreError> {
+        // The gate frames below have no error channel: refuse up front when
+        // the log has already found damage in acked history.
+        self.log.ensure_writable()?;
         let fresh_id = match &op {
             StoreOp::UpsertNode { record }
                 if self.tool_call_open && !self.nodes.contains_key(&record.id) =>
@@ -918,10 +1130,14 @@ impl StrataStore {
             params_hash,
             context,
         };
+        // A full volume refuses a frame instead of aborting; each gate step
+        // is checked so a refused write stops here with the error.
+        let _ = self.gate_log.take_refusal();
         let propose_ack = runtime.commit_propose(propose);
-        let gate_ack = runtime
-            .commit_gate(propose_ack.seq)
-            .map_err(|e| StoreError::Gate(e.to_string()))?;
+        self.refused_append()?;
+        let gate_ack = runtime.commit_gate(propose_ack.seq);
+        self.refused_append()?;
+        let gate_ack = gate_ack.map_err(|e| StoreError::Gate(e.to_string()))?;
         let (_, verdict) = runtime
             .latest_gate(propose_ack.seq)
             .expect("commit_gate just appended the gate");
@@ -945,9 +1161,9 @@ impl StrataStore {
             action_hash,
             payload_digest: hash32(&op_bytes),
         };
-        let effect_ack: SeqAck = runtime
-            .commit_effect(effect)
-            .map_err(|r| StoreError::Rejected(r.to_string()))?;
+        let effect_ack = runtime.commit_effect(effect);
+        self.refused_append()?;
+        let effect_ack: SeqAck = effect_ack.map_err(|r| StoreError::Rejected(r.to_string()))?;
         if let Some(rule) = retire_rule_id(&params_hash) {
             self.retire_rules.insert(effect_ack.seq, rule);
         }
@@ -957,10 +1173,21 @@ impl StrataStore {
         let data_seq = data_acks[0].seq;
 
         self.apply_op(&op, effect_ack.seq, data_seq)?;
+        let rule = self.retire_rules.get(&effect_ack.seq).copied();
+        self.effect_index
+            .record(&op, effect_ack.seq, data_seq, action_hash, rule);
         if let Some(id) = fresh_id {
             self.call_admitted.insert(id);
         }
         Ok((effect_ack.seq, data_seq))
+    }
+
+    /// Surface a gate frame the log refused for lack of space.
+    fn refused_append(&self) -> Result<(), StoreError> {
+        match self.gate_log.take_refusal() {
+            Some(e) => Err(StoreError::Log(e)),
+            None => Ok(()),
+        }
     }
 
     fn context_for(&self, ids: &[&str]) -> Vec<u64> {
@@ -1647,9 +1874,10 @@ impl StrataStore {
     /// Every node, intention and code-anchor effect proved from the log, in
     /// effect-seq order.
     ///
-    /// `verify_tail` checks the active segment's hash chain (and the trailer
-    /// signature when the segment is sealed). Each effect must cite an Allow
-    /// gate and a data frame with the same payload digest.
+    /// The log read is strict: every segment's hash chain and every sealed
+    /// segment's signed trailer is checked, and damage anywhere is an error
+    /// rather than a shorter answer. Each effect must cite an Allow gate and
+    /// a data frame with the same payload digest.
     pub fn prove_effects(&self) -> Result<Vec<EffectProof>, StoreError> {
         self.log.verify_tail()?;
         let frames = self.log.read_frames(1)?;
@@ -1727,124 +1955,43 @@ impl StrataStore {
                         frame.seq
                     )));
                 };
-                let proof = match op {
-                    StoreOp::UpsertNode { record } => {
-                        let handle = handle_of(&record.id);
-                        let action = if handles.contains_key(&handle) {
-                            EffectAction::Rewrite
-                        } else {
-                            EffectAction::Create
-                        };
-                        handles.insert(handle, record.id.clone());
-                        EffectProof {
-                            effect_seq,
-                            data_seq: frame.seq,
-                            node_id: record.id,
-                            action,
-                            payload_digest: digest,
-                            rating: None,
-                            edge: None,
-                        }
-                    }
-                    StoreOp::SupersedeNode { superseded_by, .. } if rule == Some(RULE_EDIT) => {
-                        EffectProof {
-                            effect_seq,
-                            data_seq: frame.seq,
-                            node_id: superseded_by,
-                            action: EffectAction::Edit,
-                            payload_digest: digest,
-                            rating: None,
-                            edge: None,
-                        }
-                    }
-                    StoreOp::ReviewNode {
-                        card_id,
-                        rating,
-                        reviewed_at_ms: _,
-                    } => {
-                        let Some(node_id) = handles.get(&card_id).cloned() else {
-                            return Err(StoreError::Verify(format!(
-                                "review effect {effect_seq} names an unknown card"
-                            )));
-                        };
-                        EffectProof {
-                            effect_seq,
-                            data_seq: frame.seq,
-                            node_id,
-                            action: EffectAction::Review,
-                            payload_digest: digest,
-                            rating: Some(rating),
-                            edge: None,
-                        }
-                    }
-                    StoreOp::UpsertIntentions { records } => {
-                        // One admitted batch: every row cites this effect.
-                        proofs.extend(records.into_iter().map(|record| EffectProof {
-                            effect_seq,
-                            data_seq: frame.seq,
-                            node_id: record.id,
-                            action: EffectAction::Intention,
-                            payload_digest: digest,
-                            rating: None,
-                            edge: None,
-                        }));
-                        continue;
-                    }
-                    StoreOp::RecordAnchors { anchors }
-                    | StoreOp::ReplaceAnchors { anchors, .. } => {
-                        // One admitted batch: every anchor row cites this effect.
-                        proofs.extend(anchors.into_iter().map(|anchor| EffectProof {
-                            effect_seq,
-                            data_seq: frame.seq,
-                            node_id: anchor.id,
-                            action: EffectAction::Anchor,
-                            payload_digest: digest,
-                            rating: None,
-                            edge: None,
-                        }));
-                        continue;
-                    }
-                    StoreOp::RecordAnchorVerdict { anchor_id, .. } => EffectProof {
-                        effect_seq,
-                        data_seq: frame.seq,
-                        node_id: anchor_id,
-                        action: EffectAction::AnchorVerdict,
-                        payload_digest: digest,
-                        rating: None,
-                        edge: None,
-                    },
-                    StoreOp::SaveEdge { edge } => EffectProof {
-                        effect_seq,
-                        data_seq: frame.seq,
-                        node_id: edge.source_id,
-                        action: EffectAction::Edge,
-                        payload_digest: digest,
-                        rating: None,
-                        edge: Some((edge.target_id, edge.link_type)),
-                    },
-                    StoreOp::SupersedeNode { .. } => continue,
-                };
-                proofs.push(proof);
+                proofs.extend(effect_proofs_for_op(
+                    &op,
+                    effect_seq,
+                    frame.seq,
+                    digest,
+                    rule,
+                    &mut handles,
+                )?);
             }
         }
         Ok(proofs)
     }
 
     /// The proved effect at `effect_seq`, if the log admits one.
+    ///
+    /// Answered from the effect index built when the log was replayed and
+    /// extended by each admitted write, so the cost does not grow with the
+    /// log. [`StrataStore::prove_effects`] is the full re-verifying scan.
     pub fn effect_by_seq(&self, effect_seq: u64) -> Result<Option<EffectProof>, StoreError> {
+        self.effect_index.check()?;
         Ok(self
-            .prove_effects()?
-            .into_iter()
-            .find(|proof| proof.effect_seq == effect_seq))
+            .effect_index
+            .by_seq
+            .get(&effect_seq)
+            .map(|&idx| self.effect_index.proofs[idx].clone()))
     }
 
     /// The latest proved effect for `node_id` (a node or an intention id).
+    ///
+    /// Answered from the effect index, like [`StrataStore::effect_by_seq`].
     pub fn latest_effect(&self, node_id: &str) -> Result<Option<EffectProof>, StoreError> {
+        self.effect_index.check()?;
         Ok(self
-            .prove_effects()?
-            .into_iter()
-            .filter(|proof| proof.node_id == node_id && proof.action != EffectAction::Edge)
-            .max_by_key(|proof| proof.effect_seq))
+            .effect_index
+            .latest
+            .get(node_id)
+            .map(|&idx| self.effect_index.proofs[idx].clone()))
     }
 
     /// Review clock recorded on the latest explicit review of `id`.
@@ -1861,8 +2008,9 @@ impl StrataStore {
     /// never stored, and reads append nothing (v1).
     ///
     /// An explicit review with `reviewed_at_ms` measures elapsed whole days
-    /// from that timestamp. `None` uses sequence distance from `last_seq`
-    /// to the log head.
+    /// from that timestamp; a card still at its ingest review measures from
+    /// the node's creation time. Otherwise sequence distance from `last_seq`
+    /// to the log head is used.
     pub fn retrievability(&self, id: &str) -> Result<Option<f64>, StoreError> {
         self.retrievability_at(id, admission_now_ms())
     }
@@ -1873,9 +2021,19 @@ impl StrataStore {
         let Some(card) = self.fsrs.cards.get(&handle) else {
             return Ok(None);
         };
+        // A card still at its ingest review has no explicit review clock;
+        // the node's recorded creation time stands in, so retention follows
+        // elapsed time rather than log writes. A node with no recorded
+        // creation time (0) keeps the sequence-distance fallback.
+        let clock = self.reviewed_at.get(&handle).copied().or_else(|| {
+            (card.review_count <= 1)
+                .then(|| self.nodes.get(id).map(|record| record.created_at_ms))
+                .flatten()
+                .filter(|ms| *ms > 0)
+        });
         FsrsFold::retrievability_at_review(
             card,
-            self.reviewed_at.get(&handle).copied(),
+            clock,
             as_of_ms,
             self.log.head().last_acked_seq,
             ALGO_V2,
@@ -2007,17 +2165,23 @@ impl StrataStore {
         verify_with_head(&self.checkpoints, anchor, events.into_iter()).map_err(StoreError::from)
     }
 
-    /// Back the store up: seal the active segment (signed trailer; a fresh
-    /// active segment is rolled so the live store keeps appending), then copy
-    /// the sealed segments plus `head.state`, the signing key, and the anchor
-    /// file into `dest`. The copy opens as a store via [`StrataStore::open`].
+    /// Back the store up: verify every segment, seal the active segment
+    /// (signed trailer; a fresh active segment is rolled so the live store
+    /// keeps appending), then copy the sealed segments plus `head.state`, the
+    /// signing key, and the anchor file into `dest`. The copy opens as a
+    /// store via [`StrataStore::open`].
+    ///
+    /// A log that fails verification is not backed up: the call fails before
+    /// anything is sealed or copied.
     ///
     /// `strata.lock` is deliberately NOT copied (it names this process).
     pub fn backup_to(&self, dest: impl AsRef<Path>) -> Result<(), StoreError> {
         let dest = dest.as_ref();
+        self.log.verify_log()?;
         self.log.seal()?;
         let dest_log = dest.join(LOG_DIR);
-        std::fs::create_dir_all(&dest_log)?;
+        create_private_dir_all(&dest_log)?;
+        set_private_dir(dest)?;
         for entry in std::fs::read_dir(&self.log_dir)? {
             let path = entry?.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -2026,10 +2190,10 @@ impl StrataStore {
             if name == "strata.lock" {
                 continue;
             }
-            std::fs::copy(&path, dest_log.join(name))?;
+            copy_private_file(&path, &dest_log.join(name))?;
         }
         if self.meta_path().exists() {
-            std::fs::copy(self.meta_path(), dest.join(META_NAME))?;
+            copy_private_file(&self.meta_path(), &dest.join(META_NAME))?;
         }
         Ok(())
     }
@@ -2080,6 +2244,7 @@ impl StrataStore {
     /// `replay` live admits use, so intentions, review clocks, and imported
     /// frames stay in the digest.
     pub fn refold(&self) -> Result<Refold, StoreError> {
+        self.log.verify_log()?;
         self.verify_segments()?;
         self.log.verify_tail()?;
         let frames = self.log.read_frames(1)?;
@@ -2107,6 +2272,7 @@ impl StrataStore {
             retire_rules: BTreeMap::new(),
             upserts: BTreeMap::new(),
             anchors: AnchorIndex::default(),
+            effect_index: EffectIndex::default(),
         };
         scratch.replay()?;
         let mut retrievability = BTreeMap::new();
@@ -2128,8 +2294,7 @@ impl StrataStore {
     }
 
     /// Strict read of every segment. A torn frame, blake3 miss, or broken
-    /// chain is an error — unlike [`StrataLog::read_frames`], which stops at
-    /// the first bad frame and returns the prefix.
+    /// chain is an error.
     fn verify_segments(&self) -> Result<(), StoreError> {
         let mut paths = Vec::new();
         for entry in std::fs::read_dir(&self.log_dir)? {
@@ -2315,16 +2480,58 @@ impl StrataStore {
                 "undo conflicts with later memory changes; no changes applied".into(),
             ));
         }
-        let record = if idx == 0 {
-            let mut tomb = history_tip;
-            tomb.superseded_by = Some(format!("undo:{frame_seq:016x}"));
-            tomb
-        } else {
-            versions[idx - 1].1.clone()
-        };
+        if idx != 0 {
+            let record = versions[idx - 1].1.clone();
+            let context = self.context_for(&[&id]);
+            let (_effect_seq, data_seq) =
+                self.admit_write(StoreOp::UpsertNode { record }, action_kind::WRITE, context)?;
+            return Ok(data_seq);
+        }
+        // Undoing the first upsert of a node retires it. When that node was
+        // the successor of an edit, the versions it retired come back live
+        // and the code anchors that moved with the edit move back, so the
+        // undo leaves the pre-edit memory rather than no memory at all.
+        let restores: Vec<NodeRecord> = self
+            .nodes
+            .values()
+            .filter(|node| node.superseded_by.as_deref() == Some(id.as_str()))
+            .map(|node| {
+                let mut restored = node.clone();
+                restored.superseded_by = None;
+                restored
+            })
+            .collect();
+        let moved_anchors = self.anchors.rows_of(&id);
+        let mut tomb = history_tip;
+        tomb.superseded_by = Some(format!("undo:{frame_seq:016x}"));
         let context = self.context_for(&[&id]);
-        let (_effect_seq, data_seq) =
-            self.admit_write(StoreOp::UpsertNode { record }, action_kind::WRITE, context)?;
+        let (_effect_seq, data_seq) = self.admit_write(
+            StoreOp::UpsertNode { record: tomb },
+            action_kind::WRITE,
+            context,
+        )?;
+        for record in &restores {
+            let context = self.context_for(&[&record.id]);
+            self.admit_write(
+                StoreOp::UpsertNode {
+                    record: record.clone(),
+                },
+                action_kind::WRITE,
+                context,
+            )?;
+        }
+        if let Some(restored) = restores.first() {
+            if !moved_anchors.is_empty() {
+                let rows = moved_anchors
+                    .into_iter()
+                    .map(|anchor| AnchorRecord {
+                        node_id: restored.id.clone(),
+                        ..anchor
+                    })
+                    .collect();
+                self.record_anchors(rows)?;
+            }
+        }
         Ok(data_seq)
     }
 }
@@ -2371,6 +2578,11 @@ fn classify_upsert(versions: &[(u64, NodeRecord)], idx: usize) -> (&'static str,
     // prior body today is `undo_node_write`.
     if idx >= 2 && record == &versions[idx - 2].1 && record != &versions[idx - 1].1 {
         return ("undo", Some(versions[idx - 1].0));
+    }
+    // A version re-admitted unchanged after its retirement was undone: the
+    // record matches the one before it exactly, which no caller edit yields.
+    if idx >= 1 && record == &versions[idx - 1].1 {
+        return ("undo", None);
     }
     ("write", None)
 }

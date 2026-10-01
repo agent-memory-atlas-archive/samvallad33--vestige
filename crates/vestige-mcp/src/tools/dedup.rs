@@ -277,7 +277,7 @@ pub fn unified_schema() -> Value {
                 "enum": ["approve", "reject", "quarantine"],
                 "description": "[verdict] Reconsolidation verdict: approve applies the plan (old memory superseded, rollback via undo); reject discards it (memory stays); quarantine suppresses the memory (existing suppress path) and closes the plan."
             },
-            "confirm": { "type": "boolean", "default": false, "description": "[apply, tag_*] Explicit confirmation. Tag actions preview when false and need preview_token when true." },
+            "confirm": { "type": "boolean", "default": false, "description": "[apply, undo, tag_*] Explicit confirmation. On Strata, undo of a logged write needs confirm=true. Tag actions preview when false and need preview_token when true." },
             "operation_id": { "type": "string", "description": "[undo] Operation to reverse. Omit to list recent operations plus tagOperations." },
             "source_tag": { "type": "string", "description": "[tag_rename] Exact source tag to rename." },
             "source_tags": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 50, "description": "[tag_merge] Two or more exact source tags." },

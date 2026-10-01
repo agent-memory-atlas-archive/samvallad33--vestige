@@ -758,6 +758,14 @@ mod strata_walk_tests {
                 store.review(&lesson.id, 4).unwrap();
             }
             store.review(&corrected.id, 4).unwrap();
+            // The untouched cause was written a month ago and has decayed
+            // with elapsed time.
+            store
+                .set_created_at(
+                    &cause.id,
+                    chrono::Utc::now().timestamp_millis() - 30 * 86_400_000,
+                )
+                .unwrap();
         }
         let storage = crate::strata_memory::open(dir.path()).unwrap();
 

@@ -940,3 +940,231 @@ fn v3_code_anchors_survive_the_upgrade() {
     let logged = fs::read_to_string(dir.path().join(UPGRADE_LOG_NAME)).unwrap();
     assert!(logged.contains("carried 2 code anchors"), "{logged}");
 }
+
+/// A `vestige.db` that is a symlink resolves to the real file: the `-wal`
+/// beside the real file is imported and backed up with it.
+#[cfg(unix)]
+#[test]
+fn symlinked_db_imports_and_backs_up_the_wal_beside_the_real_file() {
+    let real_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let real = plant(real_dir.path());
+    let conn = rusqlite::Connection::open(&real).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute(
+        "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, tags)
+         VALUES ('55555555-5555-4555-8555-555555555555', 'WAL_ONLY_ROW_NOT_IN_MAIN', 'fact',
+                 '2026-03-03T00:00:00+00:00', '2026-03-03T00:00:00+00:00',
+                 '2026-03-03T00:00:00+00:00', '[]')",
+        [],
+    )
+    .unwrap();
+    let wal = real_dir.path().join("vestige.db-wal");
+    assert!(
+        fs::metadata(&wal).unwrap().len() > 0,
+        "row must sit in the wal"
+    );
+
+    let link = data_dir.path().join("vestige.db");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let status = vestige_upgrade::upgrade_if_needed(&link).unwrap();
+    let UpgradeStatus::StrataReady { log_dir } = status else {
+        panic!("expected a ready log, got {status:?}");
+    };
+
+    let snap = snapshot(&log_dir);
+    assert!(
+        snap.nodes
+            .iter()
+            .any(|node| node.content == "WAL_ONLY_ROW_NOT_IN_MAIN"),
+        "the row that lives only in the real file's wal was dropped"
+    );
+    let has_backup = |name: &str| {
+        fs::read_dir(real_dir.path()).unwrap().flatten().any(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with(name) && n.contains(".v3-backup-") && !n.ends_with(".partial")
+        })
+    };
+    assert!(has_backup("vestige.db-wal"), "backup lacks the wal");
+    assert!(has_backup("vestige.db.v3-backup-"), "backup lacks the db");
+    drop(conn);
+}
+
+/// Take the same exclusive lock a serving `vestige-mcp` holds.
+fn hold_serve_lock(data_dir: &Path) -> fs::File {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(data_dir.join(".serve.lock"))
+        .unwrap();
+    file.lock().unwrap();
+    file
+}
+
+#[test]
+fn a_held_serve_lock_ends_in_a_bounded_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = plant(dir.path());
+    let before = sha256_file(&db);
+    let _held = hold_serve_lock(dir.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vestige-upgrade"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .env_remove("VESTIGE_DATA_DIR")
+        .env("VESTIGE_ATTACH_WAIT_SECS", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn vestige-upgrade");
+    let mut err_pipe = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = err_pipe.read_to_string(&mut text);
+        text
+    });
+    let status = child
+        .wait_timeout_ext(Duration::from_secs(30))
+        .expect("a held serve lock must not block the upgrade forever");
+    assert_eq!(status.code(), Some(1));
+    let stderr = reader.join().unwrap();
+    assert!(stderr.contains(".serve.lock"), "{stderr}");
+    assert_eq!(before, sha256_file(&db));
+    assert!(!dir.path().join(LOG_DIR_NAME).exists());
+}
+
+#[test]
+fn a_held_serve_lock_over_a_published_log_needs_no_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = plant(dir.path());
+    let status = vestige_upgrade::upgrade_if_needed(&db).unwrap();
+    assert!(matches!(status, UpgradeStatus::StrataReady { .. }));
+    let _held = hold_serve_lock(dir.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vestige-upgrade"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .env_remove("VESTIGE_DATA_DIR")
+        .env("VESTIGE_ATTACH_WAIT_SECS", "600")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn vestige-upgrade");
+    let status = child
+        .wait_timeout_ext(Duration::from_secs(30))
+        .expect("a published log must not wait on the serve lock");
+    assert_eq!(status.code(), Some(0));
+}
+
+#[test]
+fn a_closed_stderr_does_not_abort_the_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = plant(dir.path());
+    let before = sha256_file(&db);
+    // Hold the lock so the process is still waiting when its reader goes.
+    let held = hold_serve_lock(dir.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vestige-upgrade"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .env_remove("VESTIGE_DATA_DIR")
+        .env("VESTIGE_ATTACH_WAIT_SECS", "60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn vestige-upgrade");
+    drop(child.stderr.take());
+    std::thread::sleep(Duration::from_millis(500));
+    drop(held);
+    let status = child
+        .wait_timeout_ext(Duration::from_secs(120))
+        .expect("upgrade should finish");
+    assert_eq!(status.code(), Some(0), "upgrade died with {status:?}");
+    assert!(dir.path().join(LOG_DIR_NAME).exists());
+    assert_eq!(before, sha256_file(&db));
+}
+
+// APFS refuses file names that are not valid UTF-8, so this runs where the
+// filesystem can hold one.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn a_non_utf8_data_dir_is_accepted() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let parent = tempfile::tempdir().unwrap();
+    let data = parent.path().join(OsStr::from_bytes(b"data-\xff\xfe"));
+    fs::create_dir(&data).unwrap();
+    let db = plant(&data);
+    let before = sha256_file(&db);
+    let out = run_upgrade_bin(&data);
+    assert!(
+        out.status.success(),
+        "{:?} {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(data.join(LOG_DIR_NAME).exists());
+    assert_eq!(before, sha256_file(&db));
+}
+
+/// A `vestige.db` that is empty, not plain SQLite (for example an encrypted
+/// store) or unreadable is not "no v3 store": the upgrade refuses, installs no
+/// log, and leaves the file as it was.
+#[test]
+fn unrecognised_vestige_db_is_refused_and_installs_no_log() {
+    let encrypted_like: Vec<u8> = (0u32..4096)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 | 0x80)
+        .collect();
+    let cases: [(&str, Vec<u8>); 3] = [
+        ("empty", Vec::new()),
+        ("short", b"SQLite".to_vec()),
+        ("not-plain-sqlite", encrypted_like),
+    ];
+    for (label, bytes) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("vestige.db");
+        fs::write(&db, &bytes).unwrap();
+
+        let err = vestige_upgrade::upgrade_if_needed(&db)
+            .expect_err(&format!("{label}: must not count as no v3 store"));
+        let text = err.to_string();
+        assert!(text.contains("vestige.db"), "{label}: {text}");
+        assert_eq!(fs::read(&db).unwrap(), bytes, "{label}: file changed");
+        assert!(
+            !dir.path().join(LOG_DIR_NAME).exists(),
+            "{label}: a log was created"
+        );
+
+        let output = run_upgrade_bin(dir.path());
+        assert!(
+            !output.status.success(),
+            "{label}: upgrade binary exited 0: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read(&db).unwrap(), bytes, "{label}: file changed");
+        assert!(!dir.path().join(LOG_DIR_NAME).exists(), "{label}: log");
+    }
+}
+
+#[test]
+fn unreadable_vestige_db_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    // A directory opens but cannot be read, like a file the process has no
+    // access to, and works whatever user runs the tests.
+    let db = dir.path().join("vestige.db");
+    fs::create_dir(&db).unwrap();
+    let err = vestige_upgrade::upgrade_if_needed(&db)
+        .expect_err("an unreadable vestige.db must not count as no v3 store");
+    assert!(err.to_string().contains("vestige.db"), "{err}");
+    assert!(!dir.path().join(LOG_DIR_NAME).exists());
+}
+
+/// Without a `vestige.db` there is nothing to refuse.
+#[test]
+fn absent_vestige_db_still_means_no_v3() {
+    let dir = tempfile::tempdir().unwrap();
+    let status = vestige_upgrade::upgrade_if_needed(&dir.path().join("vestige.db")).unwrap();
+    assert_eq!(status, UpgradeStatus::NoV3);
+}

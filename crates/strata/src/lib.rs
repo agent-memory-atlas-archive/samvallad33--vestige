@@ -23,6 +23,15 @@
 //!   atomically (temp file + fsync + rename + directory fsync).
 //! * **ACK**: [`SeqAck`] is returned only after verify + watermark.
 //!
+//! A full volume is the one I/O failure that is not fail-stop. If writing a
+//! frame, the head watermark, or a seal trailer fails with a storage-full
+//! error, nothing of the commit has been acked: the segment is cut back to
+//! its state before the commit, every queued appender gets the error
+//! ([`StrataError::is_storage_full`]), the seq space is unchanged, and the
+//! log stays usable once space is freed. Sync, verify, and every other I/O
+//! error stay fail-stop. Opening also leaves no half-written lock, key, or
+//! segment file behind when space runs out.
+//!
 //! In production binaries, build with `panic = "abort"` so a fail-stop panic
 //! takes the process down; the library uses `panic!` (not a hard `abort`) so
 //! tests can exercise the path with `catch_unwind`.
@@ -51,11 +60,11 @@
 //!
 //! ## Single writer
 //!
-//! Enforced by `strata.lock`, created with `O_EXCL`, holding the owner pid.
-//! Stale locks are detected best-effort with a `kill(pid, 0)` liveness probe;
-//! the probe/unlink pair is racy (TOCTOU) and an unparseable or empty lock
-//! file is treated as held. Remove the file by hand if a writer crashed
-//! between creating the lock and writing its pid.
+//! Enforced by an OS advisory lock on `strata.lock`, held on an open file for
+//! the life of the log and released by the kernel when the holder exits, so a
+//! killed writer never leaves the directory locked and a recycled pid never
+//! looks like a holder. The file records the holder's pid for diagnostics
+//! only, and is never removed while a writer has the log open.
 
 mod error;
 mod format;
@@ -73,6 +82,8 @@ pub use format::{
     HEADER_WIRE_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION, TRAILER_WIRE_SIZE,
 };
 pub use log::{
-    HeadInfo, SealInfo, SeqAck, StrataLog, TailReport, TrailerCheck, GROUP_COMMIT_WINDOW_MS,
-    MAX_BATCH_FRAMES,
+    read_head_state, HeadInfo, LogReport, SealInfo, SeqAck, StrataLog, TailReport, TrailerCheck,
+    GROUP_COMMIT_WINDOW_MS, MAX_BATCH_FRAMES,
 };
+#[cfg(feature = "failpoints")]
+pub use sync::failpoints;

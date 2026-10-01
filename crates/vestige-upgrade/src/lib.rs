@@ -7,7 +7,7 @@
 //! and renames. A dead owner's staging directory is wiped there, so SIGKILL
 //! recovery is the same code. This crate decides that a v3 file needs that
 //! import, copies the sqlite family, and records progress on stderr.
-//! [`upgrade_with`] is the only path that calls `vestige_core::detect_v3`.
+//! [`upgrade_with`] is the only path that calls `vestige_core::detect_v3_strict`.
 //!
 //! v3 intentions have no migration frame. After the staged log verifies,
 //! `carry_intentions` admits them into it through the store's normal
@@ -100,7 +100,7 @@ pub fn upgrade_with(
         return Ok(status);
     }
 
-    let detected = match vestige_core::detect_v3(db_path) {
+    let detected = match vestige_core::detect_v3_strict(db_path) {
         Ok(v) => v,
         Err(e) => return Err(fail(&log_path, format!("v3 detection failed: {e}"))),
     };
@@ -124,12 +124,15 @@ pub fn upgrade_with(
         ),
     );
 
-    if let Err(detail) = ensure_space(&data_dir, db_path) {
+    // A symlinked vestige.db keeps its -wal/-shm and gets its backup beside
+    // the real file, so the size check and the backup follow the link.
+    let real_db = fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    if let Err(detail) = ensure_space(&data_dir, &real_db) {
         return Err(fail(&log_path, detail));
     }
 
     let log_path_hook = log_path.clone();
-    let backup_db = db_path.to_path_buf();
+    let backup_db = real_db.clone();
     let backup_dir = data_dir.clone();
     let backup_log = log_path.clone();
     let carry_dir = data_dir.clone();
@@ -221,6 +224,15 @@ pub fn upgrade_with(
             report.intentions_carried
         ),
     );
+    if report.skipped_dangling_edges > 0 || report.skipped_dangling_cards > 0 {
+        note(
+            &log_path,
+            &format!(
+                "vestige: skipped {} links and {} review cards that pointed at deleted memories",
+                report.skipped_dangling_edges, report.skipped_dangling_cards
+            ),
+        );
+    }
     Ok(UpgradeStatus::StrataReady { log_dir })
 }
 
@@ -600,9 +612,17 @@ fn free_bytes(_dir: &Path) -> Option<u64> {
     None
 }
 
+/// Write one line to stderr. A closed or broken stderr is ignored: the
+/// upgrade record in `upgrade.log` is the durable copy, and a reader that
+/// went away must not stop the import.
+pub fn write_stderr(line: &str) {
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(stderr, "{line}");
+    let _ = stderr.flush();
+}
+
 fn note(log_path: &Path, line: &str) {
-    eprintln!("{line}");
-    let _ = io::stderr().flush();
+    write_stderr(line);
     append_log(log_path, line);
 }
 

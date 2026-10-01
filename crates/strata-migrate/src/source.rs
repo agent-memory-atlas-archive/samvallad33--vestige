@@ -104,9 +104,21 @@ pub struct SourceFiles {
     pub wal: Option<PathBuf>,
     /// `-shm` sidecar next to `db`, when present.
     pub shm: Option<PathBuf>,
+    /// The files the source-change guard hashes: the user's original db and
+    /// sidecars, never the scratch snapshot copy. Equal to `db`/`wal`/`shm`
+    /// when no snapshot copy was made.
+    pub guard: GuardFiles,
 }
 
-impl SourceFiles {
+/// The original db + sidecars covered by the source-change guard.
+#[derive(Clone)]
+pub struct GuardFiles {
+    pub db: PathBuf,
+    pub wal: Option<PathBuf>,
+    pub shm: Option<PathBuf>,
+}
+
+impl GuardFiles {
     /// Canonical BLAKE3 over db → wal → shm (only existing files).
     pub fn blake3_hex(&self) -> Result<String, MigrationError> {
         let mut hasher = blake3::Hasher::new();
@@ -129,19 +141,178 @@ impl SourceFiles {
     }
 }
 
+impl SourceFiles {
+    /// Canonical BLAKE3 over the ORIGINAL db → wal → shm (only existing
+    /// files), so a write to the source after the snapshot copy is seen.
+    pub fn blake3_hex(&self) -> Result<String, MigrationError> {
+        self.guard.blake3_hex()
+    }
+}
+
+/// Name prefix of scratch directories (and, with a `.lock` suffix, of their
+/// lock files) inside the data directory.
+const SCRATCH_PREFIX: &str = ".strata-scratch-";
+
+/// Private scratch space for the snapshot copy of a source that has a live
+/// WAL. It lives in the data directory (never the system temp dir), the
+/// directory and every file in it are owner-only, and it is removed on drop.
+/// A process killed mid-run cannot remove it, so each new scratch first
+/// removes the ones whose owner is gone: an owner holds an OS file lock on
+/// `<scratch>.lock` for its whole life, and the kernel frees that lock when
+/// the process dies.
+pub struct Scratch {
+    parent: PathBuf,
+    live: Option<LiveScratch>,
+}
+
+struct LiveScratch {
+    dir: PathBuf,
+    lock_path: PathBuf,
+    lock: Option<std::fs::File>,
+}
+
+impl Scratch {
+    /// Scratch space inside `parent` (the data directory). Nothing is
+    /// created until [`Scratch::path`] is called.
+    pub fn new(parent: &Path) -> Self {
+        Self {
+            parent: parent.to_path_buf(),
+            live: None,
+        }
+    }
+
+    /// The scratch directory, created on first use.
+    pub fn path(&mut self) -> Result<&Path, MigrationError> {
+        if self.live.is_none() {
+            self.live = Some(LiveScratch::create(&self.parent)?);
+        }
+        Ok(&self.live.as_ref().expect("just created").dir)
+    }
+}
+
+impl LiveScratch {
+    fn create(parent: &Path) -> Result<Self, MigrationError> {
+        std::fs::create_dir_all(parent)?;
+        sweep_stale_scratch(parent);
+        for _ in 0..16 {
+            let mut random = [0u8; 8];
+            getrandom::fill(&mut random).map_err(|e| {
+                MigrationError::Io(std::io::Error::other(format!("no OS entropy: {e}")))
+            })?;
+            let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+            let dir = parent.join(format!("{SCRATCH_PREFIX}{name}"));
+            let lock_path = parent.join(format!("{SCRATCH_PREFIX}{name}.lock"));
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let lock = match options.open(&lock_path) {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            };
+            // A sweeper may take the lock of a file it has just listed; then
+            // this name is gone, try another.
+            if !matches!(lock.try_lock(), Ok(())) {
+                continue;
+            }
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            if let Err(err) = builder.create(&dir) {
+                drop(lock);
+                let _ = std::fs::remove_file(&lock_path);
+                return Err(err.into());
+            }
+            return Ok(Self {
+                dir,
+                lock_path,
+                lock: Some(lock),
+            });
+        }
+        Err(MigrationError::Io(std::io::Error::other(
+            "could not create a scratch directory",
+        )))
+    }
+}
+
+impl Drop for LiveScratch {
+    fn drop(&mut self) {
+        drop(self.lock.take());
+        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+/// Remove scratch directories left by runs that no longer exist.
+fn sweep_stale_scratch(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".lock") else {
+            continue;
+        };
+        if !stem.starts_with(SCRATCH_PREFIX) {
+            continue;
+        }
+        let lock_path = entry.path();
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        else {
+            continue;
+        };
+        if file.try_lock().is_err() {
+            continue; // its owner is alive
+        }
+        drop(file);
+        let _ = std::fs::remove_dir_all(parent.join(stem));
+        let _ = std::fs::remove_file(&lock_path);
+    }
+}
+
+/// Copy `from` to a new owner-only file `to`.
+fn copy_private(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut input = std::fs::File::open(from)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(to)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.sync_all()
+}
+
 /// Resolve `<src>` to concrete files, enforce the WAL policy, and apply the
-/// snapshot copy when `accept_wal` is set. `scratch` is only used when a
+/// snapshot copy when `accept_wal` is set. `scratch` is only created when a
 /// snapshot copy is made.
 pub fn prepare_source(
     source: &Path,
     accept_wal: bool,
-    scratch: &Path,
+    scratch: &mut Scratch,
 ) -> Result<(SourceFiles, bool), MigrationError> {
     let db = resolve_source(source)?;
     if !is_sqlite_file(&db)? {
         // Portable-archive JSON: no SQLite files involved.
         return Ok((
             SourceFiles {
+                guard: GuardFiles {
+                    db: db.clone(),
+                    wal: None,
+                    shm: None,
+                },
                 db,
                 wal: None,
                 shm: None,
@@ -166,19 +337,34 @@ pub fn prepare_source(
         // Snapshot: copy db + wal + shm into scratch and read the copy so
         // the immutable read sees a consistent image. The originals are
         // only ever read (std::fs::copy opens for reading).
-        std::fs::create_dir_all(scratch)?;
+        let guard = GuardFiles {
+            db: db.clone(),
+            wal: wal.clone(),
+            shm: shm.clone(),
+        };
+        let guard_before = guard.blake3_hex()?;
+        let scratch = scratch.path()?;
         // Sidecar names MUST line up with the snapshot db name or SQLite
         // will not associate the copied -wal with it (audit finding: the
         // first cut copied `snapshot-wal`, so the checkpoint saw nothing).
         let db_copy = scratch.join("snapshot.db");
         let wal_copy = scratch.join("snapshot.db-wal");
         let shm_copy = scratch.join("snapshot.db-shm");
-        std::fs::copy(&db, &db_copy)?;
+        copy_private(&db, &db_copy)?;
         if let Some(wal) = &wal {
-            std::fs::copy(wal, &wal_copy)?;
+            copy_private(wal, &wal_copy)?;
         }
         if let Some(shm) = &shm {
-            std::fs::copy(shm, &shm_copy)?;
+            copy_private(shm, &shm_copy)?;
+        }
+        // A writer that touched the original while it was being copied would
+        // leave the copy inconsistent with the hash: refuse rather than seal.
+        let guard_after = guard.blake3_hex()?;
+        if guard_before != guard_after {
+            return Err(MigrationError::SourceTampered {
+                before: guard_before,
+                after: guard_after,
+            });
         }
         {
             // immutable=1 does NOT see WAL-resident commits (audit finding:
@@ -195,10 +381,24 @@ pub fn prepare_source(
             db: db_copy,
             wal: wal_copy.exists().then_some(wal_copy),
             shm: shm_copy.exists().then_some(shm_copy),
+            guard,
         };
         Ok((files, true))
     } else {
-        Ok((SourceFiles { db, wal, shm }, false))
+        let guard = GuardFiles {
+            db: db.clone(),
+            wal: wal.clone(),
+            shm: shm.clone(),
+        };
+        Ok((
+            SourceFiles {
+                db,
+                wal,
+                shm,
+                guard,
+            },
+            false,
+        ))
     }
 }
 
@@ -626,10 +826,13 @@ fn parse_archive_json(bytes: &[u8]) -> Result<PortableArchive, MigrationError> {
 
 /// Resolve a directory source to its `vestige.db`; pass files through.
 fn resolve_source(source: &Path) -> Result<PathBuf, MigrationError> {
+    // A symlinked db resolves to the real file: its -wal/-shm live beside
+    // the real file, not beside the link.
+    let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if source.is_dir() {
         let db = source.join("vestige.db");
         if db.is_file() {
-            Ok(db)
+            Ok(real(&db))
         } else {
             Err(MigrationError::UnsupportedSource(format!(
                 "directory {} has no vestige.db",
@@ -637,7 +840,7 @@ fn resolve_source(source: &Path) -> Result<PathBuf, MigrationError> {
             )))
         }
     } else if source.is_file() {
-        Ok(source.to_path_buf())
+        Ok(real(source))
     } else {
         Err(MigrationError::SourceNotFound(source.display().to_string()))
     }
@@ -661,9 +864,18 @@ pub fn is_sqlite_file(path: &Path) -> Result<bool, MigrationError> {
 
 /// Percent-encode a path for use inside a `file:` URI.
 fn uri_encode_path(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    let mut out = String::with_capacity(text.len());
-    for byte in text.as_bytes() {
+    // Raw OS bytes on Unix: a path need not be valid UTF-8, and a lossy
+    // conversion would name a different file.
+    #[cfg(unix)]
+    let bytes: std::borrow::Cow<'_, [u8]> = {
+        use std::os::unix::ffi::OsStrExt;
+        std::borrow::Cow::Borrowed(path.as_os_str().as_bytes())
+    };
+    #[cfg(not(unix))]
+    let bytes: std::borrow::Cow<'_, [u8]> =
+        std::borrow::Cow::Owned(path.to_string_lossy().into_owned().into_bytes());
+    let mut out = String::with_capacity(bytes.len());
+    for byte in bytes.iter() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b'~' => {
                 out.push(*byte as char)
@@ -833,5 +1045,19 @@ mod timestamp_tests {
         ] {
             assert!(timestamp_ms(raw).is_err(), "{raw:?} must not parse");
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod uri_path_tests {
+    use super::uri_encode_path;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    #[test]
+    fn a_non_utf8_path_is_encoded_from_its_raw_bytes() {
+        let path = Path::new(OsStr::from_bytes(b"/data/d-\xff\xfe/vestige.db"));
+        assert_eq!(uri_encode_path(path), "/data/d-%FF%FE/vestige.db");
     }
 }
