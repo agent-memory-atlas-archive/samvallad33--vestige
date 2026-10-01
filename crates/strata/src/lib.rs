@@ -73,6 +73,6 @@ pub use format::{
     HEADER_WIRE_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION, TRAILER_WIRE_SIZE,
 };
 pub use log::{
-    HeadInfo, SealInfo, SeqAck, StrataLog, TailReport, TrailerCheck, GROUP_COMMIT_WINDOW_MS,
-    MAX_BATCH_FRAMES,
+    read_head_state, HeadInfo, LogReport, SealInfo, SeqAck, StrataLog, TailReport, TrailerCheck,
+    GROUP_COMMIT_WINDOW_MS, MAX_BATCH_FRAMES,
 };

@@ -93,7 +93,7 @@ pub fn open(dir: impl AsRef<Path>) -> Result<Arc<Storage>, StorageError> {
 
 static OPEN_LOGS: Mutex<Vec<(PathBuf, Weak<StrataMemory>)>> = Mutex::new(Vec::new());
 
-fn register_open(memory: &Arc<StrataMemory>) {
+pub(crate) fn register_open(memory: &Arc<StrataMemory>) {
     let mut open = OPEN_LOGS.lock().unwrap_or_else(|err| err.into_inner());
     open.retain(|(_, weak)| weak.strong_count() > 0);
     open.push((memory.log_dir.clone(), Arc::downgrade(memory)));
@@ -109,6 +109,35 @@ fn live_memory(storage: &Storage) -> Option<Arc<StrataMemory>> {
     open.iter()
         .find(|(log_dir, _)| log_dir == &path)
         .and_then(|(_, weak)| weak.upgrade())
+}
+
+/// What a whole-log verification covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogCheck {
+    /// Segments scanned, sealed and active.
+    pub segments: u32,
+    /// Sealed segments whose signed trailer was checked.
+    pub sealed_segments: u32,
+    /// Frames read back and re-hashed.
+    pub frames: u64,
+}
+
+/// Re-verify every segment of the Strata log this process has open: frame and
+/// segment hash chains, payload hashes, each sealed segment's signed trailer.
+/// Damage is an error, and the log then refuses further writes.
+pub fn verify_log(storage: &Storage) -> Result<LogCheck, String> {
+    let memory =
+        live_memory(storage).ok_or_else(|| "strata log is not open in this process".to_string())?;
+    let store = memory.lock();
+    store
+        .log()
+        .verify_log()
+        .map(|report| LogCheck {
+            segments: report.segments,
+            sealed_segments: report.sealed_segments,
+            frames: report.frames,
+        })
+        .map_err(|err| err.to_string())
 }
 
 /// `memory_status` view `provenance` on a Strata log.

@@ -1108,6 +1108,9 @@ impl StrataStore {
         context: Vec<u64>,
         params_hash: Option<[u8; 32]>,
     ) -> Result<(u64, u64), StoreError> {
+        // The gate frames below have no error channel: refuse up front when
+        // the log has already found damage in acked history.
+        self.log.ensure_writable()?;
         let fresh_id = match &op {
             StoreOp::UpsertNode { record }
                 if self.tool_call_open && !self.nodes.contains_key(&record.id) =>
@@ -1859,9 +1862,10 @@ impl StrataStore {
     /// Every node, intention and code-anchor effect proved from the log, in
     /// effect-seq order.
     ///
-    /// `verify_tail` checks the active segment's hash chain (and the trailer
-    /// signature when the segment is sealed). Each effect must cite an Allow
-    /// gate and a data frame with the same payload digest.
+    /// The log read is strict: every segment's hash chain and every sealed
+    /// segment's signed trailer is checked, and damage anywhere is an error
+    /// rather than a shorter answer. Each effect must cite an Allow gate and
+    /// a data frame with the same payload digest.
     pub fn prove_effects(&self) -> Result<Vec<EffectProof>, StoreError> {
         self.log.verify_tail()?;
         let frames = self.log.read_frames(1)?;
@@ -2149,14 +2153,19 @@ impl StrataStore {
         verify_with_head(&self.checkpoints, anchor, events.into_iter()).map_err(StoreError::from)
     }
 
-    /// Back the store up: seal the active segment (signed trailer; a fresh
-    /// active segment is rolled so the live store keeps appending), then copy
-    /// the sealed segments plus `head.state`, the signing key, and the anchor
-    /// file into `dest`. The copy opens as a store via [`StrataStore::open`].
+    /// Back the store up: verify every segment, seal the active segment
+    /// (signed trailer; a fresh active segment is rolled so the live store
+    /// keeps appending), then copy the sealed segments plus `head.state`, the
+    /// signing key, and the anchor file into `dest`. The copy opens as a
+    /// store via [`StrataStore::open`].
+    ///
+    /// A log that fails verification is not backed up: the call fails before
+    /// anything is sealed or copied.
     ///
     /// `strata.lock` is deliberately NOT copied (it names this process).
     pub fn backup_to(&self, dest: impl AsRef<Path>) -> Result<(), StoreError> {
         let dest = dest.as_ref();
+        self.log.verify_log()?;
         self.log.seal()?;
         let dest_log = dest.join(LOG_DIR);
         create_private_dir_all(&dest_log)?;
@@ -2223,6 +2232,7 @@ impl StrataStore {
     /// `replay` live admits use, so intentions, review clocks, and imported
     /// frames stay in the digest.
     pub fn refold(&self) -> Result<Refold, StoreError> {
+        self.log.verify_log()?;
         self.verify_segments()?;
         self.log.verify_tail()?;
         let frames = self.log.read_frames(1)?;
@@ -2272,8 +2282,7 @@ impl StrataStore {
     }
 
     /// Strict read of every segment. A torn frame, blake3 miss, or broken
-    /// chain is an error — unlike [`StrataLog::read_frames`], which stops at
-    /// the first bad frame and returns the prefix.
+    /// chain is an error.
     fn verify_segments(&self) -> Result<(), StoreError> {
         let mut paths = Vec::new();
         for entry in std::fs::read_dir(&self.log_dir)? {

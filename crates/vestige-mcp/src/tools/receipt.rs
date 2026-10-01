@@ -217,6 +217,7 @@ fn safe_storage_error(operation: &str, error: &impl std::fmt::Display) -> String
     if text.contains("pending_strata")
         || text.contains("similarity_disabled")
         || text.contains("verification failed")
+        || text.contains("strata halt")
         || text.contains("gate_denied")
         || text.contains("gate_held")
     {
@@ -225,6 +226,8 @@ fn safe_storage_error(operation: &str, error: &impl std::fmt::Display) -> String
     tracing::warn!(%error, "receipt storage operation failed: {operation}");
     format!("Receipt {operation} is temporarily unavailable")
 }
+
+const STRATA_EFFECT_CLAIM_BOUNDARY: &str = "Recomputed from the hash-chained log: every segment's frame chain and every sealed segment's signed trailer is checked, the effect cites an Allow gate, and its payload digest matches the admitted frame. This is not an external timestamp or a truth claim.";
 
 fn execute_get(storage: &Arc<Storage>, receipt_id: &str) -> Result<Value, String> {
     let receipt = storage
@@ -267,15 +270,32 @@ fn strata_effect_attestation(storage: &Arc<Storage>, receipt_id: &str) -> Result
             "Receipt '{receipt_id}' has no proved payload digest"
         ));
     }
-    Ok(json!({
-        "status": "strata_effect",
-        "verification": {
+    // The log is re-verified for this call; nothing here is assumed. The
+    // effect was proved from the log (an Allow gate and a matching payload
+    // digest) by the lookup above, which fails on any damaged segment.
+    let verification = match crate::strata_memory::verify_log(storage.as_ref()) {
+        Ok(check) => json!({
             "locallyVerified": true,
             "chainValid": true,
             "gateAllowed": true,
             "payloadDigest": digest,
-            "claimBoundary": "Read from the effect index derived from the hash-chained log when it was opened and extended by each admitted write: the effect cites an Allow gate and its payload digest matches the admitted frame. The full chain and any sealed trailer signature are re-verified by action=replay and by strata-verify. This is not an external timestamp or a truth claim."
-        }
+            "segmentsVerified": check.segments,
+            "sealedSegmentsVerified": check.sealed_segments,
+            "framesVerified": check.frames,
+            "claimBoundary": STRATA_EFFECT_CLAIM_BOUNDARY,
+        }),
+        Err(failure) => json!({
+            "locallyVerified": false,
+            "chainValid": false,
+            "gateAllowed": true,
+            "payloadDigest": digest,
+            "failure": failure,
+            "claimBoundary": STRATA_EFFECT_CLAIM_BOUNDARY,
+        }),
+    };
+    Ok(json!({
+        "status": "strata_effect",
+        "verification": verification,
     }))
 }
 
@@ -1379,8 +1399,8 @@ mod strata_replay {
 
     fn open() -> (Arc<Storage>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<Storage> =
-            Arc::new(crate::strata_memory::StrataMemory::open(dir.path()).unwrap());
+        // The same entry point the server uses, so the open log is registered.
+        let storage = crate::strata_memory::open(dir.path()).unwrap();
         (storage, dir)
     }
 
@@ -1519,6 +1539,96 @@ mod strata_replay {
         assert!(!err.starts_with("Database error"), "{err}");
         assert!(!err.contains("pending_strata"), "{err}");
         assert!(!err.contains("temporarily unavailable"), "{err}");
+    }
+
+    /// Sealed segment 0 plus a later effect in the active segment.
+    fn seal_then_ingest(
+        storage: &Arc<Storage>,
+        first: &str,
+        second: &str,
+    ) -> (vestige_core::KnowledgeNode, vestige_core::KnowledgeNode) {
+        let first = ingest(storage, first);
+        let backup = tempfile::tempdir().unwrap();
+        storage
+            .backup_to(&backup.path().join("copy"))
+            .expect("backup seals the active segment");
+        let second = ingest(storage, second);
+        (first, second)
+    }
+
+    #[tokio::test]
+    async fn get_on_a_healthy_log_reports_what_was_verified() {
+        let (storage, _dir) = open();
+        let (first, second) = seal_then_ingest(&storage, "get fixture one", "get fixture two");
+        for node in [&first, &second] {
+            let got = execute(
+                &storage,
+                Some(json!({"action": "get", "receipt_id": node.id})),
+            )
+            .await
+            .unwrap();
+            let verification = &got["attestation"]["verification"];
+            assert_eq!(verification["locallyVerified"], true, "{got}");
+            assert_eq!(verification["chainValid"], true, "{got}");
+            assert_eq!(verification["sealedSegmentsVerified"], 1, "{got}");
+            assert!(
+                verification["framesVerified"].as_u64().unwrap() >= 2,
+                "{got}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_on_a_log_with_a_damaged_sealed_segment_does_not_attest_or_hide_receipts() {
+        let (storage, dir) = open();
+        let (first, second) =
+            seal_then_ingest(&storage, "damage fixture one", "damage fixture two");
+        flip_segment(dir.path());
+        for node in [&first, &second] {
+            let err = execute(
+                &storage,
+                Some(json!({"action": "get", "receipt_id": node.id})),
+            )
+            .await
+            .expect_err("a log that fails verification must not attest a receipt");
+            assert!(err.contains("strata halt"), "{err}");
+            assert!(!err.contains("not found"), "{err}");
+            assert!(!err.contains("temporarily unavailable"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_log_that_found_damage_in_a_receipt_check_refuses_new_writes() {
+        let (storage, dir) = open();
+        let node = ingest(&storage, "write refusal fixture");
+        flip_segment(dir.path());
+        execute(
+            &storage,
+            Some(json!({"action": "get", "receipt_id": node.id})),
+        )
+        .await
+        .expect_err("damaged log");
+        let before = log_digest(dir.path());
+        let refused = storage.ingest(IngestInput {
+            content: "written after damage was found".into(),
+            ..IngestInput::default()
+        });
+        assert!(refused.is_err(), "the store kept accepting writes");
+        assert_eq!(before, log_digest(dir.path()), "a refused write left bytes");
+    }
+
+    #[tokio::test]
+    async fn get_on_a_log_with_a_damaged_active_segment_does_not_attest() {
+        let (storage, dir) = open();
+        let node = ingest(&storage, "active damage fixture");
+        flip_segment(dir.path());
+        let err = execute(
+            &storage,
+            Some(json!({"action": "get", "receipt_id": node.id})),
+        )
+        .await
+        .expect_err("a damaged log must not attest a receipt");
+        assert!(!err.contains("not found"), "{err}");
     }
 
     #[tokio::test]
