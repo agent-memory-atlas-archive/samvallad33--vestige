@@ -76,6 +76,8 @@ jobs:
           fi
       - run: python -m pip install ./integrations/python
       - run: python scripts/test-tool-frontier.py --output tool-frontier.json
+      - name: admission sweep (every advertised tool action is admitted)
+        run: python scripts/test-tool-frontier.py --admit-only --binary target/debug/vestige-mcp --output tool-admission.json
       - run: python scripts/test-context-evidence.py
       - run: python scripts/test-runtime-integration.py --binary target/debug/vestige-mcp --output runtime-integration.json
       - uses: actions/upload-artifact@v4
@@ -84,6 +86,7 @@ jobs:
           name: v3-stdio-evidence
           path: |
             tool-frontier.json
+            tool-admission.json
             runtime-integration.json
   # Default release profile strips symbols, which would hide a sqlite link
   # from `nm`. This job overrides strip/LTO only so the check can see them.
