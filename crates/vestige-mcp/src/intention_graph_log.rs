@@ -139,6 +139,18 @@ fn load_graph(store: &strata_store::StrataStore, scope: &str) -> Result<Intentio
     serde_json::from_str(&row.content).map_err(storage_error)
 }
 
+/// Refuse text that looks like a credential. The refusal names kinds only, so
+/// neither the scope nor the command is echoed back.
+fn refuse_credentials<'a>(texts: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    let kinds = crate::strata_memory::blocking_secrets_in(texts);
+    if kinds.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Refused to store probable credential(s): {kinds:?}. Secret bytes were not stored, logged, or returned."
+    ))
+}
+
 fn journal_limit() -> String {
     "intention graph journal limit reached; preserve this scope and create a new scope with reviewed plan definitions".into()
 }
@@ -156,12 +168,7 @@ pub(crate) fn apply(
     if command_json.len() > MAX_COMMAND_BYTES {
         return Err("intention graph command exceeds 128 KiB".into());
     }
-    let kinds = crate::strata_memory::blocking_secrets_in([command_json.as_str()]);
-    if !kinds.is_empty() {
-        return Err(format!(
-            "Refused to store probable credential(s): {kinds:?}. Secret bytes were not stored, logged, or returned."
-        ));
-    }
+    refuse_credentials([scope, command_json.as_str()])?;
     let prior = load_journal(store, scope)?;
     let mut graph = load_graph(store, scope)?;
     let before = serde_json::to_string(&graph).map_err(storage_error)?;
@@ -207,6 +214,7 @@ pub(crate) fn apply(
 /// Rebuild one scope from the recorded command journal and compare digests.
 pub(crate) fn replay(store: &strata_store::StrataStore, scope: &str) -> Result<Value, String> {
     validate_scope(scope)?;
+    refuse_credentials([scope])?;
     let rows = load_journal(store, scope)?;
     let mut graph = IntentionGraph::default();
     let mut count = 0_i64;
@@ -255,6 +263,7 @@ pub(crate) fn memory_snapshot(
     now: DateTime<Utc>,
 ) -> Result<Value, String> {
     validate_scope(scope)?;
+    refuse_credentials([scope])?;
     require_memory_id(memory_id)?;
     let now_ms = now.timestamp_millis();
     let value = store.get_node(memory_id).and_then(|record| {
@@ -330,6 +339,25 @@ mod tests {
         let err = apply(&mut store, "user", command, at()).unwrap_err();
         assert!(!err.contains(&secret), "{err}");
         assert!(store.intentions().is_empty(), "a refused command left rows");
+    }
+
+    #[test]
+    fn graph_scope_that_looks_like_a_credential_is_refused_on_every_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = strata_store::StrataStore::open(dir.path()).unwrap();
+        let scope = format!("ghp_{}", "E".repeat(36));
+        assert!(validate_scope(&scope).is_ok(), "the shape must pass the scope charset");
+        let errors = [
+            apply(&mut store, &scope, plan("p1"), at()).unwrap_err(),
+            replay(&store, &scope).unwrap_err(),
+            memory_snapshot(&store, &scope, "00000000-0000-0000-0000-000000000000", at())
+                .unwrap_err(),
+        ];
+        for err in errors {
+            assert!(!err.contains(&scope), "refusal echoed the scope: {err}");
+            assert!(err.contains("probable credential"), "{err}");
+        }
+        assert!(store.intentions().is_empty(), "a refused scope left rows");
     }
 
     #[test]
