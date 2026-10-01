@@ -8,6 +8,12 @@
 
 It keeps the decisions a project already made, and it can walk a failure backward along the links your memory actually recorded. Every write passes a gate and leaves a receipt. The store is Strata: an append-only, signed log on your machine.
 
+<p align="center">
+  <a href="https://raw.githubusercontent.com/samvallad33/vestige/media/vestige-black-box.mp4">
+    <img src="https://raw.githubusercontent.com/samvallad33/vestige/media/black-box-cause.gif" alt="Vestige Black Box — the cause never looks like the bug" width="100%">
+  </a>
+</p>
+
 **New in 4.1.0:** [GhostLink](#ghostlink-the-negative-space) proposes pairs of memories nobody has combined yet, each with its proof, and 19 hardening fixes cover data safety, upgrades from v3, the tools and the dashboard ([changelog](CHANGELOG.md)).
 
 [![Release](https://img.shields.io/github/v/release/samvallad33/vestige?color=06b6d4)](https://github.com/samvallad33/vestige/releases/latest)
@@ -46,6 +52,16 @@ echo shadow > ~/.operator/mode        # shadow-first: log everything, block noth
 python3 ~/.operator/gate/operator-gate.py corpus guardfall   # 43/43 bypass cases
 python3 ~/.operator/gate/operator-gate.py verify             # receipt chain check
 ```
+
+**On OpenClaw?** One line, gate bundled:
+
+```bash
+clawhub install vestige-operator-lite
+```
+
+Vestige's memory kernel is also on ClawHub as a six-tool plugin —
+[`clawhub install vestige-strata`](https://clawhub.ai/plugins/vestige-strata) —
+signed append-only log, exact-handle recall, causal root-cause walks.
 
 Full details in [operator-lite/README.md](operator-lite/README.md). The free tier
 blocks. Operator — the same kernel extended with a full governance loop — is where
