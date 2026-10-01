@@ -230,6 +230,12 @@ fn safe_storage_error(operation: &str, error: &impl std::fmt::Display) -> String
 const STRATA_EFFECT_CLAIM_BOUNDARY: &str = "Recomputed from the hash-chained log: every segment's frame chain and every sealed segment's signed trailer is checked, the effect cites an Allow gate, and its payload digest matches the admitted frame. This is not an external timestamp or a truth claim.";
 
 fn execute_get(storage: &Arc<Storage>, receipt_id: &str) -> Result<Value, String> {
+    // On Strata the lookup below is served from the effect index, which does
+    // not read segments. Verify the log first, so a damaged log halts here
+    // and never attests a receipt or reports one as not found.
+    if crate::strata_memory::is_strata_backend(storage.as_ref()) {
+        crate::strata_memory::verify_log(storage.as_ref())?;
+    }
     let receipt = storage
         .get_receipt(receipt_id)
         .map_err(|error| safe_storage_error("lookup", &error))?
@@ -272,7 +278,7 @@ fn strata_effect_attestation(storage: &Arc<Storage>, receipt_id: &str) -> Result
     }
     // The log is re-verified for this call; nothing here is assumed. The
     // effect was proved from the log (an Allow gate and a matching payload
-    // digest) by the lookup above, which fails on any damaged segment.
+    // digest), and `receipt get` verifies the whole log before its lookup.
     let verification = match crate::strata_memory::verify_log(storage.as_ref()) {
         Ok(check) => json!({
             "locallyVerified": true,

@@ -216,6 +216,9 @@ mod tests {
         std::fs::write(dir.path().join("vestige-mcp"), b"").unwrap();
         std::fs::write(dir.path().join(upgrade_file_name()), b"").unwrap();
         let found = find_upgrade_from(Some(&dir.path().join("vestige-mcp")), None).unwrap();
-        assert_eq!(found, dir.path().join(upgrade_file_name()));
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            dir.path().join(upgrade_file_name()).canonicalize().unwrap()
+        );
     }
 }

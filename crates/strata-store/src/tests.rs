@@ -2606,13 +2606,6 @@ fn remove_log_segments(dir: &std::path::Path) {
     }
 }
 
-fn edit_ctx() -> AdmissionContext {
-    AdmissionContext {
-        rule_id: Some(RULE_EDIT.to_string()),
-        confirm: false,
-    }
-}
-
 #[test]
 fn effect_lookups_do_not_rescan_the_log_after_writes() {
     let dir = temp_dir("effect-index-live");
@@ -2823,11 +2816,21 @@ fn proving_effects_over_a_damaged_sealed_segment_fails_instead_of_hiding_later_o
     let second = store.ingest(input("second fact", &[])).expect("second");
 
     flip_first_frame(&segment_files(&dir)[0]);
-    // The second fact's effect lives in the intact active segment. It must
-    // not be reported as simply absent: the log as a whole no longer verifies.
+    // Lookups are served from the effect index, proved when each effect was
+    // admitted, so damage found later never hides the second fact's effect.
+    // The damage itself is reported by verification, which `receipt get`
+    // runs before it attests anything.
+    assert!(
+        store
+            .latest_effect(&second)
+            .expect("an index lookup reads no segment")
+            .is_some(),
+        "the second fact's effect must not be hidden"
+    );
     store
-        .latest_effect(&second)
-        .expect_err("a damaged log must not answer lookups");
+        .log()
+        .verify_log()
+        .expect_err("a damaged log must not verify");
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&dest).ok();
 }

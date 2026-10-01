@@ -966,6 +966,7 @@ fn damage_found_on_read_stops_further_appends() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
 fn full_disk_watermark_write_is_an_error_and_the_frames_are_not_kept() {
     let _serial = serialize();
     reset_failpoints();
@@ -1008,6 +1009,7 @@ fn damage_found_by_verify_tail_stops_further_appends() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
 fn full_disk_fails_every_queued_appender_and_keeps_seqs_dense() {
     let _serial = serialize();
     reset_failpoints();
@@ -1061,6 +1063,7 @@ fn a_healthy_log_keeps_accepting_writes_after_reads_and_checks() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
 fn full_disk_seal_trailer_write_is_an_error_and_the_segment_stays_open() {
     let _serial = serialize();
     reset_failpoints();
@@ -1155,6 +1158,7 @@ fn frames_missing_from_disk_fail_verification() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
 fn full_disk_during_open_leaves_no_residue_that_blocks_the_next_open() {
     let _serial = serialize();
     reset_failpoints();

@@ -1086,7 +1086,9 @@ fn a_closed_stderr_does_not_abort_the_upgrade() {
     assert_eq!(before, sha256_file(&db));
 }
 
-#[cfg(unix)]
+// APFS refuses file names that are not valid UTF-8, so this runs where the
+// filesystem can hold one.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn a_non_utf8_data_dir_is_accepted() {
     use std::ffi::OsStr;
