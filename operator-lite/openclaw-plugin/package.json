@@ -1,6 +1,6 @@
 {
   "name": "vestige-operator-lite",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Operator Lite pre-tool gate for OpenClaw \u2014 deterministic shell verdicts, GuardFall-proof analysis, hash-chained receipts. Gate bundled, works out of the box.",
   "type": "module",
   "license": "AGPL-3.0-only",
