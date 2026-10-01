@@ -638,3 +638,141 @@ fn health_consolidate_and_upgrade_describe_the_strata_log() {
     }
     assert_eq!(std::fs::read(&v3).unwrap(), b"SQLite format 3\0kept");
 }
+
+fn token(fill: &str) -> String {
+    format!("ghp_{}", fill.repeat(36))
+}
+
+#[test]
+fn ingest_and_restore_refuse_a_credential_in_tags_or_source_without_echo() {
+    let seeded = seed();
+    let dir = seeded.path();
+    let secret = token("A");
+
+    let tagged = vestige(
+        dir,
+        &[
+            "ingest",
+            "CLI_STRATA_GATE plain note",
+            "--tags",
+            &format!("safe,{secret}"),
+        ],
+    );
+    assert!(!tagged.ok, "{}", tagged.text());
+    assert!(!tagged.text().contains(&secret), "{}", tagged.text());
+
+    let sourced = vestige(
+        dir,
+        &[
+            "ingest",
+            "CLI_STRATA_GATE plain note",
+            "--source",
+            &format!("https://example.invalid/?t={secret}"),
+        ],
+    );
+    assert!(!sourced.ok, "{}", sourced.text());
+    assert!(!sourced.text().contains(&secret), "{}", sourced.text());
+    assert_eq!(node_count(dir), 3, "a refused ingest left a memory behind");
+
+    let out = TempDir::new().unwrap();
+    let file = out.path().join("backup.json");
+    std::fs::write(
+        &file,
+        serde_json::json!([
+            {"content": "CLI_STRATA_GATE tagged", "tags": [secret]},
+            {"content": "CLI_STRATA_GATE sourced", "source": secret},
+            {"content": "CLI_STRATA_GATE clean"}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let restored = vestige(dir, &["restore", path_arg(&file)]);
+    assert!(!restored.text().contains(&secret), "{}", restored.text());
+    assert_eq!(
+        node_count(dir),
+        4,
+        "only the clean record may be restored: {}",
+        restored.text()
+    );
+}
+
+#[test]
+fn scan_secrets_reaches_retired_memories_scopes_and_intentions() {
+    let dir = TempDir::new().expect("temp dir");
+    let secret = token("C");
+    // Records written before the gate covered every field still sit in the
+    // log. Seed them below the gate, as an older binary would have.
+    let (retired, scoped) = {
+        let mut raw = strata_store::StrataStore::open(dir.path()).expect("open raw");
+        let node = |tags: Vec<String>| strata_store::IngestInput {
+            content: "CLI_STRATA_AUDIT plain note".into(),
+            source: None,
+            source_updated_at_ms: None,
+            node_type: "fact".into(),
+            tags,
+            created_at_ms: Some(1),
+            valid_from_ms: None,
+            valid_until_ms: None,
+        };
+        let retired = raw
+            .ingest_in_scope(node(vec![secret.clone()]), "user")
+            .expect("seed tagged");
+        let scoped = raw
+            .ingest_in_scope(node(Vec::new()), &secret)
+            .expect("seed scoped");
+        raw.upsert_intentions(vec![strata_store::IntentionRecord {
+            id: "int-audit".into(),
+            content: format!("rotate {secret}"),
+            trigger_type: "manual".into(),
+            trigger_data: "{}".into(),
+            priority: 2,
+            status: "active".into(),
+            created_at_ms: 1,
+            deadline_ms: None,
+            fulfilled_at_ms: None,
+            reminder_count: 0,
+            last_reminded_at_ms: None,
+            notes: None,
+            tags: Vec::new(),
+            related_memories: Vec::new(),
+            snoozed_until_ms: None,
+            source_type: "mcp".into(),
+            source_data: None,
+            scope: Some("user".into()),
+        }])
+        .expect("seed intention");
+        (retired, scoped)
+    };
+    {
+        let storage = open(dir.path());
+        storage.suppress_memory(&retired).expect("suppress");
+        assert!(storage.get_node(&retired).expect("get").is_none());
+    }
+
+    let scan = vestige(dir.path(), &["scan-secrets", "--json"]);
+    assert!(scan.ok, "{}", scan.text());
+    assert!(
+        !scan.text().contains(&secret),
+        "the audit must not print the credential: {}",
+        scan.text()
+    );
+    let report: Value = serde_json::from_str(&scan.stdout).expect("json report");
+    let hit_ids: Vec<&str> = report["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .filter_map(|hit| hit["nodeId"].as_str())
+        .collect();
+    assert!(
+        hit_ids.contains(&retired.as_str()),
+        "a suppressed memory's tag must be reported: {report}"
+    );
+    assert!(
+        hit_ids.contains(&scoped.as_str()),
+        "a credential-shaped scope must be reported: {report}"
+    );
+    assert!(
+        hit_ids.contains(&"int-audit"),
+        "an intention must be reported: {report}"
+    );
+}

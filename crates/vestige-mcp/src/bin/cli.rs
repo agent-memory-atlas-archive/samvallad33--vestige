@@ -3809,84 +3809,126 @@ fn run_ingest(
     Ok(())
 }
 
-/// Read-only audit of already-persisted memory text for credential shapes.
+/// Findings across `texts`, each (kind, fingerprint) once.
+fn credential_findings<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+    include_suspected: bool,
+) -> Vec<vestige_core::SecretFinding> {
+    let mut findings: Vec<vestige_core::SecretFinding> = Vec::new();
+    for text in texts {
+        for finding in scan_secrets(text) {
+            if !findings.contains(&finding) {
+                findings.push(finding);
+            }
+        }
+    }
+    findings
+        .retain(|finding| include_suspected || finding.confidence == SecretConfidence::Blocking);
+    findings
+}
+
+/// Read-only audit of already-persisted text for credential shapes.
 ///
-/// Deliberately emits IDs, detector classes, and short fingerprints only. It
-/// never prints the matching content, source, or surrounding context.
+/// On a Strata log it covers every record the log holds: live, suppressed and
+/// retired memories (their bytes stay in the append-only log), scopes,
+/// provenance, tags, and intentions. Deliberately emits IDs, detector
+/// classes, and short fingerprints only. It never prints the matching
+/// content, source, or surrounding context.
 fn run_scan_secrets(
     include_suspected: bool,
     json_output: bool,
     limit: Option<usize>,
 ) -> anyhow::Result<()> {
     let storage = open_storage()?;
-    let mut offset = 0_i32;
     let mut scanned = 0_usize;
     let mut hits = Vec::new();
 
-    loop {
-        let nodes = storage.get_all_nodes(100, offset)?;
-        if nodes.is_empty() {
-            break;
-        }
-        offset += nodes.len() as i32;
+    let hit_json = |id: &str,
+                    record_kind: &str,
+                    retired: bool,
+                    created_at: chrono::DateTime<chrono::Utc>,
+                    findings: Vec<vestige_core::SecretFinding>| {
+        serde_json::json!({
+            "nodeId": id,
+            "recordKind": record_kind,
+            "retired": retired,
+            "createdAt": created_at.to_rfc3339(),
+            "findings": findings.into_iter().map(|finding| serde_json::json!({
+                "kind": finding.kind.as_str(),
+                "confidence": finding.confidence.to_string(),
+                "fingerprint": finding.fingerprint,
+            })).collect::<Vec<_>>(),
+        })
+    };
 
-        for node in nodes {
+    if let Some(records) = vestige_mcp::strata_memory::secret_audit_records(storage.as_ref()) {
+        for record in records {
             scanned += 1;
-            let mut findings = scan_secrets(&node.content);
-            if let Some(source) = node.source.as_deref() {
-                for finding in scan_secrets(source) {
-                    if !findings.contains(&finding) {
-                        findings.push(finding);
-                    }
-                }
-            }
-            for tag in &node.tags {
-                for finding in scan_secrets(tag) {
-                    if !findings.contains(&finding) {
-                        findings.push(finding);
-                    }
-                }
-            }
-            if let Some(envelope) = node.source_envelope.as_ref() {
-                for value in [
-                    envelope.source_url.as_deref(),
-                    envelope.source_project.as_deref(),
-                    envelope.source_type.as_deref(),
-                    envelope.source_author.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    for finding in scan_secrets(value) {
-                        if !findings.contains(&finding) {
-                            findings.push(finding);
-                        }
-                    }
-                }
-            }
-            findings.retain(|finding| {
-                include_suspected || finding.confidence == SecretConfidence::Blocking
-            });
+            let findings =
+                credential_findings(record.texts.iter().map(String::as_str), include_suspected);
             if findings.is_empty() {
                 continue;
             }
-
-            hits.push(serde_json::json!({
-                "nodeId": node.id,
-                "createdAt": node.created_at.to_rfc3339(),
-                "findings": findings.into_iter().map(|finding| serde_json::json!({
-                    "kind": finding.kind.as_str(),
-                    "confidence": finding.confidence.to_string(),
-                    "fingerprint": finding.fingerprint,
-                })).collect::<Vec<_>>(),
-            }));
+            let record_kind = match record.kind {
+                vestige_mcp::strata_memory::AuditKind::Memory => "memory",
+                vestige_mcp::strata_memory::AuditKind::Intention => "intention",
+            };
+            hits.push(hit_json(
+                &record.id,
+                record_kind,
+                record.retired,
+                record.created_at,
+                findings,
+            ));
             if limit.is_some_and(|max| hits.len() >= max) {
                 break;
             }
         }
+    } else {
+        let mut offset = 0_i32;
+        loop {
+            let nodes = storage.get_all_nodes(100, offset)?;
+            if nodes.is_empty() {
+                break;
+            }
+            offset += nodes.len() as i32;
 
-        if limit.is_some_and(|max| hits.len() >= max) {
-            break;
+            for node in nodes {
+                scanned += 1;
+                let mut texts: Vec<&str> = vec![node.content.as_str()];
+                texts.extend(node.source.as_deref());
+                texts.extend(node.tags.iter().map(String::as_str));
+                if let Some(envelope) = node.source_envelope.as_ref() {
+                    texts.extend(
+                        [
+                            envelope.source_url.as_deref(),
+                            envelope.source_project.as_deref(),
+                            envelope.source_type.as_deref(),
+                            envelope.source_author.as_deref(),
+                        ]
+                        .into_iter()
+                        .flatten(),
+                    );
+                }
+                let findings = credential_findings(texts, include_suspected);
+                if findings.is_empty() {
+                    continue;
+                }
+                hits.push(hit_json(
+                    &node.id,
+                    "memory",
+                    false,
+                    node.created_at,
+                    findings,
+                ));
+                if limit.is_some_and(|max| hits.len() >= max) {
+                    break;
+                }
+            }
+
+            if limit.is_some_and(|max| hits.len() >= max) {
+                break;
+            }
         }
     }
 
@@ -3900,17 +3942,22 @@ fn run_scan_secrets(
             }))?
         );
     } else if hits.is_empty() {
-        println!("No potential credentials found across {scanned} memories.");
+        println!("No potential credentials found across {scanned} records.");
     } else {
         println!(
-            "Potential credentials found in {} of {scanned} scanned memories:",
+            "Potential credentials found in {} of {scanned} scanned records:",
             hits.len()
         );
         for hit in &hits {
             let node_id = hit["nodeId"].as_str().unwrap_or("unknown");
+            let note = match (hit["recordKind"].as_str(), hit["retired"].as_bool()) {
+                (Some("intention"), _) => " | intention",
+                (_, Some(true)) => " | suppressed or retired",
+                _ => "",
+            };
             for finding in hit["findings"].as_array().into_iter().flatten() {
                 println!(
-                    "{node_id} | {} | {} | {}",
+                    "{node_id} | {} | {} | {}{note}",
                     finding["kind"].as_str().unwrap_or("unknown"),
                     finding["confidence"].as_str().unwrap_or("unknown"),
                     finding["fingerprint"].as_str().unwrap_or("unknown"),
