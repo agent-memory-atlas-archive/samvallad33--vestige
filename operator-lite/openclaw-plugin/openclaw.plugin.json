@@ -1,0 +1,13 @@
+{
+  "id": "vestige-operator-lite",
+  "name": "Vestige Operator Lite",
+  "version": "0.3.2",
+  "description": "Deterministic pre-tool gate: classifies every shell command against a closed rule set (OP-000..OP-010 STOP, OP-S01..S17 SHADOW), follows cd / shell variables / heredocs, sees through GuardFall-class obfuscation, writes hash-chained receipts. The gate is bundled. Shadow mode by default — flip with: echo enforce > ~/.operator/mode",
+  "kind": "security",
+  "activation": { "onStartup": true },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
