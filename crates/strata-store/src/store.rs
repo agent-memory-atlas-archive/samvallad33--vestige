@@ -2315,16 +2315,58 @@ impl StrataStore {
                 "undo conflicts with later memory changes; no changes applied".into(),
             ));
         }
-        let record = if idx == 0 {
-            let mut tomb = history_tip;
-            tomb.superseded_by = Some(format!("undo:{frame_seq:016x}"));
-            tomb
-        } else {
-            versions[idx - 1].1.clone()
-        };
+        if idx != 0 {
+            let record = versions[idx - 1].1.clone();
+            let context = self.context_for(&[&id]);
+            let (_effect_seq, data_seq) =
+                self.admit_write(StoreOp::UpsertNode { record }, action_kind::WRITE, context)?;
+            return Ok(data_seq);
+        }
+        // Undoing the first upsert of a node retires it. When that node was
+        // the successor of an edit, the versions it retired come back live
+        // and the code anchors that moved with the edit move back, so the
+        // undo leaves the pre-edit memory rather than no memory at all.
+        let restores: Vec<NodeRecord> = self
+            .nodes
+            .values()
+            .filter(|node| node.superseded_by.as_deref() == Some(id.as_str()))
+            .map(|node| {
+                let mut restored = node.clone();
+                restored.superseded_by = None;
+                restored
+            })
+            .collect();
+        let moved_anchors = self.anchors.rows_of(&id);
+        let mut tomb = history_tip;
+        tomb.superseded_by = Some(format!("undo:{frame_seq:016x}"));
         let context = self.context_for(&[&id]);
-        let (_effect_seq, data_seq) =
-            self.admit_write(StoreOp::UpsertNode { record }, action_kind::WRITE, context)?;
+        let (_effect_seq, data_seq) = self.admit_write(
+            StoreOp::UpsertNode { record: tomb },
+            action_kind::WRITE,
+            context,
+        )?;
+        for record in &restores {
+            let context = self.context_for(&[&record.id]);
+            self.admit_write(
+                StoreOp::UpsertNode {
+                    record: record.clone(),
+                },
+                action_kind::WRITE,
+                context,
+            )?;
+        }
+        if let Some(restored) = restores.first() {
+            if !moved_anchors.is_empty() {
+                let rows = moved_anchors
+                    .into_iter()
+                    .map(|anchor| AnchorRecord {
+                        node_id: restored.id.clone(),
+                        ..anchor
+                    })
+                    .collect();
+                self.record_anchors(rows)?;
+            }
+        }
         Ok(data_seq)
     }
 }
@@ -2371,6 +2413,11 @@ fn classify_upsert(versions: &[(u64, NodeRecord)], idx: usize) -> (&'static str,
     // prior body today is `undo_node_write`.
     if idx >= 2 && record == &versions[idx - 2].1 && record != &versions[idx - 1].1 {
         return ("undo", Some(versions[idx - 1].0));
+    }
+    // A version re-admitted unchanged after its retirement was undone: the
+    // record matches the one before it exactly, which no caller edit yields.
+    if idx >= 1 && record == &versions[idx - 1].1 {
+        return ("undo", None);
     }
     ("write", None)
 }

@@ -1819,6 +1819,101 @@ fn undo_restores_the_previous_upsert_without_rewriting_it() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+fn edit_ctx() -> AdmissionContext {
+    AdmissionContext {
+        rule_id: Some(RULE_EDIT.to_string()),
+        confirm: false,
+    }
+}
+
+#[test]
+fn undoing_an_edit_restores_the_previous_version_and_retires_only_the_edit() {
+    let dir = temp_dir("undo-edit-chain");
+    let (old_id, new_id, digest) = {
+        let mut store = StrataStore::open(&dir).expect("open");
+        let old_id = store.ingest(input("version one", &[])).expect("ingest");
+        let (new_id, _) = store
+            .edit(&old_id, "version two", &edit_ctx())
+            .expect("edit");
+        assert!(!store.get_node(&old_id).expect("old").is_live());
+        let successor_write = store
+            .node_writes()
+            .into_iter()
+            .find(|write| write.record.id == new_id)
+            .expect("successor write");
+        let undo_seq = store
+            .undo_node_write(successor_write.frame_seq)
+            .expect("undo edit");
+        let old = store.get_node(&old_id).expect("old node");
+        assert!(old.is_live(), "the previous version is live again");
+        assert_eq!(old.content, "version one");
+        assert!(old.superseded_by.is_none());
+        assert!(
+            !store.get_node(&new_id).expect("new node").is_live(),
+            "the edit itself is retired"
+        );
+        assert_eq!(store.node_count(), 1);
+        let undo_write = store
+            .node_writes()
+            .into_iter()
+            .find(|write| write.frame_seq == undo_seq)
+            .expect("undo write");
+        assert_eq!(undo_write.op_type, "undo");
+        assert!(
+            store.undo_node_write(undo_seq).is_err(),
+            "an undo is not itself undone"
+        );
+        let restore_write = store
+            .node_writes()
+            .into_iter()
+            .rev()
+            .find(|write| write.record.id == old_id)
+            .expect("restore write");
+        assert_eq!(restore_write.op_type, "undo");
+        assert!(store.undo_node_write(restore_write.frame_seq).is_err());
+        (old_id, new_id, store.state_digest())
+    };
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    assert_eq!(reopened.state_digest(), digest);
+    assert!(reopened.get_node(&old_id).expect("old").is_live());
+    assert!(!reopened.get_node(&new_id).expect("new").is_live());
+    assert_eq!(reopened.node_count(), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn undoing_an_edit_moves_code_anchors_back_to_the_restored_version() {
+    let dir = temp_dir("undo-edit-anchors");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let old_id = store.ingest(input("anchored one", &[])).expect("ingest");
+    let anchor = anchor("anchor-undo-1", &old_id, "src/lib.rs", 10);
+    store
+        .record_anchors(vec![anchor.clone()])
+        .expect("anchor the memory");
+    let (new_id, _) = store
+        .edit(&old_id, "anchored two", &edit_ctx())
+        .expect("edit");
+    store
+        .record_anchors(vec![crate::AnchorRecord {
+            node_id: new_id.clone(),
+            ..anchor.clone()
+        }])
+        .expect("move the anchor with the edit");
+    let successor_write = store
+        .node_writes()
+        .into_iter()
+        .find(|write| write.record.id == new_id)
+        .expect("successor write");
+    store
+        .undo_node_write(successor_write.frame_seq)
+        .expect("undo edit");
+    let rows = store.anchors_for(&old_id);
+    assert_eq!(rows.len(), 1, "the anchor follows the restored memory");
+    assert_eq!(rows[0].id, anchor.id);
+    assert!(store.anchors_for(&new_id).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 fn imported_node(id: &str, legacy: &[(&str, &str)]) -> Vec<u8> {
     borsh::to_vec(&strata_migrate::NodeRecord {
         record_version: strata_migrate::RECORD_VERSION,

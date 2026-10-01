@@ -2305,13 +2305,38 @@ impl MemoryStoreSend for StrataMemory {
         let frame = parse_op_frame(op_id)
             .ok_or_else(|| StorageError::NotFound(format!("operation {op_id}")))?;
         let mut store = self.lock();
+        // Versions this write's node retired (an edit's predecessors). The
+        // undo brings them back, so the operation reports them as affected.
+        let predecessors: Vec<String> = store
+            .node_writes()
+            .into_iter()
+            .find(|write| write.frame_seq == frame)
+            .map(|write| {
+                store
+                    .supersession_pairs()
+                    .into_iter()
+                    .filter(|(_, successor)| *successor == write.record.id)
+                    .map(|(old, _)| old)
+                    .collect()
+            })
+            .unwrap_or_default();
         let new_seq = store.undo_node_write(frame).map_err(map_store)?;
-        store
+        let mut op = store
             .node_writes()
             .into_iter()
             .find(|write| write.frame_seq == new_seq)
             .map(merge_operation)
-            .ok_or_else(|| StorageError::Init("compensating record vanished after append".into()))
+            .ok_or_else(|| {
+                StorageError::Init("compensating record vanished after append".into())
+            })?;
+        for id in predecessors {
+            if store.get_node(&id).is_some_and(|node| node.is_live())
+                && !op.affected_ids.contains(&id)
+            {
+                op.affected_ids.push(id);
+            }
+        }
+        Ok(op)
     }
 
     fn get_consolidation_history(
