@@ -224,6 +224,15 @@ pub fn upgrade_with(
             report.intentions_carried
         ),
     );
+    if report.skipped_dangling_edges > 0 || report.skipped_dangling_cards > 0 {
+        note(
+            &log_path,
+            &format!(
+                "vestige: skipped {} links and {} review cards that pointed at deleted memories",
+                report.skipped_dangling_edges, report.skipped_dangling_cards
+            ),
+        );
+    }
     Ok(UpgradeStatus::StrataReady { log_dir })
 }
 
