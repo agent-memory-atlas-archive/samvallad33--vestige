@@ -25,6 +25,28 @@ the release checksum, and puts all four binaries in `~/.local/bin`:
 curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/install.sh | sh
 ```
 
+To detect supported local clients and configure their **memory-server**
+connection with backups before each config change, run the optional setup
+wizard after installing:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/setup.sh | sh
+```
+
+The setup wizard covers memory-server MCP configuration only. It does not
+install or enable an Operator execution gate. Its Proof Pulse separates a
+written local configuration from a verified live client connection: restart the
+selected client and check its MCP tools before treating it as connected.
+
+For a no-write preview, pass `--dry-run`; for automation, pass one explicit
+`--client <name>` or `--all --yes`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/setup.sh | sh -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/setup.sh | sh -s -- --client claude-code
+curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/setup.sh | sh -s -- --all --yes
+```
+
 To install a particular archive manually, use:
 
 ```bash
@@ -48,7 +70,7 @@ Then check it:
 vestige-mcp --version
 ```
 
-It should print `vestige-mcp 4.1.1`. If the shell says command not found, `~/.local/bin` is not on your PATH yet: add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` (or `~/.bashrc`) and open a new terminal. If it prints an older version, an older install comes first on your PATH; `which -a vestige-mcp` lists them.
+It should print the current Vestige release version. If the shell says command not found, `~/.local/bin` is not on your PATH yet: add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` (or `~/.bashrc`) and open a new terminal. If it prints an older version, an older install comes first on your PATH; `which -a vestige-mcp` lists them.
 
 On a Mac, download with `curl` as above rather than a browser. A browser marks the files as quarantined and macOS then refuses to run them. If you already used a browser, clear the flag with `xattr -d com.apple.quarantine ~/.local/bin/vestige*`.
 
@@ -108,7 +130,7 @@ On a real 297 MB store with 8,902 memories in 34 scopes, the first launch took a
 
 If the upgrade fails, the v3 data is untouched and the message says so. A `vestige.db` that is unreadable, empty or not plain SQLite is refused by name, never treated as an empty store, and a symlinked `vestige.db` is followed to the real file so memories that live only in its WAL come across. You can keep using v3.1.1 meanwhile. `vestige strata-verify <data-dir>` checks the log and its migration receipt at any time.
 
-If you installed v3 with npm, make sure your agents now run the 4.x binary: `vestige-mcp --version` should print 4.1.1, and `which -a vestige-mcp` shows every copy on your PATH in the order they are found.
+If you installed v3 with npm, make sure your agents now run the 4.x binary: `vestige-mcp --version` should print a 4.x version, and `which -a vestige-mcp` shows every copy on your PATH in the order they are found.
 
 <a id="recall-by-handle-not-resemblance"></a>
 ## Recall by handle, not resemblance

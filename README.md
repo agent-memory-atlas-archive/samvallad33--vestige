@@ -93,6 +93,44 @@ curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/in
 
 The installer selects the right macOS or Linux archive, verifies its SHA-256 checksum, and installs all four Vestige binaries in `~/.local/bin`. Archive names, PATH, flags, and `vestige.toml` are in the [reference](docs/REFERENCE.md#install).
 
+### Guided terminal setup
+
+After the install, run this optional wizard to detect compatible local clients,
+choose the ones you want, preserve a backup before it changes a configuration,
+and configure the Vestige memory server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/setup.sh | sh
+```
+
+The wizard's **Proof Pulse** makes its boundary explicit: it shows what it
+detected, what it backed up, and what it configured. `CONFIGURED` means a local
+client configuration was written; restart the client and confirm its MCP tools
+for live verification. It can optionally open Vestige's local Observatory after
+setup—no cloud account, telemetry, or fake first-run data.
+
+It configures memory-server connections only. Operator Lite execution gates
+remain a separate, shadow-first choice below.
+
+To rehearse the interactive Proof Pulse without touching a real client config,
+run `./scripts/proof-pulse-demo.sh` from a source checkout. The script itself
+lives in this repository; its disposable fixture is removed when the rehearsal
+ends.
+
+For automation and terminal power users, preview without writes or choose an
+explicit target:
+
+```bash
+# Preview detected clients and proposed paths; writes nothing.
+curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/setup.sh | sh -s -- --dry-run
+
+# Configure one detected client without a menu.
+curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/setup.sh | sh -s -- --client opencode
+
+# Configure all detected clients only with explicit confirmation.
+curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/setup.sh | sh -s -- --all --yes
+```
+
 ```bash
 claude mcp add vestige vestige-mcp -s user
 codex mcp add vestige -- vestige-mcp

@@ -155,7 +155,7 @@ For an absolute path:
 If `opencode` is installed or `~/.config/opencode` exists, Vestige's installer can add the global config automatically:
 
 ```bash
-npx @vestige/init
+curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/setup.sh | sh
 ```
 
 The installer writes a backup before modifying an existing config file. It also migrates Vestige entries copied from older `mcpServers` examples into OpenCode's current `mcp.vestige` shape.
@@ -178,7 +178,7 @@ The installer writes a backup before modifying an existing config file. It also 
    ```
 3. Use an absolute binary path if OpenCode cannot resolve `vestige-mcp`.
 4. Restart OpenCode after changing `opencode.json`.
-5. Keep `timeout` at `10000` or higher for installed binaries. If you use the direct `npx` command, use `60000` so the first cold npm download does not fail OpenCode startup.
+5. Keep `timeout` at `10000` or higher for installed binaries.
 </details>
 
 <details>
@@ -189,7 +189,7 @@ OpenCode uses the top-level `mcp` key. Do not use the `mcpServers` shape from Cl
 If you copied an older Vestige example that used `mcpServers`, rerun:
 
 ```bash
-npx @vestige/init
+curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/setup.sh | sh
 ```
 
 Correct:
