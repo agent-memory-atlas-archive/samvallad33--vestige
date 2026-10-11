@@ -103,7 +103,8 @@ and configure the Vestige memory server:
 curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/setup.sh | sh
 ```
 
-The wizard's **Proof Pulse** makes its boundary explicit: it shows what it
+The wizard is cached locally in `~/.local/share/vestige/setup/` (or your
+`XDG_DATA_HOME` equivalent). Its **Proof Pulse** makes the boundary explicit: it shows what it
 detected, what it backed up, and what it configured. `CONFIGURED` means a local
 client configuration was written; restart the client and confirm its MCP tools
 for live verification. It can optionally open Vestige's local Observatory after
