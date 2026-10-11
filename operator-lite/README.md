@@ -40,7 +40,9 @@ history through the rules. Nothing in that history is executed.
   "hooks": [{ "type": "command",
   "command": "python3 ~/.operator/gate/operator-gate.py hook --source claude" }] }] } }
 ```
-**Codex** (`~/.codex/hooks.json`): same shape, `--source codex`.
+**Codex:** the [Codex integration guide](../docs/integrations/codex.md) covers
+the memory server. Do not copy this hook shape into Codex yet: its execution
+hook needs its own verified wiring before it can be called supported.
 **OpenClaw**: the gate is already bundled in a ClawHub plugin — one line:
 
     clawhub install vestige-operator-lite

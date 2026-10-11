@@ -20,7 +20,6 @@ corpus, everywhere.
 |---|---|---|---|
 | OpenClaw | `before_tool_call` plugin | [../openclaw-plugin/](../openclaw-plugin/) (ClawHub: `clawhub install vestige-operator-lite`) | published, inspector PASS |
 | Claude Code | `PreToolUse` hook | [../README.md](../README.md#install-one-command) | shipped |
-| Codex | hooks.json | [../README.md](../README.md#install-one-command) | shipped |
 | OpenHands | `.openhands/hooks.json` PreToolUse | [openhands/](openhands/) | gate-tested, suite PASS |
 | OpenCode | `.opencode/plugins/` `tool.execute.before` | [opencode/](opencode/) | gate-tested, corpus 46/46 via adapter, boots in opencode CLI |
 | Cline | file hooks `~/.cline/hooks/PreToolUse` (fires before approval policies — covers YOLO) + SDK plugin | [cline/](cline/) | gate-tested, suite PASS, receipt chain OK |
@@ -38,6 +37,11 @@ corpus, everywhere.
 Status values: `shipped` (tested end-to-end) · `gate-tested` (gate contract
 verified locally; host wiring follows documented, unmodified upstream
 behavior) · `experimental`.
+
+Codex is intentionally absent from the execution-port table. Its
+[MCP memory integration](../../docs/integrations/codex.md) is documented, but
+the current Codex execution-hook wiring needs a separate local verification
+before it can be described as a supported Operator Lite port.
 
 ## Install any port
 

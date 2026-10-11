@@ -27,7 +27,7 @@ Operator Lite is free and stays free. Vestige Operator is the owner's version of
 
 ## Quick start
 
-Operator Lite is the free gate in [`operator-lite/`](operator-lite/). It is one file, stdlib only, and it sits on a PreToolUse hook (Claude Code, Codex, OpenClaw, or any host with command hooks).
+Operator Lite is the free gate in [`operator-lite/`](operator-lite/). It is one file, stdlib only, and it sits on a PreToolUse hook (Claude Code, OpenClaw, or any host with a documented command-hook port).
 
 macOS and Linux:
 
@@ -97,6 +97,46 @@ The installer selects the right macOS or Linux archive, verifies its SHA-256 che
 claude mcp add vestige vestige-mcp -s user
 codex mcp add vestige -- vestige-mcp
 ```
+
+## Choose your environment
+
+The installer gives you the local binaries. Choose one of the guides below to
+connect the **Vestige memory server** to the client you use. MCP connection
+makes Strata's durable records and receipts available; it does not itself add
+an execution gate.
+
+| Environment | Memory-server setup |
+|---|---|
+| Claude Code | Run `claude mcp add vestige vestige-mcp -s user` above. |
+| Codex | [Codex guide](docs/integrations/codex.md) |
+| Cursor | [Cursor guide](docs/integrations/cursor.md) |
+| VS Code + GitHub Copilot | [VS Code guide](docs/integrations/vscode.md) |
+| OpenCode | [OpenCode guide](docs/integrations/opencode.md) |
+| Windsurf | [Windsurf guide](docs/integrations/windsurf.md) |
+| Xcode | [Xcode guide](docs/integrations/xcode.md) |
+| JetBrains / Junie | [JetBrains guide](docs/integrations/jetbrains.md) |
+| Another stdio MCP client | Use the [MCP configuration pattern](docs/AGENT-MEMORY-PROTOCOL.md). |
+
+### Add an execution boundary
+
+Operator Lite is a separate, local pre-tool gate. Every supported port begins
+in **shadow mode**: it writes a receipt for each decision without blocking.
+Review the receipt chain, then intentionally switch to enforce mode.
+
+| Environment | Operator Lite setup |
+|---|---|
+| Claude Code | [One-command install](operator-lite/README.md#install-one-command) |
+| OpenClaw | `clawhub install vestige-operator-lite` |
+| Cursor | [Cursor port](operator-lite/ports/cursor/README.md) |
+| OpenCode | [OpenCode port](operator-lite/ports/opencode/README.md) |
+| Gemini CLI | [Gemini CLI port](operator-lite/ports/gemini-cli/README.md) |
+| Windsurf | [Windsurf port](operator-lite/ports/windsurf/README.md) |
+| Cline | [Cline port](operator-lite/ports/cline/README.md) |
+| Frameworks and additional hosts | [All documented ports](operator-lite/ports/README.md) |
+
+The Codex guide above covers MCP memory. Its execution-hook wiring is not yet
+listed here because it needs a separately verified local hook setup before it
+can be described as ready.
 
 ## Docs
 
