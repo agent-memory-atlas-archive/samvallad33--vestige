@@ -85,7 +85,13 @@ Operator Lite receipts are hash-chained digests, not signatures. It only blocks 
 <a id="install"></a>
 ## Memory server
 
-The memory server is a Strata signed append-only log. Every write is gated and returns a receipt. Install from a [release archive](https://github.com/samvallad33/vestige/releases/latest) or `brew install samvallad33/tap/vestige`. Archive names, PATH, flags, and `vestige.toml` are in the [reference](docs/REFERENCE.md#install).
+The memory server is a Strata signed append-only log. Every write is gated and returns a receipt. Install the latest signed release with one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/install.sh | sh
+```
+
+The installer selects the right macOS or Linux archive, verifies its SHA-256 checksum, and installs all four Vestige binaries in `~/.local/bin`. Archive names, PATH, flags, and `vestige.toml` are in the [reference](docs/REFERENCE.md#install).
 
 ```bash
 claude mcp add vestige vestige-mcp -s user

@@ -18,7 +18,14 @@ Agents re-learn the same lessons. They recommend a change you already tested and
 
 Each release archive holds four binaries: `vestige-mcp` (the MCP server your agents run), `vestige` (the CLI), `vestige-upgrade` (the v3 importer) and `vestige-restore`. Keep all four in one folder. No Docker, no signup, no compile step, and nothing downloads on first start.
 
-**macOS and Linux.** Two commands put the binaries in `~/.local/bin`:
+**macOS and Linux.** The recommended installer selects your platform, verifies
+the release checksum, and puts all four binaries in `~/.local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/install.sh | sh
+```
+
+To install a particular archive manually, use:
 
 ```bash
 mkdir -p ~/.local/bin
