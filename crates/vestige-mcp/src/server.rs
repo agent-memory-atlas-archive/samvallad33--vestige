@@ -1366,6 +1366,24 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
                 input_schema: tools::compact::of(&tools::forgotten_lesson::schema()),
                 ..Default::default()
             },
+            // ================================================================
+            // OPERATOR STOPS — what the Operator gate stopped, and why.
+            // Read-only view of ~/.operator receipts and permits; touches
+            // no store state, approves nothing, issues nothing.
+            // ================================================================
+            ToolDescription {
+                name: "vestige_stops".to_string(),
+                title: Some("Vestige Stops".to_string()),
+                annotations: Some(ToolAnnotations {
+                    read_only_hint: true,
+                    destructive_hint: false,
+                    idempotent_hint: true,
+                    open_world_hint: false,
+                }),
+                description: Some("What Operator stopped and why: reads receipts and permits.".to_string()),
+                input_schema: tools::compact::of(&tools::stops::schema()),
+                ..Default::default()
+            },
             ]
     }
 
@@ -1955,6 +1973,9 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
             "selftest" => tools::selftest::execute(&self.storage, request.arguments).await,
             "forgotten_lesson" => {
                 tools::forgotten_lesson::execute(&self.storage, request.arguments).await
+            }
+            "vestige_stops" => {
+                tools::stops::execute(&self.storage, request.arguments).await
             }
 
             // ================================================================
@@ -4588,7 +4609,7 @@ mod tests {
     #[test]
     fn full_schema_registry_matches_the_advertised_catalog() {
         let catalog = McpServer::tool_catalog();
-        let expected = if cfg!(feature = "connectors") { 18 } else { 17 };
+        let expected = if cfg!(feature = "connectors") { 19 } else { 18 };
         assert_eq!(
             catalog.len(),
             expected,
@@ -4775,7 +4796,7 @@ mod tests {
         // w3d: +2 with `selftest` + `forgotten_lesson`; v3.2: `causal_walk`
         // replaced `backfill` on the advertised surface (backfill stays
         // dispatchable as a hidden alias).
-        let expected = if cfg!(feature = "connectors") { 18 } else { 17 };
+        let expected = if cfg!(feature = "connectors") { 19 } else { 18 };
         assert_eq!(
             tools.len(),
             expected,

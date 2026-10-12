@@ -427,6 +427,7 @@ pub fn full_schema(name: &str) -> Option<Value> {
         "causal_walk" => causal_walk::schema(),
         "selftest" => selftest::schema(),
         "forgotten_lesson" => forgotten_lesson::schema(),
+        "vestige_stops" => stops::schema(),
         "purge" => memory_unified::purge_schema(),
         _ => return None,
     })
@@ -451,6 +452,7 @@ const ALL_TOOLS: &[&str] = &[
     "causal_walk",
     "selftest",
     "forgotten_lesson",
+    "vestige_stops",
 ];
 
 #[cfg(test)]

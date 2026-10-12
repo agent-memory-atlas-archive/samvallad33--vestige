@@ -326,7 +326,7 @@ fn ghostlink_is_the_advertised_composition_tool() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 16, "{names:?}");
+    assert_eq!(names.len(), 18, "{names:?}");
     assert!(names.contains(&"ghostlink"), "{names:?}");
     assert!(
         !names.contains(&"graph"),
