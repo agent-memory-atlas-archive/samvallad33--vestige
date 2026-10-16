@@ -52,6 +52,21 @@ jobs:
       - if: runner.os != 'Windows'
         run: python3 operator-lite/test_replay.py
       - if: runner.os != 'Windows'
+        run: python3 operator-lite/test_install_guard.py
+      - if: runner.os != 'Windows'
+        run: python3 operator-lite/test_sqlpipe.py
+      - if: runner.os != 'Windows'
+        run: python3 operator-lite/test_strata_guard.py
+      - if: runner.os != 'Windows'
+        run: python3 operator-lite/test_self_protect.py
+      - if: runner.os != 'Windows'
+        name: every host port's own test suite, offline
+        run: |
+          for t in operator-lite/ports/*/test.sh; do
+            echo "== $t"
+            HOME="$RUNNER_TEMP/ports-home-$(basename "$(dirname "$t")")" bash "$t" || exit 1
+          done
+      - if: runner.os != 'Windows'
         run: python3 operator-lite/operator-gate.py corpus guardfall
       - if: runner.os != 'Windows'
         run: cmp operator-lite/operator-gate.py operator-lite/openclaw-plugin/gate/operator-gate.py
