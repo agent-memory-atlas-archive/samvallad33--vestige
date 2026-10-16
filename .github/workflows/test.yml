@@ -64,7 +64,11 @@ jobs:
         run: |
           for t in operator-lite/ports/*/test.sh; do
             echo "== $t"
-            HOME="$RUNNER_TEMP/ports-home-$(basename "$(dirname "$t")")" bash "$t" || exit 1
+            # a home outside every temp folder: the gate treats temp paths as scratch, and the port tests
+            # check deletes that must be stopped
+            h="$HOME/operator-lite-ports/$(basename "$(dirname "$t")")"
+            mkdir -p "$h"
+            HOME="$h" bash "$t" || exit 1
           done
       - if: runner.os != 'Windows'
         run: python3 operator-lite/operator-gate.py corpus guardfall
