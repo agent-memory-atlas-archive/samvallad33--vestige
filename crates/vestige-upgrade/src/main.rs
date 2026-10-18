@@ -91,9 +91,7 @@ fn default_data_dir() -> PathBuf {
     {
         return PathBuf::from(value);
     }
-    directories::ProjectDirs::from("com", "vestige", "core")
-        .map(|dirs| dirs.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."))
+    vestige_core::data_dir::default_data_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// `VESTIGE_ATTACH_WAIT_SECS`, else [`DEFAULT_LOCK_WAIT`].

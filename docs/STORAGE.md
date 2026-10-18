@@ -15,13 +15,18 @@ All state lives in one **data directory**. The log is the `log/` folder inside i
 | Platform | Default data directory |
 |----------|------------------------|
 | macOS | `~/Library/Application Support/com.vestige.core` |
-| Linux | `$XDG_DATA_HOME/core`, or `~/.local/share/core` when that is unset |
+| Linux | `$XDG_DATA_HOME/vestige`, or `~/.local/share/vestige` when that is unset |
 | Windows | `%APPDATA%\vestige\core\data` |
 
-The macOS path was checked against a running 4.1.1 install. The Linux and Windows
-paths come from the `directories` crate (6.0.0) as `vestige-mcp` calls it with the
-qualifier `com`, organization `vestige` and application `core`. Older docs showed
-`~/.local/share/vestige/core` and `%APPDATA%\vestige\core`. If you are unsure, the
+The macOS path was checked against a running 4.1.1 install. The Windows path comes
+from the `directories` crate (6.0.0) as `vestige-mcp` calls it with the qualifier
+`com`, organization `vestige` and application `core`.
+
+Earlier releases stored Linux data in `$XDG_DATA_HOME/core` (`~/.local/share/core`),
+a generic folder name other software can share (#433). If that folder already
+holds a Vestige store and the `vestige` folder does not, Vestige keeps using it, so
+upgrading never hides existing memory. To move it, stop every Vestige client and
+rename `~/.local/share/core` to `~/.local/share/vestige`. If you are unsure, the
 server's startup log names the directory on the line that starts `Strata log
 initialized at`.
 

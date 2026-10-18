@@ -72,10 +72,8 @@ fn main() -> anyhow::Result<()> {
     // the platform directory.
     let dir = match std::env::var_os("VESTIGE_DATA_DIR").filter(|value| !value.is_empty()) {
         Some(value) => PathBuf::from(value),
-        None => directories::ProjectDirs::from("com", "vestige", "core")
-            .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?
-            .data_dir()
-            .to_path_buf(),
+        None => vestige_core::data_dir::default_data_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?,
     };
     // A v3 store is upgraded first. Opening a Strata log beside an
     // un-upgraded vestige.db would create an empty log, and every later

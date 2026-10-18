@@ -88,6 +88,8 @@ pub mod composition;
 pub mod config;
 pub mod connectors;
 pub mod consolidation;
+/// The platform default data directory (#433).
+pub mod data_dir;
 /// Durable profile contracts for local embedding vector spaces.
 pub mod fsrs;
 /// SQLite FTS5 query sanitization — quarantined with the SQLite backend

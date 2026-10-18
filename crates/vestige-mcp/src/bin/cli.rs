@@ -2324,9 +2324,8 @@ fn cli_data_dir() -> anyhow::Result<PathBuf> {
     {
         return Ok(expand_tilde(PathBuf::from(value)));
     }
-    let proj = directories::ProjectDirs::from("com", "vestige", "core")
-        .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?;
-    Ok(proj.data_dir().to_path_buf())
+    vestige_core::data_dir::default_data_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))
 }
 
 fn expand_tilde(path: PathBuf) -> PathBuf {

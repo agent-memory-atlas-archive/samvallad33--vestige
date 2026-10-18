@@ -3,7 +3,7 @@
 //! Core storage layer with integrated embeddings and vector search.
 
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
-use directories::{BaseDirs, ProjectDirs};
+use directories::BaseDirs;
 use rusqlite::types::{Type, Value, ValueRef};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use std::collections::{HashMap, HashSet};
