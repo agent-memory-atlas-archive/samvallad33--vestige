@@ -25,6 +25,46 @@ use crate::resources;
 use crate::tools;
 use vestige_core::{OutputConfig, Storage, VestigeConfig};
 
+/// A `memory` get that carries a non-empty `reason` and found its memory: the
+/// agent is showing that memory to its user. Returns the memory id (as the
+/// store resolved it) and the reason.
+fn shown_memory(
+    tool_name: &str,
+    args: &Option<serde_json::Value>,
+    result: &serde_json::Value,
+) -> Option<(String, String)> {
+    if tool_name != "memory" {
+        return None;
+    }
+    let args = args.as_ref()?;
+    if args.get("action").and_then(|v| v.as_str()) != Some("get") {
+        return None;
+    }
+    let reason = args.get("reason").and_then(|v| v.as_str())?.trim();
+    if reason.is_empty() {
+        return None;
+    }
+    let node = result.get("node")?;
+    let id = node
+        .get("id")
+        .and_then(|v| v.as_str())
+        .or_else(|| args.get("id").and_then(|v| v.as_str()))?;
+    Some((id.to_string(), reason.chars().take(2000).collect()))
+}
+
+/// The dashboard's port for links handed to agents: the one this process is
+/// serving, else VESTIGE_DASHBOARD_PORT, else 3927.
+fn dashboard_port() -> u16 {
+    let serving = crate::dashboard::SERVING_PORT.load(Ordering::Relaxed);
+    if serving > 0 {
+        return serving;
+    }
+    std::env::var("VESTIGE_DASHBOARD_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3927)
+}
+
 /// Build the MCP `instructions` string injected into every connecting client's
 /// system prompt.
 ///
@@ -72,6 +112,7 @@ fn build_instructions() -> String {
     instructions.push_str("\nIn a codebase, save durable conventions and design decisions with codebase(action='remember_pattern'|'remember_decision', files=['path.rs#symbol']); anchored code memories self-check against the source and are flagged when the code drifts.");
     instructions.push_str("\nghostlink(mode='propose') surfaces never-composed memory pairs from recorded edges, each with its proof; record what a tested pair showed with mode='weave'.");
     instructions.push_str("\nDiscover all available actions with memory_status(view='tools'); pass tool='<name>' for its exact schema. Choose calls that serve the task; no tool-call quota is required.");
+    instructions.push_str("\nTo show the user one memory, read it with memory(action='get', id, reason='what you will tell them'): every open Vestige dashboard goes inside that memory and shows your words, and the reply carries its dashboard link.");
     instructions
 }
 
@@ -599,6 +640,9 @@ pub struct McpServer {
     /// use it as the fallback for detail/limit when no explicit MCP param is
     /// given; explicit params always win.
     output_config: Arc<OutputConfig>,
+    /// The connected client's name from `initialize` (clientInfo.name), so the
+    /// dashboard can say which agent is showing a memory.
+    client_name: std::sync::OnceLock<String>,
 }
 
 /// Load `vestige.toml` from the storage's data directory and resolve it to an
@@ -657,6 +701,7 @@ impl McpServer {
             consolidating: Arc::new(AtomicBool::new(false)),
             event_tx: None,
             output_config,
+            client_name: std::sync::OnceLock::new(),
         }
     }
 
@@ -678,6 +723,7 @@ impl McpServer {
             consolidating: Arc::new(AtomicBool::new(false)),
             event_tx: Some(event_tx),
             output_config,
+            client_name: std::sync::OnceLock::new(),
         }
     }
 
@@ -948,6 +994,7 @@ impl McpServer {
             };
 
         self.initialized.store(true, Ordering::Release);
+        let _ = self.client_name.set(request.client_info.name.clone());
         info!(
             "MCP session initialized with protocol version {}",
             negotiated_version
@@ -1083,7 +1130,7 @@ description: Some("Manage one memory: 'get', 'get_batch', 'state', 'promote' / '
                     open_world_hint: false,
                 }),
                 description: Some("Retire one memory so it can't be retrieved. confirm=true required; the client prompts. Same path as memory(action='purge').".to_string()),
-                input_schema: tools::memory_unified::purge_schema(),
+                input_schema: tools::compact::of(&tools::memory_unified::purge_schema()),
                 meta: Some(serde_json::json!({ "anthropic/requiresUserInteraction": true })),
                 ..Default::default()
             },
@@ -1328,6 +1375,28 @@ description: Some("Walk a failure backward from explicit start points (failing_t
                 ..Default::default()
             },
             // ================================================================
+            // GATHER — GitHub issue receipt factory (MCP-only). Records the
+            // issue, its comments, cross-referenced PRs and the repo commit
+            // window as labeled receipts in one scope (commits first, so
+            // auto-connect edges point failure-ward), then proposes
+            // ghostlink leads and runs causal_walk. Gathering is dynamic;
+            // judging is deterministic over recorded edges. When the walk
+            // returns nothing, missingReceipts names what to fetch next.
+            // ================================================================
+            ToolDescription {
+                name: "gather".to_string(),
+                title: Some("Gather".to_string()),
+                annotations: Some(ToolAnnotations {
+                    read_only_hint: false,
+                    destructive_hint: false,
+                    idempotent_hint: false,
+                    open_world_hint: true,
+                }),
+                description: Some("A GitHub issue's evidence as receipts, then the walk.".to_string()),
+                input_schema: tools::compact::of(&tools::gather::schema()),
+                ..Default::default()
+            },
+            // ================================================================
             // w3d SELF-CALIBRATION — planted-cause selftest. Verifies the
             // backfill surface end-to-end against a temp COPY of the store
             // (backup_to snapshot): plants quiet causes + failures, scores
@@ -1494,8 +1563,10 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
         Ok(result)
     }
 
-    /// Handle tools/call request
-    async fn handle_tools_call(
+    /// Handle tools/call request. Crate-visible so the dashboard's tool bridge
+    /// (`POST /api/mcp/{tool}`) runs the exact path an agent's call runs:
+    /// Strata withholding, trace, review gate, receipt, events.
+    pub(crate) async fn handle_tools_call(
         &self,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, JsonRpcError> {
@@ -1791,6 +1862,20 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
                     }
                 }
             }
+            // A memory read with a reason is an agent showing that memory to
+            // its user: the reply carries the dashboard view of it, and the
+            // emit below takes every open dashboard inside it.
+            if let Some((id, _)) = shown_memory(&tool_name, &saved_args, content)
+                && let Some(object) = content.as_object_mut()
+            {
+                object.insert(
+                    "dashboard".to_string(),
+                    serde_json::json!({
+                        "url": format!("http://127.0.0.1:{}/dashboard/memory?id={}", dashboard_port(), id),
+                        "note": "Every open Vestige dashboard is now inside this memory, showing your reason. Give the user this link if theirs is not open."
+                    }),
+                );
+            }
             // Emit after receipt attachment and gating so the dashboard sees the
             // same final evidence and review state returned to the calling agent.
             self.emit_tool_event(&tool_name, &saved_args, content);
@@ -1960,6 +2045,10 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
             // CAUSAL WALK — the advertised flagship (successor to backfill)
             // ================================================================
             "causal_walk" => tools::causal_walk::execute(&self.storage, request.arguments).await,
+            "gather" => {
+                tools::gather::execute(&self.storage, Some(&self.cognitive), request.arguments)
+                    .await
+            }
 
             // ================================================================
             // HIDDEN ALIAS (v3.2): backfill → causal_walk replaced it on the
@@ -3077,6 +3166,20 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
                             timestamp: now,
                         });
                     }
+                    "get" => {
+                        if let Some((shown_id, reason)) = shown_memory(tool_name, args, result) {
+                            self.emit(VestigeEvent::MemoryShown {
+                                id: shown_id,
+                                by: self
+                                    .client_name
+                                    .get()
+                                    .cloned()
+                                    .unwrap_or_else(|| "Your agent".to_string()),
+                                reason,
+                                timestamp: now,
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -3121,8 +3224,14 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
                     .or(result.get("memories_replayed"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
+                // On Strata, connectionsFound counts the recorded edges the
+                // dream replayed; the connections it found that were not
+                // there before are stats.new_connections_found. The event
+                // means the new ones.
                 let connections = result
-                    .get("connectionsFound")
+                    .get("stats")
+                    .and_then(|stats| stats.get("new_connections_found"))
+                    .or(result.get("connectionsFound"))
                     .or(result.get("connections_found"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
@@ -4586,6 +4695,42 @@ mod tests {
     /// `every_root_and_variant_field_reaches_the_wire`), and that costs
     /// about 1.3 KiB.
     #[test]
+    fn a_memory_read_with_a_reason_is_shown_and_nothing_else_is() {
+        let found = serde_json::json!({ "node": { "id": "mem-00000000000a2be7" } });
+        let get = |reason: Option<&str>| {
+            let mut args = serde_json::json!({ "action": "get", "id": "mem-00000000000a2be7" });
+            if let Some(r) = reason {
+                args["reason"] = serde_json::json!(r);
+            }
+            Some(args)
+        };
+        assert_eq!(
+            shown_memory("memory", &get(Some("why the dashboard changed")), &found),
+            Some((
+                "mem-00000000000a2be7".to_string(),
+                "why the dashboard changed".to_string()
+            ))
+        );
+        // A plain read, an empty reason, another action, another tool, or a
+        // miss never moves anyone's dashboard.
+        assert_eq!(shown_memory("memory", &get(None), &found), None);
+        assert_eq!(shown_memory("memory", &get(Some("   ")), &found), None);
+        let demote = Some(
+            serde_json::json!({ "action": "demote", "id": "mem-00000000000a2be7", "reason": "wrong" }),
+        );
+        assert_eq!(shown_memory("memory", &demote, &found), None);
+        assert_eq!(shown_memory("recall", &get(Some("why")), &found), None);
+        assert_eq!(
+            shown_memory(
+                "memory",
+                &get(Some("why")),
+                &serde_json::json!({ "error": "not found" })
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn tools_list_wire_payload_stays_under_22_kib() {
         // The budget is for the catalog the release binaries ship. A build
         // with `connectors` also advertises `source_sync`, which no release
@@ -4609,7 +4754,7 @@ mod tests {
     #[test]
     fn full_schema_registry_matches_the_advertised_catalog() {
         let catalog = McpServer::tool_catalog();
-        let expected = if cfg!(feature = "connectors") { 19 } else { 18 };
+        let expected = if cfg!(feature = "connectors") { 20 } else { 19 };
         assert_eq!(
             catalog.len(),
             expected,
@@ -4796,15 +4941,15 @@ mod tests {
         // w3d: +2 with `selftest` + `forgotten_lesson`; v3.2: `causal_walk`
         // replaced `backfill` on the advertised surface (backfill stays
         // dispatchable as a hidden alias).
-        let expected = if cfg!(feature = "connectors") { 19 } else { 18 };
+        let expected = if cfg!(feature = "connectors") { 20 } else { 19 };
         assert_eq!(
             tools.len(),
             expected,
             "Expected {expected} tools: the v2.3/v3 consolidated set (dedup + memory_status + \
              graph + maintain + recall; session_context renamed) plus `receipt`, \
-             `causal_walk`, `project`, the #219 standalone `purge`, and the w3d \
-             `selftest` + `forgotten_lesson`. `source_sync` counts only with \
-             the connectors feature"
+             `causal_walk`, `project`, the #219 standalone `purge`, the w3d \
+             `selftest` + `forgotten_lesson`, `precedent` and `gather`. \
+             `source_sync` counts only with the connectors feature"
         );
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();

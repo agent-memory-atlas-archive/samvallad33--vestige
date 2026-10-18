@@ -102,7 +102,14 @@ fn parse_decision(v: Option<&str>) -> Result<Option<Vec<String>>, String> {
     }
 }
 
+/// Records an agent gets per call: a page that fits in a context.
+const AGENT_LIMIT: usize = 50;
+
 fn parse_query(args: Option<Value>) -> Result<Query, String> {
+    parse_query_capped(args, AGENT_LIMIT)
+}
+
+fn parse_query_capped(args: Option<Value>, max_limit: usize) -> Result<Query, String> {
     let a: Args = match args {
         Some(v) => serde_json::from_value(v).map_err(|e| e.to_string())?,
         None => Args::default(),
@@ -115,7 +122,7 @@ fn parse_query(args: Option<Value>) -> Result<Query, String> {
         session: nonempty(a.session),
         rule: nonempty(a.rule),
         decisions: parse_decision(a.decision.as_deref())?,
-        limit: a.limit.unwrap_or(10).clamp(1, 50) as usize,
+        limit: a.limit.unwrap_or(10).clamp(1, max_limit.max(1) as i64) as usize,
         label,
     })
 }
@@ -307,7 +314,17 @@ fn build_item(rec: &Value, permits: &[Value]) -> Value {
         "detail": rec.get("detail").cloned().unwrap_or(Value::Null),
         "digest": rec.get("digest").cloned().unwrap_or(Value::Null),
     });
-    for k in ["via", "action_digest", "commitment"] {
+    // `prev` is the digest this receipt chains to; `normalized` and
+    // `transforms` are what the gate saw through before it judged the call.
+    for k in [
+        "via",
+        "action_digest",
+        "commitment",
+        "prev",
+        "normalized",
+        "transforms",
+        "gate_version",
+    ] {
         if let Some(v) = rec.get(k) {
             item[k] = v.clone();
         }
@@ -469,6 +486,13 @@ pub async fn execute(_storage: &Arc<Storage>, args: Option<Value>) -> Result<Val
     run(&operator_home(), &q)
 }
 
+/// The same reader with a wider cap, for the dashboard: it draws every stop
+/// in a window, not one page of them. Agents keep the 50-record page.
+pub fn execute_wide(args: Option<Value>, max_limit: usize) -> Result<Value, String> {
+    let q = parse_query_capped(args, max_limit)?;
+    run(&operator_home(), &q)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,6 +588,27 @@ mod tests {
             Some(vec!["SHADOW_STOP".to_string()])
         );
         assert!(parse_decision(Some("maybe")).is_err());
+    }
+
+    #[test]
+    fn items_carry_the_chain_link_and_what_the_gate_saw_through() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path().to_path_buf();
+        let fresh = iso(Utc::now() - chrono::Duration::minutes(5));
+        let stop = rec(
+            &fresh,
+            "STOP",
+            r#","prev":"79ecb0a2a995efb2","normalized":"git checkout -- src/app.py","transforms":["variables-expanded","heredoc-extracted"],"commitment":"OP-011","rule":"no-unrestorable-loss","detail":"git checkout discards uncommitted changes token=hunter2""#,
+        );
+        write(&home, "receipts/2026-10-16.jsonl", &format!("{stop}\n"));
+        let out = run(&home, &query(json!({"since": "1h"}))).unwrap();
+        let item = &out["items"][0];
+        assert_eq!(item["prev"], "79ecb0a2a995efb2");
+        assert_eq!(item["normalized"], "git checkout -- src/app.py");
+        assert_eq!(item["transforms"], json!(["variables-expanded", "heredoc-extracted"]));
+        assert_eq!(item["gate_version"], "0.3.13");
+        // The pass-through fields go through the same masking as the rest.
+        assert_eq!(item["detail"], "git checkout discards uncommitted changes [REDACTED]");
     }
 
     #[test]
@@ -705,6 +750,14 @@ mod tests {
         );
         assert!(find("012345678901234567890123").get("permit").is_none());
         assert_eq!(out["summary"], "3 stops in the last 24h");
+    }
+
+    #[test]
+    fn wide_cap_reaches_past_the_agent_page() {
+        let q = parse_query_capped(Some(json!({"limit": 900})), 2000).unwrap();
+        assert_eq!(q.limit, 900);
+        let q = parse_query(Some(json!({"limit": 900}))).unwrap();
+        assert_eq!(q.limit, AGENT_LIMIT);
     }
 
     #[test]

@@ -1,12 +1,13 @@
 //! Dashboard shared state
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::{Mutex, broadcast, watch};
 use vestige_core::Storage;
 
 use super::events::VestigeEvent;
 use crate::cognitive::CognitiveEngine;
+use crate::server::McpServer;
 
 /// Broadcast channel capacity — how many events can buffer before old ones drop.
 // 4096 events of headroom before a slow dashboard subscriber lags. A lagging
@@ -28,6 +29,10 @@ pub struct AppState {
     /// Flips to `true` once when this dashboard stops serving: the listener
     /// closes and every open WebSocket ends.
     stopped: Arc<watch::Sender<bool>>,
+    /// The tool bridge: one MCP server over the same store, cognitive engine
+    /// and event channel, built on first use, so a dashboard tool call runs
+    /// the exact path an agent's call runs.
+    mcp: Arc<OnceLock<Arc<McpServer>>>,
 }
 
 impl AppState {
@@ -54,7 +59,26 @@ impl AppState {
             event_tx,
             start_time: Instant::now(),
             stopped: Arc::new(watch::channel(false).0),
+            mcp: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// The dashboard's MCP server (see the `mcp` field).
+    pub fn mcp_server(&self) -> Arc<McpServer> {
+        self.mcp
+            .get_or_init(|| {
+                let cognitive = self.cognitive.clone().unwrap_or_else(|| {
+                    let mut engine = CognitiveEngine::new();
+                    engine.hydrate(&self.storage);
+                    Arc::new(Mutex::new(engine))
+                });
+                Arc::new(McpServer::new_with_events(
+                    Arc::clone(&self.storage),
+                    cognitive,
+                    self.event_tx.clone(),
+                ))
+            })
+            .clone()
     }
 
     /// Stop serving: the listener closes and open WebSockets end.

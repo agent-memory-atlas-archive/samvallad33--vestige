@@ -2832,6 +2832,70 @@ fn effect_lookups_do_not_rescan_the_log_after_writes() {
 }
 
 #[test]
+fn indexed_effects_walk_the_full_scan_with_each_ops_own_clock() {
+    let dir = temp_dir("indexed-effects");
+    let mut store = StrataStore::open(&dir).expect("open");
+    let a = store.ingest(input("clock memory a", &[])).expect("a");
+    let b = store.ingest(input("clock memory b", &[])).expect("b");
+    store.review_at(&a, 3, Some(1_700_000_000_500)).expect("review");
+    store.review_at(&b, 2, None).expect("review with no clock");
+    store
+        .save_connection(&ConnectionRecord {
+            source_id: a.clone(),
+            target_id: b.clone(),
+            strength_milli: 1000,
+            link_type: "derived_from".into(),
+            meta_sha: None,
+            created_at_ms: 1_700_000_000_900,
+            activation_count: 0,
+        })
+        .expect("edge");
+    store
+        .upsert_intentions(vec![intention("i1", "one")])
+        .expect("intention");
+    drop(store);
+
+    let reopened = StrataStore::open(&dir).expect("reopen");
+    let expected = reopened.prove_effects().expect("full scan proves");
+    remove_log_segments(&dir);
+
+    let indexed: Vec<_> = reopened
+        .indexed_effects()
+        .expect("indexed, no log read")
+        .map(|(proof, clock)| (proof.clone(), clock))
+        .collect();
+    let proofs: Vec<_> = indexed.iter().map(|(proof, _)| proof.clone()).collect();
+    assert_eq!(proofs, expected, "the index walks exactly what the log proves");
+    let clocks: Vec<_> = indexed
+        .iter()
+        .map(|(proof, clock)| (proof.action, *clock))
+        .collect();
+    assert_eq!(
+        clocks,
+        vec![
+            (EffectAction::Create, Some(1_700_000_000_000)),
+            (EffectAction::Create, Some(1_700_000_000_000)),
+            (EffectAction::Review, Some(1_700_000_000_500)),
+            (EffectAction::Review, None),
+            (EffectAction::Edge, Some(1_700_000_000_900)),
+            (EffectAction::Intention, None),
+        ]
+    );
+    let newest = reopened
+        .indexed_effects()
+        .expect("indexed")
+        .next_back()
+        .map(|(proof, _)| proof.action);
+    assert_eq!(newest, Some(EffectAction::Intention));
+    assert_eq!(
+        reopened.node_record(&a).map(|record| record.content.as_str()),
+        Some("clock memory a")
+    );
+    assert!(reopened.node_record("mem-no-such-node").is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn effect_index_rebuilt_on_open_matches_the_full_scan() {
     let dir = temp_dir("effect-index-reopen");
     let mut store = StrataStore::open(&dir).expect("open");

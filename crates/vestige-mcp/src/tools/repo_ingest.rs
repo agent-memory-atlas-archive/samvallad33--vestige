@@ -131,9 +131,13 @@ pub struct Request {
 /// work runs off the async executor.
 pub async fn execute(storage: &Arc<Storage>, req: Request) -> Result<Value, String> {
     let storage = Arc::clone(storage);
-    tokio::task::spawn_blocking(move || run(&storage, req))
-        .await
-        .map_err(|e| format!("ingest_repo task failed: {e}"))?
+    // A background caller (gather) stays background on the blocking thread.
+    let background = crate::strata_memory::current_background();
+    tokio::task::spawn_blocking(move || {
+        crate::strata_memory::run_as_background(background, || run(&storage, req))
+    })
+    .await
+    .map_err(|e| format!("ingest_repo task failed: {e}"))?
 }
 
 fn run(storage: &Arc<Storage>, req: Request) -> Result<Value, String> {
@@ -220,6 +224,14 @@ fn run(storage: &Arc<Storage>, req: Request) -> Result<Value, String> {
 
     let now = Utc::now();
     let started = Instant::now();
+    // Time spent yielding the store to foreground callers is not write time:
+    // a background run fits the same commits in its budget as one alone.
+    let yielded_before = crate::strata_memory::background_yielded();
+    let spent = || {
+        started.elapsed().saturating_sub(
+            crate::strata_memory::background_yielded().saturating_sub(yielded_before),
+        )
+    };
     let budget = req.budget.unwrap_or(WRITE_BUDGET);
     let mut stats = Stats::default();
     let mut node_ids: Vec<String> = Vec::new();
@@ -227,7 +239,7 @@ fn run(storage: &Arc<Storage>, req: Request) -> Result<Value, String> {
     let mut queue: Vec<CodeAnchor> = Vec::new();
 
     for commit in &fresh {
-        if !req.dry_run && started.elapsed() >= budget {
+        if !req.dry_run && spent() >= budget {
             stats.stopped_by_budget = true;
             break;
         }
@@ -271,7 +283,7 @@ fn run(storage: &Arc<Storage>, req: Request) -> Result<Value, String> {
     }
 
     for (commit, node_id) in &to_repair {
-        if !req.dry_run && started.elapsed() >= budget {
+        if !req.dry_run && spent() >= budget {
             stats.stopped_by_budget = true;
             break;
         }

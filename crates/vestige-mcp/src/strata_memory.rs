@@ -7,7 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -284,10 +286,132 @@ fn hex32(bytes: &[u8; 32]) -> String {
     out
 }
 
+// ----------------------------------------------------------------------
+// Background store work
+// ----------------------------------------------------------------------
+//
+// Every admitted write holds the store for as long as the gate takes to
+// admit it, which grows with the log (about 0.4 s on a 680k-frame log). A
+// long job that writes back to back (gather: a commit window, then one edge
+// per entity-sharing pair) takes the lock again the moment it lets go, so a
+// reader that needs the lock k times waits k writes. Background work steps
+// aside instead: before each acquisition it waits while a foreground caller
+// holds or waits for the store, or let go of it within
+// `FOREGROUND_GRACE`. What it writes, and in what order, is unchanged.
+
+/// How long after a foreground release background work still waits, so a
+/// reader taking the lock several times in a row gets all of its turns.
+const FOREGROUND_GRACE: Duration = Duration::from_millis(25);
+/// The longest one background acquisition yields, so steady foreground
+/// traffic slows background work but never stops it.
+const MAX_BACKGROUND_YIELD: Duration = Duration::from_secs(2);
+
+tokio::task_local! {
+    static BACKGROUND: BackgroundWork;
+}
+
+/// A long job running as background store work. Clones share one tally of
+/// the time spent yielding, so a blocking thread the job hands work to (see
+/// [`run_as_background`]) adds to the same total.
+#[derive(Clone, Default)]
+pub struct BackgroundWork {
+    yielded_ns: Arc<AtomicU64>,
+}
+
+impl BackgroundWork {
+    fn add(&self, waited: Duration) {
+        let ns = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
+        self.yielded_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    fn yielded(&self) -> Duration {
+        Duration::from_nanos(self.yielded_ns.load(Ordering::Relaxed))
+    }
+}
+
+/// Run `future` as background store work: each store acquisition it makes
+/// waits for foreground callers first.
+pub async fn as_background<F: std::future::Future>(future: F) -> F::Output {
+    BACKGROUND.scope(BackgroundWork::default(), future).await
+}
+
+/// The background job the current task runs, to hand to a blocking thread.
+pub fn current_background() -> Option<BackgroundWork> {
+    BACKGROUND.try_with(Clone::clone).ok()
+}
+
+/// Run `f` as part of `work` when there is one (a blocking thread a
+/// background job spawned), else as it is.
+pub fn run_as_background<R>(work: Option<BackgroundWork>, f: impl FnOnce() -> R) -> R {
+    match work {
+        Some(work) => BACKGROUND.sync_scope(work, f),
+        None => f(),
+    }
+}
+
+/// Time the current background job has spent yielding to foreground callers
+/// so far; zero outside one. A time budget subtracts it, so yielding never
+/// changes how much work fits in the budget.
+pub fn background_yielded() -> Duration {
+    BACKGROUND
+        .try_with(BackgroundWork::yielded)
+        .unwrap_or_default()
+}
+
+/// The store, held. A foreground hold counts itself in the store's
+/// foreground tally until it is dropped.
+pub(crate) struct StoreGuard<'a> {
+    // Declared first so the store is released before the ticket marks the
+    // release.
+    guard: std::sync::MutexGuard<'a, strata_store::StrataStore>,
+    _foreground: Option<ForegroundTicket<'a>>,
+}
+
+impl std::ops::Deref for StoreGuard<'_> {
+    type Target = strata_store::StrataStore;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for StoreGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+/// One foreground caller waiting for or holding the store.
+struct ForegroundTicket<'a>(&'a StrataMemory);
+
+impl<'a> ForegroundTicket<'a> {
+    fn enter(memory: &'a StrataMemory) -> Self {
+        memory.foreground.fetch_add(1, Ordering::AcqRel);
+        Self(memory)
+    }
+}
+
+impl Drop for ForegroundTicket<'_> {
+    fn drop(&mut self) {
+        let memory = self.0;
+        // Zero means "never released"; a release always stores at least 1.
+        let at = u64::try_from(memory.opened.elapsed().as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        memory.foreground_released_ns.store(at, Ordering::Release);
+        memory.foreground.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub struct StrataMemory {
     data_dir: PathBuf,
     log_dir: PathBuf,
     store: Mutex<strata_store::StrataStore>,
+    /// Foreground callers waiting for or holding `store`.
+    foreground: AtomicUsize,
+    /// When a foreground caller last released `store`, in nanoseconds since
+    /// `opened`; zero before the first release.
+    foreground_released_ns: AtomicU64,
+    opened: Instant,
     actor: Mutex<Option<String>>,
     /// `Some` only after `set_merge_policy`. A get with `None` reads the side
     /// file, then env, then the built-in defaults.
@@ -351,15 +475,60 @@ impl StrataMemory {
             log_dir: data_dir.join("log"),
             data_dir,
             store: Mutex::new(store),
+            foreground: AtomicUsize::new(0),
+            foreground_released_ns: AtomicU64::new(0),
+            opened: Instant::now(),
             actor: Mutex::new(None),
             merge_policy: Mutex::new(None),
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, strata_store::StrataStore> {
-        self.store
+    /// Take the store. Inside [`as_background`] work this first yields to
+    /// foreground callers; everywhere else it counts as foreground.
+    fn lock(&self) -> StoreGuard<'_> {
+        let foreground = match BACKGROUND.try_with(Clone::clone) {
+            Ok(work) => {
+                self.yield_to_foreground(&work);
+                None
+            }
+            Err(_) => Some(ForegroundTicket::enter(self)),
+        };
+        let guard = self
+            .store
             .lock()
-            .unwrap_or_else(|err| panic!("strata memory lock poisoned: {err}"))
+            .unwrap_or_else(|err| panic!("strata memory lock poisoned: {err}"));
+        StoreGuard {
+            guard,
+            _foreground: foreground,
+        }
+    }
+
+    /// Wait, at most [`MAX_BACKGROUND_YIELD`], while a foreground caller
+    /// holds or waits for the store or released it within
+    /// [`FOREGROUND_GRACE`]. The wait is added to `work`'s tally.
+    fn yield_to_foreground(&self, work: &BackgroundWork) {
+        let started = Instant::now();
+        let mut yielded = false;
+        while started.elapsed() < MAX_BACKGROUND_YIELD && self.foreground_busy() {
+            yielded = true;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if yielded {
+            work.add(started.elapsed());
+        }
+    }
+
+    fn foreground_busy(&self) -> bool {
+        if self.foreground.load(Ordering::Acquire) > 0 {
+            return true;
+        }
+        let released = self.foreground_released_ns.load(Ordering::Acquire);
+        released != 0
+            && Duration::from_nanos(
+                u64::try_from(self.opened.elapsed().as_nanos())
+                    .unwrap_or(u64::MAX)
+                    .saturating_sub(released),
+            ) < FOREGROUND_GRACE
     }
 
     fn nodes(&self) -> Vec<strata_store::NodeRecord> {
@@ -1022,6 +1191,207 @@ fn receipt_from_edge_batch(
         }
     }
     receipt
+}
+
+/// The receipt for one proved effect, at its memory's current trust.
+fn strata_receipt(store: &strata_store::StrataStore, proof: &strata_store::EffectProof) -> Receipt {
+    let trust = store
+        .retrievability(&proof.node_id)
+        .ok()
+        .flatten()
+        .unwrap_or(0.0);
+    receipt_from_proof(proof, trust)
+}
+
+/// Whether a memory listing shows this proved effect: a write, edit or
+/// review of a live memory, or a typed edge from a live memory whose target,
+/// when it is a memory, is live too. A retired or suppressed memory stays
+/// hidden here as in every other read. Intention and anchor effects name no
+/// memory, so they are not memory receipts.
+fn listed_memory_effect(
+    store: &strata_store::StrataStore,
+    proof: &strata_store::EffectProof,
+) -> bool {
+    use strata_store::EffectAction;
+    let live = |id: &str| store.node_record(id).is_some_and(retrievable);
+    match proof.action {
+        EffectAction::Create
+        | EffectAction::Rewrite
+        | EffectAction::Edit
+        | EffectAction::Review => live(&proof.node_id),
+        EffectAction::Edge => {
+            live(&proof.node_id)
+                && proof
+                    .edge
+                    .as_ref()
+                    .is_none_or(|(target, _)| store.node_record(target).is_none_or(retrievable))
+        }
+        EffectAction::Intention | EffectAction::Anchor | EffectAction::AnchorVerdict => false,
+    }
+}
+
+/// The memories one proved effect names: the memory it wrote, and for a typed
+/// edge its target when the target is a memory. These are the exact handles
+/// a Strata run is keyed by.
+fn effect_memories<'a>(
+    store: &strata_store::StrataStore,
+    proof: &'a strata_store::EffectProof,
+) -> [Option<&'a str>; 2] {
+    let target = proof
+        .edge
+        .as_ref()
+        .map(|(target, _)| target.as_str())
+        .filter(|target| *target != proof.node_id && store.node_record(target).is_some());
+    [Some(proof.node_id.as_str()), target]
+}
+
+/// When the log says an effect happened: the clock its own op recorded. An
+/// edit's retire records none, so it takes the successor's creation time
+/// (the successor lands in the same call). 0 when the log holds no clock.
+fn effect_clock_ms(
+    store: &strata_store::StrataStore,
+    proof: &strata_store::EffectProof,
+    clock: Option<i64>,
+) -> i64 {
+    clock
+        .or_else(|| {
+            (proof.action == strata_store::EffectAction::Edit)
+                .then(|| store.node_record(&proof.node_id))
+                .flatten()
+                .map(|record| record.created_at_ms)
+        })
+        .unwrap_or(0)
+}
+
+/// One memory's recorded history, tallied while the log is walked newest
+/// first.
+struct RunTally<'a> {
+    run_id: &'a str,
+    first_kind: &'static str,
+    events: i64,
+    started_at: i64,
+    last_at: i64,
+}
+
+/// Which Strata runs to tally.
+#[derive(Clone, Copy)]
+enum RunSelection<'a> {
+    /// The `limit` memories with the newest recorded effects.
+    Newest(usize),
+    /// Exactly this memory id.
+    One(&'a str),
+}
+
+/// Tally Strata runs. On a Strata log a run is one memory's recorded
+/// history, keyed by its exact memory id: every admitted effect that names
+/// it (its write, edits, reviews, and typed edges in either direction).
+/// The log records no agent session or tool call, so a run is never
+/// inferred from time, source text or likeness. Runs come newest activity
+/// first in log order.
+fn tally_runs<'a>(
+    store: &'a strata_store::StrataStore,
+    selection: RunSelection<'_>,
+) -> Result<Vec<RunTally<'a>>, StorageError> {
+    let mut order: Vec<&'a str> = Vec::new();
+    let mut tallies: std::collections::HashMap<&'a str, RunTally<'a>> =
+        std::collections::HashMap::new();
+    for (proof, clock) in store.indexed_effects().map_err(map_store)?.rev() {
+        if !listed_memory_effect(store, proof) {
+            continue;
+        }
+        let at = effect_clock_ms(store, proof, clock);
+        for id in effect_memories(store, proof).into_iter().flatten() {
+            if !tallies.contains_key(id) {
+                let admit = match selection {
+                    RunSelection::Newest(limit) => order.len() < limit,
+                    RunSelection::One(want) => id == want,
+                };
+                if !admit {
+                    continue;
+                }
+                order.push(id);
+                tallies.insert(
+                    id,
+                    RunTally {
+                        run_id: id,
+                        first_kind: mutation_kind(proof),
+                        events: 0,
+                        started_at: at,
+                        last_at: at,
+                    },
+                );
+            }
+            let Some(tally) = tallies.get_mut(id) else {
+                continue;
+            };
+            // Walking newest first, the last kind seen is the run's first.
+            tally.first_kind = mutation_kind(proof);
+            tally.events += 1;
+            tally.started_at = tally.started_at.min(at);
+            tally.last_at = tally.last_at.max(at);
+        }
+    }
+    Ok(order
+        .into_iter()
+        .filter_map(|id| tallies.remove(id))
+        .collect())
+}
+
+fn run_summary(tally: RunTally<'_>) -> vestige_core::AgentRunSummary {
+    vestige_core::AgentRunSummary {
+        run_id: tally.run_id.to_string(),
+        first_tool: Some(tally.first_kind.to_string()),
+        event_count: tally.events,
+        // Every effect on a Strata log is a write; a write recalls,
+        // suppresses and vetoes nothing.
+        retrieved_count: 0,
+        suppressed_count: 0,
+        write_count: tally.events,
+        veto_count: 0,
+        started_at: tally.started_at,
+        last_at: tally.last_at,
+    }
+}
+
+/// The trace event for one proved effect in a Strata run: a `memory.write`
+/// naming the memory the effect wrote, its receipt, and what the log
+/// recorded about it.
+fn run_event(
+    store: &strata_store::StrataStore,
+    run_id: &str,
+    proof: &strata_store::EffectProof,
+    clock: Option<i64>,
+) -> vestige_core::MemoryTraceEvent {
+    let mut diff = json!({
+        "receiptId": receipt_id_for(proof.effect_seq),
+        "kind": mutation_kind(proof),
+        "effectSeq": proof.effect_seq,
+        "dataSeq": proof.data_seq,
+        "digest": hex32(&proof.payload_digest),
+    });
+    if let Some(rating) = proof.rating {
+        diff["rating"] = json!(rating);
+    }
+    if let Some((target, link_type)) = &proof.edge {
+        diff["edge"] = json!({ "target": target, "linkType": link_type });
+    }
+    // A connector envelope is recorded as a full source key; any other write
+    // came in through the agent surface.
+    let connector = store
+        .node_record(&proof.node_id)
+        .and_then(|record| record.source.as_ref())
+        .is_some_and(|key| !key.id.is_empty());
+    vestige_core::MemoryTraceEvent::MemoryWrite {
+        run_id: run_id.to_string(),
+        id: proof.node_id.clone(),
+        diff,
+        source: if connector {
+            vestige_core::WriteSource::Connector
+        } else {
+            vestige_core::WriteSource::Agent
+        },
+        at: effect_clock_ms(store, proof, clock),
+    }
 }
 
 fn blocking_secrets(text: &str) -> Vec<String> {
@@ -2199,6 +2569,89 @@ impl MemoryStoreSend for StrataMemory {
             .flatten()
             .unwrap_or(0.0);
         Ok(Some(receipt_from_proof(&proof, trust)))
+    }
+
+    /// The newest memory receipts the log proves, newest first: one per
+    /// admitted effect, the same receipt `get_receipt` gives for its `eff-` id.
+    fn list_receipts(&self, limit: usize) -> Result<Vec<Receipt>, StorageError> {
+        let store = self.lock();
+        let mut seen = HashSet::new();
+        let mut receipts = Vec::new();
+        for (proof, _) in store.indexed_effects().map_err(map_store)?.rev() {
+            if receipts.len() >= limit {
+                break;
+            }
+            if listed_memory_effect(&store, proof) && seen.insert(proof.effect_seq) {
+                receipts.push(strata_receipt(&store, proof));
+            }
+        }
+        Ok(receipts)
+    }
+
+    /// The receipts of one Strata run (see [`tally_runs`]), newest first:
+    /// every admitted effect that names the memory `run_id`.
+    fn list_receipts_for_run(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Receipt>, StorageError> {
+        let store = self.lock();
+        if !store.node_record(run_id).is_some_and(retrievable) {
+            return Ok(Vec::new());
+        }
+        let mut receipts = Vec::new();
+        for (proof, _) in store.indexed_effects().map_err(map_store)?.rev() {
+            if receipts.len() >= limit {
+                break;
+            }
+            if listed_memory_effect(&store, proof)
+                && effect_memories(&store, proof).contains(&Some(run_id))
+            {
+                receipts.push(strata_receipt(&store, proof));
+            }
+        }
+        Ok(receipts)
+    }
+
+    fn list_agent_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<vestige_core::AgentRunSummary>, StorageError> {
+        let store = self.lock();
+        Ok(tally_runs(&store, RunSelection::Newest(limit))?
+            .into_iter()
+            .map(run_summary)
+            .collect())
+    }
+
+    fn get_agent_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<vestige_core::AgentRunSummary>, StorageError> {
+        let store = self.lock();
+        Ok(tally_runs(&store, RunSelection::One(run_id))?
+            .into_iter()
+            .next()
+            .map(run_summary))
+    }
+
+    /// One Strata run's timeline, oldest first: a `memory.write` per admitted
+    /// effect that names the memory `run_id`. Empty for an id that is not a
+    /// live memory.
+    fn get_trace(&self, run_id: &str) -> Result<Vec<vestige_core::MemoryTraceEvent>, StorageError> {
+        let store = self.lock();
+        if !store.node_record(run_id).is_some_and(retrievable) {
+            return Ok(Vec::new());
+        }
+        Ok(store
+            .indexed_effects()
+            .map_err(map_store)?
+            .filter(|(proof, _)| {
+                listed_memory_effect(&store, proof)
+                    && effect_memories(&store, proof).contains(&Some(run_id))
+            })
+            .map(|(proof, clock)| run_event(&store, run_id, proof, clock))
+            .collect())
     }
 
     fn get_retrieval_replay_capsule(
@@ -5050,5 +5503,124 @@ mod tests {
             reopened.find_intent_record(scope, "run-42").unwrap(),
             Some((node.id, seq, "digest-one".to_string()))
         );
+    }
+
+    /// Time `READS` foreground reads take while another thread writes back
+    /// to back, holding the store `HOLD` per write the way each gated write
+    /// does on a large log. Like gather, the writer takes the store again
+    /// almost at once; like a dashboard handler, the reader does a little
+    /// work between its acquisitions.
+    fn reads_during_bulk_writer(background: bool) -> Duration {
+        const HOLD: Duration = Duration::from_millis(40);
+        const READS: usize = 15;
+        // Bounds the writer, so the run ends even if a read never got in.
+        const MAX_WRITES: usize = 100;
+        let dir = tempfile::TempDir::new().unwrap();
+        let memory = Arc::new(StrataMemory::open(dir.path()).unwrap());
+        let id = memory
+            .ingest(IngestInput {
+                content: "read probe".into(),
+                ..IngestInput::default()
+            })
+            .unwrap()
+            .id;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let memory = Arc::clone(&memory);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let work = background.then(BackgroundWork::default);
+                run_as_background(work, || {
+                    for _ in 0..MAX_WRITES {
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let store = memory.lock();
+                        std::thread::sleep(HOLD);
+                        drop(store);
+                        // The writer's own work between two writes.
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                })
+            })
+        };
+        // Let the writer get going, so the first read lands mid-write.
+        std::thread::sleep(HOLD * 2);
+        let started = Instant::now();
+        for _ in 0..READS {
+            assert!(memory.get_node(&id).unwrap().is_some());
+            // The reader's own work between two acquisitions.
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::Release);
+        writer.join().unwrap();
+        elapsed
+    }
+
+    /// The bug gather hit: a bulk writer re-takes the store between every
+    /// write, so a reader that needs it k times waits k writes. Run as
+    /// background work, the writer steps aside and the reader waits for at
+    /// most the one write already in flight.
+    #[test]
+    fn background_work_yields_the_store_to_foreground_reads() {
+        let queued = reads_during_bulk_writer(false);
+        let yielded = reads_during_bulk_writer(true);
+        eprintln!("15 reads behind a bulk writer: queued {queued:?}, yielded {yielded:?}");
+        // 15 reads x 40 ms holds: queued reads pay roughly one hold each
+        // (about 600 ms); yielded reads pay one at most, plus their own
+        // 15 x 2 ms of work.
+        assert!(
+            queued >= Duration::from_millis(300),
+            "reads behind a foreground writer took {queued:?}; the test no longer reproduces the queueing"
+        );
+        assert!(
+            yielded < Duration::from_millis(160),
+            "reads behind a background writer took {yielded:?} (queued: {queued:?})"
+        );
+    }
+
+    /// repo_ingest hands its git and log work to a blocking thread. That
+    /// thread stays background work, and its waits land in the same tally
+    /// the async side reads (the write budget subtracts it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blocking_thread_inherits_background_work_and_its_yield_tally() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let memory = Arc::new(StrataMemory::open(dir.path()).unwrap());
+        assert!(current_background().is_none());
+        assert_eq!(background_yielded(), Duration::ZERO);
+
+        // A foreground caller holds the store for 50 ms.
+        let holder = {
+            let memory = Arc::clone(&memory);
+            std::thread::spawn(move || {
+                let store = memory.lock();
+                std::thread::sleep(Duration::from_millis(50));
+                drop(store);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(10));
+
+        let yielded = as_background(async {
+            let work = current_background();
+            assert!(work.is_some());
+            let memory = Arc::clone(&memory);
+            tokio::task::spawn_blocking(move || {
+                run_as_background(work, || {
+                    assert!(current_background().is_some());
+                    drop(memory.lock());
+                })
+            })
+            .await
+            .unwrap();
+            background_yielded()
+        })
+        .await;
+        holder.join().unwrap();
+
+        // It waited out the rest of the foreground hold and the grace after
+        // it, and the async side sees that wait.
+        assert!(yielded >= Duration::from_millis(30), "{yielded:?}");
+        assert!(current_background().is_none());
     }
 }

@@ -122,12 +122,6 @@ fn withheld_what(method: &str) -> Option<&'static str> {
     Some(match method {
         "get_dream_history" => "past dream cycles are not recorded on a Strata log",
         "get_recent_connections" => "link history is not recorded on a Strata log",
-        "list_agent_runs" | "get_trace" | "get_agent_run" => {
-            "agent-run traces are not recorded on a Strata log"
-        }
-        "list_receipts" | "list_receipts_for_run" => {
-            "retrieval receipts are not listed from a Strata log"
-        }
         "get_state_transitions" => "per-memory state transitions are not recorded on a Strata log",
         "reverse_suppression" => {
             "a Strata suppression cannot be undone (the memory's bytes stay on the log, hidden from every read)"
@@ -2638,6 +2632,116 @@ pub async fn get_receipt(
 }
 
 // ============================================================================
+// TOOL BRIDGE — every MCP tool, live in the dashboard
+// ============================================================================
+
+/// Run one MCP tool for the dashboard through the same `tools/call` path an
+/// agent's call takes (Strata withholding, trace, review gate, receipt,
+/// events). The body is the tool's arguments object. A tool's own refusal
+/// answers with its words: a withheld feature as 501 with its 4.0 code,
+/// anything else as 422 `tool_error`.
+pub async fn call_tool(
+    State(state): State<AppState>,
+    Path(tool): Path<String>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    if tool.is_empty() || tool.len() > 64 || !tool.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+        return Err(ApiError::reason(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "invalid_input: tool names are lowercase letters and underscores".to_string(),
+        ));
+    }
+    let arguments = match body {
+        Some(Json(Value::Object(map))) => Value::Object(map),
+        Some(Json(Value::Null)) | None => serde_json::json!({}),
+        Some(Json(_)) => {
+            return Err(ApiError::reason(
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+                "invalid_input: tool arguments must be a JSON object".to_string(),
+            ));
+        }
+    };
+    // A Strata replay re-derives state from the whole log while it holds the
+    // store; from the dashboard it froze every other request for minutes
+    // (health included). Agents keep it; the dashboard answers with why.
+    if tool == "receipt" && arguments.get("action").and_then(Value::as_str) == Some("replay") {
+        return Err(ApiError::reason(
+            StatusCode::NOT_IMPLEMENTED,
+            "too_slow_for_dashboard",
+            "too_slow_for_dashboard: receipt replay re-derives state from the whole log and can hold the store for minutes; run it from an agent".to_string(),
+        ));
+    }
+    let server = state.mcp_server();
+    let call = serde_json::json!({ "name": tool, "arguments": arguments });
+    // Tools do their store work synchronously inside an async fn. Each call
+    // runs on a blocking thread, so a slow one never occupies the async
+    // workers the rest of the dashboard is served from.
+    let runtime = tokio::runtime::Handle::current();
+    let result = tokio::task::spawn_blocking(move || runtime.block_on(server.handle_tools_call(Some(call))))
+        .await
+        .map_err(|e| {
+            ApiError::reason(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tool_failed",
+                format!("tool_failed: the tool call did not finish ({e})"),
+            )
+        })?
+        .map_err(|e| ApiError::reason(StatusCode::BAD_REQUEST, "invalid_input", e.message))?;
+    let structured = result.get("structuredContent").cloned().unwrap_or(Value::Null);
+    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        let message = structured
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| structured.to_string());
+        return Err(ApiError::withheld(&message).unwrap_or_else(|| {
+            ApiError::reason(StatusCode::UNPROCESSABLE_ENTITY, "tool_error", message)
+        }));
+    }
+    Ok(Json(structured))
+}
+
+// ============================================================================
+// OPERATOR STOPS — the Guard organ (Consciousness Theater)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct StopsParams {
+    pub since: Option<String>,
+    pub session: Option<String>,
+    pub rule: Option<String>,
+    pub decision: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// What the Operator gate stopped and allowed, newest first: a thin adapter
+/// over the read-only `precedent` tool, so the Guard organ shows exactly
+/// the receipts an agent reads. Nothing here writes, approves or issues a
+/// permit, and secret-shaped text stays masked by the tool.
+pub async fn list_stops(
+    State(_state): State<AppState>,
+    Query(params): Query<StopsParams>,
+) -> Result<Json<Value>, ApiError> {
+    let args = serde_json::json!({
+        "since": params.since,
+        "session": params.session,
+        "rule": params.rule,
+        "decision": params.decision,
+        "limit": params.limit,
+    });
+    // The Guard organ draws a whole window of stops, so this view reads up
+    // to 2,000 records (agents get the tool's 50-record page). The reader
+    // walks receipt files on disk, so it runs off the async workers.
+    tokio::task::spawn_blocking(move || crate::tools::precedent::execute_wide(Some(args), 2000))
+        .await
+        .map_err(|e| ApiError::reason(StatusCode::INTERNAL_SERVER_ERROR, "stops_failed", format!("stops_failed: {e}")))?
+        .map(Json)
+        .map_err(|message| ApiError::reason(StatusCode::BAD_REQUEST, "invalid_input", message))
+}
+
+// ============================================================================
 // MEMORY PRs (v2.2) — risk-gated brain-change review queue
 // ============================================================================
 
@@ -3073,6 +3177,10 @@ pub async fn list_contradictions(
 
     let limit = params.limit.unwrap_or(50).clamp(2, 200);
     let min_trust = params.min_trust.unwrap_or(0.3).clamp(0.0, 1.0);
+    // A Strata log pairs nothing by wording: tension is what the log recorded.
+    if crate::strata_memory::is_strata_backend(state.storage.as_ref()) {
+        return recorded_tension_pairs(&state, limit as usize);
+    }
     let topic_param = params
         .topic
         .as_deref()
@@ -3152,6 +3260,85 @@ pub async fn list_contradictions(
         "memoriesAnalyzed": memories.len(),
         "total": contradictions.len(),
         "contradictions": contradictions,
+    })))
+}
+
+/// Edge types that record one memory standing against, replacing or closing
+/// another. Only these join a pair on the Healing organ.
+const TENSION_EDGES: [&str; 4] = ["corrects", "supersedes", "contradicts", "closed_by"];
+
+/// Healing pairs on a Strata log: every recorded `corrects` / `supersedes` /
+/// `contradicts` / `closed_by` edge whose two memories still resolve, newest
+/// first, in the dashboard's contradiction contract (a = older, b = newer).
+/// `similarity` carries the edge's recorded strength and `topic` its type;
+/// `relation`, `source_id` and `target_id` keep the edge's own direction.
+fn recorded_tension_pairs(state: &AppState, limit: usize) -> Result<Json<Value>, ApiError> {
+    use crate::tools::cross_reference::compute_trust;
+
+    let edges = state.storage.get_all_connections().map_err(storage_error)?;
+    let mut recorded: Vec<_> = edges
+        .into_iter()
+        .filter(|e| TENSION_EDGES.contains(&e.link_type.as_str()) && e.source_id != e.target_id)
+        .collect();
+    recorded.sort_by_key(|e| Reverse(e.created_at));
+
+    let mut seen = HashSet::new();
+    let mut pairs = Vec::new();
+    for edge in recorded {
+        if pairs.len() >= limit {
+            break;
+        }
+        let Some(source) = state.storage.get_node(&edge.source_id).map_err(storage_error)? else {
+            continue;
+        };
+        let Some(target) = state.storage.get_node(&edge.target_id).map_err(storage_error)? else {
+            continue;
+        };
+        if !seen.insert((edge.source_id.clone(), edge.target_id.clone(), edge.link_type.clone())) {
+            continue;
+        }
+        let (a, b) = if source.created_at <= target.created_at {
+            (&source, &target)
+        } else {
+            (&target, &source)
+        };
+        let trust = |n: &KnowledgeNode| {
+            (compute_trust(n.retention_strength, n.stability, n.reps, n.lapses) * 100.0).round() / 100.0
+        };
+        pairs.push(serde_json::json!({
+            "memory_a_id": a.id,
+            "memory_b_id": b.id,
+            "memory_a_preview": a.content.chars().take(200).collect::<String>(),
+            "memory_b_preview": b.content.chars().take(200).collect::<String>(),
+            "memory_a_type": a.node_type,
+            "memory_b_type": b.node_type,
+            "memory_a_created": a.created_at.to_rfc3339(),
+            "memory_b_created": b.created_at.to_rfc3339(),
+            "memory_a_tags": a.tags,
+            "memory_b_tags": b.tags,
+            "trust_a": trust(a),
+            "trust_b": trust(b),
+            "similarity": edge.strength.clamp(0.0, 1.0),
+            "date_diff_days": (b.created_at - a.created_at).num_days().abs(),
+            "topic": edge.link_type,
+            "relation": edge.link_type,
+            "source_id": edge.source_id,
+            "target_id": edge.target_id,
+            "recorded_at": edge.created_at.to_rfc3339(),
+        }));
+    }
+
+    let involved: HashSet<&str> = pairs
+        .iter()
+        .flat_map(|p| [p["memory_a_id"].as_str(), p["memory_b_id"].as_str()])
+        .flatten()
+        .collect();
+    Ok(Json(serde_json::json!({
+        "memoriesAnalyzed": involved.len(),
+        "total": pairs.len(),
+        "contradictions": pairs,
+        "source": "recorded_edges",
+        "edgeTypes": TENSION_EDGES,
     })))
 }
 
