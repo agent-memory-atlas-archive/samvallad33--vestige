@@ -4101,6 +4101,16 @@ fn print_auto_connect(value: &serde_json::Value) {
                     .unwrap_or_default();
                 println!("  {source} -[touched]-> {target}  joined on: {joined}");
             }
+            let total = report
+                .get("pairsTotal")
+                .and_then(|total| total.as_u64())
+                .unwrap_or(pairs.len() as u64);
+            if total > pairs.len() as u64 {
+                println!(
+                    "  ... and {} more pair(s); the receipt lists every edge",
+                    total - pairs.len() as u64
+                );
+            }
         }
         if let Some(receipt_id) = report.get("receiptId").and_then(|id| id.as_str()) {
             println!("Auto-connect receipt: {receipt_id} (one write for the {edges} edge(s))");

@@ -151,6 +151,9 @@ fn storage_error(err: StorageError) -> ApiError {
             "invalid_input",
             err.to_string(),
         ),
+        StorageError::Refused(message) => {
+            ApiError::withheld(message).unwrap_or_else(|| ApiError::internal(&err))
+        }
         StorageError::Init(message) => {
             if let Some(withheld) = ApiError::withheld(message) {
                 withheld

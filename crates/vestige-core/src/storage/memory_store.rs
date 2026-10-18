@@ -81,6 +81,11 @@ pub enum MemoryStoreError {
     #[error("initialization error: {0}")]
     Init(String),
 
+    /// Refused by design (`similarity_disabled: ...` and the like); the
+    /// message starts with its stable code and is shown as is.
+    #[error("{0}")]
+    Refused(String),
+
     #[error("probable credential rejected: {0}")]
     SecretDetected(String),
 }
@@ -102,6 +107,7 @@ impl From<crate::storage::StorageError> for MemoryStoreError {
                 MemoryStoreError::InvalidInput(format!("invalid embedding profile: {s}"))
             }
             S::Init(s) => MemoryStoreError::Init(s),
+            S::Refused(s) => MemoryStoreError::Refused(s),
             S::V3StoreNeedsMigration {
                 path,
                 schema_version,

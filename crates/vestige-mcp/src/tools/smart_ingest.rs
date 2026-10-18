@@ -985,6 +985,10 @@ fn auto_connect_saved(storage: &Arc<Storage>, value: &mut Value) {
     }
 }
 
+/// Most joined pairs one save's `autoConnect` block names (strongest first).
+/// `pairsTotal` counts them all, and `receiptId` lists every edge written.
+const AUTO_CONNECT_PAIRS_SHOWN: usize = 5;
+
 /// Auto-connect one saved memory and attach the report to its response slot.
 /// The node is read back from the store so the memory's own (post-gate)
 /// content and tags drive the identity extraction. Each written edge is
@@ -1014,9 +1018,15 @@ fn auto_connect_slot(storage: &Arc<Storage>, slot: &mut Value, node_id: &str, sc
             slot["autoConnect"] = serde_json::json!({
                 "edges": report.edges,
                 "sharedIdentities": report.shared_identities,
+                // The strongest pairs only: one save can join up to
+                // MAX_AUTO_EDGES memories. Every edge is written either way;
+                // the receipt below lists them all.
+                "pairsTotal": report.pairs.len(),
+                "pairsShown": report.pairs.len().min(AUTO_CONNECT_PAIRS_SHOWN),
                 "pairs": report
                     .pairs
                     .iter()
+                    .take(AUTO_CONNECT_PAIRS_SHOWN)
                     .map(|pair| serde_json::json!({
                         "source": pair.source_id,
                         "target": pair.target_id,
@@ -4816,5 +4826,75 @@ mod echo_reuse_tests {
             16 + 1,
             "the first fixture's echo plus 16 capped echoes"
         );
+    }
+}
+
+/// The `autoConnect` block of a save names at most `AUTO_CONNECT_PAIRS_SHOWN`
+/// pairs and counts the rest; every edge is still written. Before 4.2.1 one
+/// save listed every pair it joined, up to `MAX_AUTO_EDGES` (100).
+#[cfg(all(test, not(feature = "legacy-sqlite")))]
+mod auto_connect_response_tests {
+    use std::sync::Arc;
+
+    use tokio::sync::Mutex;
+
+    use crate::cognitive::CognitiveEngine;
+
+    async fn save(
+        storage: &Arc<vestige_core::Storage>,
+        content: &str,
+        tag: &str,
+    ) -> serde_json::Value {
+        super::execute(
+            storage,
+            &Arc::new(Mutex::new(CognitiveEngine::new())),
+            Some(serde_json::json!({ "content": content, "node_type": "fact", "tags": [tag] })),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_save_that_joins_many_memories_lists_five_pairs_and_writes_every_edge() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        for n in 0..8 {
+            save(
+                &storage,
+                &format!("case {n} edited src/hot.rs"),
+                &format!("case-{n}"),
+            )
+            .await;
+        }
+        let last = save(&storage, "one more edit to src/hot.rs", "final").await;
+        let report = &last["autoConnect"];
+        assert_eq!(report["edges"], 8, "{last}");
+        assert_eq!(report["pairs"].as_array().unwrap().len(), 5, "{last}");
+        assert_eq!(report["pairsTotal"], 8, "{last}");
+        assert_eq!(report["pairsShown"], 5, "{last}");
+        assert_eq!(
+            report["sharedIdentities"],
+            serde_json::json!(["path:src/hot.rs"])
+        );
+        let id = last["nodeId"].as_str().unwrap();
+        let edges = storage.get_connections_for_memory(id).unwrap();
+        assert_eq!(
+            edges.len(),
+            8,
+            "every edge is written, only the response is cut"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_with_few_pairs_lists_them_all() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
+        save(&storage, "first edit of src/cold.rs", "a").await;
+        let second = save(&storage, "second edit of src/cold.rs", "b").await;
+        let report = &second["autoConnect"];
+        assert_eq!(report["edges"], 1, "{second}");
+        assert_eq!(report["pairs"].as_array().unwrap().len(), 1, "{second}");
+        assert_eq!(report["pairsTotal"], 1, "{second}");
+        assert_eq!(report["pairsShown"], 1, "{second}");
     }
 }

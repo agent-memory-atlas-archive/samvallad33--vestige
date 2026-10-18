@@ -379,13 +379,15 @@ fn candidate_json(resolution: &HandleResolution) -> Vec<Value> {
         .collect()
 }
 
-/// Lean node payload for handle responses.
+/// Lean node payload for handle responses. `createdAt` lets a caller order
+/// what one tag returns (the SessionStart rules hook lists newest first).
 fn node_payload(node: KnowledgeNode) -> Value {
     serde_json::json!({
         "id": node.id,
         "type": node.node_type,
         "content": node.content,
         "tags": node.tags,
+        "createdAt": node.created_at.to_rfc3339(),
     })
 }
 
@@ -785,5 +787,25 @@ mod strata_query {
         };
         assert!(text.contains("similarity_disabled"), "{text}");
         assert!(!text.contains("RECALL_QUERY"), "{text}");
+    }
+
+    /// The refusal is a refusal. Before 4.2.1 it was wrapped in the store's
+    /// `Init` error and read "Initialization error: similarity_disabled: ...",
+    /// as if the store had failed to start.
+    #[tokio::test]
+    async fn free_text_refusal_starts_with_its_code_and_is_not_an_init_failure() {
+        let (storage, _dir, _tagged, _other) = store();
+        let err = recall(
+            &storage,
+            serde_json::json!({ "query": "what is the deploy timeout" }),
+        )
+        .await
+        .expect_err("free text is refused on a Strata log");
+        assert!(err.starts_with("similarity_disabled: "), "{err}");
+        assert!(
+            !err.to_lowercase().contains("initialization error"),
+            "{err}"
+        );
+        assert!(err.contains("pass an exact handle"), "{err}");
     }
 }
