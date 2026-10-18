@@ -21,6 +21,14 @@
 	import { OS_ROUTES, DOCK_ROUTES, routesByGroup, HOME_ROUTE } from '$lib/os-routes';
 	import { shell } from '$lib/stores/shell.svelte';
 	import { routeBurst } from '$lib/stores/route-burst';
+	import HandoffVeil from '$lib/trace/HandoffVeil.svelte';
+	import WordGravity from '$lib/trace/WordGravity.svelte';
+	import { agentVoice } from '$lib/inside/agent-voice';
+	import { enterMemory } from '$lib/inside/enter';
+	import { untrack } from 'svelte';
+	import CursorLight from '$lib/trace/CursorLight.svelte';
+	import { veil } from '$lib/trace/handoff';
+	import { get } from 'svelte/store';
 
 	let { children } = $props();
 	let showCommandPalette = $state(false);
@@ -102,11 +110,34 @@
 		};
 	});
 
+	// An agent showing its user a memory (memory get with a reason): go inside
+	// that memory from wherever the dashboard is, and keep the agent's words
+	// beside it. Each event is acted on once.
+	let lastShown = '';
+	$effect(() => {
+		const ev = $websocket.events[0];
+		if (!ev || ev.type !== 'MemoryShown') return;
+		const d = ev.data as { id?: string; by?: string; reason?: string; timestamp?: string };
+		const key = `${d.id}|${d.timestamp}`;
+		if (!d.id || key === lastShown) return;
+		lastShown = key;
+		const id = d.id;
+		untrack(() => {
+			agentVoice.set({ id, by: d.by || 'Your agent', text: d.reason ?? '', at: Date.now() });
+			const here = $page.url.searchParams.get('id');
+			if (dashboardPath === '/memory' && here === id) return;
+			const canvas = document.querySelector('[data-app-root] canvas') as HTMLCanvasElement | null;
+			void enterMemory(id, { canvas, focus: canvas ? { x: 0, y: 0 } : null });
+		});
+	});
+
 	// Native View Transitions for client-side route navigation. Crossfades route
 	// changes when supported; respects prefers-reduced-motion. This replaces the
 	// old hand-rolled .animate-page-in keyframe on the route content wrapper.
 	onNavigate((navigation) => {
 		if (!document.startViewTransition || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+		// A Palace dive carries its own transition (HandoffVeil); no crossfade over it.
+		if (get(veil)) return;
 		// A second startViewTransition while one is running throws InvalidStateError
 		// (Safari TP / Chromium). Skip the crossfade rather than crashing the route.
 		if (document.documentElement.dataset.vt === '1') return;
@@ -227,6 +258,15 @@
 	style:--burst-color={$routeBurst.color}
 	aria-hidden="true"
 ></div>
+
+<!-- The Palace dive: the clicked organ's own particles carried into the destination. -->
+<HandoffVeil />
+<WordGravity />
+
+<!-- One pointer everywhere (Memory Cinema keeps its own). -->
+{#if dashboardPath !== '/cinema'}
+	<CursorLight />
+{/if}
 
 {#if showShell}
 	<!-- ── Persistent desktop dock (floating, left edge) ──────────────────────

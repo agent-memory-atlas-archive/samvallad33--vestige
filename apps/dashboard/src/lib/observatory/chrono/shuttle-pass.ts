@@ -60,6 +60,8 @@ struct ShuttleState {
 	days: f32,
 	density: f32,
 	dragging: f32,
+	// Where the rail stands (NDC): left, right, y; the host places it beside its words.
+	place: vec4f,
 };
 
 // x normalized timeline position; y kind (0 birth / 1 review); z retention;
@@ -75,11 +77,7 @@ const QUAD = array<vec2f, 6>(
 	vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0)
 );
 
-const RAIL_Y = -0.685;
-const RAIL_LEFT = -0.835;
-const RAIL_RIGHT = 0.835;
-
-fn rail_x(t: f32) -> f32 { return mix(RAIL_LEFT, RAIL_RIGHT, clamp(t, 0.0, 1.0)); }
+fn rail_x(t: f32) -> f32 { return mix(shuttle.place.x, shuttle.place.y, clamp(t, 0.0, 1.0)); }
 
 // A compact erf approximation makes the beam's edges physically continuous
 // rather than a CSS-style blur.  It is evaluated only in fragments of a small
@@ -105,7 +103,7 @@ fn vs_rail(@builtin(vertex_index) vi: u32) -> RailOut {
 	// params lanes 6-7.
 	let py = 2.0 / max(params.viewport_h, 1.0);
 	var out: RailOut;
-	out.clip = vec4f(mix(RAIL_LEFT, RAIL_RIGHT, q.x * 0.5 + 0.5), RAIL_Y + q.y * max(0.022, py * 5.0), 0.0, 1.0);
+	out.clip = vec4f(mix(shuttle.place.x, shuttle.place.y, q.x * 0.5 + 0.5), shuttle.place.z + q.y * max(0.022, py * 5.0), 0.0, 1.0);
 	out.local = q;
 	return out;
 }
@@ -144,7 +142,7 @@ fn vs_dwell(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) ->
 	let width = max(0.0017 + density * 0.0016, px * 1.6);
 	let direction = select(-1.0, 1.0, d.y > 0.5);
 	var out: DwellOut;
-	out.clip = vec4f(rail_x(d.x) + q.x * width, RAIL_Y + direction * (0.008 + height * (q.y * 0.5 + 0.5)), 0.0, 1.0);
+	out.clip = vec4f(rail_x(d.x) + q.x * width, shuttle.place.z + direction * (0.008 + height * (q.y * 0.5 + 0.5)), 0.0, 1.0);
 	out.uv = q;
 	out.kind = d.y;
 	out.retention = d.z;
@@ -180,7 +178,7 @@ fn vs_head(@builtin(vertex_index) vi: u32) -> HeadOut {
 	let height = 0.095 + shuttle.dragging * 0.038 + speed * 0.022;
 	let px = 2.0 / max(params.viewport_w, 1.0);
 	var out: HeadOut;
-	out.clip = vec4f(rail_x(shuttle.scrub) + q.x * max(0.021, px * 7.0), RAIL_Y + q.y * height, 0.0, 1.0);
+	out.clip = vec4f(rail_x(shuttle.scrub) + q.x * max(0.021, px * 7.0), shuttle.place.z + q.y * height, 0.0, 1.0);
 	out.local = q;
 	return out;
 }
@@ -213,6 +211,15 @@ type Resources = {
 };
 
 /** Raw-WebGPU phosphor rail backed by real memory lifecycle points. */
+/** Where the time rail stands, in NDC, and whether it shows at all. */
+export interface RailPlace {
+	left: number;
+	right: number;
+	y: number;
+	show: boolean;
+}
+export const DEFAULT_RAIL: RailPlace = { left: -0.835, right: 0.835, y: -0.685, show: true };
+
 export class ChronoShuttlePass implements FramePass {
 	private engine: ObservatoryEngine;
 	private resources: Resources | null = null;
@@ -224,10 +231,19 @@ export class ChronoShuttlePass implements FramePass {
 	private minMs = 0;
 	private maxMs = 0;
 	private state: ShuttleState = { scrub: 1, days: 0, density: 0, active: 0 };
+	private place: RailPlace = DEFAULT_RAIL;
 
-	constructor(engine: ObservatoryEngine, nodes: readonly ObservatoryNode[]) {
+	constructor(engine: ObservatoryEngine, nodes: readonly ObservatoryNode[], place: RailPlace = DEFAULT_RAIL) {
 		this.engine = engine;
+		this.place = place;
 		this.upload(nodes);
+	}
+
+	/** Move the rail (or hide it) without touching its marks. */
+	setPlace(place: RailPlace): void {
+		this.place = place;
+		this.writeState();
+		this.engine.requestRender();
 	}
 
 	/**
@@ -251,7 +267,7 @@ export class ChronoShuttlePass implements FramePass {
 	}
 
 	render(pass: GPURenderPassEncoder): void {
-		if (!this.resources || !this.railPipeline || !this.dwellPipeline || !this.headPipeline) return;
+		if (!this.place.show || !this.resources || !this.railPipeline || !this.dwellPipeline || !this.headPipeline) return;
 		pass.setBindGroup(0, this.resources.bindGroup);
 		pass.setPipeline(this.railPipeline);
 		pass.draw(6);
@@ -341,7 +357,7 @@ export class ChronoShuttlePass implements FramePass {
 		});
 		const stateBuffer = device.createBuffer({
 			label: 'fossil-light-chrono-state',
-			size: 16,
+			size: 32,
 			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 		});
 		this.resources = {
@@ -362,6 +378,11 @@ export class ChronoShuttlePass implements FramePass {
 	private writeState(): void {
 		const device = this.engine.gpuDevice;
 		if (!device || !this.resources) return;
-		device.queue.writeBuffer(this.resources.stateBuffer, 0, new Float32Array([this.state.scrub, this.state.days, this.state.density, this.state.active]));
+		const p = this.place;
+		device.queue.writeBuffer(
+			this.resources.stateBuffer,
+			0,
+			new Float32Array([this.state.scrub, this.state.days, this.state.density, this.state.active, p.left, p.right, p.y, p.show ? 1 : 0])
+		);
 	}
 }

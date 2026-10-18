@@ -27,42 +27,46 @@
  */
 
 import type { FramePass, ObservatoryEngine } from './engine';
-import { BITEMPORAL, IMMUNE, RETENTION, rgb01 } from './cognitive-palette';
 import type { OrganRegion } from './palace-map';
 
 const FLOATS_PER_PARTICLE = 12;
 const UNIFORM_FLOATS = 16;
-// ~1s snappy transition (Sam: don't waste the user's time): fly to CENTER ->
-// collapse -> singularity flash -> the shape-specific EXPLOSION -> navigate. There
-// is NO veil; the destination appears under the last of the debris. Nav fires LATE
-// (0.90) so the detonation is fully visible on the Palace before the silent handoff.
-const BURST_MS = 1000;
+// The click's flight. The burst's first act (0..0.42 of BURST_MS) flies the
+// clicked organ to the centre of the screen and grows it while everything else
+// is drawn in; that is where the Palace hands over (DIVE_END): the frame is
+// captured and the camera keeps going into the organ while its page boots
+// (HandoffVeil). The later acts (collapse, flash, detonation) still run when a
+// caller asks for the flash instead (FLASH_REQUEST_AT).
+const BURST_MS = 1400;
 const REDUCED_BURST_MS = 200;
 const FLASH_REQUEST_AT = 0.9;
+/** The end of the burst's dive: the clicked organ sits centred and grown. */
+export const DIVE_END = 0.42;
+/** How far the camera has flown into the organ when it bursts. */
+const DOLLY_ZOOM = 2.4;
+/**
+ * After the dive, the organ explodes in its own way across the whole screen,
+ * this long; the page takes over when the burst is this far along (the screen
+ * full of its light), and starts from those very particles.
+ */
+const EXPLODE_MS = 800;
+const EXPLODE_HANDOVER = 0.42;
 
-const FAMILY_COLOR: Record<OrganRegion['family'], string> = {
-	reasoning: RETENTION.bridge,
-	memory: RETENTION.recall,
-	immune: IMMUNE.veto,
-	signal: BITEMPORAL.supersession,
-	temporal: BITEMPORAL.txShadow,
-	system: RETENTION.luciferin
-};
-
-// Nine bespoke organ shapes (art-director fleet wf_81764e70-be2). Each is a
-// distinct form that MEANS its organ (the discipline test), built from real math
-// and orientation-verified so none collapses to a flat bar under Y-rotation.
+// Each organ's shape draws what its page does (organPoint below), in its
+// page's own colour (the shader's ORGAN_DEEP / ORGAN_BRIGHT).
 const FORMATION_KIND: Record<string, number> = {
-	'/observatory': 0, // FOLDED CORTEX SHELL — a breathing gyrified brain (the mind at rest)
-	'/graph': 1, // HOPF FIBRATION — nested tori of interlinked rings (everything connected)
-	'/memories': 2, // CONSTELLATION ARCHIVE — Fibonacci shells of discrete memory-pearls
-	'/timeline': 3, // BITEMPORAL CLIFFORD TORUS — two woven time-clocks (valid vs transaction)
-	'/blackbox': 4, // SEALED VAULT — a gem sealed in a cubic crystal cage (the receipt)
-	'/reasoning': 5, // AIZAWA CONVERGENCE — chaos converging onto a spine (a conclusion forming)
-	'/explore': 6, // SEMANTIC WALK — a seed branching into dendritic neighborhoods
-	'/feed': 7, // VORTEX RING — a circulating smoke-ring (the live event stream)
-	'/contradictions': 8 // STELLA OCTANGULA — two interpenetrating dual tetrahedra (opposition)
+	'/trace': 0, // THE BRAIN — a folded cortex, neural fibres through it, synapses sparking
+	'/graph': 1, // WITNESS LENS — filaments from many witnesses converging on one decision
+	'/field': 2, // STAR SPHERE — the mind's memories, each a star in its kind's colour
+	'/ledger': 3, // OPEN BOOK — pages fanned from one spine, ruled with lines of writes
+	'/guard': 4, // THE GATE — a ring and its membrane; what was stopped stays at it
+	'/causal': 5, // ROOT TREE — one failure at the top, its causes branching below
+	'/cinema': 6, // FILM LOOP — a strip of film looping through itself, frames running
+	'/system': 7, // STRATA CORE — the log's layers stacked in a column, a heartbeat rising
+	'/healing': 8 // DOUBLE HELIX — two strands knit by rungs: memory correcting itself
 };
+/** Every organ is seen a little from above (radians), so rings read as rings. */
+const VIEW_TILT = 0.34;
 
 // Palace composition: the cortex (Observatory) sits at center; the 8 outer organs
 // are spread on a WIDE ring around it so each shape reads clearly and the axons
@@ -71,18 +75,21 @@ const FORMATION_KIND: Record<string, number> = {
 // touch so neighbors never touch. [x, y, z, scale] in logical NDC. pickAt tests
 // these exact anchors, so navigation stays correct.
 const DESKTOP_ANCHORS: Record<string, [number, number, number, number]> = {
-	'/observatory': [0.0, 0.0, 0.12, 0.26], // center cortex, largest
-	'/graph': [-0.78, 0.5, 0.04, 0.15], // upper-left
-	'/memories': [0.8, 0.46, -0.04, 0.15], // upper-right
-	'/timeline': [-0.9, -0.06, 0.1, 0.14], // left
-	'/reasoning': [0.92, -0.02, -0.08, 0.15], // right
-	'/blackbox': [-0.72, -0.56, 0.18, 0.14], // lower-left
-	'/feed': [0.74, -0.54, 0.02, 0.14], // lower-right
-	'/explore': [-0.02, 0.66, -0.13, 0.14], // top
-	'/contradictions': [0.0, -0.66, -0.02, 0.14] // bottom
+	// The VESTIGE logo stands top-centre (palace-logo-pass); the brain sits
+	// under it, and the eight organs ring them, clear of the dock on the left,
+	// each with room under it for its own name.
+	'/trace': [0.0, -0.08, 0.12, 0.24], // the brain, centre
+	'/graph': [-0.7, 0.36, 0.04, 0.14], // upper-left
+	'/field': [0.7, 0.36, -0.04, 0.14], // upper-right
+	'/ledger': [-0.76, -0.16, 0.1, 0.13], // left
+	'/causal': [0.78, -0.16, -0.08, 0.14], // right
+	'/guard': [-0.58, -0.62, 0.18, 0.13], // lower-left
+	'/system': [0.58, -0.62, 0.02, 0.13], // lower-right
+	'/healing': [-0.2, -0.7, -0.02, 0.12], // bottom, left of centre
+	'/cinema': [0.2, -0.7, -0.13, 0.12] // bottom, right of centre
 };
 
-const CORTEX: [number, number] = [0.0, 0.0];
+const CORTEX: [number, number] = [0.0, -0.08];
 
 interface PlacedRegion {
 	href: string;
@@ -91,13 +98,48 @@ interface PlacedRegion {
 	z: number;
 	scale: number;
 	kind: number;
+	/** How far the drawn shape reaches below its centre, in units of `scale`. */
+	below: number;
+	/** How far the drawn shape reaches from its centre in any direction, in units of `scale`. */
+	reach: number;
+}
+
+/**
+ * The drawn extent of a formation, measured from its own points: the shape
+ * spins about its vertical axis, so its lowest point never changes, and its
+ * reach in any direction is bounded by the 3D radius. A high percentile
+ * ignores the few particles that wander; the breathing swell (3.5%) is added.
+ */
+const extentCache = new Map<number, { below: number; reach: number }>();
+export function formationExtent(kind: number): { below: number; reach: number } {
+	const hit = extentCache.get(kind);
+	if (hit) return hit;
+	const downs: number[] = [];
+	const radii: number[] = [];
+	for (let id = 1; id <= 1600; id++) {
+		const [x, y, z] = formationPoint(kind, id * 7 + 3);
+		// The lowest it reaches as it turns, seen through the view's tilt.
+		downs.push(-y * Math.cos(VIEW_TILT) + Math.hypot(x, z) * Math.sin(VIEW_TILT));
+		radii.push(Math.hypot(x, y, z));
+	}
+	// The 99.5th percentile keeps thin branch tips (Cinema's walk, Witness's rings) inside the extent.
+	const pct = (v: number[]) => v.sort((a, b) => a - b)[Math.floor(v.length * 0.995)];
+	const out = { below: Math.max(0.6, pct(downs)) * 1.035, reach: Math.max(0.6, pct(radii)) * 1.035 };
+	extentCache.set(kind, out);
+	return out;
 }
 
 export interface PalaceSwarmScreenPos {
 	href: string;
+	/** Centre in the text layer's logical NDC (x times max(aspect,1), y over min(aspect,1)). */
 	ndcX: number;
 	ndcY: number;
+	/** Centre in screen NDC (what the canvas pixels use). */
+	screenX: number;
+	screenY: number;
 	depth: number;
+	/** How far the drawn shape reaches below its centre, in logical NDC. */
+	radius: number;
 	visible: boolean;
 }
 
@@ -111,8 +153,8 @@ const palaceBrainWGSL = /* wgsl */ `
 struct Uniforms {
 	viewport: vec4<f32>,     // x=w y=h z=simTime w=reducedMotion
 	interaction: vec4<f32>,  // x=hoverIndex y=hoverStrength z=selectedIndex w=burstProgress
-	portal: vec4<f32>,       // x=portalX y=portalY z=unused w=flash
-	intro: vec4<f32>,        // x=introProgress y=count z=pulse w=unused
+	portal: vec4<f32>,       // x=portalX y=portalY z=dolly zoom (0: the burst instead) w=flash
+	intro: vec4<f32>,        // x=introProgress y=count z=pulse w=dolly glide to centre (0..1)
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -163,6 +205,183 @@ fn palette(seed: f32, energy: f32, world: vec3<f32>, t: f32) -> vec3<f32> {
 	col = mix(col, gold, clamp((energy - 2.0) * 0.5, 0.0, 0.6));
 	col = mix(col, vec3<f32>(1.0), clamp((energy - 3.2) * 0.5, 0.0, 0.6));
 	return col;
+}
+
+// Each organ in its page's own colours (shape kind order: trace, witness,
+// field, ledger, guard, causal, cinema, system, healing).
+const ORGAN_DEEP = array<vec3<f32>, 9>(
+	vec3<f32>(0.06, 0.24, 0.16), vec3<f32>(0.05, 0.22, 0.15), vec3<f32>(0.10, 0.12, 0.20),
+	vec3<f32>(0.30, 0.18, 0.05), vec3<f32>(0.22, 0.06, 0.20), vec3<f32>(0.30, 0.08, 0.03),
+	vec3<f32>(0.14, 0.08, 0.32), vec3<f32>(0.05, 0.12, 0.32), vec3<f32>(0.04, 0.26, 0.16)
+);
+const ORGAN_BRIGHT = array<vec3<f32>, 9>(
+	vec3<f32>(0.34, 1.00, 0.62), vec3<f32>(0.55, 0.96, 0.70), vec3<f32>(0.80, 0.86, 0.96),
+	vec3<f32>(1.00, 0.76, 0.36), vec3<f32>(0.80, 0.40, 0.98), vec3<f32>(1.00, 0.52, 0.22),
+	vec3<f32>(0.74, 0.64, 1.00), vec3<f32>(0.46, 0.72, 1.00), vec3<f32>(0.36, 1.00, 0.66)
+);
+// How fast light travels through each shape, and how many packets at once.
+const ORGAN_SPEED = array<f32, 9>(0.16, 0.32, 0.05, 0.12, 0.45, 0.28, 0.08, 0.22, 0.18);
+const ORGAN_PACKETS = array<f32, 9>(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 3.0, 1.0, 2.0);
+// The kinds of memory, for the Field's stars (decision, correction, fact, event, pattern, note).
+const TYPE_RGB = array<vec3<f32>, 6>(
+	vec3<f32>(1.00, 0.74, 0.30), vec3<f32>(1.00, 0.42, 0.33), vec3<f32>(0.35, 0.88, 1.00),
+	vec3<f32>(0.30, 1.00, 0.68), vec3<f32>(0.72, 0.62, 1.00), vec3<f32>(0.78, 0.84, 0.90)
+);
+
+// A point's colour: its organ's palette, its part of the shape (accent), and
+// the light travelling through the shape along its flow.
+fn organ_color(kind: u32, accent: u32, seed: f32, packet: f32) -> vec3<f32> {
+	let k = min(kind, 8u);
+	let deep = ORGAN_DEEP[k];
+	let bright = ORGAN_BRIGHT[k];
+	var base = mix(deep, bright, 0.5 + 0.45 * seed);
+	if (accent >= 8u) {
+		base = TYPE_RGB[min(accent - 8u, 5u)] * (0.75 + 0.35 * seed);
+	} else if (accent == 1u) {
+		// The shape's focus: a decision's crystal, a stop, a failure, a memory bead.
+		var hot = select(vec3<f32>(1.0, 0.86, 0.55), vec3<f32>(1.0, 0.3, 0.32), k == 4u || k == 5u);
+		// The brain's synapses spark violet, like the logo above it.
+		if (k == 0u) { hot = vec3<f32>(0.74, 0.44, 1.0); }
+		base = mix(bright, hot, select(0.75, 0.85, k == 0u));
+	} else if (accent == 2u) {
+		base = mix(bright, vec3<f32>(1.0), 0.45);
+	} else if (accent == 3u) {
+		base = mix(deep, bright, 0.25);
+	} else if (accent == 4u) {
+		// Healing's second strand: the correction, warmer.
+		base = mix(bright, vec3<f32>(1.0, 0.72, 0.42), 0.6);
+	} else if (accent == 5u) {
+		base = mix(bright, vec3<f32>(0.9, 1.0, 0.92), 0.5);
+	} else if (accent == 6u) {
+		base = mix(bright, vec3<f32>(0.92, 0.97, 1.0), 0.2);
+	} else if (accent == 7u) {
+		base = mix(deep, bright, 0.22);
+	}
+	return base * (0.8 + packet * 0.9) + vec3<f32>(1.0, 0.95, 0.85) * packet * 0.25;
+}
+
+// A smooth rainbow, for the colour that runs through every burst.
+fn rainbow(x: f32) -> vec3<f32> {
+	return 0.5 + 0.5 * cos(TAU * (x + vec3<f32>(0.0, 0.33, 0.67)));
+}
+
+// The burst into a page: where a particle flies, its colour, and its direction
+// of travel (for its streak). Each organ bursts its own way, as its page reads.
+struct Boom {
+	p: vec2<f32>,
+	c: vec3<f32>,
+	dir: vec2<f32>,
+};
+fn explode(sk: u32, s0: f32, s1: f32, s2: f32, ex: f32, t: f32, aspect: f32) -> Boom {
+	// Fast out of the organ and never coming to rest: the light is still
+	// flying when the page takes it over.
+	let e = ex * (1.7 - 0.7 * ex);
+	let R = 1.9;
+	var a = s0 * TAU;
+	var r = e * R * (0.12 + 0.88 * s1);
+	var p = vec2<f32>(cos(a), sin(a)) * r;
+	var dir = vec2<f32>(cos(a), sin(a));
+	let k = min(sk, 8u);
+	var c = mix(ORGAN_BRIGHT[k], rainbow(s2 + r * 0.45 + t * 0.4), 0.4);
+	switch k {
+		case 0u: {
+			// The brain: a neural storm, lightning down sixteen branching bolts.
+			let bolt = floor(s0 * 16.0);
+			a = (bolt + 0.5) / 16.0 * TAU + (s2 - 0.5) * 0.3 * r;
+			dir = vec2<f32>(cos(a), sin(a));
+			let zig = sin(r * 26.0 + bolt * 3.1) * 0.04 * r;
+			p = dir * r + vec2<f32>(-dir.y, dir.x) * zig;
+			c = mix(vec3<f32>(0.34, 1.0, 0.62), vec3<f32>(0.74, 0.44, 1.0), fract(s2 * 3.0 + r * 0.7));
+			c = mix(c, rainbow(r * 0.5 + t * 0.6 + s2), 0.3);
+		}
+		case 1u: {
+			// Witness: the decision's crystal shatters into rays of light.
+			let ray = floor(s0 * 30.0);
+			a = (ray + 0.5) / 30.0 * TAU + (s2 - 0.5) * 0.02;
+			dir = vec2<f32>(cos(a), sin(a));
+			p = dir * e * R * s1;
+			c = mix(vec3<f32>(0.55, 0.98, 0.72), vec3<f32>(1.0, 0.86, 0.48), fract(s2 + s1 * 2.0));
+			c = mix(c, rainbow(ray * 0.033 + t * 0.3), 0.3);
+		}
+		case 2u: {
+			// Field: a supernova of stars, every kind of memory's colour at once.
+			r = e * R * sqrt(s1);
+			a = s0 * TAU + r * 0.7;
+			dir = vec2<f32>(cos(a), sin(a));
+			p = dir * r;
+			c = TYPE_RGB[min(u32(s2 * 6.0), 5u)] * 1.15;
+		}
+		case 3u: {
+			// Ledger: the book's ruled lines fly out across the whole screen.
+			let row = floor(s1 * 22.0);
+			let y = (row / 21.0 * 2.0 - 1.0) * e * 1.05;
+			let x = (s0 * 2.0 - 1.0) * e * 2.2 + sin(row * 1.7 + t * 3.0) * 0.02;
+			p = vec2<f32>(x, y);
+			dir = vec2<f32>(sign(s0 - 0.5), 0.0);
+			c = mix(vec3<f32>(1.0, 0.76, 0.36), vec3<f32>(1.0, 0.96, 0.82), step(0.78, s2));
+			c = mix(c, rainbow(row * 0.05 + t * 0.3), 0.22);
+		}
+		case 4u: {
+			// Guard: the gate's shockwave, rings racing out; what it stopped shoots straight.
+			let ring = floor(s1 * 5.0);
+			r = e * R * (0.22 + ring * 0.2) * (0.97 + s2 * 0.06);
+			p = dir * r;
+			c = mix(vec3<f32>(0.8, 0.4, 0.98), vec3<f32>(1.0, 0.36, 0.62), ring / 4.0);
+			if (s2 > 0.8) {
+				p = dir * e * R * (0.3 + s1);
+				c = vec3<f32>(1.0, 0.28, 0.3);
+			}
+		}
+		case 5u: {
+			// Causal: the roots crack outward and down like lightning.
+			let crack = floor(s0 * 12.0);
+			a = -PI * 0.5 + (crack / 11.0 - 0.5) * PI * 1.6 + (s2 - 0.5) * 0.3 * r;
+			dir = vec2<f32>(cos(a), sin(a));
+			let zig = sin(r * 22.0 + crack * 2.3) * 0.045 * r;
+			p = dir * r + vec2<f32>(-dir.y, dir.x) * zig;
+			c = mix(vec3<f32>(1.0, 0.52, 0.22), vec3<f32>(1.0, 0.24, 0.26), s2);
+			c = mix(c, vec3<f32>(1.0, 0.92, 0.52), smoothstep(0.75, 1.0, s1));
+		}
+		case 6u: {
+			// Cinema: the film unspools into a turning spiral, every colour a projector throws.
+			a = s0 * TAU * 3.0 + e * 5.0;
+			r = e * R * s0;
+			dir = vec2<f32>(-sin(a), cos(a));
+			p = vec2<f32>(cos(a), sin(a)) * r;
+			c = rainbow(s0 * 2.0 + t * 0.5) * 1.1;
+		}
+		case 7u: {
+			// System: the strata erupt, layers sliding apart in opposite bands.
+			let band = floor(s1 * 9.0);
+			let side = select(-1.0, 1.0, (u32(band) % 2u) == 0u);
+			let y = (band / 8.0 * 2.0 - 1.0) * e * 0.95;
+			let x = (s0 * 2.0 - 1.0) * e * 2.0 + side * e * 0.4;
+			p = vec2<f32>(x, y);
+			dir = vec2<f32>(side, 0.0);
+			c = mix(vec3<f32>(0.46, 0.72, 1.0), vec3<f32>(0.86, 0.95, 1.0), step(0.5, fract(band * 0.5)));
+			c = mix(c, rainbow(0.55 + band * 0.04 + t * 0.2), 0.22);
+		}
+		default: {
+			// Healing: the helix unwinds into a double vortex.
+			let arm = select(0.0, PI, s1 < 0.5);
+			a = s0 * TAU * 2.5 + arm + e * 4.0;
+			r = e * R * s0;
+			dir = vec2<f32>(-sin(a), cos(a));
+			p = vec2<f32>(cos(a), sin(a)) * r;
+			c = select(vec3<f32>(0.36, 1.0, 0.66), vec3<f32>(1.0, 0.72, 0.42), s1 < 0.5);
+		}
+	}
+	// The whole burst turns as it opens, and every colour runs through it,
+	// out from the white-hot moment it went off.
+	p = rot2(p, ex * 0.8);
+	dir = rot2(dir, ex * 0.8);
+	c = mix(c, rainbow(length(p) * 0.9 - t * 1.4 + s2 * 0.25), 0.35);
+	c = mix(c, vec3<f32>(1.0), exp(-ex * 10.0) * 0.65);
+	var b: Boom;
+	b.p = vec2<f32>(p.x / max(aspect, 0.5) * 1.2, p.y);
+	b.c = c;
+	b.dir = normalize(vec2<f32>(dir.x / max(aspect, 0.5), dir.y) + vec2<f32>(1e-5, 0.0));
+	return b;
 }
 
 struct VSOut {
@@ -217,6 +436,26 @@ fn vs_main(
 		) * (0.004 + seed2 * 0.005);
 	}
 
+	// Every organ is seen a little from above, so its rings read as rings.
+	{
+		let tc = cos(${VIEW_TILT});
+		let ts = sin(${VIEW_TILT});
+		local3 = vec3<f32>(local3.x, local3.y * tc - local3.z * ts, local3.y * ts + local3.z * tc);
+	}
+
+	// Which organ, which part of it, and how far along its meaning this point is.
+	let shape_kind = u32(floor(color_route.z + 0.001));
+	let accent = u32(round(fract(color_route.z) * 16.0));
+	let flow = color_route.y;
+	let kk = min(shape_kind, 8u);
+	// Light travelling through the shape along its meaning: around the drum's
+	// rings, page to page, into the gate, up the helix, down the roots, along
+	// the film, up the strata, into the witness's crystal.
+	var packet = 0.0;
+	if (!reduced) {
+		packet = pow(0.5 + 0.5 * cos(TAU * (flow * ORGAN_PACKETS[kk] - t * ORGAN_SPEED[kk])), 14.0);
+	}
+
 	// Project the local formation point to the organ's screen anchor.
 	var pos = organ_anchor + vec2<f32>(local3.x / aspect, local3.y) * scale;
 
@@ -226,7 +465,7 @@ fn vs_main(
 	// cortex, ends just before the organ) so it never crosses through a shape. Each
 	// particle is a small point flowing outward; sparse bright packets pulse along
 	// it. Thin, single-file (tiny normal jitter, no fat rope), tapering to the organ.
-	if (!reduced && route > 0.5 && seed0 < 0.05) {
+	if (!reduced && route > 0.5 && seed0 < 0.07) {
 		let cortexP = vec2<f32>(${CORTEX[0]}, ${CORTEX[1]});
 		let dir = normalize(organ_anchor - cortexP + vec2<f32>(0.00001, 0.0));
 		let normal = vec2<f32>(-dir.y, dir.x);
@@ -236,17 +475,18 @@ fn vs_main(
 		// at BOTH ends so it emerges from the brain and arrives at the organ without a
 		// hard dot piling onto either body.
 		let base = seed1;                          // static position along the line 0..1
-		let travel = fract(base + t * 0.05);       // slow outward drift
+		// Every organ reports to the hub: its light flows in along the link.
+		let travel = fract(base - t * 0.06);
 		// gentle single curve across the whole span, tiny amplitude = one clean thread.
 		let bow = sin(travel * PI) * 0.03;
 		let jitter = (seed2 - 0.5) * 0.006;
 		pos = mix(cortexP, organ_anchor, travel) + normal * (bow + jitter);
 		// bright nerve packets sweeping outward along the fiber.
-		let packet = pow(0.5 + 0.5 * sin(travel * TAU * 2.0 - t * 2.6 + seed2 * TAU), 10.0);
+		let pulse = pow(0.5 + 0.5 * sin(travel * TAU * 2.0 + t * 2.6 + seed2 * TAU), 10.0);
 		// fade near BOTH endpoints (0 at ends, full in the middle) so the line reads
 		// as connecting, not as dots stacked on the bodies.
 		let endsFade = smoothstep(0.0, 0.14, travel) * (1.0 - smoothstep(0.86, 1.0, travel));
-		axon = (0.35 + packet * 1.2) * endsFade + 0.15;
+		axon = (0.35 + pulse * 1.4) * endsFade + 0.15;
 		local3 = vec3<f32>(0.0, 0.0, 0.0);
 	}
 
@@ -300,7 +540,10 @@ fn vs_main(
 	//                       dissolves into the destination organ (the waitlist's
 	//                       shape-to-shape morph, now the route transition itself).
 	let progress = u.interaction.w;
-	let bursting = u.interaction.z >= 0.0 && progress > 0.0;
+	// The dolly (a click going into an organ) is a camera move, applied last;
+	// the burst's acts below run only when it is not.
+	let dolly = u.portal.z > 0.5;
+	let bursting = u.interaction.z >= 0.0 && progress > 0.0 && !dolly;
 	let selected = abs(route - u.interaction.z) < 0.25;
 	var flash = 0.0;
 	if (bursting) {
@@ -858,14 +1101,46 @@ fn vs_main(
 	// ── Energy = the launch engine's living blaze ──
 	var living = 0.55;
 	if (!reduced) { living = 0.62 + 0.18 * sin(t * 8.0 + seed2 * TAU); }
+	// Twinkle: now and then a single point flares, so the organs glitter.
+	var twinkle = 0.0;
+	if (!reduced) { twinkle = pow(max(0.0, sin(t * (0.7 + seed1 * 1.9) + seed0 * 40.0)), 60.0) * 2.4; }
 	var energy = living + axon * 1.3 + focus * 1.7 + systole * 2.2 + weather
-		+ sin(intro * PI) * 1.1 + flash * 7.0 + burst_blaze;
+		+ sin(intro * PI) * 1.1 + flash * 7.0 + burst_blaze + packet * 1.5 * (1.0 - step(0.001, axon)) + twinkle;
 	if (hover_on && !hovered) { energy *= 0.30; }
 	energy = max(energy, 0.08);
 
+	// The dolly: the camera flies into the clicked organ. u.portal.xy is its
+	// anchor, u.portal.z the zoom and u.intro.w how far the organ has glided to
+	// the centre. Everything else streams outward past the edges of the screen.
+	var dolly_size = 1.0;
+	var streak = vec2<f32>(0.0);
+	var boom_c = vec3<f32>(0.0);
+	var boom_k = 0.0;
+	if (dolly) {
+		pos = (pos - u.portal.xy) * u.portal.z + u.portal.xy * (1.0 - u.intro.w);
+		dolly_size = 1.0 + (u.portal.z - 1.0) * 0.35;
+		if (!selected) { energy *= 1.0 - 0.45 * u.intro.w; }
+		// The burst: the organ explodes wide in its own way and every particle of
+		// the Palace is swept into it, colour everywhere, streaking as it flies.
+		let ex = u.interaction.w;
+		if (ex > 0.0 && !reduced) {
+			let sk = u32(max(u.portal.w - 1.0, 0.0) + 0.5);
+			let boom = explode(sk, seed0, seed1, seed2, ex, t, aspect);
+			// The organ's own light leaves from where it is; the rest pours in
+			// through the centre from off the screen.
+			let take = smoothstep(0.0, 0.3, ex);
+			pos = select(boom.p, mix(pos, boom.p, take), selected);
+			if (!selected) { energy *= smoothstep(0.02, 0.16, ex); }
+			energy = energy * 0.6 + 1.6 + 2.2 * (1.0 - ex) * (0.6 + 0.4 * seed2);
+			boom_c = boom.c;
+			boom_k = smoothstep(0.0, 0.2, ex);
+			streak = boom.dir * (2.0 + 9.0 * (1.0 - ex));
+		}
+	}
+
 	let corner = QUAD[vertex_index];
 	let pixel = 2.0 / max(min(u.viewport.x, u.viewport.y), 1.0);
-	let depth_size = clamp(1.0 + local3.z * 0.12, 0.82, 1.24);
+	let depth_size = clamp(1.0 + local3.z * 0.12, 0.82, 1.24) * dolly_size;
 	// Axon particles are a THIN thread: a small fixed base (packets briefly widen),
 	// NOT the fat organ-body size. Organ particles keep the full size profile.
 	let is_axon = step(0.001, axon);
@@ -875,10 +1150,23 @@ fn vs_main(
 
 	// Color: the REAL iridescent palette, seeded per-particle, energized by the beat.
 	let world = vec3<f32>(pos.x, pos.y, local3.z);
-	let col = palette(color_route.x + color_route.y * 0.3 + color_route.z * 0.6, energy, world, t);
+	// Colour: the organ's own palette, its part of the shape, and the light
+	// travelling through it; the links glow in their organ's colour.
+	var col = organ_color(kk, select(accent, 2u, axon > 0.001), color_route.x, select(packet, 0.0, axon > 0.001));
+	col = mix(col, vec3<f32>(1.00, 0.86, 0.55), clamp((energy - 2.6) * 0.35, 0.0, 0.5));
+	col = mix(col, vec3<f32>(1.0), clamp((energy - 3.6) * 0.4, 0.0, 0.5));
 
+	if (boom_k > 0.0) { col = mix(col, boom_c, boom_k); }
 	var out: VSOut;
-	out.position = vec4<f32>(pos + corner * pixel * size, 0.0, 1.0);
+	// Bursting particles streak along their flight; the rest are round.
+	let sl = length(streak);
+	if (sl > 0.0) {
+		let d = streak / sl;
+		let n = vec2<f32>(-d.y, d.x);
+		out.position = vec4<f32>(pos + (corner.x * d * (1.0 + sl) + corner.y * n) * pixel * size, 0.0, 1.0);
+	} else {
+		out.position = vec4<f32>(pos + corner * pixel * size, 0.0, 1.0);
+	}
 	out.local = corner;
 	out.color = col;
 	out.energy = energy;
@@ -927,18 +1215,45 @@ function rot2cpu(x: number, y: number, a: number): [number, number] {
 
 const TAU = Math.PI * 2;
 
-// ── OBSERVATORY (0): NEURAL SPHERE — a dense cortex-sphere with sulci ridges and
-// a hollow-biased shell so it reads as a living mind, not a solid ball. ──
 // ─────────────────────────────────────────────────────────────────────────────
-// Nine bespoke organ shapes (art-director fleet wf_81764e70-be2, all beauty 9/10).
-// Each is a deterministic pure function of the particle id (hash h(), no random),
-// filling ~volumetrically so it never collapses to a bar under the slow Y-rotation.
-// Each MEANS its organ (the discipline test).
+// The organs' shapes (2026-10-17, after the organs were redesigned): each one
+// draws what its page now does. Every point carries a flow value (0..1 along
+// the shape's own meaning, where the shader sends light) and an accent (which
+// part of the shape it belongs to, for its colour). Deterministic in the
+// particle id, filled in 3D so none collapses to a bar as it turns.
 // ─────────────────────────────────────────────────────────────────────────────
+type OrganPoint = [number, number, number, number, number];
+/** The k-th independent hash of a particle id. */
+function uu(id: number, k: number): number {
+	return h(id * (1.371 + k * 0.913) + k * 7.31);
+}
+function inBall(id: number, k: number, r: number): [number, number, number] {
+	const rr = r * Math.cbrt(uu(id, k));
+	const a = uu(id, k + 1) * TAU;
+	const c = 2 * uu(id, k + 2) - 1;
+	const s = Math.sqrt(Math.max(0, 1 - c * c));
+	return [rr * s * Math.cos(a), rr * c, rr * s * Math.sin(a)];
+}
 
-// OBSERVATORY — Folded cortex shell (spherical-harmonic gyrification + fissure):
-// a literal breathing brain, the mind at rest at the center of everything.
-function observatoryFormation(id: number): [number, number, number] {
+// TRACE — the brain: a folded cortex (two hemispheres, a fissure between
+// them), neural fibres crossing through it, synapses sparking violet; light
+// sweeps round it.
+function traceBrain(id: number): OrganPoint {
+	const pick = uu(id, 7);
+	if (pick < 0.1) {
+		// A fibre: a straight neuron between two points of the cortex.
+		const k = Math.floor(uu(id, 1) * 90);
+		const a = brainShell(Math.floor(h(k * 3.1 + 1) * 1e6) + 7);
+		const b = brainShell(Math.floor(h(k * 5.7 + 2) * 1e6) + 11);
+		const t = uu(id, 2);
+		return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, t, 2];
+	}
+	const [x, y, z, fold] = brainShell(id);
+	const flow = fract(Math.atan2(z, x) / TAU + y * 0.25);
+	// Synapses spark violet; the grooves between the folds are shaded darker.
+	return [x, y, z, flow, pick < 0.2 ? 1 : fold < -0.04 ? 7 : 0];
+}
+function brainShell(id: number): [number, number, number, number] {
 	const u0 = h(id * 0.7351 + 1.0);
 	const u1 = h(id * 1.2971 + 5.0);
 	const u2 = h(id * 2.1637 + 9.0);
@@ -948,7 +1263,7 @@ function observatoryFormation(id: number): [number, number, number] {
 		const st = Math.sqrt(Math.max(0, 1 - ct * ct));
 		const ph = u2 * TAU;
 		const r = 0.2 + 0.16 * Math.cbrt(u3);
-		return [st * Math.cos(ph) * r, ct * r, st * Math.sin(ph) * r];
+		return [st * Math.cos(ph) * r, ct * r, st * Math.sin(ph) * r, -1];
 	}
 	const hemi = u1 < 0.5 ? -1 : 1;
 	const cphi = 2 * u2 - 1;
@@ -968,74 +1283,212 @@ function observatoryFormation(id: number): [number, number, number] {
 	const fissure = -0.16 * Math.exp(-(dMid * dMid) / (0.1 * 0.1)) * sphi;
 	const thick = 0.02 * (h(id * 5.19 + 2.0) - 0.5);
 	const r = 0.92 + fold + fissure + thick;
-	x *= r; y *= r; z *= r;
+	x *= r;
+	y *= r;
+	z *= r;
 	x += hemi * 0.05 * Math.exp(-(dMid * dMid) / (0.16 * 0.16)) * sphi;
-	y *= 0.9; z *= 1.06; x *= 1.04;
-	return [x, y, z];
+	y *= 0.9;
+	z *= 1.06;
+	x *= 1.04;
+	return [x, y, z, fold + fissure];
 }
 
-// GRAPH — Hopf fibration: nested tori of interlinked Villarceau rings, THE math
-// object of linkage (everything connected to everything, causal edges).
-function graphFormation(id: number): [number, number, number] {
-	const RINGS = 12, TUBE = 0.05, PROJ_SCALE = 0.66;
-	const r = h(id * 1.17 + 3.0);
-	const t = h(id * 1.91 + 7.0);
-	const j1 = h(id * 2.37 + 11.0);
-	const j2 = h(id * 3.11 + 5.0);
-	const ring = Math.floor(r * RINGS);
-	const band = ring % 3;
-	const cBase = [0.55, 0.05, -0.45][band];
-	const perBand = Math.ceil(RINGS / 3);
-	const idxInBand = Math.floor(ring / 3);
-	const lon = (idxInBand / perBand) * TAU + band * 0.9;
-	const sB = Math.sqrt(Math.max(0, 1 - cBase * cBase));
-	const a = sB * Math.cos(lon);
-	const b = sB * Math.sin(lon);
-	const c = cBase;
-	const theta = t * TAU;
-	const denom = Math.sqrt(2 * (1 + c));
-	const x1 = ((1 + c) * Math.cos(theta)) / denom;
-	const x2 = (a * Math.sin(theta) - b * Math.cos(theta)) / denom;
-	const x3 = (a * Math.cos(theta) + b * Math.sin(theta)) / denom;
-	const x4 = ((1 + c) * Math.sin(theta)) / denom;
-	// Stereographic projection blows up near the pole (x4 -> 1, w -> 0), throwing a
-	// few particles thousands of units away -> a visible streak flying off-screen
-	// (worse when the dive magnifies the organ). Fix: for near-pole particles, pull
-	// the fiber angle OFF the pole (re-evaluate theta shifted) so no particle ever
-	// projects to the divergent region — the ring just wraps to its near side.
-	let w = 1 - x4;
-	if (Math.abs(w) < 0.12) {
-		const th2 = theta + Math.PI; // opposite side of the fiber, far from the pole
-		const nx1 = ((1 + c) * Math.cos(th2)) / denom;
-		const nx2 = (a * Math.sin(th2) - b * Math.cos(th2)) / denom;
-		const nx3 = (a * Math.cos(th2) + b * Math.sin(th2)) / denom;
-		const nx4 = ((1 + c) * Math.sin(th2)) / denom;
-		let X2 = nx1 / (1 - nx4), Y2 = nx2 / (1 - nx4), Z2 = nx3 / (1 - nx4);
-		const R2 = Math.hypot(X2, Y2, Z2) || 1;
-		const Rc2 = 1.6 * Math.tanh(R2 / 1.6);
-		X2 *= Rc2 / R2; Y2 *= Rc2 / R2; Z2 *= Rc2 / R2;
-		const ph2 = j1 * TAU;
-		const rr2 = TUBE * Math.sqrt(j2);
-		return [
-			(Z2 + (j2 - 0.5) * TUBE) * PROJ_SCALE,
-			(Y2 + Math.sin(ph2) * rr2) * PROJ_SCALE,
-			(X2 + Math.cos(ph2) * rr2) * PROJ_SCALE
-		];
+// LEDGER — an open book: two stacks of pages spread from one spine, each page
+// ruled with lines of writes of every length; light turns from page to page.
+function ledgerBook(id: number): OrganPoint {
+	const PER_SIDE = 5;
+	const side = uu(id, 5) < 0.5 ? -1 : 1;
+	const k = Math.floor(uu(id, 0) * PER_SIDE);
+	// Each side opens about 70 degrees from the spine, its pages fanned a little.
+	const open = (0.32 + k * 0.07) * Math.PI;
+	const phi = side < 0 ? Math.PI - open : open;
+	const cx = Math.cos(phi);
+	const cz = Math.sin(phi);
+	const page = (side < 0 ? PER_SIDE - 1 - k : PER_SIDE + k) / (2 * PER_SIDE);
+	const pick = uu(id, 1);
+	if (pick < 0.06) return [0, -0.72 + uu(id, 2) * 1.44, 0, page, 2];
+	if (pick < 0.2) {
+		// The page's edge, so each page reads as a sheet.
+		const e = uu(id, 2) * 3;
+		const [s0, y] = e < 1 ? [0.06 + e * 1.0, 0.72] : e < 2 ? [0.06 + (e - 1) * 1.0, -0.72] : [1.06, -0.72 + (e - 2) * 1.44];
+		return [cx * s0, y, cz * s0, page, 3];
 	}
-	let X = x1 / w, Y = x2 / w, Z = x3 / w;
-	const R = Math.hypot(X, Y, Z);
-	// Hard clamp to a tight radius so nothing can escape the frame.
-	const Rc = 1.55 * Math.tanh(R / 1.55);
-	const sc = R > 1e-6 ? Rc / R : 0;
-	X *= sc; Y *= sc; Z *= sc;
-	const ph = j1 * TAU;
-	const rr = TUBE * Math.sqrt(j2);
-	X += Math.cos(ph) * rr; Y += Math.sin(ph) * rr; Z += (j2 - 0.5) * TUBE;
-	return [Z * PROJ_SCALE, Y * PROJ_SCALE, X * PROJ_SCALE];
+	const LINES = 10;
+	const line = Math.floor(uu(id, 2) * LINES);
+	const y = -0.56 + line * (1.12 / (LINES - 1)) + (uu(id, 3) - 0.5) * 0.01;
+	const len = 0.3 + h(k * 5.1 + line * 2.3 + side) * 0.62;
+	const s0 = 0.14 + uu(id, 4) * len;
+	return [cx * s0, y, cz * s0, page, 0];
 }
 
-// MEMORIES — Constellation archive: 3 concentric Fibonacci shells of discrete
-// memory-cell pearls; retention = shell brightness. Many separable units.
+// GUARD — the gate: a ring with a thin membrane across it; what the agents try
+// streams in along straight lines, and what was stopped stays at the membrane.
+function guardGate(id: number): OrganPoint {
+	const p = uu(id, 0);
+	if (p < 0.36) {
+		const th = uu(id, 1) * TAU;
+		const ph = uu(id, 2) * TAU;
+		const R = 1.0 + 0.05 * Math.cos(ph);
+		return [R * Math.cos(th), R * Math.sin(th), 0.05 * Math.sin(ph), th / TAU, 0];
+	}
+	if (p < 0.52) {
+		const rr = 0.96 * Math.sqrt(uu(id, 1));
+		const th = uu(id, 2) * TAU;
+		return [rr * Math.cos(th), rr * Math.sin(th), (uu(id, 3) - 0.5) * 0.016, 0.5, 3];
+	}
+	if (p < 0.66) {
+		const j = Math.floor(uu(id, 1) * 8);
+		const a = h(j * 3.7) * TAU;
+		const r = 0.25 + h(j * 5.3) * 0.55;
+		const [bx, by] = inBall(id, 2, 0.07);
+		return [r * Math.cos(a) + bx, r * Math.sin(a) + by, 0.05 + uu(id, 5) * 0.06, 1, 1];
+	}
+	const j = Math.floor(uu(id, 1) * 16);
+	const a = h(j * 2.9 + 1) * TAU;
+	const r = 0.15 + h(j * 4.1 + 2) * 0.7;
+	const t = uu(id, 2);
+	const ex = r * Math.cos(a);
+	const ey = r * Math.sin(a);
+	return [ex * (1 + (1 - t) * 0.6), ey * (1 + (1 - t) * 0.6), 0.06 + (1 - t) * 1.3, t, 0];
+}
+
+// HEALING — two strands knit together by rungs: memory correcting itself;
+// light climbs the helix as it zips.
+function healingHelix(id: number): OrganPoint {
+	const H = 2.0;
+	const TURNS = 2.2;
+	const R = 0.5;
+	const p = uu(id, 0);
+	const t = uu(id, 1);
+	if (p < 0.8) {
+		const second = p >= 0.4;
+		const th = t * TURNS * TAU + (second ? Math.PI : 0);
+		const j = (uu(id, 2) - 0.5) * 0.035;
+		return [Math.cos(th) * (R + j), -H / 2 + t * H, Math.sin(th) * (R + j), t, second ? 4 : 0];
+	}
+	const RUNGS = 18;
+	const tk = (Math.floor(t * RUNGS) + 0.5) / RUNGS;
+	const th = tk * TURNS * TAU;
+	const s = uu(id, 2) * 2 - 1;
+	return [Math.cos(th) * R * s, -H / 2 + tk * H, Math.sin(th) * R * s, tk, 5];
+}
+
+// CAUSAL — from a failure down to its causes: one knot at the top, roots
+// branching below it; light runs from the failure out to every cause.
+interface Branch {
+	a: [number, number, number];
+	b: [number, number, number];
+	level: number;
+}
+let rootTree: Branch[] | null = null;
+function causalTree(): Branch[] {
+	if (rootTree) return rootTree;
+	const out: Branch[] = [];
+	const LEVELS = 5;
+	const grow = (a: [number, number, number], dir: [number, number, number], len: number, level: number, seed: number) => {
+		const b: [number, number, number] = [a[0] + dir[0] * len, a[1] + dir[1] * len, a[2] + dir[2] * len];
+		out.push({ a, b, level });
+		if (level + 1 >= LEVELS) return;
+		for (let k = 0; k < 3; k++) {
+			const az = (k / 3) * TAU + h(seed * 7.1 + k) * 1.2;
+			const spread = 0.42 + h(seed * 3.3 + k) * 0.3;
+			const nd: [number, number, number] = [Math.sin(spread) * Math.cos(az) + dir[0] * 0.5, -Math.cos(spread), Math.sin(spread) * Math.sin(az) + dir[2] * 0.5];
+			const n = Math.hypot(nd[0], nd[1], nd[2]);
+			grow(b, [nd[0] / n, nd[1] / n, nd[2] / n], len * 0.66, level + 1, seed * 3 + k + 1);
+		}
+	};
+	grow([0, 0.98, 0], [0, -1, 0], 0.52, 0, 1);
+	rootTree = out;
+	return out;
+}
+function causalRoots(id: number): OrganPoint {
+	if (uu(id, 0) < 0.06) {
+		const [bx, by, bz] = inBall(id, 1, 0.07);
+		return [bx, 0.98 + by, bz, 0, 1];
+	}
+	const tree = causalTree();
+	const br = tree[Math.min(tree.length - 1, Math.floor(uu(id, 1) * tree.length))];
+	const t = uu(id, 2);
+	const w = (1 - br.level / 5) * 0.012;
+	return [
+		br.a[0] + (br.b[0] - br.a[0]) * t + (uu(id, 3) - 0.5) * w,
+		br.a[1] + (br.b[1] - br.a[1]) * t,
+		br.a[2] + (br.b[2] - br.a[2]) * t + (uu(id, 4) - 0.5) * w,
+		(br.level + t) / 5,
+		0
+	];
+}
+
+// SYSTEM — the store as a core sample: strata of the log stacked in a column,
+// each layer its own thickness; a heartbeat rises up through them.
+const STRATA = (() => {
+	const n = 9;
+	const w = Array.from({ length: n }, (_, k) => 0.5 + h(k * 9.7 + 2) * 1.2);
+	const sum = w.reduce((a, b) => a + b, 0);
+	let y = -0.95;
+	return w.map((v) => {
+		const y0 = y;
+		y += (v / sum) * 1.9;
+		return [y0, y - 0.06] as [number, number];
+	});
+})();
+function systemStrata(id: number): OrganPoint {
+	const k = Math.floor(uu(id, 0) * STRATA.length);
+	const [y0, y1] = STRATA[k];
+	const R = 0.62 + (k % 2) * 0.03;
+	if (uu(id, 1) < 0.6) {
+		const th = uu(id, 2) * TAU;
+		const y = y0 + uu(id, 3) * (y1 - y0);
+		return [Math.cos(th) * R, y, Math.sin(th) * R, (y + 1) / 2, k % 2 ? 7 : 6];
+	}
+	const rr = R * Math.sqrt(uu(id, 2));
+	const th = uu(id, 3) * TAU;
+	return [Math.cos(th) * rr, y1, Math.sin(th) * rr, (y1 + 1) / 2, 7];
+}
+
+// WITNESS — what shaped the decision: filaments from many witnesses converge
+// on one bright crystal, and light flows up every one of them into it.
+function witnessLens(id: number): OrganPoint {
+	const fy = 0.82;
+	if (uu(id, 0) < 0.08) {
+		// The decision: a small octahedral crystal at the focus.
+		const a = uu(id, 1) * 2 - 1;
+		const b = (uu(id, 2) * 2 - 1) * (1 - Math.abs(a));
+		const c = (1 - Math.abs(a) - Math.abs(b)) * (uu(id, 3) < 0.5 ? -1 : 1);
+		return [a * 0.13, fy + b * 0.16, c * 0.13, 1, 1];
+	}
+	const j = Math.floor(uu(id, 1) * 26);
+	const az = h(j * 7.13 + 1) * TAU;
+	const r0 = 0.7 + h(j * 2.3 + 5) * 0.4;
+	const oy = -0.95 + h(j * 5.7 + 3) * 0.55;
+	const o: [number, number, number] = [Math.cos(az) * r0, oy, Math.sin(az) * r0];
+	if (uu(id, 0) < 0.2) {
+		const [bx, by, bz] = inBall(id, 4, 0.05);
+		return [o[0] + bx, o[1] + by, o[2] + bz, 0, 2];
+	}
+	const t = uu(id, 2);
+	// A gentle outward bow, so the filaments read as a lens, not a cone.
+	const bow = Math.sin(t * Math.PI) * 0.18;
+	return [o[0] * (1 - t) + o[0] * bow, o[1] + (fy - o[1]) * t, o[2] * (1 - t) + o[2] * bow, t, 0];
+}
+
+// CINEMA — a strip of film looping through itself, sprocket holes along both
+// edges; the frames run along it.
+function cinemaFilm(id: number): OrganPoint {
+	const s = uu(id, 0) * TAU;
+	const edge = uu(id, 1) < 0.24;
+	const w = edge ? (uu(id, 2) < 0.5 ? -1 : 1) * 0.33 : (uu(id, 2) * 2 - 1) * 0.27;
+	const FRAMES = 22;
+	const f = fract((s / TAU) * FRAMES);
+	const R = 0.95;
+	const half = s / 2;
+	const x = (R + w * Math.cos(half)) * Math.cos(s);
+	const z = (R + w * Math.cos(half)) * Math.sin(s);
+	const y = w * Math.sin(half);
+	const accent = edge ? (fract(f * 3) < 0.5 ? 2 : 3) : f < 0.06 ? 3 : 0;
+	return [x, y, z, s / TAU, accent];
+}
+
 const MEM_SHELLS = [
 	{ radius: 1.18, cells: 210 },
 	{ radius: 0.86, cells: 132 },
@@ -1066,243 +1519,35 @@ function memoriesFormation(id: number): [number, number, number] {
 	return [(cx * R + jx) * 1.06, (cy * R + jy) * 1.06, (cz * R + jz) * 1.06];
 }
 
-// TIMELINE — Bitemporal Clifford torus: two independent clocks (valid-time u,
-// transaction-time v) woven as a 3:2 braid on the 4D torus, projected to 3D.
-function timelineFormation(id: number): [number, number, number] {
-	const R = Math.SQRT1_2;
-	const t = h(id * 1.7 + 3.1);
-	const S = 6;
-	const s = Math.floor(h(id * 0.31 + 9.2) * S);
-	const phase = (s / S) * TAU;
-	const u = t * TAU * 3 + phase;
-	const v = t * TAU * 2 + phase * 1.618;
-	const x4 = R * Math.cos(u), y4 = R * Math.sin(u), z4 = R * Math.cos(v), w4 = R * Math.sin(v);
-	const D = 1.28 - w4;
-	let X = x4 / D, Y = y4 / D, Z = z4 / D;
-	const tubeR = 0.045;
-	const fa = h(id * 2.3 + 1.0) * TAU;
-	const fb = Math.sqrt(h(id * 3.7 + 2.0)) * tubeR;
-	X += Math.cos(fa) * fb; Y += Math.sin(fa) * fb; Z += (h(id * 4.1 + 5.0) - 0.5) * tubeR * 2;
-	const k = 1.02, tilt = 0.5;
-	const ct = Math.cos(tilt), st = Math.sin(tilt);
-	const Yt = Y * ct - Z * st, Zt = Y * st + Z * ct;
-	return [X * k, Yt * k, Zt * k];
+
+// FIELD — the mind: Fibonacci shells of discrete stars, each one a memory
+// coloured by its kind (accents 8..13: decision, correction, fact, event,
+// pattern, note), the same colours as every organ's lanes.
+function fieldStars(id: number): OrganPoint {
+	const [x, y, z] = memoriesFormation(id);
+	let gcell = Math.floor(h(id * 1.6180339887 + 0.5) * MEM_TOTAL_CELLS);
+	if (gcell >= MEM_TOTAL_CELLS) gcell = MEM_TOTAL_CELLS - 1;
+	const kind = Math.floor(h(gcell * 4.77 + 1.3) * 6);
+	return [x, y, z, gcell / MEM_TOTAL_CELLS, 8 + kind];
 }
 
-// BLACKBOX — Sealed vault: a faceted gem sealed inside a cubic crystal cage bound
-// by 8 corner seal-struts. A thing sealed inside a thing = the exportable receipt.
-const BB_PHI = (1 + Math.sqrt(5)) / 2;
-const BB_ICO: [number, number, number][] = (() => {
-	const p = BB_PHI;
-	const base: [number, number, number][] = [
-		[0, 1, p], [0, 1, -p], [0, -1, p], [0, -1, -p],
-		[1, p, 0], [1, -p, 0], [-1, p, 0], [-1, -p, 0],
-		[p, 0, 1], [p, 0, -1], [-p, 0, 1], [-p, 0, -1]
-	];
-	const n = Math.hypot(0, 1, p);
-	return base.map((v) => [v[0] / n, v[1] / n, v[2] / n] as [number, number, number]);
-})();
-function bbGemRadius(nx: number, ny: number, nz: number): number {
-	let m = -2;
-	for (const a of BB_ICO) {
-		const d = Math.abs(nx * a[0] + ny * a[1] + nz * a[2]);
-		if (d > m) m = d;
-	}
-	return 0.86 + 0.14 * m;
-}
-function blackboxFormation(id: number): [number, number, number] {
-	const CUBE = 1.16, GEM = 0.56;
-	const bucket = h(id + 2);
-	if (bucket < 0.46) {
-		if (h(id + 4) < 0.82) {
-			const axis = Math.floor(h(id + 6) * 3) % 3;
-			const s1 = h(id + 8) < 0.5 ? -1 : 1;
-			const s2 = h(id + 10) < 0.5 ? -1 : 1;
-			const t = -CUBE + 2 * CUBE * h(id + 12);
-			const j = (h(id + 14) - 0.5) * 0.03;
-			const c: [number, number, number] = [0, 0, 0];
-			c[axis] = t + j;
-			c[(axis + 1) % 3] = s1 * CUBE + j;
-			c[(axis + 2) % 3] = s2 * CUBE + j;
-			return c;
-		}
-		const face = Math.floor(h(id + 16) * 6);
-		const axis = Math.floor(face / 2);
-		const side = (face % 2) ? 1 : -1;
-		const t = h(id + 18);
-		const dir = h(id + 20) < 0.5 ? 1 : -1;
-		const u = -CUBE + 2 * CUBE * t;
-		const w = dir * (-CUBE + 2 * CUBE * t);
-		const c: [number, number, number] = [0, 0, 0];
-		c[axis] = side * CUBE;
-		c[(axis + 1) % 3] = u;
-		c[(axis + 2) % 3] = w;
-		return c;
-	}
-	if (bucket < 0.86) {
-		const N = 1600;
-		const k = Math.floor(h(id + 22) * N);
-		const yy = 1 - (2 * k) / (N - 1);
-		const rr = Math.sqrt(Math.max(0, 1 - yy * yy));
-		const ga = 2.399963229728653 * k;
-		const nx = Math.cos(ga) * rr, ny = yy, nz = Math.sin(ga) * rr;
-		const rad = GEM * bbGemRadius(nx, ny, nz);
-		return [nx * rad, ny * rad, nz * rad];
-	}
-	const corner = Math.floor(h(id + 24) * 8);
-	const sx = (corner & 1) ? 1 : -1;
-	const sy = (corner & 2) ? 1 : -1;
-	const sz = (corner & 4) ? 1 : -1;
-	const inR = GEM * 0.62;
-	const t = h(id + 26);
-	const j = (h(id + 28) - 0.5) * 0.025;
-	const ix = sx * inR, iy = sy * inR, iz = sz * inR;
-	const ox = sx * CUBE, oy = sy * CUBE, oz = sz * CUBE;
-	return [ix + (ox - ix) * t + j, iy + (oy - iy) * t + j, iz + (oz - iz) * t + j];
-}
-
-// REASONING — Aizawa convergence attractor: scattered evidence flung into orbital
-// lobes and dragged onto a dense vertical spine — chaos converging to a conclusion.
-function reasoningFormation(id: number): [number, number, number] {
-	const a = 0.95, b = 0.7, c = 0.6, d = 3.5, e = 0.25, f = 0.1;
-	let x = (h(id + 1) - 0.5) * 1.2;
-	let y = (h(id + 2) - 0.5) * 1.2;
-	let z = (h(id + 3) - 0.5) * 0.6 + 0.4;
-	const dt = 0.01;
-	const burn = 520;
-	const steps = burn + Math.floor(h(id + 7) * 260);
-	for (let i = 0; i < steps; i++) {
-		const dx = (z - b) * x - d * y;
-		const dy = d * x + (z - b) * y;
-		const dz = c + a * z - (z * z * z) / 3 - (x * x + y * y) * (1 + e * z) + f * z * x * x * x;
-		x += dx * dt; y += dy * dt; z += dz * dt;
-	}
-	const s = 0.92;
-	return [x * s, (z - 0.6) * s * 1.05, y * s];
-}
-
-// EXPLORE — Semantic walk: a glowing seed with dendritic filaments radiating and
-// forking outward into an expanding neighborhood (a walk that branches). Full 3D.
-function exploreFormation(id: number): [number, number, number] {
-	const TRUNKS = 14, DEPTH = 3, STEP0 = 0.5, STEP_DECAY = 0.8, SPREAD = 0.42;
-	const GOLDEN = 2.399963229728653, CORE_FRAC = 0.12, TUBE = 0.02, REACH = 1.3;
-	if (h(id * 0.53 + 0.9) < CORE_FRAC) {
-		const rr = 0.11 * Math.cbrt(h(id + 21));
-		const th = h(id + 22) * TAU;
-		const ph = Math.acos(2 * h(id + 23) - 1);
-		return [rr * Math.sin(ph) * Math.cos(th), rr * Math.cos(ph), rr * Math.sin(ph) * Math.sin(th)];
-	}
-	const trunk = Math.floor(h(id * 1.373 + 5.3) * TRUNKS);
-	const uy = 1 - ((trunk + 0.5) / TRUNKS) * 2;
-	const ur = Math.sqrt(Math.max(0, 1 - uy * uy));
-	const ua = trunk * GOLDEN;
-	let hx = Math.cos(ua) * ur, hy = uy, hz = Math.sin(ua) * ur;
-	const t = Math.pow(h(id * 0.911 + 1.7), 0.9);
-	let L = 0;
-	const segLen: number[] = [];
-	for (let dd = 0; dd < DEPTH; dd++) { const s = STEP0 * Math.pow(STEP_DECAY, dd); segLen.push(s); L += s; }
-	const target = t * L;
-	let x = 0, y = 0, z = 0, walked = 0;
-	for (let dd = 0; dd < DEPTH; dd++) {
-		if (dd > 0) {
-			const child = h(id * (1.0 + dd * 0.41) + dd * 7.13 + 3.1) < 0.5 ? 0 : 1;
-			const forkAz = (child - 0.5) * Math.PI + GOLDEN * (dd + trunk);
-			const forkPol = SPREAD * Math.pow(0.9, dd - 1) * (0.7 + 0.6 * h(id + dd * 11 + 17));
-			let ux = 0, uyy = 1, uz = 0;
-			if (Math.abs(hy) > 0.9) { ux = 1; uyy = 0; uz = 0; }
-			let sx = hy * uz - hz * uyy, sy = hz * ux - hx * uz, sz = hx * uyy - hy * ux;
-			const sl = Math.hypot(sx, sy, sz) || 1;
-			sx /= sl; sy /= sl; sz /= sl;
-			const vx = sy * hz - sz * hy, vy = sz * hx - sx * hz, vz = sx * hy - sy * hx;
-			const ca = Math.cos(forkAz), sa = Math.sin(forkAz);
-			const dxx = ca * sx + sa * vx, dyy = ca * sy + sa * vy, dzz = ca * sz + sa * vz;
-			const cp = Math.cos(forkPol), sp = Math.sin(forkPol);
-			hx = cp * hx + sp * dxx; hy = cp * hy + sp * dyy; hz = cp * hz + sp * dzz;
-			const hl = Math.hypot(hx, hy, hz) || 1;
-			hx /= hl; hy /= hl; hz /= hl;
-		}
-		const s = segLen[dd];
-		if (walked + s >= target) { const fr = (target - walked) / s; x += hx * s * fr; y += hy * s * fr; z += hz * s * fr; break; }
-		x += hx * s; y += hy * s; z += hz * s; walked += s;
-	}
-	const taper = 0.35 + 0.65 * Math.sin(Math.min(1, t) * Math.PI);
-	x += (h(id * 3.1 + 1) - 0.5) * TUBE * taper;
-	y += (h(id * 3.3 + 2) - 0.5) * TUBE * taper;
-	z += (h(id * 3.7 + 3) - 0.5) * TUBE * taper;
-	const scale = REACH / L;
-	return [x * scale, y * scale, z * scale];
-}
-
-// FEED — Tilted vortex ring: particles ride intertwined helical streamlines around
-// a smoke-ring tube (poloidal flow), tilted so the hole faces the viewer. The
-// endless circulating event stream.
-function feedFormation(id: number): [number, number, number] {
-	const a = h(id * 1.17 + 3.0), b = h(id * 1.91 + 7.0);
-	const R = 0.82, rTube = 0.34, STRANDS = 5, TWIST = 6;
-	const u = a * TAU;
-	const strand = Math.floor(b * STRANDS);
-	const v = u * TWIST + (strand / STRANDS) * TAU + (h(id + 5) - 0.5) * 0.5;
-	const shell = 0.72 + 0.28 * Math.sqrt(h(id + 13));
-	const rr = rTube * shell;
-	let x = (R + rr * Math.cos(v)) * Math.cos(u);
-	let z = (R + rr * Math.cos(v)) * Math.sin(u);
-	let y = rr * Math.sin(v);
-	const tx = 1.0821;
-	const cyt = Math.cos(tx), syt = Math.sin(tx);
-	const y1 = y * cyt - z * syt, z1 = y * syt + z * cyt;
-	y = y1; z = z1;
-	const rz = 0.2094;
-	const czr = Math.cos(rz), szr = Math.sin(rz);
-	const x2 = x * czr - y * szr, y2 = x * szr + y * czr;
-	return [x2, y2, z];
-}
-
-// CONTRADICTIONS — Stella octangula: two interpenetrating dual tetrahedra (the 3D
-// Star of David), strained apart on X. The canonical symbol of duals in opposition.
-function contradictionsFormation(id: number): [number, number, number] {
-	const a = h(id * 1.17 + 3.0), b = h(id * 1.91 + 7.0), c = h(id * 2.37 + 11.0);
-	const R = 0.92;
-	const A_VERTS: [number, number, number][] = [[1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]];
-	const B_VERTS: [number, number, number][] = [[-1, -1, -1], [-1, 1, 1], [1, -1, 1], [1, 1, -1]];
-	const tetB = a < 0.5;
-	const verts = tetB ? B_VERTS : A_VERTS;
-	const shift = tetB ? -0.16 : 0.16;
-	if (b < 0.72) {
-		const edges: [number, number][] = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]];
-		const e = edges[Math.floor(c * 6) % 6];
-		const v0 = verts[e[0]], v1 = verts[e[1]];
-		const u = h(id * 3.11 + 5.0);
-		const t = 0.5 + 0.5 * Math.sign(u - 0.5) * Math.pow(Math.abs(2 * u - 1), 0.55);
-		const jx = (h(id * 4.7 + 1.0) - 0.5) * 0.05, jy = (h(id * 5.3 + 2.0) - 0.5) * 0.05, jz = (h(id * 6.1 + 3.0) - 0.5) * 0.05;
-		return [(v0[0] + (v1[0] - v0[0]) * t) * R + jx + shift, (v0[1] + (v1[1] - v0[1]) * t) * R + jy, (v0[2] + (v1[2] - v0[2]) * t) * R + jz];
-	}
-	if (b < 0.92) {
-		const v = verts[Math.floor(c * 4) % 4];
-		const r = Math.pow(h(id * 7.7 + 4.0), 1.5) * 0.11;
-		const th = h(id * 8.3 + 6.0) * TAU;
-		const ph = Math.acos(2 * h(id * 9.1 + 8.0) - 1);
-		return [v[0] * R + r * Math.sin(ph) * Math.cos(th) + shift, v[1] * R + r * Math.sin(ph) * Math.sin(th), v[2] * R + r * Math.cos(ph)];
-	}
-	const th = h(id * 10.3 + 7.0) * TAU;
-	const ph = Math.acos(2 * h(id * 11.7 + 9.0) - 1);
-	const sx = Math.sin(ph) * Math.cos(th), sy = Math.sin(ph) * Math.sin(th), sz = Math.cos(ph);
-	const l1 = Math.abs(sx) + Math.abs(sy) + Math.abs(sz);
-	const s = 0.34;
-	return [sx / l1 * s, sy / l1 * s, sz / l1 * s];
-}
-
-function formationPoint(kind: number, id: number): [number, number, number] {
+/** A point of an organ's shape, with its flow and accent. */
+function organPoint(kind: number, id: number): OrganPoint {
 	switch (kind) {
-		case 0: return observatoryFormation(id);
-		case 1: return graphFormation(id);
-		case 2: return memoriesFormation(id);
-		case 3: return timelineFormation(id);
-		case 4: return blackboxFormation(id);
-		case 5: return reasoningFormation(id);
-		case 6: return exploreFormation(id);
-		case 7: return feedFormation(id);
-		default: return contradictionsFormation(id);
+		case 0: return traceBrain(id);
+		case 1: return witnessLens(id);
+		case 2: return fieldStars(id);
+		case 3: return ledgerBook(id);
+		case 4: return guardGate(id);
+		case 5: return causalRoots(id);
+		case 6: return cinemaFilm(id);
+		case 7: return systemStrata(id);
+		default: return healingHelix(id);
 	}
+}
+function formationPoint(kind: number, id: number): [number, number, number] {
+	const [x, y, z] = organPoint(kind, id);
+	return [x, y, z];
 }
 
 function particleCount(reducedMotion: boolean): number {
@@ -1327,7 +1572,7 @@ export class PalaceBrainPass implements FramePass {
 	private hoverStrength = 0;
 	private reducedMotion = false;
 	private bornMs: number;
-	private burst: { href: string; startMs: number; callbackFired: boolean } | null = null;
+	private burst: { href: string; startMs: number; callbackFired: boolean; at: number; dolly: boolean } | null = null;
 	private onFlashPeak: ((href: string) => void) | null = null;
 	private watchdog: ReturnType<typeof setTimeout> | null = null;
 
@@ -1354,21 +1599,26 @@ export class PalaceBrainPass implements FramePass {
 		return this.burst !== null;
 	}
 
-	startBurst(href: string, onFlashPeak: (href: string) => void): boolean {
+	/**
+	 * Fly into an organ. `onFlashPeak` fires once the burst reaches `at` (its
+	 * progress, 0..1): DIVE_END for the hand-over into the organ's page, or
+	 * FLASH_REQUEST_AT to let the detonation play first.
+	 */
+	startBurst(href: string, onFlashPeak: (href: string) => void, at = FLASH_REQUEST_AT): boolean {
 		if (this.burst) return false;
 		const target = this.placed.find((placed) => placed.href === href);
 		if (!target) return false;
 		this.hoveredIndex = this.placed.indexOf(target);
 		this.hoverStrength = 1;
-		this.burst = { href, startMs: this.engine.wallNowMs, callbackFired: false };
+		// Handing over at the end of the dive is a camera dolly into the organ;
+		// a later hand-over plays the burst's collapse and detonation.
+		this.burst = { href, startMs: this.engine.wallNowMs, callbackFired: false, at, dolly: at <= DIVE_END + 1e-6 };
 		this.onFlashPeak = onFlashPeak;
-		// Safety fallback: if the GPU loop stalls, still navigate. Fires just AFTER
-		// the intended flash peak (0.66 * 2000ms = 1320ms) so a healthy run navigates
-		// via the shader-driven flash, and only a real stall trips this backstop.
-		// Stall-only backstop: fire just AFTER the intended nav point (0.90 * 1000ms
-		// = 900ms) so a healthy run navigates via the shader-driven flash AFTER the
-		// explosion has played, and only a genuine GPU stall trips this early.
-		this.watchdog = setTimeout(() => this.fireFlashCallback(), 980);
+		// Stall-only backstop: a healthy run calls back from compute() when the
+		// burst reaches `at`; only a stalled frame loop trips this.
+		const duration = this.reducedMotion ? REDUCED_BURST_MS : BURST_MS;
+		const due = this.burst.dolly && !this.reducedMotion ? DIVE_END * duration + EXPLODE_MS * EXPLODE_HANDOVER : at * duration;
+		this.watchdog = setTimeout(() => this.fireFlashCallback(), due + 160);
 		return true;
 	}
 
@@ -1378,13 +1628,17 @@ export class PalaceBrainPass implements FramePass {
 
 		this.placed = regions.map((region, index) => {
 			const anchor = DESKTOP_ANCHORS[region.href] ?? [0, 0, index * 0.01, 0.14];
+			const kind = FORMATION_KIND[region.href] ?? index % 9;
+			const extent = formationExtent(kind);
 			return {
 				href: region.href,
 				x: anchor[0],
 				y: anchor[1],
 				z: anchor[2],
 				scale: anchor[3],
-				kind: FORMATION_KIND[region.href] ?? index % 9
+				kind,
+				below: extent.below,
+				reach: extent.reach
 			};
 		});
 
@@ -1397,8 +1651,7 @@ export class PalaceBrainPass implements FramePass {
 			// Route-contiguous, cortex (route 0) weighted ~2x.
 			const route = this.routeForIndex(i);
 			const region = this.placed[route];
-			const local = formationPoint(region.kind, id);
-			const color = rgb01(FAMILY_COLOR[regions[route].family]);
+			const local = organPoint(region.kind, id);
 			data[offset + 0] = local[0];
 			data[offset + 1] = local[1];
 			data[offset + 2] = local[2];
@@ -1407,12 +1660,12 @@ export class PalaceBrainPass implements FramePass {
 			data[offset + 5] = region.y;
 			data[offset + 6] = region.z;
 			data[offset + 7] = region.scale;
-			// Color slot carries a per-particle hue seed (for the iridescent palette)
-			// in .x plus the family base in a compressed form; the shader reads
-			// color_route.xyz as (hueSeed, familyBias, familyBias2) and .w as route.
-			data[offset + 8] = h(id * 1.7 + 5); // hue seed 0..1
-			data[offset + 9] = color[0] * 0.5 + color[1] * 0.3; // gentle family bias
-			data[offset + 10] = color[2] * 0.6; // family bias 2
+			// color_route: a twinkle seed, the point's flow along its shape (where
+			// the light travels), its organ's shape kind plus its accent / 16,
+			// and its route (which organ it belongs to).
+			data[offset + 8] = h(id * 1.7 + 5);
+			data[offset + 9] = local[3];
+			data[offset + 10] = region.kind + local[4] / 16;
 			data[offset + 11] = route;
 		}
 
@@ -1527,12 +1780,32 @@ export class PalaceBrainPass implements FramePass {
 		// detonates center-stage (Sam: "go to the middle THEN burst").
 		let portalX = portal?.x ?? 0;
 		let portalY = portal?.y ?? 0;
-		if (this.burst) {
+		let dollyZoom = 0;
+		let dollyGlide = 0;
+		let burstKind = 0;
+		if (this.burst?.dolly) {
+			selectedIndex = this.indexOfHref(this.burst.href);
+			const target = selectedIndex >= 0 ? this.placed[selectedIndex] : null;
+			const diveMs = (this.reducedMotion ? REDUCED_BURST_MS : BURST_MS) * DIVE_END;
+			const elapsed = now - this.burst.startMs;
+			const k = Math.min(1, Math.max(0, elapsed / diveMs));
+			// Then the organ bursts wide, in its own way (the shader's explode()).
+			const ex = this.reducedMotion ? 0 : Math.min(1, Math.max(0, (elapsed - diveMs) / EXPLODE_MS));
+			if (this.reducedMotion ? k >= 1 : ex >= EXPLODE_HANDOVER) this.fireFlashCallback();
+			// The organ glides to the centre and grows; the zoom keeps going a
+			// little as it bursts, so the camera never stops moving in.
+			dollyGlide = smooth01(k);
+			dollyZoom = 1 + (DOLLY_ZOOM - 1) * k * k + ex * 0.6;
+			portalX = target?.x ?? 0;
+			portalY = target?.y ?? 0;
+			progress = ex;
+			burstKind = (target?.kind ?? 0) + 1;
+		} else if (this.burst) {
 			selectedIndex = this.indexOfHref(this.burst.href);
 			portal = selectedIndex >= 0 ? this.placed[selectedIndex] : portal;
 			const duration = this.reducedMotion ? REDUCED_BURST_MS : BURST_MS;
 			progress = Math.min(1, Math.max(0, (now - this.burst.startMs) / duration));
-			const threshold = this.reducedMotion ? 0.3 : FLASH_REQUEST_AT;
+			const threshold = this.reducedMotion ? 0.3 : this.burst.at;
 			if (progress >= threshold) this.fireFlashCallback();
 			// smoothstep the anchor -> (0,0) over the dive so the organ glides to center.
 			const anchorX = portal?.x ?? 0;
@@ -1544,7 +1817,7 @@ export class PalaceBrainPass implements FramePass {
 
 		const introDur = 1_650;
 		const intro = this.engine.params[11] > 0.5 ? 1 : Math.min(1, (now - this.bornMs) / introDur);
-		const flash = this.reducedMotion || progress <= 0 ? 0 : Math.exp(-Math.pow((progress - 0.58) / 0.065, 2));
+		const flash = this.reducedMotion || progress <= 0 || this.burst?.dolly ? 0 : Math.exp(-Math.pow((progress - 0.58) / 0.065, 2));
 		// Deterministic sim time from the DemoClock (params[10]) so ?frame=N reproduces.
 		const simTime = this.engine.params[10] || 0;
 		this.uniformData[0] = this.engine.params[6] || 1;
@@ -1557,12 +1830,13 @@ export class PalaceBrainPass implements FramePass {
 		this.uniformData[7] = progress;
 		this.uniformData[8] = portalX;
 		this.uniformData[9] = portalY;
-		this.uniformData[10] = 0;
-		this.uniformData[11] = flash;
+		this.uniformData[10] = dollyZoom;
+		// In the dive, .w of the portal carries the organ that bursts (kind + 1).
+		this.uniformData[11] = this.burst?.dolly ? burstKind : flash;
 		this.uniformData[12] = intro;
 		this.uniformData[13] = this.placed.length;
 		this.uniformData[14] = this.engine.params[5] || 0;
-		this.uniformData[15] = 0;
+		this.uniformData[15] = dollyGlide;
 		device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
 	}
 
@@ -1585,7 +1859,9 @@ export class PalaceBrainPass implements FramePass {
 			const p = this.placed[i];
 			const dx = (ndcX - p.x) * aspect;
 			const dy = ndcY - p.y;
-			let score = Math.hypot(dx, dy) / (p.scale * 1.35);
+			// The whole drawn shape is the click target (its measured reach), never
+			// less than the old 1.35 * scale disc.
+			let score = Math.hypot(dx, dy) / (p.scale * Math.max(1.35, p.reach * 1.05));
 			if (i === this.hoveredIndex) score *= 0.78;
 			if (score < 1.1 && score < bestScore) {
 				best = i;
@@ -1596,11 +1872,21 @@ export class PalaceBrainPass implements FramePass {
 	}
 
 	getScreenPositions(): PalaceSwarmScreenPos[] {
+		// The shader draws anchors in screen NDC with round formations of radius
+		// `scale` (NDC-y). The text layer works in logical NDC (it divides x by
+		// max(aspect,1) and multiplies y by min(aspect,1)), so convert here: one
+		// place, and labels can never disagree with the formations again.
+		const aspect = (this.engine.params[6] || 1) / Math.max(1, this.engine.params[7] || 1);
+		const sx = Math.max(aspect, 1);
+		const sy = 1 / Math.min(aspect, 1);
 		return this.placed.map((p) => ({
 			href: p.href,
-			ndcX: p.x,
-			ndcY: p.y,
+			ndcX: p.x * sx,
+			ndcY: p.y * sy,
+			screenX: p.x,
+			screenY: p.y,
 			depth: Math.min(1, Math.max(0, 0.72 + p.z)),
+			radius: p.scale * p.below * sy,
 			visible: true
 		}));
 	}

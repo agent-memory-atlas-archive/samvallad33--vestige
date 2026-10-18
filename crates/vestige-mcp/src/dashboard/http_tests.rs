@@ -454,8 +454,6 @@ async fn withheld_features_answer_with_a_structured_reason() {
     let explore = format!(r#"{{"action":"associations","from_id":"{id}"}}"#);
     let calls: Vec<(&str, String, Option<&str>)> = vec![
         ("GET", "/api/changelog?limit=100".into(), None),
-        ("GET", "/api/traces".into(), None),
-        ("GET", "/api/receipts".into(), None),
         ("GET", "/api/search?q=x".into(), None),
         ("GET", "/api/memories?q=x".into(), None),
         ("GET", format!("/api/memories/{id}/audit"), None),
@@ -490,6 +488,153 @@ async fn withheld_features_answer_with_a_structured_reason() {
             .any(|code| error.starts_with(code)),
             "{method} {uri}: {error:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Receipts and runs on a Strata log: Field's receipt list and the Witness.
+// ---------------------------------------------------------------------------
+
+fn mutation_kinds(receipts: &Value) -> Vec<String> {
+    receipts
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|receipt| receipt["mutations"][0]["kind"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn receipts_list_the_logs_write_effects_newest_first() {
+    let (_dir, storage) = strata();
+    let first = remember(&storage, "the first memory written", &[]);
+    let second = remember(&storage, "the second memory written", &[]);
+    link(&storage, &first, &second);
+    storage.promote_memory(&first).unwrap();
+    let hidden = remember(&storage, "a memory suppressed later", &[]);
+    storage.suppress_memory(&hidden).unwrap();
+    let app = router(&storage);
+
+    let reply = own(&app, "GET", "/api/receipts?limit=60", None).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let answer = reply.json();
+    let receipts = &answer["receipts"];
+    assert_eq!(answer["total"], 4, "{answer}");
+    assert_eq!(
+        mutation_kinds(receipts),
+        ["promoted", "edge_recorded", "created", "created"],
+        "{answer}"
+    );
+    let named: Vec<&str> = receipts
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|receipt| receipt["retrieved"][0].as_str().unwrap())
+        .collect();
+    assert_eq!(named, [&first, &first, &second, &first], "{answer}");
+    assert!(
+        !answer.to_string().contains(&hidden),
+        "a suppressed memory's receipts stay hidden: {answer}"
+    );
+
+    // Each listed receipt is exactly the one its `eff-` id resolves to.
+    for receipt in receipts.as_array().unwrap() {
+        let id = receipt["receipt_id"].as_str().unwrap();
+        assert!(id.starts_with("eff-"), "{id}");
+        let one = own(&app, "GET", &format!("/api/receipts/{id}"), None).await;
+        assert_eq!(one.status, StatusCode::OK, "{}", one.body);
+        assert_eq!(&one.json(), receipt);
+    }
+
+    let reply = own(&app, "GET", "/api/receipts?limit=2", None).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(
+        mutation_kinds(&reply.json()["receipts"]),
+        ["promoted", "edge_recorded"]
+    );
+}
+
+#[tokio::test]
+async fn traces_list_each_memorys_recorded_history_as_a_run() {
+    let (_dir, storage) = strata();
+    let first = remember(&storage, "the memory a run is keyed by", &[]);
+    let second = remember(&storage, "the memory it was derived from", &[]);
+    link(&storage, &first, &second);
+    storage.promote_memory(&first).unwrap();
+    let hidden = remember(&storage, "a memory suppressed later", &[]);
+    storage.suppress_memory(&hidden).unwrap();
+    let app = router(&storage);
+
+    let reply = own(&app, "GET", "/api/traces?limit=48", None).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let answer = reply.json();
+    assert_eq!(answer["total"], 2, "{answer}");
+    let runs = answer["runs"].as_array().unwrap();
+    // Newest activity first: the promote names `first`, the edge `second`.
+    assert_eq!(runs[0]["runId"], first.as_str(), "{answer}");
+    assert_eq!(runs[0]["firstTool"], "created", "{answer}");
+    assert_eq!(runs[0]["eventCount"], 3, "{answer}");
+    assert_eq!(runs[0]["writeCount"], 3, "{answer}");
+    assert_eq!(runs[0]["retrievedCount"], 0, "{answer}");
+    assert_eq!(runs[1]["runId"], second.as_str(), "{answer}");
+    assert_eq!(runs[1]["eventCount"], 2, "{answer}");
+    assert!(runs[0]["startedAt"].as_i64().unwrap() > 0, "{answer}");
+    assert!(
+        runs[0]["lastAt"].as_i64().unwrap() >= runs[0]["startedAt"].as_i64().unwrap(),
+        "{answer}"
+    );
+
+    // The run's timeline, oldest first, one write per admitted effect.
+    let reply = own(&app, "GET", &format!("/api/traces/{first}"), None).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let trace = reply.json();
+    assert_eq!(trace["runId"], first.as_str(), "{trace}");
+    assert_eq!(trace["summary"]["eventCount"], 3, "{trace}");
+    let events = trace["events"].as_array().unwrap();
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|event| {
+            assert_eq!(event["type"], "memory.write", "{event}");
+            assert_eq!(event["runId"], first.as_str(), "{event}");
+            event["diff"]["kind"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(kinds, ["created", "edge_recorded", "promoted"], "{trace}");
+    assert_eq!(events[1]["diff"]["edge"]["target"], second.as_str(), "{trace}");
+    assert_eq!(events[1]["diff"]["edge"]["linkType"], "derived_from", "{trace}");
+
+    // The run's receipts are exactly the ones its events cite, newest first.
+    let reply = own(
+        &app,
+        "GET",
+        &format!("/api/receipts?run={first}&limit=24"),
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let run_receipts: Vec<Value> = reply.json()["receipts"].as_array().unwrap().clone();
+    let cited: Vec<&Value> = events.iter().rev().map(|event| &event["diff"]["receiptId"]).collect();
+    let listed: Vec<&Value> = run_receipts.iter().map(|receipt| &receipt["receipt_id"]).collect();
+    assert_eq!(listed, cited);
+
+    // The edge is part of the target's run too, named by its writer.
+    let reply = own(&app, "GET", &format!("/api/receipts?run={second}"), None).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let receipts = reply.json()["receipts"].clone();
+    assert_eq!(mutation_kinds(&receipts), ["edge_recorded", "created"]);
+    assert_eq!(receipts[0]["retrieved"][0], first.as_str());
+
+    let reply = own(&app, "GET", &format!("/api/traces/{first}/export"), None).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(reply.json()["events"].as_array().unwrap().len(), 3);
+
+    // A suppressed memory, or an id no memory has, is no run.
+    for missing in [hidden.as_str(), "mem-ffffffffffffffff"] {
+        let reply = own(&app, "GET", &format!("/api/traces/{missing}"), None).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{missing}: {}", reply.body);
+        let reply = own(&app, "GET", &format!("/api/receipts?run={missing}"), None).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        assert_eq!(reply.json()["total"], 0, "{missing}");
     }
 }
 

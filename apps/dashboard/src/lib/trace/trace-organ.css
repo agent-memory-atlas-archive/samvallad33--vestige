@@ -1,0 +1,435 @@
+/*
+ * The words around a TraceStage, shared by every organ built on it.
+ *
+ * No cards, no boxes: text floats over the field with a dark halo, one
+ * question at the top left, a reading lane at the right, steps at the
+ * bottom. Classes are prefixed tr- because this sheet is global.
+ */
+.tr-ask,
+.tr-lane,
+.tr-beats {
+	position: fixed;
+	z-index: 20;
+	color: #e8f4f2;
+	text-shadow: 0 0 22px rgba(2, 3, 7, 0.95), 0 1px 2px rgba(2, 3, 7, 0.9);
+}
+.tr-ask {
+	top: 1.5rem;
+	left: 6.2rem;
+	width: min(44rem, 54vw);
+}
+.tr-ask.tr-quiet .tr-types,
+.tr-ask.tr-quiet .tr-hint,
+.tr-ask.tr-quiet .tr-nudge {
+	opacity: 0.35;
+}
+.tr-eyebrow {
+	margin: 0;
+	font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+	font-size: 0.66rem;
+	letter-spacing: 0.34em;
+	text-transform: uppercase;
+	color: #5dcaa5;
+}
+.tr-question,
+.tr-title {
+	width: 100%;
+	margin: 0.3rem 0 0;
+	padding: 0.1rem 0 0.35rem;
+	background: none;
+	border: none;
+	border-bottom: 1px solid rgba(127, 243, 230, 0.25);
+	color: #f4fbfa;
+	font: inherit;
+	font-size: clamp(1.6rem, 2.5vw, 2.4rem);
+	font-weight: 300;
+	letter-spacing: -0.01em;
+	outline: none;
+	text-shadow: inherit;
+}
+.tr-question:focus {
+	border-bottom-color: rgba(127, 243, 230, 0.75);
+}
+.tr-hint {
+	margin: 0.55rem 0 0;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.9rem;
+	align-items: baseline;
+}
+.tr-chip {
+	background: none;
+	border: none;
+	padding: 0;
+	font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+	font-size: 0.7rem;
+	letter-spacing: 0.12em;
+	color: #7ff3e6;
+	border-bottom: 1px solid rgba(127, 243, 230, 0.4);
+	cursor: pointer;
+	text-shadow: inherit;
+}
+.tr-chip[aria-pressed='true'] {
+	color: #f4fbfa;
+	border-bottom-color: #f4fbfa;
+}
+.tr-chip[aria-pressed='false'] {
+	color: #6f8f8b;
+	border-bottom-color: transparent;
+}
+.tr-hint-text {
+	font-size: 0.72rem;
+	color: #6f8f8b;
+}
+.tr-line {
+	margin: 1rem 0 0;
+	font-size: 0.92rem;
+	line-height: 1.5;
+	color: #c9dedb;
+}
+.tr-line strong {
+	font-size: 1.5rem;
+	font-weight: 300;
+	color: #7ff3e6;
+	margin-right: 0.25rem;
+}
+.tr-types {
+	margin: 0.5rem 0 0;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.4rem 1.1rem;
+	font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+	font-size: 0.64rem;
+	letter-spacing: 0.1em;
+	color: #9fb9b6;
+}
+.tr-types i {
+	display: inline-block;
+	width: 0.45rem;
+	height: 0.45rem;
+	border-radius: 50%;
+	margin-right: 0.4rem;
+	box-shadow: 0 0 8px currentColor;
+}
+.tr-nudge {
+	margin: 0.7rem 0 0;
+	font-size: 0.75rem;
+	color: #6f8f8b;
+}
+.tr-err {
+	color: #ff7a66;
+}
+.tr-ok {
+	color: #29f2a9;
+}
+.tr-warn {
+	color: #f6c35b;
+}
+.tr-beats {
+	left: 6.2rem;
+	bottom: 1.4rem;
+	display: flex;
+	gap: 1.6rem;
+	font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+	font-size: 0.66rem;
+	letter-spacing: 0.16em;
+	text-transform: uppercase;
+	color: #4f6966;
+}
+.tr-beats .on {
+	color: #7ff3e6;
+	text-shadow: 0 0 14px rgba(127, 243, 230, 0.55), 0 0 22px rgba(2, 3, 7, 0.95);
+}
+/* A zoomed row lists its memories where the page's reading lane was. */
+:root[data-row-panel='1'] .tr-lane:not(.tr-row) {
+	display: none;
+}
+.tr-lane {
+	top: 1.5rem;
+	right: 1.8rem;
+	bottom: 40vh;
+	width: min(26rem, 30vw);
+	overflow-y: auto;
+	scrollbar-width: none;
+	padding-left: 1rem;
+	border-left: 1px solid rgba(127, 243, 230, 0.16);
+}
+.tr-kicker,
+.tr-proof-kicker,
+.tr-depth {
+	margin: 0;
+	font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+	font-size: 0.6rem;
+	letter-spacing: 0.22em;
+	text-transform: uppercase;
+}
+.tr-text {
+	margin: 0.45rem 0 0.4rem;
+	font-size: 0.86rem;
+	line-height: 1.55;
+	color: #e4f1ef;
+	overflow-wrap: anywhere;
+}
+.tr-id {
+	font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+	font-size: 0.66rem;
+	color: #7ff3e6;
+	text-decoration: none;
+	overflow-wrap: anywhere;
+}
+.tr-block {
+	margin-top: 1.2rem;
+}
+.tr-proof-kicker {
+	color: #f6c35b;
+	margin-bottom: 0.35rem;
+}
+.tr-proof-line {
+	margin: 0.3rem 0 0;
+	font-size: 0.78rem;
+	line-height: 1.5;
+	color: #c9dedb;
+	overflow-wrap: anywhere;
+}
+.tr-note {
+	margin: 0.25rem 0 0;
+	font-size: 0.68rem;
+	line-height: 1.45;
+	color: #6f8f8b;
+}
+.tr-depth {
+	margin-top: 0.7rem;
+	color: #6f8f8b;
+}
+.tr-item {
+	display: block;
+	width: 100%;
+	text-align: left;
+	background: none;
+	border: none;
+	padding: 0.3rem 0;
+	font: inherit;
+	font-size: 0.76rem;
+	line-height: 1.45;
+	color: #d4e6e3;
+	cursor: pointer;
+	text-shadow: inherit;
+}
+.tr-item:hover,
+.tr-item[aria-current='true'] {
+	color: #ffffff;
+}
+.tr-edge {
+	display: inline-block;
+	margin-right: 0.45rem;
+	font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+	font-size: 0.6rem;
+	letter-spacing: 0.1em;
+	color: #5f8a87;
+}
+.tr-edge.causal {
+	color: #ffb04a;
+}
+.tr-item.fading {
+	color: #f6c35b;
+}
+.tr-tag {
+	display: block;
+	margin-top: 0.15rem;
+	font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+	font-size: 0.58rem;
+	letter-spacing: 0.12em;
+	color: #6f8f8b;
+}
+.tr-item.fading .tr-tag {
+	color: #f6c35b;
+}
+.tr-actions {
+	margin-top: 1.3rem;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.9rem 1.3rem;
+}
+.tr-act {
+	background: none;
+	border: none;
+	padding: 0.2rem 0;
+	font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+	font-size: 0.7rem;
+	letter-spacing: 0.14em;
+	text-transform: uppercase;
+	color: #ffb04a;
+	border-bottom: 1px solid rgba(255, 176, 74, 0.5);
+	cursor: pointer;
+	text-shadow: inherit;
+}
+.tr-act.alt {
+	color: #7ff3e6;
+	border-bottom-color: rgba(127, 243, 230, 0.5);
+}
+.tr-act.quiet {
+	color: #8fa8a5;
+	border-bottom-color: rgba(143, 168, 165, 0.35);
+}
+.tr-act.danger {
+	color: #ff7a66;
+	border-bottom-color: rgba(255, 122, 102, 0.5);
+}
+.tr-act:disabled {
+	opacity: 0.5;
+	cursor: default;
+}
+.tr-field {
+	width: 100%;
+	margin-top: 0.4rem;
+	padding: 0.3rem 0;
+	background: none;
+	border: none;
+	border-bottom: 1px solid rgba(127, 243, 230, 0.22);
+	color: #eef6f4;
+	font: inherit;
+	font-size: 0.8rem;
+	line-height: 1.5;
+	outline: none;
+	resize: vertical;
+	text-shadow: inherit;
+}
+.tr-field:focus {
+	border-bottom-color: rgba(127, 243, 230, 0.7);
+}
+.tr-field::placeholder {
+	color: #4f6966;
+}
+/* The film plays above everything on the page: the host is its own stacking
+   context over the organ's words, and its launch button stays off screen
+   (the overlay itself is fixed to the viewport). */
+.tr-cinema-host {
+	position: fixed;
+	z-index: 80;
+	left: -9999px;
+	top: 0;
+}
+@media (max-width: 900px) {
+	.tr-ask {
+		left: 5.6rem;
+		width: auto;
+		right: 1rem;
+	}
+	.tr-lane {
+		top: auto;
+		left: 5.6rem;
+		right: 0;
+		bottom: 3.6rem;
+		width: auto;
+		max-height: 38dvh;
+		border-left: none;
+		padding: 1rem 1rem 0.4rem;
+		background: linear-gradient(to top, rgba(2, 3, 7, 0.94) 72%, rgba(2, 3, 7, 0));
+	}
+}
+/* Below the dock breakpoint the shell's bar sits at the bottom instead. */
+@media (max-width: 767px) {
+	.tr-ask {
+		top: 1rem;
+		left: 1rem;
+		right: 1rem;
+	}
+	.tr-question,
+	.tr-title {
+		font-size: 1.5rem;
+	}
+	.tr-line {
+		margin-top: 0.7rem;
+		font-size: 0.82rem;
+	}
+	.tr-line strong {
+		font-size: 1.2rem;
+	}
+	.tr-lane {
+		left: 0;
+		bottom: calc(3.9rem + env(safe-area-inset-bottom));
+		max-height: 40dvh;
+		padding-top: 1.6rem;
+	}
+	.tr-beats {
+		left: 1rem;
+		bottom: calc(4.4rem + env(safe-area-inset-bottom));
+		gap: 1rem;
+		font-size: 0.58rem;
+	}
+	.tr-beats.under-lane {
+		display: none;
+	}
+	/* A lane with nothing picked stays short on a phone, under the islands. */
+	.tr-lane.idle {
+		max-height: 22dvh;
+	}
+	/* The islands' names already say how to read them; the nudge waits for a wider screen. */
+	.tr-ask .tr-nudge {
+		display: none;
+	}
+	/* An opened island takes the screen: the page keeps only its title, and
+	   the list of its memories stays short underneath. */
+	:root[data-row-panel='1'] .tr-ask > :not(.tr-eyebrow, .tr-title, .tr-question) {
+		display: none;
+	}
+	:root[data-row-panel='1'] .tr-row {
+		max-height: 30dvh;
+	}
+}
+
+/* ── alive: every letter is part of the field (lib/trace/alive.ts) ───────── */
+.alive-word {
+	display: inline-block;
+	white-space: nowrap;
+}
+.alive-l {
+	--g: 0;
+	display: inline-block;
+	transform: translateY(calc(var(--g) * -0.06em));
+	color: color-mix(in oklab, currentColor, #ffffff calc(var(--g) * 70%));
+	text-shadow:
+		0 0 22px rgba(2, 3, 7, 0.95),
+		0 1px 2px rgba(2, 3, 7, 0.9),
+		0 0 calc(var(--g) * 18px) rgba(127, 243, 230, calc(var(--g) * 0.95));
+	transition:
+		transform 0.22s cubic-bezier(0.2, 0.9, 0.3, 1.4),
+		color 0.22s ease,
+		text-shadow 0.22s ease;
+}
+.alive-l.alive-hot {
+	color: #7ff3e6;
+	opacity: 0.8;
+	text-shadow:
+		0 0 22px rgba(2, 3, 7, 0.95),
+		0 0 10px rgba(127, 243, 230, 0.75);
+}
+@media (prefers-reduced-motion: reduce) {
+	.alive-l {
+		transition: none;
+		transform: none;
+	}
+}
+
+/* ── Each universe's light in its words ─────────────────────────────────────
+   The page's type glows in the colours of the world it sits in (TraceStage
+   sets data-universe from the organ's story). */
+:root[data-universe='trace'] { --uni-ink: #e4fff8; --uni-glow: rgba(110, 255, 210, 0.5); --uni-glow2: rgba(150, 110, 255, 0.3); }
+:root[data-universe='ledger'] { --uni-ink: #fff2d6; --uni-glow: rgba(255, 196, 92, 0.5); --uni-glow2: rgba(255, 140, 40, 0.28); }
+:root[data-universe='guard'] { --uni-ink: #f6e8ff; --uni-glow: rgba(196, 110, 255, 0.55); --uni-glow2: rgba(255, 70, 120, 0.25); }
+:root[data-universe='healing'] { --uni-ink: #e6fff0; --uni-glow: rgba(90, 255, 160, 0.5); --uni-glow2: rgba(40, 200, 140, 0.28); }
+:root[data-universe='causal'] { --uni-ink: #fff0e4; --uni-glow: rgba(255, 130, 50, 0.55); --uni-glow2: rgba(255, 60, 40, 0.28); }
+:root[data-universe='system'] { --uni-ink: #eaf3ff; --uni-glow: rgba(110, 170, 255, 0.55); --uni-glow2: rgba(80, 120, 255, 0.28); }
+:root[data-universe='witness'] { --uni-ink: #f1fff0; --uni-glow: rgba(170, 255, 150, 0.5); --uni-glow2: rgba(255, 220, 120, 0.26); }
+:root[data-universe] .tr-title {
+	color: var(--uni-ink);
+	text-shadow:
+		0 0 18px var(--uni-glow),
+		0 0 46px var(--uni-glow2);
+}
+:root[data-universe] :is(.tr-eyebrow, .tr-line strong, .tr-proof-kicker, .tr-kicker) {
+	text-shadow: 0 0 12px var(--uni-glow);
+}
+:root[data-universe] :is(.tr-line, .tr-text, .tr-item) {
+	text-shadow: 0 0 10px color-mix(in srgb, var(--uni-glow) 45%, transparent);
+}

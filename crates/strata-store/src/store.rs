@@ -804,12 +804,35 @@ fn effect_proofs_for_op(
     }
 }
 
+/// The clock an admitted op carries in its own payload: a node's
+/// `created_at_ms`, an edge's `created_at_ms`, a review's `reviewed_at_ms`,
+/// an anchor verdict's `checked_at_ms`. `None` for an op that records no
+/// clock (an edit's retire, an intention or anchor batch). Frames carry no
+/// time, so this is the only clock the log holds for an effect.
+fn op_clock_ms(op: &StoreOp) -> Option<i64> {
+    match op {
+        StoreOp::UpsertNode { record } => Some(record.created_at_ms),
+        StoreOp::SaveEdge { edge } => Some(edge.created_at_ms),
+        // One admitted batch carries one clock: its first edge's.
+        StoreOp::SaveEdges { edges } => edges.first().map(|edge| edge.created_at_ms),
+        StoreOp::ReviewNode { reviewed_at_ms, .. } => *reviewed_at_ms,
+        StoreOp::RecordAnchorVerdict { checked_at_ms, .. } => Some(*checked_at_ms),
+        StoreOp::SupersedeNode { .. }
+        | StoreOp::UpsertIntentions { .. }
+        | StoreOp::RecordAnchors { .. }
+        | StoreOp::ReplaceAnchors { .. } => None,
+    }
+}
+
 /// Incremental index over the proved effects: lookups by receipt seq or by
 /// node id without re-reading the log. Derived state, rebuilt by replay and
 /// extended by every admitted write, like the other registries.
 #[derive(Default)]
 struct EffectIndex {
     proofs: Vec<EffectProof>,
+    /// The clock each proof's op recorded, parallel to `proofs`
+    /// (see [`op_clock_ms`]).
+    clocks: Vec<Option<i64>>,
     /// Effect seq -> first proof that cites it.
     by_seq: BTreeMap<u64, usize>,
     /// Node id -> latest non-edge proof (highest effect seq; later wins ties).
@@ -840,6 +863,7 @@ impl EffectIndex {
         }
         match effect_proofs_for_op(op, effect_seq, data_seq, digest, rule, &mut self.handles) {
             Ok(rows) => {
+                let clock = op_clock_ms(op);
                 for proof in rows {
                     let idx = self.proofs.len();
                     self.by_seq.entry(proof.effect_seq).or_insert(idx);
@@ -853,6 +877,7 @@ impl EffectIndex {
                         }
                     }
                     self.proofs.push(proof);
+                    self.clocks.push(clock);
                 }
             }
             Err(StoreError::Verify(message)) => self.poisoned = Some(message),
@@ -2617,6 +2642,30 @@ impl StrataStore {
             .latest
             .get(node_id)
             .map(|&idx| self.effect_index.proofs[idx].clone()))
+    }
+
+    /// Every proved effect in log order (oldest first), each with the clock
+    /// its op recorded (see [`op_clock_ms`]), borrowed from the effect index.
+    ///
+    /// Answered from the index like [`StrataStore::effect_by_seq`]: no log
+    /// read, and `.rev()` walks newest first, so a caller that wants the
+    /// latest few effects stops early.
+    pub fn indexed_effects(
+        &self,
+    ) -> Result<impl DoubleEndedIterator<Item = (&EffectProof, Option<i64>)> + '_, StoreError>
+    {
+        self.effect_index.check()?;
+        Ok(self
+            .effect_index
+            .proofs
+            .iter()
+            .zip(self.effect_index.clocks.iter().copied()))
+    }
+
+    /// Borrow one node record by id, without the clone [`Self::get_node`]
+    /// makes.
+    pub fn node_record(&self, id: &str) -> Option<&NodeRecord> {
+        self.nodes.get(id)
     }
 
     /// Review clock recorded on the latest explicit review of `id`.

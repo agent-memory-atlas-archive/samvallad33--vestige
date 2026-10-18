@@ -638,8 +638,8 @@ def run(binary, output):
             handshake()
             catalog = rpc("tools/list", {})["tools"]
             names = [x["name"] for x in catalog]
-            assert len(names) == 17, names
-            assert "precedent" in names, names
+            assert len(names) == 18, names
+            assert "precedent" in names and "gather" in names, names
             assert "source_sync" not in names, names
             assert "purge" not in names and "suppress" in names, names
             memory_actions = next(x for x in catalog if x["name"] == "memory")["inputSchema"]["properties"]["action"]["enum"]
@@ -981,6 +981,10 @@ def run(binary, output):
             ), ruling
             typed("precedent", {"since": "yesterday"}, "invalid since")
             passed("precedent reads Operator receipts read-only and masks secrets")
+            # gather fetches from GitHub; offline, its typed refusal of a
+            # non-issue URL is the call, and nothing is written.
+            typed("gather", {"url": "https://example.test/not-an-issue"}, "url must be a GitHub issue URL")
+            passed("gather refuses a URL that names no GitHub issue")
             called = {row["tool"] for row in coverage}
             missing = [name for name in names if name not in called]
             assert not missing, missing

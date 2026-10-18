@@ -79,6 +79,13 @@ export interface FramePass {
 	 * post chain. Passes that omit it retain the normal 60 fps behavior.
 	 */
 	targetFrameRate?(frame: number): number;
+	/**
+	 * True when the pass drives its motion from `engine.simSeconds` (which
+	 * moves between 60 Hz ticks), so presenting faster than 60 fps shows real
+	 * new motion. The engine renders above 60 fps only when every pass on it
+	 * says so; a pass that steps once per 60 Hz tick keeps the engine at 60.
+	 */
+	highRefresh?: boolean;
 }
 
 export class ObservatoryEngine {
@@ -119,10 +126,21 @@ export class ObservatoryEngine {
 	 * contract — the bridge drains a preallocated ring buffer here.
 	 */
 	private preFrameHook: ((simFrame: number) => void) | null = null;
+	/** Called once, in the same task, right after the next frame is submitted (the canvas still holds it). */
+	private afterRender: Array<() => void> = [];
 
 	// fps estimate for telemetry only (never sim state)
 	private lastRafTs = 0;
 	private fpsEstimate = 0;
+	/** Smoothed time between animation frames, i.e. the display's refresh interval. */
+	private rafIntervalMs = 1000 / 60;
+	/**
+	 * GPU time per frame, from timestamp queries around the passes' compute
+	 * work and the main render pass (post stack excluded). Null until the
+	 * first sample, and forever on an adapter without 'timestamp-query'.
+	 */
+	private gpuTimer: { device: GPUDevice; set: GPUQuerySet; resolve: GPUBuffer; read: GPUBuffer; pending: boolean } | null = null;
+	private gpuMsValue: number | null = null;
 
 	// Fixed-timestep accumulator (gafferongames.com/post/fix_your_timestep):
 	// wall clock ONLY schedules how many fixed 60Hz ticks to run — sim state
@@ -249,7 +267,29 @@ export class ObservatoryEngine {
 		this.preFrameHook = hook;
 	}
 
+	/**
+	 * Run `cb` right after the next frame this engine actually renders, in the
+	 * same task, while its canvas still holds that frame: the one moment a
+	 * WebGPU canvas can be copied. (A frame the engine skips, on a display
+	 * faster than its rate, leaves the canvas empty to a copy.)
+	 */
+	afterNextRender(cb: () => void): void {
+		this.afterRender.push(cb);
+		this.requestRender();
+	}
+
 	/** Monotonic sim frame (does NOT wrap at the loop period). */
+	/**
+	 * Seconds of sim time including the fraction of the current 60 Hz tick, so
+	 * motion keeps advancing between ticks on 120 Hz displays. Capture and
+	 * export pin it to whole ticks so stills and clips stay byte-stable.
+	 */
+	get simSeconds(): number {
+		const whole = this.clock.state.totalFrames;
+		if (this.freezeFrame !== null || this.exportMode) return whole / 60;
+		return (whole + Math.min(0.999, this.accumulatorMs / ObservatoryEngine.FIXED_DT_MS)) / 60;
+	}
+
 	get totalFrames(): number {
 		return this.clock.state.totalFrames;
 	}
@@ -331,7 +371,10 @@ export class ObservatoryEngine {
 		}
 
 		try {
-			this.device = await adapter.requestDevice();
+			// Optional features ride along only where the adapter has them.
+			const optional: GPUFeatureName[] = ['timestamp-query'];
+			const requiredFeatures = optional.filter((f) => adapter!.features.has(f));
+			this.device = await adapter.requestDevice({ requiredFeatures });
 		} catch (e) {
 			this.setStatus({
 				state: 'error',
@@ -503,7 +546,11 @@ export class ObservatoryEngine {
 			}
 			target = Math.max(target, requested);
 		}
-		return Math.max(1, Math.min(60, target || 60));
+		// Above 60 only when every pass moves on simSeconds (FramePass.highRefresh);
+		// a pass that steps per tick would just repeat frames.
+		const cap = this.passes.length > 0 && this.passes.every((p) => p.highRefresh) ? 120 : 60;
+		const wanted = target === 60 && cap > 60 ? cap : target || 60;
+		return Math.max(1, Math.min(cap, wanted));
 	}
 
 	private frame = (ts: number) => {
@@ -517,6 +564,7 @@ export class ObservatoryEngine {
 		let deltaMs = 0;
 		if (this.lastRafTs > 0) deltaMs = ts - this.lastRafTs;
 		this.lastRafTs = ts;
+		if (deltaMs > 2 && deltaMs < 60) this.rafIntervalMs = this.rafIntervalMs * 0.9 + deltaMs * 0.1;
 
 		// Fixed 60Hz timestep: advance the deterministic clock by however many
 		// whole ticks of wall time elapsed (clamped so a background tab doesn't
@@ -539,7 +587,14 @@ export class ObservatoryEngine {
 		const frame = this.freezeFrame ?? state.frame;
 		const targetFrameRate = this.frameRateFor(frame);
 		const minFrameInterval = 1000 / targetFrameRate;
-		if (ts - this.lastRenderTs < minFrameInterval) {
+		// rAF timestamps jitter around the refresh interval, so compare against
+		// the interval minus half a refresh: a frame that lands a hair early still
+		// renders instead of turning into a double-length gap. At or above the
+		// display's own rate this never skips.
+		if (
+			minFrameInterval > this.rafIntervalMs * 1.25 &&
+			ts - this.lastRenderTs < minFrameInterval - this.rafIntervalMs * 0.5
+		) {
 			this.rafId = requestAnimationFrame(this.frame);
 			return;
 		}
@@ -605,8 +660,7 @@ export class ObservatoryEngine {
 		// so stills stay byte-stable and exported clips loop seamlessly.
 		// Choreography must keep keying off p[0]/p[1], never this lane —
 		// ambience is allowed off-loop, stories are not.
-		p[10] =
-			this.freezeFrame !== null || this.exportMode ? frame / 60 : totalFrames / 60;
+		p[10] = this.freezeFrame !== null || this.exportMode ? frame / 60 : this.simSeconds;
 		// p[11] capture_mode — 1.0 when freezeFrame is active (capture mode).
 		// When 1.0, the compute shader skips physics integration so the
 		// storage-buffer state stays frozen at the initial upload values,
@@ -635,6 +689,11 @@ export class ObservatoryEngine {
 		const swapView = swapTex.createView();
 
 		const encoder = this.device.createCommandEncoder({ label: 'observatory-frame' });
+		const timer = this.timerFor(this.device);
+		const sample = timer !== null && !timer.pending;
+		if (timer) {
+			encoder.beginComputePass({ label: 'gpu-timer-start', timestampWrites: { querySet: timer.set, beginningOfPassWriteIndex: 0 } }).end();
+		}
 
 		// Passes receive the freeze-adjusted frame — same value as params.frame,
 		// so capture mode pins hook-driven sim work too, not just uniforms.
@@ -649,17 +708,63 @@ export class ObservatoryEngine {
 					loadOp: 'clear',
 					storeOp: 'store'
 				}
-			]
+			],
+			...(timer ? { timestampWrites: { querySet: timer.set, endOfPassWriteIndex: 1 } } : {})
 		});
 		for (const pass of this.passes) pass.render?.(render, frame);
 		render.end();
+		if (timer && sample) {
+			encoder.resolveQuerySet(timer.set, 0, 2, timer.resolve, 0);
+			encoder.copyBufferToBuffer(timer.resolve, 0, timer.read, 0, 16);
+		}
 
 		// Post stack: bloom pyramid + composite (tonemap/grain/vignette) to the
 		// swapchain — same encoder, single submit, no readback.
 		this.post.encode(encoder, swapView);
 
 		this.device.queue.submit([encoder.finish()]);
+		if (timer && sample) this.readTimer(timer);
+		if (this.afterRender.length) {
+			const due = this.afterRender;
+			this.afterRender = [];
+			for (const cb of due) cb();
+		}
 		return true;
+	}
+
+	/** GPU milliseconds per frame (passes + main render), smoothed; null if unmeasured. */
+	get gpuMs(): number | null {
+		return this.gpuMsValue;
+	}
+
+	private timerFor(device: GPUDevice) {
+		if (!device.features.has('timestamp-query')) return null;
+		if (this.gpuTimer?.device === device) return this.gpuTimer;
+		this.gpuTimer = {
+			device,
+			set: device.createQuerySet({ label: 'gpu-timer', type: 'timestamp', count: 2 }),
+			resolve: device.createBuffer({ label: 'gpu-timer-resolve', size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC }),
+			read: device.createBuffer({ label: 'gpu-timer-read', size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }),
+			pending: false
+		};
+		return this.gpuTimer;
+	}
+
+	private readTimer(timer: NonNullable<ObservatoryEngine['gpuTimer']>) {
+		timer.pending = true;
+		timer.read
+			.mapAsync(GPUMapMode.READ)
+			.then(() => {
+				const t = new BigUint64Array(timer.read.getMappedRange());
+				const ms = Number(t[1] - t[0]) / 1e6;
+				timer.read.unmap();
+				if (ms > 0 && ms < 1000) this.gpuMsValue = this.gpuMsValue === null ? ms : this.gpuMsValue * 0.85 + ms * 0.15;
+				timer.pending = false;
+			})
+			.catch(() => {
+				// Device lost or destroyed mid-read: the next device gets a new timer.
+				timer.pending = false;
+			});
 	}
 
 	// ------------------------------------------------------------------------
@@ -734,6 +839,9 @@ export class ObservatoryEngine {
 		}
 		this.paramsBuffer?.destroy();
 		this.paramsBuffer = null;
+		this.gpuTimer?.set.destroy();
+		this.gpuTimer?.resolve.destroy();
+		this.gpuTimer = null;
 		this.post?.dispose();
 		this.post = null;
 		this.device?.destroy();

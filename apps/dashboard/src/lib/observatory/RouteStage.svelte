@@ -516,19 +516,17 @@
 		z-index: 41;
 		margin: 0;
 		max-width: min(64vw, 72ch);
-		padding: 0.45rem 0.75rem;
-		border: 1px solid rgba(233, 255, 183, 0.18);
-		border-radius: 0.55rem;
-		background: rgba(2, 3, 7, 0.62);
-		backdrop-filter: blur(10px);
-		-webkit-backdrop-filter: blur(10px);
+		/* Bare text on the void — no pill, no panel. */
+		padding: 0;
 		color: #e9ffb7;
 		font-family: ui-monospace, 'SF Mono', Menlo, monospace;
 		font-size: 0.66rem;
 		letter-spacing: 0.08em;
 		line-height: 1.4;
 		text-transform: uppercase;
-		text-shadow: 0 0 14px rgba(233, 255, 183, 0.35);
+		text-shadow:
+			0 0 14px rgba(233, 255, 183, 0.35),
+			0 0 22px rgba(2, 3, 7, 0.95);
 		pointer-events: none;
 		clip-path: inset(0 100% 0 0);
 		animation:
@@ -565,11 +563,11 @@
 		right: 1rem;
 		bottom: 1rem;
 		z-index: 2;
-		border: 1px solid rgba(34, 199, 222, 0.32);
-		border-radius: 0.7rem;
-		background: rgba(5, 6, 10, 0.84);
-		color: rgba(143, 232, 242, 0.95);
-		padding: 0.45rem 0.65rem;
+		border: none;
+		background: none;
+		color: rgba(143, 232, 242, 0.7);
+		padding: 0.3rem 0;
+		text-shadow: 0 0 18px rgba(2, 3, 7, 0.95);
 		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 		font-size: 0.65rem;
 		letter-spacing: 0.1em;

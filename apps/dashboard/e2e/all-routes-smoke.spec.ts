@@ -14,7 +14,14 @@
 // assertion self-skips rather than false-failing.
 // ─────────────────────────────────────────────────────────────────────────────
 import { test, expect } from '@playwright/test';
-import { ROUTES, BASE, captureErrors, expectNoErrors, gotoRoute, sampleCanvas } from './helpers/dashboard';
+import { ROUTES, ABSORBED, BASE, captureErrors, expectNoErrors, gotoRoute, sampleCanvas } from './helpers/dashboard';
+
+for (const { path, to } of ABSORBED) {
+	test(`absorbed route ${path} redirects to ${to} with its query intact`, async ({ page }) => {
+		await page.goto(`${BASE}${path}?memory=mem-0000000000000001`);
+		await expect(page).toHaveURL(new RegExp(`${BASE}${to}\\?memory=mem-0000000000000001$`));
+	});
+}
 
 for (const route of ROUTES) {
 	if (route.webgpu) {

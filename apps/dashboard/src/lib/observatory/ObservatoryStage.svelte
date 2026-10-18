@@ -12,8 +12,10 @@
 	 * All engine/plan/overlay wiring moved verbatim from the route page —
 	 * behavior is identical; only the input source changed (props, not URL).
 	 */
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { api } from '$stores/api';
+	import { loadMindGraph } from '$lib/observatory/mind-graph';
+	import { memoryHref } from '$lib/inside/enter';
 	import {
 		ReceiptReplay,
 		receiptsToReplayItems,
@@ -42,10 +44,14 @@
 	import { buildFirewallPlan, type FirewallPlan } from '$lib/observatory/firewall-plan';
 	import type { PathStepMeta } from '$lib/observatory/path-builder';
 	import { LiveBridge } from '$lib/observatory/live-bridge';
-	import { ChronoShuttlePass } from '$lib/observatory/chrono/shuttle-pass';
+	import { ChronoShuttlePass, DEFAULT_RAIL, type RailPlace } from '$lib/observatory/chrono/shuttle-pass';
 	import { FossilLightTransportPass } from '$lib/observatory/chrono/radiance-cascade-pass';
 	import { CameraRigController } from '$lib/observatory/camera-rig';
 	import PickReceipt, { type PickProvenance } from '$lib/observatory/overlays/PickReceipt.svelte';
+	import HoverCard from '$lib/trace/HoverCard.svelte';
+	import { typeColor } from '$lib/trace/trace-pass';
+	import { headline } from '$lib/trace/trace-data';
+	import { cursorHot } from '$lib/trace/cursor';
 
 	interface Props {
 		demo: DemoMode;
@@ -82,7 +88,18 @@
 		 * GPU picking: when provided, clicking a memory node in the field calls
 		 * back with its memory id (the host opens its inspector panel).
 		 */
-		onpick?: (memoryId: string) => void;
+		/** A memory was clicked; `at` is where on the canvas (NDC). */
+		onpick?: (memoryId: string, at: { x: number; y: number }) => void;
+		/** Where the field sits on screen (scale < 1 pulls it back; x, y move its centre in NDC). */
+		fieldFrame?: { scale: number; x: number; y: number };
+		/**
+		 * The memories the agent leans on hardest (by real recall receipts, or by
+		 * retention when receipts do not reach the field). With a callback the
+		 * host shows them in its own words; the stage then draws no list of its own.
+		 */
+		ontop?: (list: { id: string; recalls: number; label: string }[], source: 'recalls' | 'retention') => void;
+		/** Where the time rail stands (NDC) and whether it shows; the host keeps it clear of its words. */
+		rail?: RailPlace;
 		/** Route-local all-WebGPU instrument overlays can attach their own passes. */
 		onready?: (engine: ObservatoryEngine) => void;
 		/**
@@ -127,6 +144,9 @@
 		embedded = false,
 		chrome = 'none',
 		onpick,
+		fieldFrame,
+		ontop,
+		rail,
 		onready,
 		maxDpr = 2,
 		focusIds = [],
@@ -163,6 +183,10 @@
 	let shuttlePass: ChronoShuttlePass | null = null;
 	let radiancePass: FossilLightTransportPass | null = null;
 	let shuttleReady = $state(false);
+	$effect(() => {
+		const place = railPlace;
+		if (shuttleReady) shuttlePass?.setPlace(place);
+	});
 	let liveDecayReady = $state(false);
 
 	// FOSSIL LIGHT — grab the GPU rail itself. The phosphor rail band (bottom
@@ -171,8 +195,7 @@
 	// [oldest, +365d] domain the shuttle renders; release keeps momentum with
 	// friction; a glide that comes home within a day of NOW snaps to it.
 	// Time has mass, and NOW is magnetic.
-	const RAIL_SPAN = 0.835; // shuttle-pass RAIL_LEFT/RIGHT (NDC)
-	const RAIL_Y_FRAC = (1 + 0.685) / 2; // shuttle-pass RAIL_Y → screen-y fraction
+	const railPlace = $derived(rail ?? DEFAULT_RAIL);
 	let railDragging = false;
 	let railGlideRaf = 0;
 	let railVel = 0; // days per 60Hz frame
@@ -183,14 +206,17 @@
 		const rect = canvasLayerEl?.getBoundingClientRect();
 		if (!rect || rect.width === 0) return timeAxisDays;
 		const ndc = ((clientX - rect.left) / rect.width) * 2 - 1;
-		const t = Math.max(0, Math.min(1, (ndc / RAIL_SPAN) * 0.5 + 0.5));
+		const t = Math.max(0, Math.min(1, (ndc - railPlace.left) / Math.max(0.01, railPlace.right - railPlace.left)));
 		return chronoMinDays + t * (365 - chronoMinDays);
 	}
 	function inRailBand(e: PointerEvent): boolean {
 		const rect = canvasLayerEl?.getBoundingClientRect();
 		if (!rect || rect.height === 0) return false;
+		if (!railPlace.show) return false;
 		const fy = (e.clientY - rect.top) / rect.height;
-		return fy > RAIL_Y_FRAC - 0.075 && fy < RAIL_Y_FRAC + 0.075;
+		const fx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+		const railFrac = (1 - railPlace.y) / 2;
+		return fy > railFrac - 0.075 && fy < railFrac + 0.075 && fx > railPlace.left - 0.04 && fx < railPlace.right + 0.04;
 	}
 	function stopGlide() {
 		if (railGlideRaf) cancelAnimationFrame(railGlideRaf);
@@ -290,7 +316,20 @@
 	const cameraRig = new CameraRigController();
 	let lastPick = $state<PickProvenance | null>(null);
 	let hoverAt = 0;
-	let hoverLabel = $state('');
+	/** The memory under the pointer, shown beside it (HoverCard). */
+	let hoverCard = $state<{ id: string; x: number; y: number; left: boolean; tone: string; kicker: string; text: string } | null>(null);
+	function whenOf(iso: string | undefined): string {
+		const t = iso ? Date.parse(iso) : NaN;
+		if (!Number.isFinite(t)) return '';
+		const d = new Date(t);
+		return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+	}
+	function clearHover() {
+		hoverCard = null;
+		renderer?.setHovered(-1);
+		cursorHot.set(false);
+	}
+	$effect(() => () => cursorHot.set(false));
 
 	async function handleFieldClick(e: MouseEvent) {
 		// A rail drag OR camera orbit ends in a click on this same layer —
@@ -306,8 +345,9 @@
 		const ndcY = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
 		const hit = await renderer.pickAt(ndcX, ndcY);
 		if (hit) {
+			clearHover();
 			lastPick = { kind: 'memory', id: hit.id, label: 'Field cell' };
-			onpick?.(hit.id);
+			onpick?.(hit.id, { x: ndcX, y: ndcY });
 		}
 	}
 
@@ -325,16 +365,34 @@
 			renderer?.setCameraRig(cameraRig.state);
 		}
 		const now = performance.now();
-		if (now - hoverAt < 120 || !renderer || !canvasLayerEl) return;
+		if (now - hoverAt < 60 || !renderer || !canvasLayerEl) return;
 		hoverAt = now;
 		const rect = canvasLayerEl.getBoundingClientRect();
 		if (rect.width === 0) return;
 		const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
 		const ndcY = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
+		const px = { x: e.clientX, y: e.clientY };
 		void renderer.pickAt(ndcX, ndcY).then((hit) => {
 			renderer?.setHovered(hit?.index ?? -1);
-			hoverLabel = hit?.id?.slice(0, 8) ?? '';
-			if (canvasLayerEl) canvasLayerEl.style.cursor = hit ? 'crosshair' : 'grab';
+			if (canvasLayerEl) canvasLayerEl.style.cursor = hit ? 'pointer' : 'grab';
+			cursorHot.set(!!hit && !!onpick);
+			const node = hit ? graphData?.nodes.find((n) => n.id === hit.id) : undefined;
+			if (!hit || !node || capture) {
+				hoverCard = null;
+				return;
+			}
+			if (hoverCard?.id === hit.id) return;
+			const [r, g, b] = typeColor(node.type);
+			const when = whenOf(node.createdAt);
+			hoverCard = {
+				id: hit.id,
+				x: px.x,
+				y: px.y,
+				left: px.x > innerWidth * 0.62,
+				tone: `rgb(${Math.round(r * 255)} ${Math.round(g * 255)} ${Math.round(b * 255)})`,
+				kicker: `${node.type}${when ? ` · ${when}` : ''}${typeof node.retention === 'number' ? ` · ${Math.round(node.retention * 100)}% retained` : ''}`,
+				text: headline(node.label || hit.id, 160)
+			};
 		});
 	}
 	function fieldPointerUp(e: PointerEvent) {
@@ -464,7 +522,7 @@
 							edgeCount: edges.length
 						} satisfies GraphResponse;
 					})()
-				: await api.graph({ max_nodes: 200, depth: 3, sort: 'connected' });
+				: await loadMindGraph();
 			graphData = scoped;
 			nodeCount = scoped.nodeCount;
 			edgeCount = scoped.edgeCount;
@@ -505,6 +563,11 @@
 	// (when receipts don't intersect the field) FSRS retention. Both real; the
 	// label must say which so the number is never misread.
 	let topRecalledSource = $state<'recalls' | 'retention'>('recalls');
+	$effect(() => {
+		const list = topRecalled;
+		const source = topRecalledSource;
+		untrack(() => ontop?.(list, source));
+	});
 
 	function handleFrame(frame: number, fps: number) {
 		frameCount = frame;
@@ -575,8 +638,14 @@
 		cameraRig.enabled = !capture;
 		if (capture) cameraRig.reset();
 		renderer.setCameraRig(cameraRig.state);
+		if (fieldFrame) renderer.setFrame(fieldFrame);
 		onready?.(e);
 	}
+
+	$effect(() => {
+		const f = fieldFrame;
+		if (f) renderer?.setFrame(f);
+	});
 
 	// Upload the memory field once the engine AND the graph are both ready.
 	$effect(() => {
@@ -739,7 +808,7 @@
 					// The GPU shuttle is an instrument, not a second time model. It reads
 					// the same graph timestamps the closed-form decay bridge uses, then
 					// receives only the small signed control uniform while the user scrubs.
-					shuttlePass = new ChronoShuttlePass(engine, renderer.graph.nodes);
+					shuttlePass = new ChronoShuttlePass(engine, renderer.graph.nodes, railPlace);
 					engine.addPass(shuttlePass);
 					shuttleReady = true;
 				}
@@ -831,6 +900,7 @@
 		onclick={handleFieldClick}
 		onpointerdown={fieldPointerDown}
 		onpointermove={fieldPointerMove}
+		onpointerleave={clearHover}
 		onpointerup={fieldPointerUp}
 		onpointercancel={fieldPointerCancel}
 		onwheel={fieldWheel}
@@ -856,22 +926,22 @@
 		     that saturate hottest in the field. Two users see different names
 		     here because their minds are different — the discipline test as the
 		     sales pitch. Only shown when real receipts exist. -->
-		{#if live && topRecalled.length > 0}
+		{#if live && topRecalled.length > 0 && !ontop}
 			<div
 				class="absolute top-20 right-4 sm:right-6 max-w-[15rem] flex flex-col gap-1.5
-					px-3.5 py-3 rounded-xl border border-[#A8FF5E]/15 bg-[#05060a]/55 backdrop-blur-[2px]"
+					pl-3 border-l border-[#A8FF5E]/20 [text-shadow:0_0_18px_rgba(2,3,7,0.95),0_1px_2px_rgba(2,3,7,0.9)]"
 			>
 				<div class="font-mono text-[10px] tracking-[0.16em] text-[#A8FF5E]/70 uppercase">
 					{topRecalledSource === 'recalls' ? 'Most recalled · your mind' : 'Strongest memories · your mind'}
 				</div>
 				{#each topRecalled as m, i (m.id)}
-					<div class="flex items-baseline gap-2 font-mono text-[11px]">
+					<a class="flex items-baseline gap-2 font-mono text-[11px] no-underline hover:underline" href={memoryHref(m.id)}>
 						<span class="text-[#E9FFB7]/90 tabular-nums w-4">{i + 1}</span>
 						<span class="text-[#d8ded0]/90 truncate flex-1" title={m.label}>{m.label}</span>
 						<span class="text-[#A8FF5E]/80 tabular-nums whitespace-nowrap"
 							>{m.recalls}{topRecalledSource === 'recalls' ? '×' : '%'}</span
 						>
-					</div>
+					</a>
 				{/each}
 			</div>
 		{/if}
@@ -883,8 +953,8 @@
 		{#if live && liveFirewallVisible}
 			<div
 				class="absolute top-20 left-1/2 -translate-x-1/2 pointer-events-none
-					flex flex-col items-center gap-1 px-5 py-3 rounded-xl border border-[#ff2d55]/40
-					bg-[#1a0508]/85 backdrop-blur-sm text-center enter"
+					flex flex-col items-center gap-1 text-center enter
+					[text-shadow:0_0_18px_rgba(2,3,7,0.95),0_1px_2px_rgba(2,3,7,0.9)]"
 			>
 				<div class="font-mono text-[11px] tracking-[0.2em] text-[#ff5c78] uppercase">
 					⬤ threat quarantined
@@ -904,10 +974,9 @@
 		{#if !capture}
 			<button
 				onclick={togglePause}
-				class="absolute bottom-4 right-4 pointer-events-auto flex items-center gap-2 px-3 py-1.5
-					rounded-xl border border-[#22C7DE]/25 bg-[#05060a]/80 backdrop-blur-sm
-					font-mono text-[11px] tracking-wide text-[#22C7DE]/80 hover:text-[#22C7DE]
-					hover:border-[#22C7DE]/50 transition-colors"
+				class="absolute bottom-4 right-4 pointer-events-auto flex items-center gap-2 py-0.5
+					border-b border-[#22C7DE]/30 font-mono text-[11px] tracking-wide text-[#22C7DE]/80
+					hover:text-[#22C7DE] hover:border-[#22C7DE]/60 transition-colors"
 				title={paused ? 'Resume field motion' : 'Pause field motion'}
 				aria-pressed={paused}
 				aria-label={paused ? 'Resume 3D memory field motion' : 'Pause 3D memory field motion'}
@@ -923,8 +992,8 @@
 		{#if live && liveDecayReady}
 			<div
 				class="absolute bottom-3 left-1/2 -translate-x-1/2 pointer-events-auto
-					flex items-center gap-3 px-3 py-1.5 rounded-full border border-[#91ad8a]/20
-					bg-[#05060a]/45 backdrop-blur-[2px] font-mono text-[10px] tracking-[0.14em]"
+					flex items-center gap-3 font-mono text-[10px] tracking-[0.14em]
+					[text-shadow:0_0_18px_rgba(2,3,7,0.95)]"
 				class:opacity-100={shuttleReady}
 				class:opacity-75={!shuttleReady}
 			>
@@ -1065,10 +1134,18 @@
 </div>
 
 <PickReceipt pick={lastPick} onclose={() => (lastPick = null)} />
-{#if hoverLabel && !capture}
-	<div class="pointer-events-none fixed left-4 bottom-24 z-30 font-mono text-[10px] tracking-widest text-[#7ff3e6]/80">
-		HOVER {hoverLabel}
-	</div>
+{#if hoverCard && !capture}
+	{#key hoverCard.id}
+		<HoverCard
+			x={hoverCard.x}
+			y={hoverCard.y}
+			left={hoverCard.left}
+			tone={hoverCard.tone}
+			kicker={hoverCard.kicker}
+			text={hoverCard.text}
+			action={onpick ? 'Click to open this memory' : 'A memory in the field'}
+		/>
+	{/key}
 {/if}
 
 <!-- VISUAL DNA §7: void #05060a is the base (bg utility above) — no exceptions -->

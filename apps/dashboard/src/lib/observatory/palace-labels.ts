@@ -81,10 +81,8 @@ const CENTER_LABEL_COLOR: [number, number, number, number] = [...rgb01('#FFFFFF'
 // A label floats up-and-right of its orb, just clear of the glowing disc. The
 // glow's visible halo extends past the geometric radius (render-nodes halo term),
 // so we clear it by a multiple of the projected radius plus a floor.
-const RADIUS_CLEAR = 1.35; // push label this * projected-radius off the orb
-const OFFSET_FLOOR = 0.028; // minimum clearance when a node projects tiny
-const OFFSET_UP = 0.6; // vertical share of the clearance (up-right diagonal)
-const OFFSET_RIGHT = 0.85; // horizontal share of the clearance
+const RADIUS_CLEAR = 1.0; // radius is already the shape's measured reach below its centre
+const OFFSET_FLOOR = 0.03; // and at least this much clear of the shape's edge
 
 // Depth -> size/brightness. Nearer orbs get bigger, brighter captions so the
 // constellation reads with real front-to-back depth instead of a flat wall.
@@ -161,23 +159,6 @@ export function buildOrganLabels(
 		const depth = clamp01(p.depth);
 		const isHover = hovered !== null && p.href === hovered;
 
-		// Offset the label clear of the glowing disc (up-and-right diagonal).
-		// getScreenPositions() doesn't expose a projected radius, so scale the
-		// clearance by DEPTH: nearer orbs (depth→1) project larger and bloom
-		// brighter, so their captions sit further off the halo.
-		const clear = OFFSET_FLOOR + depth * RADIUS_CLEAR;
-		let x = p.ndcX + clear * OFFSET_RIGHT;
-		let y = p.ndcY + clear * OFFSET_UP;
-
-		// Portrait title-guard: fold any label out of the reserved title band so
-		// it never overprints "THE MEMORY PALACE" / the subtitle. Reflect it down
-		// below the ceiling (mirror across titleCeil) so a top-arc orb's caption
-		// still reads, just underneath the title instead of on top of it. The
-		// de-confliction pass below then keeps folded labels from stacking.
-		if (portrait && y > titleCeil) {
-			y = titleCeil - (y - titleCeil);
-		}
-
 		// Size + brightness ride depth; hover overrides to a hot readout.
 		let size = lerp(SIZE_FAR, SIZE_NEAR, depth);
 		let alpha = lerp(ALPHA_FAR, ALPHA_NEAR, depth);
@@ -189,14 +170,29 @@ export function buildOrganLabels(
 			alpha *= 0.32; // fade the field so the hovered organ pops
 		}
 
-		// ── Edge clamp: text is left-anchored and grows rightward, so a label near
-		// the right screen edge clips ('TIMELINE' → 'TIMELIN'). If the estimated
-		// run would cross the conservative logical bound, FLIP it to the left of
-		// the orb instead. (0.62em ≈ measured average advance of the mono atlas.)
+		// The name sits centred just under its formation, clear of the drawn
+		// shape (its radius is the shape's measured reach below its centre), so
+		// text never lies on a visual. Everything here is in SCREEN terms; the
+		// text shader then divides each glyph by w = 1 + z (z = mix(0.42, 0.10,
+		// depth)), so the run is pre-multiplied by that w below to land exactly
+		// where it is placed. Glyphs span about 0.2 em under the baseline to 0.8
+		// em over it; 0.62 em is the mono atlas's average advance.
+		const itemDepth = isHover ? 1 : 0.8 + depth * 0.2;
+		const w = 1 + lerp(0.42, 0.1, itemDepth);
 		const estWidth = region.label.length * size * 0.62;
-		if (x + estWidth > 0.97) {
-			x = p.ndcX - clear * OFFSET_RIGHT - estWidth;
+		const radius = p.radius ?? 0.14;
+		let x = p.ndcX - estWidth / 2;
+		let y = p.ndcY - radius - OFFSET_FLOOR - size * 0.8;
+
+		// Portrait title-guard: fold any label out of the reserved title band so
+		// it never overprints the title / subtitle.
+		if (portrait && y > titleCeil) {
+			y = titleCeil - (y - titleCeil);
 		}
+
+		// Keep the whole run on screen (logical x spans ±max(aspect,1)).
+		const xMax = Math.max(aspect, 1) * 0.97;
+		x = Math.min(xMax - estWidth, Math.max(-xMax, x));
 		// ── De-confliction: when two orbs project close together their captions
 		// stack unreadably. Greedy pass in deterministic order: if this label's
 		// rect overlaps an already-placed one, nudge it BELOW that label.
@@ -236,15 +232,15 @@ export function buildOrganLabels(
 		item.id = 'palace-label:' + p.href;
 		item.kind = 'palace-label';
 		item.text = region.label; // ASCII-safe already (ORGAN_REGIONS labels are caps A-Z)
-		item.x = x;
-		item.y = y;
-		item.size = size;
+		item.x = x * w;
+		item.y = y * w;
+		item.size = size * w;
 		item.color = color;
 		// Readability on the bright nebula: keep EVERY caption crisp+bright (high
 		// depth) and thick-stroked (high weight) so it punches through the bloom,
 		// rather than dimming far labels into the glow. Depth still nudges near
 		// orbs a touch crisper for subtle front-to-back feel.
-		item.depth = isHover ? 1 : 0.8 + depth * 0.2;
+		item.depth = itemDepth;
 		item.weight = 0.95;
 		n++;
 	}

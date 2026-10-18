@@ -33,6 +33,16 @@ pub enum VestigeEvent {
         new_retention: f64,
         timestamp: DateTime<Utc>,
     },
+    /// An agent read this memory to show it to its user (`memory` get with a
+    /// `reason`): every open dashboard goes inside the memory and shows the
+    /// agent's words beside it.
+    MemoryShown {
+        id: String,
+        /// The client that called (its `initialize` clientInfo name).
+        by: String,
+        reason: String,
+        timestamp: DateTime<Utc>,
+    },
     MemoryDemoted {
         id: String,
         new_retention: f64,

@@ -14,7 +14,8 @@
  */
 
 import type { GraphResponse } from '$types';
-import { getMemoryState, getAhaGraphColor, MEMORY_STATE_COLORS } from '$lib/memory-state';
+import { getAhaGraphColor } from '$lib/memory-state';
+import { typeColor } from '$lib/trace/trace-pass';
 import {
 	FLOATS_PER_NODE,
 	NODE_LANE,
@@ -36,15 +37,16 @@ export function hexToRgb01(hex: string): [number, number, number] {
 }
 
 /**
- * Meaning-layer base color for a node (visual DNA §7.1).
- * Tag kinds override via the REAL Graph3D mapping (getAhaGraphColor — case-
- * insensitive, aha gold → confusion red → failure/guardrail grey), else the
- * FSRS state palette. Reused verbatim so Observatory and Graph3D never drift.
+ * Meaning-layer base color for a node: its memory TYPE, in the same palette
+ * every organ uses (lib/trace/trace-pass typeColor), so a decision is the same
+ * amber in the Field, the Ledger and Trace. Tag kinds still override (aha gold,
+ * confusion red, failure grey). Retention is not the hue: the node shader maps
+ * it to brightness and saturation, so a fading memory dims toward cool ash.
  */
 export function nodeBaseColor(node: ObservatoryNode): [number, number, number] {
 	const tagColor = getAhaGraphColor({ tags: node.tags });
 	if (tagColor) return hexToRgb01(tagColor);
-	return hexToRgb01(MEMORY_STATE_COLORS[getMemoryState(node.retention)]);
+	return typeColor(node.type);
 }
 
 /**

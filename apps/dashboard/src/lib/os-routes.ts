@@ -46,38 +46,58 @@ export interface OsRoute {
 	ready: boolean;
 }
 
-// ── The registry — all 20 customer organs (order = canonical display order) ──
+// ── The registry — the Palace plus five organs (order = canonical display order) ──
+//
+// Condensed on 2026-10-15 to fewer, fuller views: 22 routes became the Palace
+// plus the full-bleed organs. Every older route redirects to the organ that absorbed it
+// (ABSORBED_ROUTES below), so Palace links and bookmarks keep working.
 export const OS_ROUTES: OsRoute[] = [
-	// PRIMARY — the spine of the product, in the persistent dock.
 	{ href: '/palace', label: 'Palace', purpose: 'The spatial launcher — every organ as a constellation you fly into.', group: 'Primary', shortcut: 'P', icon: 'logo', stage: 'canvas', visibility: 'dock', ready: true },
-	{ href: '/observatory', label: 'Observatory', purpose: 'The living memory field + the deterministic cognitive moments (Salience Rescue).', group: 'Primary', shortcut: 'O', icon: 'sparkle', stage: 'observatory', visibility: 'dock', ready: true },
-	{ href: '/graph', label: 'Witness', purpose: 'Receipt-bounded evidence loom — prove which memories shaped an agent run.', group: 'Primary', shortcut: 'G', icon: 'graph', stage: 'canvas', visibility: 'dock', ready: true },
-	{ href: '/memories', label: 'Memories', purpose: 'Browse, search, and inspect individual memories with their FSRS state.', group: 'Primary', shortcut: 'M', icon: 'memories', stage: 'observatory', visibility: 'dock', ready: true },
-	{ href: '/timeline', label: 'Timeline', purpose: 'Bitemporal history — when memories were valid vs recorded, with audit windows.', group: 'Primary', shortcut: 'T', icon: 'timeline', stage: 'route-stage', visibility: 'dock', ready: true },
-	{ href: '/blackbox', label: 'Black Box', purpose: 'The receipt — what Vestige concluded, the evidence, and why, exportable.', group: 'Primary', shortcut: 'B', icon: 'blackbox', stage: 'route-stage', visibility: 'dock', ready: true },
+	{ href: '/trace', label: 'Trace', purpose: 'Trace your own memory: ask by exact handle, see the receipt, walk the recorded edges back to why.', group: 'Primary', shortcut: 'T', icon: 'trace', stage: 'canvas', visibility: 'dock', ready: true },
+	{ href: '/guard', label: 'Guard', purpose: 'What the gate stopped and why: every Operator receipt on its shield, each chained to the one before.', group: 'Primary', shortcut: 'G', icon: 'guard', stage: 'canvas', visibility: 'dock', ready: true },
+	{ href: '/field', label: 'Field', purpose: 'The living mind — every memory a light, every recorded edge a filament.', group: 'Primary', shortcut: 'F', icon: 'sparkle', stage: 'observatory', visibility: 'dock', ready: true },
+	{ href: '/ledger', label: 'Ledger', purpose: 'The hash-chained record as strata — writes, receipts and intentions through time.', group: 'Primary', shortcut: 'L', icon: 'timeline', stage: 'route-stage', visibility: 'dock', ready: true },
+	{ href: '/healing', label: 'Healing', purpose: 'Where memory disagrees with itself or with the code, and the recorded edges that heal it.', group: 'Primary', shortcut: 'H', icon: 'contradictions', stage: 'route-stage', visibility: 'dock', ready: true },
+	{ href: '/causal', label: 'Causal', purpose: 'From a failure back to its causes, along recorded edges only.', group: 'Primary', shortcut: 'C', icon: 'reasoning', stage: 'route-stage', visibility: 'dock', ready: true },
+	{ href: '/system', label: 'System', purpose: 'The store as it is right now: health, retention, a dream, the durable projection, every tool.', group: 'Primary', shortcut: 'S', icon: 'pulse', stage: 'canvas', visibility: 'dock', ready: true },
+	{ href: '/cinema', label: 'Cinema', purpose: 'Memory Cinema — the WebGPU flythrough of your own memory graph.', group: 'Primary', shortcut: 'M', icon: 'cinema', stage: 'canvas', visibility: 'dock', ready: true },
 
-	// UNDERSTAND — the reasoning + exploration organs.
-	{ href: '/reasoning', label: 'Reasoning', purpose: 'Watch a decision trace form from recorded evidence.', group: 'Understand', shortcut: 'R', icon: 'reasoning', stage: 'route-stage', visibility: 'nav', ready: true },
-	{ href: '/explore', label: 'Explore', purpose: 'A shareable walk over recorded edges from one memory.', group: 'Understand', shortcut: 'E', icon: 'explore', stage: 'observatory', visibility: 'nav', ready: true },
-	{ href: '/contradictions', label: 'Contradictions', purpose: 'Trust-weighted conflict pairs — where your memory disagrees with itself.', group: 'Understand', shortcut: 'C', icon: 'contradictions', stage: 'route-stage', visibility: 'nav', ready: true },
-	{ href: '/patterns', label: 'Patterns', purpose: 'Cross-project patterns mined from the corpus.', group: 'Understand', icon: 'patterns', stage: 'route-stage', visibility: 'hidden', ready: true },
-
-	// MAINTAIN — the memory-hygiene organs.
-	{ href: '/duplicates', label: 'Duplicates', purpose: 'Exact duplicates (same content hash or declared source) listed for review; nothing merges.', group: 'Maintain', shortcut: 'D', icon: 'duplicates', stage: 'route-stage', visibility: 'nav', ready: true },
-	{ href: '/memory-prs', label: 'Memory PRs', purpose: 'Proposed memory changes held for review before they touch the graph.', group: 'Maintain', icon: 'memorypr', stage: 'route-stage', visibility: 'nav', ready: true },
-	{ href: '/importance', label: 'Importance', purpose: 'Which memories rank highest by the 4-channel importance model, and why.', group: 'Maintain', icon: 'importance', stage: 'route-stage', visibility: 'hidden', ready: true },
-	{ href: '/activation', label: 'Activation', purpose: 'The activation field — which memories light up for a query.', group: 'Maintain', shortcut: 'A', icon: 'activation', stage: 'observatory', visibility: 'hidden', ready: true },
-
-	// REFLECT — the temporal / ambient organs.
-	{ href: '/feed', label: 'Activity', purpose: 'The live event stream — recalls, dreams, suppressions, as they happen.', group: 'Reflect', shortcut: 'F', icon: 'feed', stage: 'route-stage', visibility: 'nav', ready: true },
-	{ href: '/dreams', label: 'Dreams', purpose: 'Replay consolidation cycles and the connections they discover.', group: 'Reflect', icon: 'dreams', stage: 'route-stage', visibility: 'nav', ready: true },
-	{ href: '/schedule', label: 'Schedule', purpose: 'Review urgency — what is due now, overdue, and coming next.', group: 'Reflect', shortcut: 'H', icon: 'schedule', stage: 'route-stage', visibility: 'hidden', ready: true },
-	{ href: '/intentions', label: 'Intentions', purpose: 'Active and predicted intentions grouped by state.', group: 'Reflect', shortcut: 'I', icon: 'intentions', stage: 'route-stage', visibility: 'nav', ready: true },
-	{ href: '/stats', label: 'Stats', purpose: 'System vitals — retention distribution, coverage, throughput.', group: 'Reflect', shortcut: 'S', icon: 'stats', stage: 'route-stage', visibility: 'nav', ready: true },
-
-	// SYSTEM
-	{ href: '/settings', label: 'Settings', purpose: 'Vitals and the maintenance actions a Strata log supports.', group: 'System', shortcut: ',', icon: 'settings', stage: 'route-stage', visibility: 'hidden', ready: true }
+	// Reachable by URL, the palette and the Palace, kept off the dock.
+	{ href: '/graph', label: 'Witness', purpose: 'What shaped each decision: its recorded lineage walked back, every witness with its receipt.', group: 'Reflect', icon: 'graph', stage: 'route-stage', visibility: 'hidden', ready: true },
+	// One memory, inside: opened from any timeline, a neighbour, or an agent.
+	{ href: '/memory', label: 'Memory', purpose: 'One memory, inside: its own words, how strongly it is held, its receipt re-verified live, and every recorded edge to walk on.', group: 'Reflect', icon: 'sparkle', stage: 'canvas', visibility: 'hidden', ready: true },
 ];
+
+/**
+ * Routes that no longer render on their own: each redirects (query string
+ * kept) to the organ that absorbed it. Old URLs, Palace links and bookmarks
+ * land in the right place without touching any Palace file.
+ */
+export const ABSORBED_ROUTES: Readonly<Record<string, string>> = Object.freeze({
+	'/observatory': '/field',
+	'/memories': '/field',
+	'/explore': '/field',
+	'/activation': '/field',
+	'/importance': '/field',
+	'/schedule': '/field',
+	'/stats': '/field',
+	'/timeline': '/ledger',
+	'/blackbox': '/ledger',
+	'/feed': '/ledger',
+	'/dreams': '/ledger',
+	'/memory-prs': '/ledger',
+	'/intentions': '/ledger',
+	'/contradictions': '/healing',
+	'/duplicates': '/healing',
+	'/patterns': '/healing',
+	'/reasoning': '/causal',
+	'/settings': '/system'
+});
+
+/** The organ an absorbed route now lives in, or undefined for a live route. */
+export function absorbedTarget(pathNoBase: string): string | undefined {
+	return ABSORBED_ROUTES[pathNoBase];
+}
 
 // ── Derived views (every consumer uses these, never re-lists routes) ──────────
 
