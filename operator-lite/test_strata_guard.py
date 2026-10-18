@@ -123,10 +123,13 @@ check("the gate states where Vestige keeps its store", callable(fn))
 if callable(fn):
     check("macOS default", fn({}, "/Users/u", "darwin") == ["/Users/u/Library/Application Support/com.vestige.core"],
           fn({}, "/Users/u", "darwin"))
-    check("Linux default", fn({}, "/home/u", "linux") == ["/home/u/.local/share/core"], fn({}, "/home/u", "linux"))
+    check("Linux default: the 5.0 folder and the 4.x one",
+          fn({}, "/home/u", "linux") == ["/home/u/.local/share/vestige", "/home/u/.local/share/core"],
+          fn({}, "/home/u", "linux"))
     check("Linux XDG_DATA_HOME (absolute only)",
-          fn({"XDG_DATA_HOME": "/data/x"}, "/home/u", "linux") == ["/data/x/core"]
-          and fn({"XDG_DATA_HOME": "rel/x"}, "/home/u", "linux") == ["/home/u/.local/share/core"],
+          fn({"XDG_DATA_HOME": "/data/x"}, "/home/u", "linux") == ["/data/x/vestige", "/data/x/core"]
+          and fn({"XDG_DATA_HOME": "rel/x"}, "/home/u", "linux")
+          == ["/home/u/.local/share/vestige", "/home/u/.local/share/core"],
           (fn({"XDG_DATA_HOME": "/data/x"}, "/home/u", "linux"), fn({"XDG_DATA_HOME": "rel/x"}, "/home/u", "linux")))
     win = fn({"APPDATA": "C:\\Users\\u\\AppData\\Roaming"}, "C:/Users/u", "win32")
     check("Windows default", [p.replace("\\", "/") for p in win] == ["C:/Users/u/AppData/Roaming/vestige/core/data"], win)
