@@ -127,6 +127,9 @@ mod contention_tests {
 
     #[test]
     fn a_lock_released_a_moment_after_the_attempt_started_is_taken() {
+        // DirLock writes go through the process-wide full-disk failpoints that
+        // crate::tests arms, so this test takes the same lock they hold.
+        let _serial = crate::tests::serialize();
         let dir = scratch("late-release");
         let holder = DirLock::acquire(&dir).expect("holder");
         let release = std::thread::spawn(move || {
@@ -144,6 +147,9 @@ mod contention_tests {
 
     #[test]
     fn a_lock_that_stays_held_is_still_refused_with_its_holder() {
+        // DirLock writes go through the process-wide full-disk failpoints that
+        // crate::tests arms, so this test takes the same lock they hold.
+        let _serial = crate::tests::serialize();
         let dir = scratch("still-held");
         let _holder = DirLock::acquire(&dir).expect("holder");
         let started = Instant::now();
@@ -165,6 +171,9 @@ mod contention_tests {
     #[cfg(unix)]
     #[test]
     fn reacquiring_survives_children_spawned_by_sibling_threads() {
+        // DirLock writes go through the process-wide full-disk failpoints that
+        // crate::tests arms, so this test takes the same lock they hold.
+        let _serial = crate::tests::serialize();
         let dir = scratch("sibling-spawns");
         let stop = Arc::new(AtomicBool::new(false));
         let spawners: Vec<_> = (0..4)
