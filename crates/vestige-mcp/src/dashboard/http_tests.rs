@@ -448,8 +448,19 @@ async fn retention_distribution_measures_every_memory() {
 #[tokio::test]
 async fn withheld_features_answer_with_a_structured_reason() {
     let (_dir, storage) = strata();
-    let id = remember(&storage, "a memory with no recorded audit", &[]);
+    let id = remember(&storage, "a memory behind the withheld routes", &[]);
     let app = router_with_engine(&storage);
+
+    // The per-memory audit trail is not withheld: on Strata it answers with
+    // the memory's own recorded write.
+    let audit = own(&app, "GET", &format!("/api/memories/{id}/audit"), None).await;
+    assert_eq!(audit.status, StatusCode::OK, "{}", audit.body);
+    let events = audit.json()["events"].as_array().cloned().unwrap_or_default();
+    assert!(
+        events.iter().any(|event| event["action"] == "created"),
+        "{}",
+        audit.body
+    );
 
     let explore = format!(r#"{{"action":"associations","from_id":"{id}"}}"#);
     let calls: Vec<(&str, String, Option<&str>)> = vec![
@@ -458,7 +469,6 @@ async fn withheld_features_answer_with_a_structured_reason() {
         ("GET", "/api/receipts".into(), None),
         ("GET", "/api/search?q=x".into(), None),
         ("GET", "/api/memories?q=x".into(), None),
-        ("GET", format!("/api/memories/{id}/audit"), None),
         (
             "POST",
             "/api/deep_reference".into(),

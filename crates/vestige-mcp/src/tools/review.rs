@@ -91,7 +91,7 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
     }))
 }
 
-fn is_strata_memory_id(id: &str) -> bool {
+pub(crate) fn is_strata_memory_id(id: &str) -> bool {
     let Some(rest) = id.strip_prefix("mem-") else {
         return false;
     };

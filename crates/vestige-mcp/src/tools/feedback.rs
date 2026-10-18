@@ -82,8 +82,10 @@ pub async fn execute_promote(
         None => return Err("Missing arguments".to_string()),
     };
 
-    // Validate UUID
-    uuid::Uuid::parse_str(&args.id).map_err(|_| "Invalid node ID format".to_string())?;
+    // SQLite ids are UUIDs. Strata ids are `mem-` + 16 hex chars.
+    if uuid::Uuid::parse_str(&args.id).is_err() && !super::review::is_strata_memory_id(&args.id) {
+        return Err("Invalid node ID format".to_string());
+    }
 
     // Get node before for comparison
     let before = storage
@@ -181,8 +183,10 @@ pub async fn execute_demote(
         None => return Err("Missing arguments".to_string()),
     };
 
-    // Validate UUID
-    uuid::Uuid::parse_str(&args.id).map_err(|_| "Invalid node ID format".to_string())?;
+    // SQLite ids are UUIDs. Strata ids are `mem-` + 16 hex chars.
+    if uuid::Uuid::parse_str(&args.id).is_err() && !super::review::is_strata_memory_id(&args.id) {
+        return Err("Invalid node ID format".to_string());
+    }
 
     // Get node before for comparison
     let before = storage
@@ -299,8 +303,10 @@ pub async fn execute_request_feedback(
         None => return Err("Missing arguments".to_string()),
     };
 
-    // Validate UUID
-    uuid::Uuid::parse_str(&args.id).map_err(|_| "Invalid node ID format".to_string())?;
+    // SQLite ids are UUIDs. Strata ids are `mem-` + 16 hex chars.
+    if uuid::Uuid::parse_str(&args.id).is_err() && !super::review::is_strata_memory_id(&args.id) {
+        return Err("Invalid node ID format".to_string());
+    }
 
     let node = storage
         .get_node(&args.id)
