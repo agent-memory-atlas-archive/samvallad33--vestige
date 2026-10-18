@@ -8,7 +8,7 @@
 #      (downloads from GitHub unless an existing copy is same-or-newer;
 #      never overwrites a newer gate)
 #   2. installs the middleware module to ~/.operator/ports/langchain/operator_middleware.py
-#   3. sets mode to shadow if no mode file exists yet
+#   3. sets mode to enforce if no mode file exists yet
 #   4. prints the pip-style usage and next steps
 #
 # LangChain needs no config-file wiring (unlike Claude Code's settings.json or
@@ -73,7 +73,10 @@ if [ -s "$TMP_GATE" ] && grep -q '^VERSION = ' "$TMP_GATE"; then
 else
     rm -f "$TMP_GATE"
 fi
-if [ "$SRC" = "" ] && [ -f "$REPO_GATE" ] && grep -q '^VERSION = ' "$REPO_GATE"; then
+# the checkout's own gate wins when it is newer than main's (a branch being tested, a release not yet merged)
+if [ -f "$REPO_GATE" ] && grep -q '^VERSION = ' "$REPO_GATE" && \
+    { [ "$SRC" = "" ] || ! version_ge "$(gate_version "$SRC")" "$(gate_version "$REPO_GATE")"; }; then
+    [ "$SRC" = "$TMP_GATE" ] && rm -f "$TMP_GATE"
     SRC="$REPO_GATE"
 fi
 
@@ -115,11 +118,11 @@ python3 -c 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.
     "$MIDDLEWARE_DST" 2>/dev/null || die "$MIDDLEWARE_DST does not parse"
 say "langchain: middleware installed -> $MIDDLEWARE_DST"
 
-# --- mode: shadow unless the owner already chose ----------------------------- #
+# --- mode: enforce unless the owner already chose ----------------------------- #
 MODE_DST="$OP_HOME/mode"
 if [ ! -f "$MODE_DST" ]; then
-    printf 'shadow\n' > "$MODE_DST"
-    say "operator-gate: mode=shadow (log-only). Flip with: echo enforce > $MODE_DST"
+    printf 'enforce\n' > "$MODE_DST"
+    say "operator-gate: mode=enforce (blocking). To record without blocking: echo shadow > $MODE_DST"
 else
     say "operator-gate: mode=$(cat "$MODE_DST") (existing mode kept)"
 fi
@@ -142,10 +145,10 @@ say ""
 say "Next steps:"
 say "  1. Prove the chain offline: sh $PORT_DIR/test.sh"
 say "  2. Review receipts: python3 $GATE_DST status ; python3 $GATE_DST verify"
-say "  3. Inside your agent (shadow mode logs the STOP without blocking), ask it to run:"
+say "  3. Inside your agent (the gate stops it), ask it to run:"
 say "       echo OPERATOR_CANARY_STOP_7f3a"
 say "     then check $OP_HOME/receipts/ for the OP-CANARY receipt."
-say "  4. When the shadow log looks right, flip to blocking:"
-say "        echo enforce > $MODE_DST"
+say "  4. To record without blocking instead:"
+say "        echo shadow > $MODE_DST"
 say "  5. Uninstall: rm $MIDDLEWARE_DST"
 say "     and remove operator_middleware() from your agent's middleware list."

@@ -19,7 +19,7 @@
 #   2. installs the shim dispatcher to ~/.operator/shim/lib/
 #   3. generates shims into ~/.operator/shim/bin/ with absolute real-binary
 #      paths baked in (binaries missing on this machine are skipped and noted)
-#   4. sets mode to shadow if no mode file exists yet
+#   4. sets mode to enforce if no mode file exists yet
 #   5. prints how to run aider under the shims
 #
 # Installs are run by the owner in their own terminal -- same guard as the gate.
@@ -42,7 +42,7 @@ MODE_DST="$OP_HOME/mode"
 # publishes, deploys, destructive SQL, reverse shells, init-file and
 # credential writes). Binaries missing on this machine are skipped and
 # reported; re-run install.sh after installing new tooling to cover them.
-SHIM_BINS="ls rm rmdir unlink shred srm mv cp ln install rsync scp dd truncate chmod chown chflags xattr mkfifo tee sed find git gh npm pnpm yarn cargo twine docker fly flyctl stripe vercel wrangler supabase psql mysql mariadb duckdb mongosh redis-cli sqlite3 curl wget nc ncat base64 mkfs crontab at launchctl systemctl tmux screen"
+SHIM_BINS="ls rm rmdir unlink shred srm mv cp ln install rsync scp dd truncate chmod chown chgrp chflags xattr mkfifo tee sed find git gh npm pnpm yarn npx pnpx bunx cargo twine docker fly flyctl stripe vercel wrangler supabase railway netlify heroku terraform tofu terragrunt pulumi cdk serverless sls kubectl helm eksctl aws gcloud az doctl psql mysql mariadb duckdb mongosh redis-cli sqlite3 dropdb rails rake curl wget nc ncat base64 mkfs mkfs.ext4 mkfs.xfs mkfs.vfat mkfs.btrfs newfs_apfs newfs_hfs fdisk sfdisk gdisk sgdisk parted wipefs mkswap diskutil crontab at launchctl systemctl tmux screen"
 
 # ERE translation of openclaw-plugin/index.js DESTRUCTIVE_LIKE (POSIX ERE
 # has no \b). Baked into every shim as the unreachable-gate fallback filter.
@@ -111,7 +111,10 @@ if [ -s "$TMP_GATE" ] && grep -q '^VERSION = ' "$TMP_GATE"; then
 else
     rm -f "$TMP_GATE"
 fi
-if [ "$SRC" = "" ] && [ -f "$REPO_GATE" ] && grep -q '^VERSION = ' "$REPO_GATE"; then
+# the checkout's own gate wins when it is newer than main's (a branch being tested, a release not yet merged)
+if [ -f "$REPO_GATE" ] && grep -q '^VERSION = ' "$REPO_GATE" && \
+    { [ "$SRC" = "" ] || ! version_ge "$(gate_version "$SRC")" "$(gate_version "$REPO_GATE")"; }; then
+    [ "$SRC" = "$TMP_GATE" ] && rm -f "$TMP_GATE"
     SRC="$REPO_GATE"
 fi
 
@@ -212,10 +215,10 @@ else
     say "operator-lite: WARNING -- shimmed ls did not run cleanly; inspect $SHIM_BIN/ls"
 fi
 
-# --- 4. mode: shadow unless the owner already chose ------------------------------- #
+# --- 4. mode: enforce unless the owner already chose ------------------------------- #
 if [ ! -f "$MODE_DST" ]; then
-    printf 'shadow\n' > "$MODE_DST"
-    MODE_MSG="mode=shadow (log-only). Flip with: echo enforce > $MODE_DST"
+    printf 'enforce\n' > "$MODE_DST"
+    MODE_MSG="mode=enforce (blocking). To record without blocking: echo shadow > $MODE_DST"
 else
     MODE_MSG="mode=$(cat "$MODE_DST") (existing mode kept)"
 fi
@@ -239,4 +242,4 @@ say "sudo, shell builtins and redirects from unshimmed primaries bypass them."
 say "Next steps:"
 say "  1. Prove it:  sh $PORT_DIR/test.sh"
 say "  2. Receipts:  python3 $GATE_DST verify ; python3 $GATE_DST status"
-say "  3. When the shadow log looks right, flip to blocking:  echo enforce > $MODE_DST"
+say "  3. To record without blocking instead:  echo shadow > $MODE_DST"

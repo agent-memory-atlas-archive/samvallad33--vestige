@@ -80,7 +80,7 @@ cat "$LOGS/install.log"
 
 [ -f "$TEST_HOME/.operator/gate/operator-gate.py" ] && ok "gate installed" || bad "gate missing"
 [ -x "$TEST_HOME/.operator/gate/operator-gate.py" ] && ok "gate is executable" || bad "gate not executable"
-[ "$(cat "$TEST_HOME/.operator/mode" 2>/dev/null)" = "shadow" ] && ok "mode file = shadow" || bad "mode file not shadow"
+[ "$(cat "$TEST_HOME/.operator/mode" 2>/dev/null)" = "enforce" ] && ok "mode file = enforce (the installer default)" || bad "mode file not enforce: a fresh install must block"
 
 python3 - "$CRUSH_JSON" <<'PYEOF' && ok "crush.json valid + wired (name, \$HOME command, --source crush, timeout)" || bad "crush.json wrong"
 import json, sys
@@ -93,7 +93,8 @@ assert e["command"].startswith('python3 "$HOME/'), e
 PYEOF
 
 # ---- 2. shadow mode: receipts written, nothing blocked ------------------------ #
-section "shadow mode (default)"
+section "shadow mode (the owner's choice)"
+echo shadow > "$TEST_HOME/.operator/mode"
 HOOK_CMD=$(hook_cmd_of "$CRUSH_JSON")
 
 rc=$(run_hook "$HOOK_CMD" bash '{"command":"ls -la"}' "$TEST_PROJ" s1 p-ls; echo $?)

@@ -211,12 +211,21 @@ if command -v opencode >/dev/null 2>&1; then
   note ""
   note "  UNTESTED-IN-HOST: a live blocking decision inside a real OpenCode"
   note "  session (needs a configured model). Verify manually with the canary:"
-  note "    echo OPERATOR_CANARY_STOP_7f3a   (shadow: logs a STOP receipt)"
+  note "    echo OPERATOR_CANARY_STOP_7f3a   (the gate stops it and writes a receipt)"
 else
   note "SKIP  opencode CLI not found — plugin-in-host: UNTESTED."
   note "      Gate contract and adapter contract above still fully cover the"
   note "      documented behavior; wire-up is per upstream docs."
 fi
+
+IH=$(mktemp -d "${TMPDIR:-/tmp}/opgate-opencode-install.XXXXXX") || exit 1
+if ( cd "$IH" && env -u OPERATOR_HOME -u OPERATOR_AGENT_SESSION HOME="$IH" XDG_CONFIG_HOME="$IH/.config" \
+       sh "$SRC_DIR/install.sh" > "$IH/install.log" 2>&1 ) && [ "$(cat "$IH/.operator/mode" 2>/dev/null)" = "enforce" ]; then
+  ok "install.sh starts in enforce (a fresh install blocks)"
+else
+  bad "install.sh did not start in enforce"; tail -n 5 "$IH/install.log" | sed 's/^/  /'
+fi
+rm -rf "$IH"
 
 note ""
 note "== summary: $PASS passed, $FAIL failed =="

@@ -4,7 +4,7 @@
 One job: before a command-carrying function tool runs, spawn the host-agnostic
 gate and let its closed rule set judge the command string.
 
-    gate exit 0 -> allow  (the tool runs; shadow receipts written by the gate)
+    gate exit 0 -> allow  (the tool runs; the gate wrote the receipt, a shadow stop included)
     gate exit 2 -> deny   ("Operator Lite blocked: <gate stderr>" replaces the
                            tool result, so the model sees the reason and must
                            change course)
@@ -268,7 +268,7 @@ def describe() -> dict:
         "gate": gate,
         "gate_present": os.path.exists(gate),
         "mode": mode or "(no mode file -- the gate treats this as enforce; "
-                        "install.sh writes 'shadow')",
+                        "install.sh writes 'enforce')",
         "agents_sdk": agents_sdk_available(),
     }
 

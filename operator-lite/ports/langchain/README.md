@@ -65,23 +65,28 @@ with shell-rc writes), in which case it fails **closed**.
 
 ## What it stops
 
-Eleven STOP rules (blocking in enforce mode):
+Fifteen STOP rules (blocking in enforce mode, the install default):
 
 | Rule | Catches |
 |---|---|
 | OP-000 | edits to the gate itself, hook registrations, agent settings files |
 | OP-001 | delete/move of a workspace root (or a parent of one) |
 | OP-002 | wiping the Vestige store (sqlite3 writes, `vestige gc/purge`) |
-| OP-003 | blind recursive deletes, sweeps from `/`, fork bombs |
-| OP-004 | force-push to shared branches, remote-main deletion, `.git` removal |
-| OP-005 | unreviewed publishes (npm/cargo/twine/docker/gh release) |
-| OP-006 | paid deploys and live-billing actions |
-| OP-007 | destructive SQL (DROP/TRUNCATE/unscoped DELETE) |
+| OP-003 | recursive deletes outside the project and outside scratch/build folders, sweeps from `/` |
+| OP-004 | force-push to shared branches, remote-main deletion, deleting `.git` or a whole repository |
+| OP-005 | unreviewed publishes (npm/pnpm/yarn/cargo/twine/docker push/gh release), deleting a public repo |
+| OP-006 | production deploys, infrastructure apply and teardown, live billing |
+| OP-007 | destructive SQL (DROP/TRUNCATE/unscoped DELETE), framework database resets |
 | OP-008 | shell-init writes (`>> ~/.zshrc` = code execution by install) |
 | OP-009 | reverse shells (`/dev/tcp`, `nc -e`, DNS-tunnel tools) |
 | OP-010 | cloud metadata endpoints (169.254.169.254, metadata.google.internal) |
 
-Plus shadow-only OP-S01..S17 (work-loss git, outgoing comms, public mutation,
+| OP-011 | discarding uncommitted git work, shredding or emptying files outside the project, `crontab -r` |
+| OP-014 | raw-disk writes, formatting or erasing a volume, fork bombs, recursive `chmod`/`chown` on `/` or home |
+| OP-018 | a download piped or handed straight to a shell or interpreter (`curl X \| sh`, `bash <(curl X)`) |
+| OP-CANARY | the verification canary string |
+
+Plus shadow-only OP-S01..S08 and OP-S11..S17 (work-loss git, outgoing comms, public mutation,
 credential-shaped writes, pipe-to-interpreter, persistence, env hijacks, exfil
 shapes, invisible characters, MCP argument exfil, agent-config writes,
 paste/tunnel egress, new git remotes, sandbox-escape primitives), recorded in
@@ -90,8 +95,8 @@ through quote reassembly (`r''m`), `$IFS`, `$(echo rm)`, ANSI-C quoting,
 base64 bodies, brace/glob enumeration, heredocs, session variables and
 subshell time-bombs; every STOP names the transforms it applied.
 
-**GuardFall-proof:** the gate replays a 43-case corpus of bypass techniques
-and must pass 43/43:
+**GuardFall-proof:** the gate replays a 46-case corpus of bypass techniques
+and must pass 46/46:
 
 ```
 python3 ~/.operator/gate/operator-gate.py corpus guardfall
@@ -112,10 +117,11 @@ sh ports/langchain/test.sh                    # optional: proves the chain end-t
 `install.sh` is idempotent:
 
 - installs the gate to `~/.operator/gate/operator-gate.py` (downloads from
-  GitHub unless an existing copy is same-or-newer; never overwrites a newer
-  gate; refuses to wire a gate that does not parse)
+  GitHub, or uses this checkout's copy when it is newer, unless an existing
+  copy is same-or-newer; never overwrites a newer gate; refuses to wire a gate
+  that does not parse)
 - installs the middleware to `~/.operator/ports/langchain/operator_middleware.py`
-- sets `~/.operator/mode` to `shadow` if no mode file exists yet
+- sets `~/.operator/mode` to `enforce` if no mode file exists yet
 - prints the usage snippet and next steps; requires `python3` (the gate and
   the adapter are stdlib-only — no `pip install` of anything)
 
@@ -162,12 +168,13 @@ def run_shell_command(command: str) -> str:
     return subprocess.run(command, shell=True, capture_output=True, text=True).stdout
 ```
 
-## Shadow → enforce
+## Enforce and shadow
 
-Start in shadow: every decision is analyzed and receipted, nothing is blocked.
-When the log looks right, flip:
+A fresh install blocks: every command a STOP rule matches is denied, and every
+decision is receipted. To record without blocking, and back:
 
 ```
+echo shadow > ~/.operator/mode
 echo enforce > ~/.operator/mode
 ```
 
@@ -199,7 +206,7 @@ tool call — with args in the exact shape LangChain passes:
   (fail open)
 - non-shell tools (`read_file`) and shell-named tools without a command key →
   passed through with no gate spawn and no receipt
-- the **GuardFall corpus replayed through the adapter**: all 43 verdicts
+- the **GuardFall corpus replayed through the adapter**: all 46 verdicts
   survive `decide()` (same semantics as the gate's own corpus runner)
 - the module imports with langchain absent (stdlib-only adapter), install.sh
   is idempotent and never clobbers an existing mode, the receipt chain

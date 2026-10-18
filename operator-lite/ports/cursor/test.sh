@@ -97,7 +97,7 @@ cat "$LOGS/install.log"
 
 [ -f "$TEST_HOME/.operator/gate/operator-gate.py" ] && ok "gate installed" || bad "gate missing"
 [ -x "$TEST_HOME/.operator/gate/operator-gate.py" ] && ok "gate is executable" || bad "gate not executable"
-[ "$(cat "$TEST_HOME/.operator/mode" 2>/dev/null)" = "shadow" ] && ok "mode file = shadow" || bad "mode file not shadow"
+[ "$(cat "$TEST_HOME/.operator/mode" 2>/dev/null)" = "enforce" ] && ok "mode file = enforce (the installer default)" || bad "mode file not enforce: a fresh install must block"
 [ -x "$ADAPTER" ] && ok "adapter installed + executable" || bad "adapter missing"
 
 ls "$TEST_HOME/.cursor/" | grep -q '^hooks.json.backup-operator-' \
@@ -124,7 +124,8 @@ assert "REPLACE_WITH_HOME" not in json.dumps(d), "placeholder not substituted"
 PYEOF
 
 # ---- 2. shadow mode (default): receipts written, nothing blocked ------------- #
-section "shadow mode (default)"
+section "shadow mode (the owner's choice)"
+echo shadow > "$TEST_HOME/.operator/mode"
 
 rc=$(gate_hook \
   "$(env_fields beforeShellExecution)"'"command":"ls -la","cwd":"'"$TEST_PROJ"'","sandbox":false}' \

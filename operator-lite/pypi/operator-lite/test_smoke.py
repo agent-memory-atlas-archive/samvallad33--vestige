@@ -146,8 +146,8 @@ def test_hook_contract_allow_in_shadow():
         assert proc.returncode == 0, "benign command did not allow: %s" % \
             proc.stderr.decode("utf-8", "replace")
         assert proc.stdout.strip() == b""
-        hard_stops = [d for d in (receipt_decisions(hermetic) or [])
-                      if d != "SHADOW_STOP"]
+        # receipts say PASS, STOP or SHADOW_STOP; only STOP is a hard stop
+        hard_stops = [d for d in (receipt_decisions(hermetic) or []) if d == "STOP"]
         assert not hard_stops, "benign command drew hard stops: %s" % hard_stops
 
 
@@ -219,9 +219,9 @@ def test_unreachable_gate_fails_closed_on_destructive():
 
 
 @_skipif_no_gate
-def test_corpus_replay_43_of_43():
-    """When the gate is a repo checkout (corpora/ next to it), the gate's own
-    GuardFall corpus must pass 43/43 through classify()."""
+def test_corpus_replay_every_case():
+    """When the gate is a repo checkout (corpora/ next to it), every case in
+    the gate's own GuardFall corpus must pass through classify()."""
     corpus = os.path.join(os.path.dirname(GATE), "corpora", "guardfall.json")
     if not os.path.exists(corpus):
         # Installed-copy case: ~/.operator/gate/ ships without corpora/.
@@ -234,7 +234,9 @@ def test_corpus_replay_43_of_43():
                               capture_output=True, timeout=60,
                               env=dict(os.environ))
         assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
-        assert b"passed=43" in proc.stdout and b"failed=0" in proc.stdout, \
+        with open(corpus, encoding="utf-8") as f:
+            cases = len(json.load(f)["cases"])
+        assert (b"passed=%d" % cases) in proc.stdout and b"failed=0" in proc.stdout, \
             proc.stdout.decode("utf-8", "replace")
 
 

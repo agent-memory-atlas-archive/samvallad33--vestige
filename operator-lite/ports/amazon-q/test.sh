@@ -50,8 +50,8 @@ cat "$TMPROOT/install1.log"
 [ -f "$HOME/.operator/gate/operator-gate.py" ] && ok "gate installed" || bad "gate missing"
 [ -f "$HOME/.operator/gate/q-wrapper.py" ] && ok "wrapper installed" || bad "wrapper missing"
 [ -x "$HOME/.operator/gate/operator-gate.py" ] && ok "gate is executable" || bad "gate not executable"
-[ "$(cat "$HOME/.operator/mode" 2>/dev/null)" = "shadow" ] && ok "mode file = shadow" \
-    || bad "mode file not shadow"
+[ "$(cat "$HOME/.operator/mode" 2>/dev/null)" = "enforce" ] && ok "mode file = enforce (the installer default)" \
+    || bad "mode file not enforce: a fresh install must block"
 
 AGENT_FILE="$HOME/.aws/amazonq/cli-agents/q_cli_default.json"
 python3 - "$AGENT_FILE" <<'PYEOF' && ok "created q_cli_default.json mirrors Q's built-in default + the hook" \
@@ -133,7 +133,8 @@ PYEOF
 }
 
 say ""
-say "=== shadow phase (mode file = shadow; gate must analyze but always allow) ==="
+printf 'shadow\n' > "$HOME/.operator/mode"   # the owner's choice: record, do not block
+say "=== shadow phase (mode file = shadow, set by the owner; gate must analyze but always allow) ==="
 
 run_hook execute_bash "{\"command\": \"$P1\", \"summary\": \"cleanup\"}" p1; rc=$?
 say "p1 (execute_bash: rm -rf ~/demo-factory/canary)    exit=$rc"

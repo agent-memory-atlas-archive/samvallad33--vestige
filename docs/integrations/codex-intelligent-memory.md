@@ -61,4 +61,4 @@ For Codex, the portable layer is:
 2. `AGENTS.md` instruction trigger.
 3. Explicit agent discipline: call Vestige at the start of a task and save what the task established.
 
-To stop destructive commands before they run, use the [Operator Lite](../../operator-lite/README.md) gate. It supports Codex hooks and is a separate layer from this protocol.
+To stop destructive commands before they run, Vestige ships the [Operator Lite](../../operator-lite/README.md) gate, a separate layer from this protocol. Codex is not one of its ports yet: its execution-hook wiring has not been verified, so the gate's [host list](../../operator-lite/ports/README.md) does not include it.

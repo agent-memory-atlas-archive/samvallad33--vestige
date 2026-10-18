@@ -69,23 +69,28 @@ owner-tty-only, as on every other host. Timeout per call: 8s.
 
 ## What it protects against
 
-Eleven STOP rules (blocking in enforce mode):
+Fifteen STOP rules (blocking in enforce mode, the install default):
 
 | Rule | Catches |
 |---|---|
 | OP-000 | edits to the gate itself, hook registrations, agent settings files |
 | OP-001 | delete/move of a workspace root (or a parent of one) |
 | OP-002 | wiping the Vestige store (sqlite3 writes, `vestige gc/purge`) |
-| OP-003 | blind recursive deletes, sweeps from `/`, fork bombs |
-| OP-004 | force-push to shared branches, remote-main deletion, `.git` removal |
-| OP-005 | unreviewed publishes (npm/cargo/twine/docker/gh release) |
-| OP-006 | paid deploys and live-billing actions |
-| OP-007 | destructive SQL (DROP/TRUNCATE/unscoped DELETE) |
+| OP-003 | recursive deletes outside the project and outside scratch/build folders, sweeps from `/` |
+| OP-004 | force-push to shared branches, remote-main deletion, deleting `.git` or a whole repository |
+| OP-005 | unreviewed publishes (npm/pnpm/yarn/cargo/twine/docker push/gh release), deleting a public repo |
+| OP-006 | production deploys, infrastructure apply and teardown, live billing |
+| OP-007 | destructive SQL (DROP/TRUNCATE/unscoped DELETE), framework database resets |
 | OP-008 | shell-init writes (`tee ~/.zshrc` = code execution by install) |
 | OP-009 | reverse shells (`/dev/tcp`, `nc -e`, DNS-tunnel tools) |
 | OP-010 | cloud metadata endpoints (169.254.169.254, metadata.google.internal) |
 
-Plus shadow-only OP-S01..S17 (work-loss git, outgoing comms, public mutation,
+| OP-011 | discarding uncommitted git work, shredding or emptying files outside the project, `crontab -r` |
+| OP-014 | raw-disk writes, formatting or erasing a volume, fork bombs, recursive `chmod`/`chown` on `/` or home |
+| OP-018 | a download piped or handed straight to a shell or interpreter (`curl X \| sh`, `bash <(curl X)`) |
+| OP-CANARY | the verification canary string |
+
+Plus shadow-only OP-S01..S08 and OP-S11..S17 (work-loss git, outgoing comms, public mutation,
 credential-shaped writes, pipe-to-interpreter, persistence, env hijacks, exfil
 shapes, invisible characters, MCP argument exfil, agent-config writes,
 paste/tunnel egress, new git remotes, sandbox-escape primitives), recorded in
@@ -94,8 +99,8 @@ through quote reassembly (`r''m`), `$IFS`, `$(echo rm)`, ANSI-C quoting, base64
 bodies, brace/glob enumeration, heredocs, session variables and subshell
 time-bombs.
 
-**GuardFall-proof:** the gate replays a 43-case corpus of bypass techniques and
-must pass 43/43: `python3 ~/.operator/gate/operator-gate.py corpus guardfall`.
+**GuardFall-proof:** the gate replays a 46-case corpus of bypass techniques and
+must pass 46/46: `python3 ~/.operator/gate/operator-gate.py corpus guardfall`.
 
 Every decision appends a hash-chained receipt to `~/.operator/receipts/`
 (`operator-gate verify` walks the chain). Receipts are digests, not signatures.
@@ -105,13 +110,13 @@ Every decision appends a hash-chained receipt to `~/.operator/receipts/`
 ```python
 import sys, os
 sys.path.insert(0, os.path.expanduser("~/.operator/ports/crewai"))
-import operator_hooks   # registers the global PRE_TOOL_CALL gate hook (shadow)
+import operator_hooks   # registers the global PRE_TOOL_CALL gate hook
 
 from crewai import Agent, Task, Crew
 researcher = Agent(role="Researcher", goal="Research the topic", backstory="...", verbose=True)
 task = Task(description="Investigate {topic}", agent=researcher, expected_output="A report.")
 Crew(agents=[researcher], tasks=[task]).kickoff(inputs={"topic": "Operator Lite"})
-# every shell-ish tool call now passes the gate; flip: echo enforce > ~/.operator/mode
+# every shell-ish tool call now passes the gate; log-only instead: echo shadow > ~/.operator/mode
 ```
 
 Prefer explicit control? Set `OPERATOR_CREWAI_AUTOINSTALL=0` before the import
@@ -130,23 +135,25 @@ sh ports/crewai/test.sh                    # optional: proves the chain end-to-e
 `install.sh` is idempotent and:
 
 - installs the gate to `~/.operator/gate/operator-gate.py` (downloads from
-  GitHub unless an existing copy is same-or-newer; never overwrites a newer
-  gate; refuses to wire a gate that does not parse)
+  GitHub, or uses this checkout's copy when it is newer, unless an existing
+  copy is same-or-newer; never overwrites a newer gate; refuses to wire a gate
+  that does not parse)
 - installs the adapter to `~/.operator/ports/crewai/operator_hooks.py`
   (backing up any previous copy) and smoke-checks that it resolves the gate
-- sets `~/.operator/mode` to `shadow` if no mode file exists yet
+- sets `~/.operator/mode` to `enforce` if no mode file exists yet
 - prints the wiring snippet and next steps; requires `python3`
 
 There is no hooks.json to merge: CrewAI hooks are registered from Python, so
 the wiring is the one import above (put the path on `sys.path`, or copy the
 module into your project — it is dependency-free).
 
-## Shadow → enforce
+## Enforce and shadow
 
-Start in shadow: every decision is analyzed and receipted, nothing is blocked.
-When the log looks right, flip:
+A fresh install blocks: every command a STOP rule matches is denied, and every
+decision is receipted. To record without blocking, and back:
 
 ```
+echo shadow > ~/.operator/mode
 echo enforce > ~/.operator/mode
 ```
 
@@ -163,7 +170,7 @@ your crews are never touched) and drives the adapter's **exact decision path**
 when a Python with `crewai` importable is available (`OPERATOR_CREWAI_PYTHON`
 or a probe) — the **real dispatch** through crewAI 1.15.23:
 
-- install into the throwaway HOME: gate + adapter + `mode=shadow` + smoke status
+- install into the throwaway HOME: gate + adapter + `mode=enforce` (the installer default) + smoke status
 - shadow: `rm -rf ~/demo-factory/canary` → allowed + `SHADOW_STOP` receipt with
   OP-003, `source=crewai`, tool `bash`, cwd = adapter cwd; obfuscated `r''m`
   variant receipted identically (gate sees through quote reassembly); `tee
@@ -217,7 +224,7 @@ or a probe) — the **real dispatch** through crewAI 1.15.23:
   hook-API changes are upstream's to break; the port is one dependency-free
   glue file.
 - **No per-call human prompt.** CrewAI's `ctx.request_human_input()` exists,
-  but Operator Lite's model is shadow-then-enforce with owner-side
+  but Operator Lite's model is a deterministic stop with owner-side
   `operator-gate approve` permits, not interactive prompts mid-run.
 - **`import operator_hooks` registers globally** — every crew in the process
   is gated. That is the feature; use `OPERATOR_CREWAI_AUTOINSTALL=0` +

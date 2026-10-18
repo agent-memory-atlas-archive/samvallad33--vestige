@@ -11,7 +11,7 @@ Subscribes to `before_tool_call` and pipes each command through the Operator
 Lite gate (one stdlib-only Python file, analyzer-only — it never executes what
 it inspects):
 
-- **Deterministic verdicts** — 11 STOP rules + 15 SHADOW rules evaluated by a
+- **Deterministic verdicts** — 15 STOP rules + 15 SHADOW rules evaluated by a
   shell walker that follows `cd`, expands shell variables, reads heredocs,
   and simulates subshells before matching.
 - **GuardFall-proof** — sees through the obfuscation classes from CSA's
@@ -23,36 +23,43 @@ it inspects):
   appended to `~/.operator/receipts/<date>.jsonl` as a tamper-evident chain.
   `operator-gate verify` walks the chain.
 
-## Shadow mode first
+## Enforce mode from the first call
 
-The plugin ships in shadow mode: the gate classifies and receipts every call
-but blocks nothing. Watch the verdict stream, then flip:
+The plugin writes no mode file, and the gate reads a missing `~/.operator/mode`
+as enforce: every command a STOP rule matches is blocked before it runs, and
+every call gets a receipt. To record without blocking:
 
 ```sh
-echo enforce > ~/.operator/mode
+echo shadow > ~/.operator/mode
 ```
 
-Back to logging only: `echo shadow > ~/.operator/mode`.
+Back to blocking: `echo enforce > ~/.operator/mode`.
 
 ## What the STOP rules catch
 
 | Rule | Catches |
 |---|---|
-| OP-000 | edits to the gate itself, hook registrations, settings files |
-| OP-001 | delete/move of a workspace root (or parent) |
-| OP-002 | wiping the memory store |
-| OP-003 | blind recursive deletes, sweeps from `/`, fork bombs |
-| OP-004 | force-push to shared branches, remote-main deletion, `.git` removal |
-| OP-005 | unreviewed publishes (npm/cargo/twine/docker/gh release) |
-| OP-006 | paid deploys and live-billing actions |
-| OP-007 | destructive SQL (DROP/TRUNCATE/unscoped DELETE) |
+| OP-000 | edits to the gate itself, its mode, permits and rules, hook registrations, settings files |
+| OP-001 | delete/move of a workspace root or a parent of one, including `/` and home |
+| OP-002 | wiping the Vestige memory store |
+| OP-003 | recursive deletes outside the project and outside scratch/build folders, sweeps from `/` |
+| OP-004 | force-push to shared branches, remote-main deletion, deleting `.git` or a whole repository |
+| OP-005 | unreviewed publishes (npm/pnpm/yarn/cargo/twine/docker push/gh release), deleting a public repo |
+| OP-006 | production deploys, infrastructure apply and teardown (terraform, pulumi, cdk, kubectl delete, helm uninstall, cloud delete commands), live billing |
+| OP-007 | destructive SQL (DROP/TRUNCATE/unscoped DELETE, FLUSHALL), framework database resets |
 | OP-008 | shell-init writes (`>> ~/.zshrc` = code execution by install) |
-| OP-009 | reverse shells (`/dev/tcp`, `nc -e`, DNS-tunnel tools) |
+| OP-009 | reverse shells (`/dev/tcp`, `nc -e`, DNS-tunnel tools, inline code that hands a socket a shell) |
 | OP-010 | cloud metadata endpoints (169.254.169.254, metadata.google.internal) |
 
-SHADOW rules log work-loss git patterns, comms, public mutation, secret
-writes, pipe-to-interpreter, persistence, env hijacks, exfil shapes,
-invisible characters, and sandbox-escape primitives — without blocking.
+| OP-011 | loss nothing can undo: `git reset --hard`, `git clean -f`, `git checkout -- <path>`, `git stash drop` when they would discard real work, `shred`, emptying a file outside the project, `crontab -r` |
+| OP-014 | machine wreck: `dd` onto a device, `mkfs`/`fdisk`-class tools, `diskutil erase*`, recursive `chmod`/`chown` on `/`, a system folder or home, fork bombs |
+| OP-018 | a download run unread: `curl X \| sh`, `bash <(curl X)`, `sh -c "$(curl X)"` |
+| OP-CANARY | the verification canary string, which proves the plugin is wired |
+
+SHADOW rules log git commands that can lose work but did not here, comms,
+public mutation, secret writes, other pipe-to-interpreter, persistence, env
+hijacks, exfil shapes, invisible characters, and sandbox-escape primitives —
+without blocking.
 
 ## Exit contract
 
@@ -64,7 +71,8 @@ invisible characters, and sandbox-escape primitives — without blocking.
 
 ## Also works without OpenClaw
 
-The same file is a PreToolUse hook for Claude Code and Codex — see the
+The same file is the PreToolUse hook for Claude Code and for every host in
+[ports/](https://github.com/samvallad33/vestige/tree/main/operator-lite/ports) — see the
 [Operator Lite README](https://github.com/samvallad33/vestige/tree/main/operator-lite).
 
 Local-first. No telemetry. No dependencies beyond python3.

@@ -11,7 +11,7 @@
 #      ~/.operator/ports/openai-agents/operator_guard.py
 #      (repo copy first -- it is version-matched to this installer -- raw
 #      download as fallback; never overwrites a newer module)
-#   3. sets mode to shadow if no mode file exists yet
+#   3. sets mode to enforce if no mode file exists yet
 #   4. prints next steps
 #
 # The port is code, not configuration: the SDK gets the gate as a tool
@@ -80,7 +80,10 @@ if [ -s "$TMP_GATE" ] && grep -q '^VERSION = ' "$TMP_GATE"; then
 else
     rm -f "$TMP_GATE"
 fi
-if [ "$SRC" = "" ] && [ -f "$REPO_GATE" ] && grep -q '^VERSION = ' "$REPO_GATE"; then
+# the checkout's own gate wins when it is newer than main's (a branch being tested, a release not yet merged)
+if [ -f "$REPO_GATE" ] && grep -q '^VERSION = ' "$REPO_GATE" && \
+    { [ "$SRC" = "" ] || ! version_ge "$(file_version "$SRC" 'VERSION')" "$(file_version "$REPO_GATE" 'VERSION')"; }; then
+    [ "$SRC" = "$TMP_GATE" ] && rm -f "$TMP_GATE"
     SRC="$REPO_GATE"
 fi
 if [ "$SRC" = "" ]; then
@@ -151,11 +154,11 @@ python3 -c 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.
 python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import operator_guard as g; g.describe()' \
     "$MOD_DST_DIR" 2>/dev/null || die "$MOD_DST_DIR is not importable without the openai-agents package; refusing to ship it"
 
-# --- 3. mode: shadow unless the owner already chose -------------------------- #
+# --- 3. mode: enforce unless the owner already chose -------------------------- #
 MODE_DST="$OP_HOME/mode"
 if [ ! -f "$MODE_DST" ]; then
-    printf 'shadow\n' > "$MODE_DST"
-    say "operator-gate: mode=shadow (log-only). Flip with: echo enforce > $MODE_DST"
+    printf 'enforce\n' > "$MODE_DST"
+    say "operator-gate: mode=enforce (blocking). To record without blocking: echo shadow > $MODE_DST"
 else
     say "operator-gate: mode=$(cat "$MODE_DST") (existing mode kept)"
 fi
@@ -169,6 +172,5 @@ say "  2. Wrap your shell tool:  from operator_guard import gated_shell_tool"
 say "     (minimal snippet in README.md, next to this installer)"
 say "  3. Prove it:  sh $PORT_DIR/test.sh"
 say "  4. Review receipts: python3 $GATE_DST status ; python3 $GATE_DST verify"
-say "  5. Shadow mode logs every STOP without blocking. When the log looks"
-say "     right, flip to blocking:"
-say "        echo enforce > $MODE_DST"
+say "  5. The gate stops what its rules block. To record without blocking:"
+say "        echo shadow > $MODE_DST"

@@ -4,7 +4,7 @@
 One import wires the Operator gate ([../../operator-gate.py](../../operator-gate.py))
 in front of every tool call a Crew makes:
 
-    import operator_hooks   # registers a global PRE_TOOL_CALL hook, shadow by default
+    import operator_hooks   # registers a global PRE_TOOL_CALL hook; the gate's mode applies (enforce unless set)
 
 This module is the thin adapter; all rule logic lives in the gate. Per tool call
 it runs:

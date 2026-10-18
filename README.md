@@ -47,7 +47,7 @@ OpenClaw:
 clawhub install vestige-operator-lite
 ```
 
-Install copies the gate to `~/.operator/gate`, registers the Claude Code hook, and starts in shadow mode, which records every verdict and blocks nothing. It then replays your last 30 days of Claude Code history through the same rules. Nothing in that history is executed. When that looks right, switch it on with `mode enforce`.
+Install copies the gate to `~/.operator/gate`, registers the Claude Code hook, and starts in enforce mode: from your agent's next tool call, every command a STOP rule matches is stopped before it runs. It then replays your last 30 days of Claude Code history through the same rules. Nothing in that history is executed. An existing `~/.operator/mode` file is kept as it is; `mode shadow` records without blocking, and `mode enforce` blocks again.
 
 ## Proof
 
@@ -56,24 +56,26 @@ Install copies the gate to `~/.operator/gate`, registers the Claude Code hook, a
 ```
 operator-gate replay: the last 30 days on this machine. Nothing was executed.
 
-       23  tool calls your agents made (2 Claude Code sessions, 2 projects)
-        3  a built-in rule would have stopped
+       22  tool calls your agents made (2 Claude Code sessions, 2 projects)
+        4  a built-in rule would have stopped
         1  flagged in shadow: recorded, not stopped
-       14  no built-in rule decides: only you can
+       13  no built-in rule decides: only you can
 
 Would have been stopped (all of them):
-  Mar 21  shop-api           OP-004 force push to a shared branch
+  Oct 16  shop-api           OP-004 force push to a shared branch
                              git push --force origin main
-  Mar 19  shop-api           OP-007 destructive SQL
+  Oct 15  shop-api           OP-007 destructive SQL
                              psql $DATABASE_URL -c 'DROP TABLE sessions'
-  Mar 14  infra              OP-003 recursive delete of ~/Documents/old-terraform-state
+  Oct 10  infra              OP-003 recursive delete of ~/Documents/old-terraform-state
                              rm -rf ~/Documents/old-terraform-state
+  Oct 10  infra              OP-006 terraform apply
+                             terraform apply -auto-approve
 
 Flagged in shadow, recorded and not stopped:
-      1  OP-S01 work-loss                   git reset --hard HEAD~1
+      1  OP-S01 work-loss                   git branch -D spike-cache
 ```
 
-- 27 deterministic rules: workspace armor, memory-store protection, destructive SQL, force-push, unreviewed publishes, paid deploys, reverse shells, cloud-metadata endpoints, shell-init poisoning, and MCP argument exfil.
+- 30 deterministic rules. 15 STOP rules block: workspace armor, memory-store protection, recursive deletes outside the project, force-push and `.git` removal, unreviewed publishes, production deploys and infrastructure teardown, destructive SQL and framework database resets, shell-init poisoning, reverse shells, cloud-metadata endpoints, discarded uncommitted git work, shredded or emptied files, raw-disk writes and recursive permission changes on `/` or home, and a download piped into a shell. 15 SHADOW rules record without blocking: outbound messages, public mutations, secret-shaped writes, persistence, env hijacks, exfil shapes and MCP argument exfil.
 - Shell obfuscation: quote reassembly (`r''m`), `$IFS`, `$(echo rm)` as the program, ANSI-C `$'\x72m'`, base64-decoded pipelines, brace and glob expansion against the live filesystem, subshell time-bombs, session variables, `cd` tracking, heredocs, and fork bombs.
 
 Operator Lite receipts are hash-chained digests, not signatures. It only blocks what is routed through hooked tools.
@@ -114,8 +116,8 @@ client configuration was written; restart the client and confirm its MCP tools
 for live verification. It can optionally open Vestige's local Observatory after
 setup—no cloud account, telemetry, or fake first-run data.
 
-It configures memory-server connections only. Operator Lite execution gates
-remain a separate, shadow-first choice below.
+It configures memory-server connections only. Operator Lite, the execution
+gate, is a separate install below.
 
 To rehearse the interactive Proof Pulse without touching a real client config,
 run `./scripts/proof-pulse-demo.sh` from a source checkout. The script itself
@@ -162,9 +164,9 @@ an execution gate.
 
 ### Add an execution boundary
 
-Operator Lite is a separate, local pre-tool gate. Every supported port begins
-in **shadow mode**: it writes a receipt for each decision without blocking.
-Review the receipt chain, then intentionally switch to enforce mode.
+Operator Lite is a separate, local pre-tool gate. Every supported port installs
+in **enforce mode**: it stops what its STOP rules match and writes a hash-chained
+receipt for every decision. `mode shadow` records without blocking.
 
 | Environment | Operator Lite setup |
 |---|---|

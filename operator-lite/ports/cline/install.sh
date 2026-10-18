@@ -3,13 +3,13 @@
 #
 #   1. ensures the gate at ~/.operator/gate/operator-gate.py
 #      (downloaded from the Vestige repo if missing; never overwritten)
-#   2. sets shadow mode (log-only) if no mode file exists yet
+#   2. sets enforce mode (blocking) if no mode file exists yet
 #   3. installs the PreToolUse hook to ~/.cline/hooks/PreToolUse
 #      (an existing different file is backed up, never clobbered)
 #   4. if a `cline` CLI is present, also attempts the SDK plugin install;
 #      otherwise prints the exact manual steps
 #
-# Run it from your own terminal. It never enables enforce mode for you.
+# Run it from your own terminal. It starts in enforce mode unless a mode is already set.
 
 set -u
 
@@ -60,13 +60,13 @@ else
     note "gate:      installed $GATE"
 fi
 
-# --- 2. mode (shadow first, always) ------------------------------------------
+# --- 2. mode (enforce unless already set) ------------------------------------------
 if [ -f "$GATE_ROOT/mode" ]; then
     note "mode:      $(cat "$GATE_ROOT/mode") (existing file left untouched)"
 else
     mkdir -p "$GATE_ROOT" 2>/dev/null
-    echo shadow > "$GATE_ROOT/mode"
-    note "mode:      shadow (log-only). Flip later with: echo enforce > $GATE_ROOT/mode"
+    echo enforce > "$GATE_ROOT/mode"
+    note "mode:      enforce (blocking). To record without blocking: echo shadow > $GATE_ROOT/mode"
 fi
 
 # --- 3. PreToolUse hook --------------------------------------------------------
@@ -119,7 +119,7 @@ note "  Hooks are macOS/Linux only in Cline (no Windows support yet)."
 note ""
 note "Verify:"
 note "  sh test.sh                 # gate contract, Cline-shaped payloads"
-note "  echo 'OPERATOR_CANARY_STOP_7f3a' as a task command in shadow mode"
+note "  echo 'OPERATOR_CANARY_STOP_7f3a' as a task command: the gate stops it"
 note "  tail -f $GATE_ROOT/receipts/$(date +%Y-%m-%d).jsonl"
 note ""
-note "When the shadow log looks right:  echo enforce > $GATE_ROOT/mode"
+note "To record without blocking:  echo shadow > $GATE_ROOT/mode"

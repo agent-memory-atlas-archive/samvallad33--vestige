@@ -7,8 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Operator Lite 0.3.9. Version 0.3.8 is skipped: it was published to npm and
+withdrawn, so the number cannot be used again.
+
+Upgrading Operator Lite: install keeps an existing `~/.operator/mode` file. An
+install that 0.3.7 or earlier set to `shadow` stays in shadow, which blocks
+nothing, until the owner runs `operator-gate mode enforce` (or
+`npx operator-lite mode enforce`).
+
 ### Changed
 
+- **Operator Lite blocks from install.** `install`, `npx operator-lite` and
+  every `ports/*/install.sh` write `enforce` to `~/.operator/mode` when there
+  is no mode file, so a STOP rule stops a command from the agent's next tool
+  call. `mode shadow` still records without blocking.
+- **Fifteen STOP rules, up from twelve.** OP-011 no-unrestorable-loss:
+  `git reset --hard`, `git clean -f`, `git checkout -- <path>` and
+  `git stash drop`/`clear` when they would discard work git cannot bring back,
+  `shred`/`srm`/`rm -P`, emptying a non-empty file outside the project, and
+  `crontab -r`. OP-014 no-machine-wreck: `dd` onto a device, `mkfs`/`fdisk`-class
+  tools, `diskutil erase*`, recursive `chmod`/`chown`/`chgrp` on `/`, a system
+  folder or home, and fork bombs. OP-018 no-blind-fetch-run: a download piped
+  into a shell or interpreter (`curl X | sh`), or run through `<(...)` or
+  `$(...)` (`bash <(curl X)`, `sh -c "$(curl X)"`, `eval "$(wget -qO- X)"`).
+- **Wider STOP rules.** OP-006 covers infrastructure apply and teardown
+  (`terraform`/`tofu` apply or destroy, `pulumi up`, `cdk deploy`,
+  `kubectl delete`, `helm uninstall`, `aws s3 rb`, cloud `delete` commands) and
+  `railway up` and `netlify deploy --prod`. OP-007 covers framework database
+  resets (`prisma migrate reset`, `rails db:drop`, `manage.py flush`,
+  `artisan migrate:fresh`, `dropdb`). OP-003 covers a filtered `find` delete
+  outside the project, `trash`/`rip`/`gio trash` on a folder, inline
+  `shutil.rmtree`/`fs.rmSync` outside the project, the working folder and its
+  parents. OP-004 covers deleting a whole repository. OP-009 covers inline code
+  that hands a socket a shell. A fork bomb is now stopped under OP-014 with its
+  own reason; it was OP-001 with the reason "delete of /".
+- **The port installers install this checkout's gate when it is newer than
+  main's.** Ten of them downloaded main's gate first, so their test suites
+  judged main's gate, not the branch's.
 - **A stop tells the agent what to do next, in three lines.** Operator Lite's
   refusal now reads: what was stopped, with the rule and the receipt id; next,
   do not retry it or try a workaround, take the rule's compliant path, and
@@ -17,6 +52,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal, so no new hook is needed. What the gate saw through stays on the
   first line, and the normalized command stays in the receipt, where
   `precedent` returns it.
+
+### Fixed
+
+- **Text that mentions a command is not the command.** A pipe, `<(` or `$(`
+  inside quotes is data: `git commit -m "curl X | sh"` and
+  `echo 'curl X | sh' >> README.md` pass. A download piped into a tool that
+  reads it as data passes too (`| jq`, `| python3 -m json.tool`,
+  `| python3 -c '...'`, `| node -e '...'`, `| perl -ne '...'`).
+- **Function bodies are judged.** `wipe() { rm -rf ~/Documents; }; wipe` is
+  stopped; defining a function no longer hides what it runs.
+- **Inline code that deletes inside a temp folder is scratch**, including
+  paths built with `os.path.join` from a temp name; a temp name that is
+  reassigned or joined with `..` or an absolute path is judged as an ordinary
+  path.
+- The Aider port shims the deploy, teardown, disk and database-reset tools
+  (`terraform`, `kubectl`, `helm`, `aws`, `gcloud`, `railway`, `netlify`,
+  `npx`, `rails`, `dropdb`, `diskutil`, `fdisk`, `mkfs.*`, `chgrp`), so their
+  rules reach commands Aider runs.
+- The documentation matches the gate: every README, port README and package
+  description says enforce, lists the 15 STOP rules and the 46-case GuardFall
+  corpus, and leaves Codex out of the execution ports. `commitments.json` can
+  loosen a rule (`disabled_rules`, `mode_overrides`), which the Cline README
+  said it could not. The pip package's status line said `ensure_gate` writes
+  `shadow`; it writes no mode file. The PRECEDENT journey's empty screen named
+  `npx @vestige/init` as the Operator setup; it now names `npx operator-lite`.
+- The pip package's smoke test expected 43 GuardFall cases and counted `PASS`
+  receipts as stops. `npm test` in the `operator-lite` package named a test
+  file that did not exist; `test.js` now checks the bundled gate's bytes and
+  version and every bundled host installer. CI runs both, and
+  `operator-lite/test_destructive.py`: 113 commands through a fresh install,
+  each stop checked against the rule it must name.
 
 ## [5.0.0] - 2026-10-18
 

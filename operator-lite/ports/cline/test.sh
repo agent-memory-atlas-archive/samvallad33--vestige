@@ -108,8 +108,20 @@ else
     echo "           the adapter and gate contract above are what this machine can prove."
 fi
 
+echo ""
+echo "--- install.sh in a throwaway home: a fresh install blocks ---"
+IH=$(mktemp -d "${TMPDIR:-/tmp}/opgate-cline-install.XXXXXX") || exit 1
+if env -u OPERATOR_HOME -u OPERATOR_AGENT_SESSION HOME="$IH" sh "$(dirname "$0")/install.sh" > "$IH/install.log" 2>&1 \
+    && [ "$(cat "$IH/.operator/mode" 2>/dev/null)" = "enforce" ]; then
+    echo "PASS: install.sh starts in enforce"
+else
+    echo "FAIL: install.sh did not start in enforce"; tail -n 5 "$IH/install.log" | sed 's/^/  /'
+    failures=$((failures + 1))
+fi
+rm -rf "$IH"
+
 if [ "$failures" -gt 0 ]; then
     echo "RESULT: $failures case(s) FAILED"
     exit 1
 fi
-echo "RESULT: all 3 cases PASS"
+echo "RESULT: all 3 cases and the install check PASS"

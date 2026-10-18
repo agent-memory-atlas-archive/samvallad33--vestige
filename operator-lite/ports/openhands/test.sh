@@ -43,8 +43,8 @@ cat "$TMPROOT/install.log"
 # ---- 2. install shape -------------------------------------------------------- #
 [ -f "$HOME/.operator/gate/operator-gate.py" ] && ok "gate installed" || bad "gate missing"
 [ -f "$HOME/.operator/gate/openhands-wrapper.py" ] && ok "wrapper installed" || bad "wrapper missing"
-[ "$(cat "$HOME/.operator/mode" 2>/dev/null)" = "shadow" ] && ok "mode file = shadow" \
-    || bad "mode file not shadow"
+[ "$(cat "$HOME/.operator/mode" 2>/dev/null)" = "enforce" ] && ok "mode file = enforce (the installer default)" \
+    || bad "mode file not enforce: a fresh install must block"
 [ -x "$HOME/.operator/gate/operator-gate.py" ] && ok "gate is executable" || bad "gate not executable"
 
 python3 - "$TEST_PROJ/.openhands/hooks.json" <<'PYEOF' && ok "hooks.json valid and wired" || bad "hooks.json wrong"
@@ -86,7 +86,8 @@ PYEOF
 
 say() { printf '%s\n' "$*"; }
 say ""
-say "=== shadow phase (mode file = shadow; gate must analyze but always allow) ==="
+printf 'shadow\n' > "$HOME/.operator/mode"   # the owner's choice: record, do not block
+say "=== shadow phase (mode file = shadow, set by the owner; gate must analyze but always allow) ==="
 
 run_hook "$P1" "$WD1" p1; rc=$?
 say "p1 (rm -rf ~/demo-factory/canary)        exit=$rc"

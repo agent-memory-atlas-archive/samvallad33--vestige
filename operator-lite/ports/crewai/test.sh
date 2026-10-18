@@ -68,14 +68,15 @@ cat "$LOGS/install.log"
 [ -f "$GATE_DST" ] && ok "gate installed" || bad "gate missing"
 [ -x "$GATE_DST" ] && ok "gate is executable" || bad "gate not executable"
 [ -f "$MODULE_DST" ] && ok "adapter installed to ~/.operator/ports/crewai/" || bad "adapter missing"
-[ "$(cat "$TEST_HOME/.operator/mode" 2>/dev/null)" = "shadow" ] && ok "mode file = shadow" || bad "mode file not shadow"
+[ "$(cat "$TEST_HOME/.operator/mode" 2>/dev/null)" = "enforce" ] && ok "mode file = enforce (the installer default)" || bad "mode file not enforce: a fresh install must block"
 grep -q "operator-lite: dialect=" "$LOGS/install.log" && \
   ok "install smoke: adapter status line printed (dialect per machine, gate resolved)" || \
   bad "no adapter status line in install.log"
 grep -q "$GATE_DST" "$LOGS/install.log" && ok "status line resolves the installed gate" || bad "status line gate path wrong"
 
 # ---- 2. shadow mode (default): receipts written, nothing blocked --------------- #
-section "shadow mode (default)"
+section "shadow mode (the owner's choice)"
+echo shadow > "$TEST_HOME/.operator/mode"
 
 hookcheck 'ls -la' bash s-ls; rc=$?
 [ "$rc" = "0" ] && ok "benign ls -> exit 0 (allowed)" || bad "benign ls exited $rc, want 0"

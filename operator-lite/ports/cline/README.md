@@ -40,7 +40,7 @@ plus the [v3.36 hooks announcement](https://cline.bot/blog/cline-v3-36-hooks) an
 
 ## What it stops
 
-11 STOP rules (block) + 17 SHADOW rules (log-only until promoted), evaluated by
+15 STOP rules (block) + 15 SHADOW rules (log-only until promoted), evaluated by
 a shell walker that follows `cd`, expands variables, reads heredocs, and
 simulates subshells before matching. It sees through the GuardFall obfuscation
 classes: `$IFS` splitting, ANSI-C quoting, quote reassembly (`r''m -rf`),
@@ -52,14 +52,19 @@ expansion, fork bombs.
 | OP-000 | edits to the gate itself, hook registrations, agent settings files |
 | OP-001 | delete/move of a workspace root (or a parent of one) |
 | OP-002 | wiping the Vestige store |
-| OP-003 | blind recursive deletes, sweeps from `/` |
-| OP-004 | force-push to shared branches, remote-main deletion, `.git` removal |
-| OP-005 | unreviewed publishes (npm/cargo/twine/docker/gh release) |
-| OP-006 | paid deploys and live-billing actions |
-| OP-007 | destructive SQL (DROP/TRUNCATE/unscoped DELETE) |
+| OP-003 | recursive deletes outside the project and outside scratch/build folders, sweeps from `/` |
+| OP-004 | force-push to shared branches, remote-main deletion, deleting `.git` or a whole repository |
+| OP-005 | unreviewed publishes (npm/pnpm/yarn/cargo/twine/docker push/gh release), deleting a public repo |
+| OP-006 | production deploys, infrastructure apply and teardown, live billing |
+| OP-007 | destructive SQL (DROP/TRUNCATE/unscoped DELETE), framework database resets |
 | OP-008 | shell-init writes (`>> ~/.zshrc` = code execution by install) |
 | OP-009 | reverse shells (`/dev/tcp`, `nc -e`, DNS tunnels) |
 | OP-010 | cloud metadata endpoints (169.254.169.254 et al.) |
+
+| OP-011 | discarding uncommitted git work, shredding or emptying files outside the project, `crontab -r` |
+| OP-014 | raw-disk writes, formatting or erasing a volume, fork bombs, recursive `chmod`/`chown` on `/` or home |
+| OP-018 | a download piped or handed straight to a shell or interpreter (`curl X \| sh`, `bash <(curl X)`) |
+| OP-CANARY | the verification canary string |
 
 SHADOW rules log work-loss git patterns, outbound comms, public mutations,
 secret-shaped writes, pipe-to-interpreter, persistence (cron/launchd),
@@ -87,17 +92,17 @@ Then one manual step the installer cannot do for you: in the Cline VS Code
 extension, open **Settings → Features** and enable **Hooks**, and start a new
 task. That's it — 2 commands + 1 toggle.
 
-Install order is safe by construction: shadow mode first, nothing blocks until
-you flip it.
+The gate is in place before the hook is: install.sh puts the gate down first,
+then the hook, so the hook never runs without a gate behind it.
 
-## Shadow → enforce
+## Enforce and shadow
 
-The gate starts in **shadow** mode: it classifies and receipts every call but
-blocks nothing. Watch the verdict stream, and when it looks right:
+The gate starts in **enforce** mode: it stops what a STOP rule matches and
+receipts every call. An existing `~/.operator/mode` file is kept.
 
 ```sh
-echo enforce > ~/.operator/mode     # flip to blocking
-echo shadow  > ~/.operator/mode     # back to log-only
+echo shadow  > ~/.operator/mode     # log-only: nothing is blocked
+echo enforce > ~/.operator/mode     # blocking again
 ```
 
 The canary proves wiring end-to-end: with hooks enabled, ask Cline to run
@@ -110,7 +115,7 @@ The canary proves wiring end-to-end: with hooks enabled, ask Cline to run
 |---|---|
 | `PreToolUse` | the hook script (node builtins only); reads Cline's stdin payload, normalizes Cline tool names, runs the gate, translates exit 2 into `cancel: true` |
 | `operator-gate.plugin.mjs` | the same gate as an SDK/CLI plugin (`cline plugin install <file>`) using `beforeTool` → `{skip: true, reason}`; for headless Cline users |
-| `install.sh` | gate download (never overwrites), shadow mode, hook install (backs up existing), optional CLI plugin install |
+| `install.sh` | gate install from the checkout, else a download (never overwrites), enforce mode when no mode file exists, hook install (backs up existing), optional CLI plugin install |
 | `test.sh` | gate-contract test with Cline-shaped payloads; prints exit codes and the cancel verdicts |
 
 Cline tool names are normalized adapter-side, so the gate file stays untouched:
@@ -147,7 +152,9 @@ questions) are allowed without spawning Python.
 ## Gate home
 
 Everything lives under `~/.operator/`: `gate/operator-gate.py`, `mode`,
-`receipts/`, `permits/`. One gate, shared across hosts (Claude Code, ZCode,
-Codex, OpenClaw, Cline) — one receipt chain, one set of owner rules
-(`~/.operator/commitments.json` may only *add* constraints, never loosen the
-built-ins).
+`receipts/`, `permits/`. One gate, shared across hosts (Claude Code, OpenClaw,
+Cline and every other port) — one receipt chain, one set of owner rules in
+`~/.operator/commitments.json`: `protected_roots` and `protected_files` add
+paths, `mode_overrides` sets a rule to `enforce` or `shadow`, and
+`disabled_rules` turns a rule off. Only the owner edits that file; OP-000
+stops an agent from writing anything under `~/.operator/`.

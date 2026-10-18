@@ -87,7 +87,7 @@ cat "$LOGS/install.log"
 [ -x "$GATE" ] && ok "gate is executable" || bad "gate not executable"
 [ -f "$MIDDLEWARE" ] && ok "middleware installed to ~/.operator/ports/langchain/" || bad "middleware missing"
 cmp -s "$PORT_DIR/operator_middleware.py" "$MIDDLEWARE" && ok "installed middleware is byte-identical to the port" || bad "installed middleware diverges from the port"
-[ "$(cat "$TEST_HOME/.operator/mode" 2>/dev/null)" = "shadow" ] && ok "mode file = shadow" || bad "mode file not shadow"
+[ "$(cat "$TEST_HOME/.operator/mode" 2>/dev/null)" = "enforce" ] && ok "mode file = enforce (the installer default)" || bad "mode file not enforce: a fresh install must block"
 grep -q "operator_middleware" "$LOGS/install.log" && ok "usage snippet printed" || bad "no usage snippet"
 
 # module must import with NO langchain present (stdlib-only adapter)
@@ -106,7 +106,8 @@ assert mod.decide and mod.gate_verdict and mod.DESTRUCTIVE_LIKE
   || bad "middleware import failed"
 
 # ---- 2. shadow mode (default): analyzed + receipted, nothing blocked ---------- #
-section "shadow mode (default)"
+section "shadow mode (the owner's choice)"
+echo shadow > "$TEST_HOME/.operator/mode"
 
 decide_call shell '{"command":"rm -rf ~/demo-factory/canary"}' "$TEST_PROJ" sess-rm allow \
   && ok "rm -rf in shadow -> gate allowed it (logged, not blocked)" \

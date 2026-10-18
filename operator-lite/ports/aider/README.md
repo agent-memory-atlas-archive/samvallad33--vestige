@@ -52,25 +52,35 @@ the `PATH` for that one invocation — a mechanism Aider cannot not use.
 ## What it stops
 
 The shims route the covered binaries through the gate's closed rule set —
-the same **11 STOP rules** every host gets:
+the same **15 STOP rules** every host gets, for every command that reaches a
+shim:
 
 | Rule | Stops |
 |---|---|
 | OP-000 | editing the gate, its rules, permits, mode or hook registrations |
 | OP-001 | deleting/moving a registered workspace root (or a parent of one) |
 | OP-002 | wiping or rewriting the Vestige store |
-| OP-003 | blind recursive deletes outside scratch/build dirs |
-| OP-004 | force-pushing over a shared branch; deleting `.git` |
+| OP-003 | recursive deletes outside the project and outside scratch/build dirs |
+| OP-004 | force-pushing over a shared branch; deleting `.git` or a whole repository |
 | OP-005 | unreviewed publishes/releases (`npm publish`, `gh release create`, repo delete) |
-| OP-006 | paid/billing-plane deploys (fly, vercel, wrangler, supabase, stripe live) |
-| OP-007 | destructive SQL (`DROP`/`TRUNCATE`/unscoped `DELETE`) |
+| OP-006 | production deploys and infrastructure teardown (fly, vercel, wrangler, railway, netlify, supabase, stripe live, terraform, pulumi, cdk, kubectl, helm, aws/gcloud/az delete) |
+| OP-007 | destructive SQL (`DROP`/`TRUNCATE`/unscoped `DELETE`), framework database resets (`npx prisma migrate reset`, `rails db:drop`, `dropdb`) |
 | OP-008 | writing shell rc/init files (code execution by install) |
 | OP-009 | reverse shells and DNS tunnels (`/dev/tcp`, `nc -e`) |
 | OP-010 | cloud metadata credential endpoints (169.254.169.254 et al.) |
 
-plus the shadow-only log-first rules OP-S01..S17 (work loss, outbound comms,
-exfil shapes, persistence writes, env hijacks, ...). Shadow vs enforce is the
-gate's own `~/.operator/mode`, shared with every other port.
+| OP-011 | discarding uncommitted git work, `shred`/`srm`, emptying a file outside the project with `truncate`, `crontab -r` |
+| OP-014 | `dd` onto a device, `mkfs`/`fdisk`-class tools, `diskutil erase*`, recursive `chmod`/`chown`/`chgrp` on `/` or home |
+| OP-CANARY | the verification canary string |
+
+OP-018 (a download piped into a shell) does not reach this port: a shim sees
+one binary's arguments, never the pipe around it, so `curl X | sh` arrives as
+a plain `curl X`. The same goes for `> file` redirections, which no binary
+performs. Hosts with a hook (every other port) see the whole command.
+
+Plus the shadow-only log-first rules OP-S01..S08 and OP-S11..S17 (work loss,
+outbound comms, exfil shapes, persistence writes, env hijacks, ...). Enforce
+vs shadow is the gate's own `~/.operator/mode`, shared with every other port.
 
 ## Install (3 commands)
 
@@ -84,26 +94,27 @@ PATH="$HOME/.operator/shim/bin:$PATH" aider
 (downloading from GitHub only if the existing copy is older — never overwrites
 a newer gate), installs the shim dispatcher, generates the shims with absolute
 real-binary paths baked in (binaries missing on your machine are skipped and
-listed), defaults to shadow mode, smoke-tests one shimmed call, and prints the
-exact `PATH=` line and alias for your setup.
+listed), defaults to enforce mode when no mode file exists, smoke-tests one
+shimmed call, and prints the exact `PATH=` line and alias for your setup.
 
 The shim set covers what the gate's rules can judge through a binary:
-`ls rm rmdir unlink mv cp ln install rsync scp dd truncate chmod chown chflags
-xattr mkfifo tee sed find git gh npm pnpm yarn cargo docker fly flyctl stripe
-vercel supabase psql duckdb mongosh redis-cli sqlite3 curl wget nc base64
-mkfs crontab at launchctl tmux screen ...` — the authoritative list is the
+`ls rm shred mv cp dd truncate chmod chown chgrp tee sed find git gh npm npx
+cargo docker fly vercel railway netlify terraform pulumi kubectl helm aws
+gcloud psql sqlite3 dropdb rails curl wget nc mkfs fdisk diskutil crontab
+launchctl tmux ...` — the authoritative list is the
 `SHIM_BINS` variable in `install.sh`; edit it and re-run the installer to
 regenerate. Re-run `install.sh` any time to pick up new binaries (idempotent).
 
-## Shadow → enforce
+## Enforce and shadow
 
-Install starts in **shadow** (log-only): every shimmed command is judged and
-receipted, nothing blocks. Watch the log, then flip:
+Install starts in **enforce**: every shimmed command is judged and receipted,
+and what a STOP rule matches is blocked. An existing mode file is kept.
 
 ```sh
 python3 ~/.operator/gate/operator-gate.py status     # rules + mode
 python3 ~/.operator/gate/operator-gate.py verify     # receipt chain
-echo enforce > ~/.operator/mode                      # flip to blocking
+echo shadow > ~/.operator/mode                       # record without blocking
+echo enforce > ~/.operator/mode                      # block again
 ```
 
 Blocked actions print `Operator Lite blocked:` plus the gate's reason and the

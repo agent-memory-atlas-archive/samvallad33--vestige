@@ -3,7 +3,7 @@
 #
 # Owner-side script: installs the gate to ~/.operator/gate/, copies the plugin
 # into OpenCode's plugin directory (global by default, --project for project
-# scope), sets shadow mode if unset, and prints next steps.
+# scope), sets enforce mode if unset, and prints next steps.
 #
 # POSIX sh. No arguments required. `--project` installs into ./.opencode/plugin/
 # of the current directory instead of the global config.
@@ -76,8 +76,8 @@ fi
 # ------------------------------------------------------------ mode file ------
 mkdir -p "$OP_HOME"
 if [ ! -f "$OP_HOME/mode" ]; then
-  echo shadow > "$OP_HOME/mode"
-  echo "mode:  shadow (log-only) written to $OP_HOME/mode"
+  echo enforce > "$OP_HOME/mode"
+  echo "mode:  enforce (blocking) written to $OP_HOME/mode"
 else
   echo "mode:  existing $(cat "$OP_HOME/mode") left untouched ($OP_HOME/mode)"
 fi
@@ -96,7 +96,7 @@ Next steps:
        cd $(dirname -- "$0") && sh test.sh
      or end-to-end inside OpenCode: ask it to run
        echo OPERATOR_CANARY_STOP_7f3a
-     Shadow mode logs the STOP to ~/.operator/receipts/ without blocking.
-  3. When the log looks right, flip to enforce:
-       echo enforce > $OP_HOME/mode
+     The gate stops it and writes a receipt to ~/.operator/receipts/.
+  3. To record without blocking instead:
+       echo shadow > $OP_HOME/mode
 EOF

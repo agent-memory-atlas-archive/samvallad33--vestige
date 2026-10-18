@@ -105,7 +105,7 @@ cat "$LOGS/install.log"
 [ -f "$TEST_HOME/.operator/gate/operator-gate.py" ] && ok "gate installed" || bad "gate missing"
 [ -x "$TEST_HOME/.operator/gate/operator-gate.py" ] && ok "gate is executable" || bad "gate not executable"
 [ -f "$TEST_HOME/.operator/gate/windsurf-wrapper.py" ] && ok "adapter installed next to the gate" || bad "adapter missing"
-[ "$(cat "$TEST_HOME/.operator/mode" 2>/dev/null)" = "shadow" ] && ok "mode file = shadow" || bad "mode file not shadow"
+[ "$(cat "$TEST_HOME/.operator/mode" 2>/dev/null)" = "enforce" ] && ok "mode file = enforce (the installer default)" || bad "mode file not enforce: a fresh install must block"
 
 python3 - "$HOOKS_JSON" <<'PYEOF' && ok "hooks.json valid + wired: 3 pre-events, flat schema (command only, no matcher/timeout), \$HOME form" || bad "hooks.json wrong"
 import json, sys
@@ -123,7 +123,8 @@ for ev, lst in h.items():
 PYEOF
 
 # ---- 2. shadow mode: receipts written, nothing blocked ------------------------ #
-section "shadow mode (default)"
+section "shadow mode (the owner's choice)"
+echo shadow > "$TEST_HOME/.operator/mode"
 HOOK_CMD=$(hook_cmd_of "$HOOKS_JSON")
 
 rc=$(run_cmd "$HOOK_CMD" '{"command_line":"ls -la","cwd":"'"$TEST_PROJ"'"}' traj-ls s-ls; echo $?)

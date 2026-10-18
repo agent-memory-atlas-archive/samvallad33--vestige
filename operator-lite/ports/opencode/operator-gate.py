@@ -38,7 +38,7 @@ try:
 except ImportError:                                  # Windows: receipts lock through msvcrt instead
     fcntl = None
 
-VERSION = "0.3.7"
+VERSION = "0.3.9"
 EDITION = "lite"                 # the paid gate is "operator"; install never replaces a gate that outranks this one
 INTEGRITY = "reference_digest_not_signature"
 IS_WINDOWS = os.name == "nt"
@@ -185,15 +185,21 @@ RULES = {
     "OP-005": ("no-unreviewed-publish", "STOP",
                "Publishing a release/package or deleting a public repo needs the owner's review."),
     "OP-006": ("no-paid-deploy", "STOP",
-               "Production deploys, live database changes and live billing actions need the owner's approval."),
+               "Production deploys, infrastructure teardown, live database changes and live billing actions need the owner's approval."),
     "OP-007": ("no-destructive-sql", "STOP",
-               "DROP/TRUNCATE/unscoped DELETE against a database needs the owner's approval."),
+               "DROP/TRUNCATE/unscoped DELETE or a framework database reset needs the owner's approval."),
     "OP-008": ("no-shell-init-write", "STOP",
                "Writing shell rc/init files plants commands that fire later; that is code execution by install."),
     "OP-009": ("no-reverse-shell", "STOP",
                "/dev/tcp, /dev/udp, nc -e and DNS-tunneling tools are raw outbound command channels, not tooling."),
     "OP-010": ("no-cloud-metadata", "STOP",
                "Cloud metadata endpoints hand out instance credentials; an agent has no legitimate reason to query them."),
+    "OP-011": ("no-unrestorable-loss", "STOP",
+               "Discarding uncommitted git work, shredding or emptying files outside the project, or wiping the crontab cannot be undone."),
+    "OP-014": ("no-machine-wreck", "STOP",
+               "Writing a raw disk, formatting or erasing a volume, a fork bomb, or changing permissions or owners recursively on / or home wrecks the machine."),
+    "OP-018": ("no-blind-fetch-run", "STOP",
+               "Piping a download straight into a shell or interpreter, or running it through <(...) or $(...), runs code nobody has read."),
     "OP-CANARY": ("canary", "STOP",
                   "Verification canary: this string exists only to prove the gate is wired."),
     # shadow-only candidates: recorded, never blocking, promote after reviewing the log
@@ -450,7 +456,24 @@ MEMORY_FILE_RE = re.compile(r"vestige\.db|\.wal$|\.shm$|\.sqlite3?$", re.I)
 # its receipts and identify its actor, the store marker, and the backups. Exports and logs stay writable.
 STRATA_CRITICAL_RE = re.compile(r"^(?:log|backups)(?:/.*)?$|^(?:actor\.key|receipt-signing\.key|store\.meta)$")
 KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "{", "(", "!", "}", ")", "done", "fi", "esac"}
-LOOP_HEADS = {"for", "case", "select", "function"}
+LOOP_HEADS = {"for", "case", "select"}
+FUNC_HEAD_RE = re.compile(r"^[^\s(){}|&;<>=$`]+\(\)\{?$")
+
+
+def strip_function_head(toks):
+    """`name() { body` and `function name { body`: the body's first command is the program."""
+    if toks and toks[0] == "function":
+        toks = toks[2:]
+        if toks and toks[0] in ("()", "(){"):
+            toks = toks[1:]
+    elif toks and FUNC_HEAD_RE.match(toks[0]):
+        toks = toks[1:]
+    elif len(toks) > 1 and toks[1] in ("()", "(){") and re.match(r"^[^\s(){}|&;<>=$`]+$", toks[0]):
+        toks = toks[2:]
+    return toks
+TRUNCATE_RE = re.compile(r"^\s*(?:(?::|true|cat\s+/dev/null|echo\s+-n(?:\s+(?:''|\"\"))?)?\s*>\|?\s*(?P<a>[^\s;&|<>]+)\s*$"
+                         r"|^\s*truncate\s+(?:-s\s*0|--size[= ]0)\s+(?P<b>[^\s;&|<>]+)\s*$"
+                         r"|^\s*cp\s+/dev/null\s+(?P<c>[^\s;&|<>]+)\s*$)")
 HEREDOC_RE = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 SUBST_RE = re.compile(r"\$\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|`[^`]*`")
 INTERPRETERS = ("python", "python3", "node", "perl", "ruby", "deno", "bun", "php", "osascript", "lua")
@@ -639,8 +662,12 @@ def write_targets(prog, rest, flags, args, seg, cwd):
     return [resolve(w, cwd) for w in out if w]
 
 
-FORK_BOMB_RE = re.compile(r":\s*\(\s*\)\s*\{[^}]*\|[^}]*&?\s*\}\s*;?\s*:"
-                          r"|\(\s*\)\s*\{\s*.*\|\s*&?\s*.*\}\s*;\s*.*&")
+# A fork bomb is a function that pipes into itself in the background, then is called:
+# `:(){ :|:& };:`, `bomb() { bomb | bomb & }; bomb`, `function f { f|f& }; f`.
+FORK_NAME = r"[^\s(){}|&;<>]+"
+FORK_BOMB_RE = re.compile(
+    r"(?:^|[\s;&|(])(?:function\s+)?(" + FORK_NAME + r")\s*\(\s*\)\s*\{\s*\1\s*\|&?\s*\1\s*&\s*;?\s*\}\s*;?\s*\1(?=$|[\s;&|)])"
+    r"|(?:^|[\s;&|(])function\s+(" + FORK_NAME + r")\s*\{\s*\2\s*\|&?\s*\2\s*&\s*;?\s*\}\s*;?\s*\2(?=$|[\s;&|)])")
 PIPE_SINK_RE = re.compile(
     r"\|\s*(?:(?:sudo|env|command|nohup|timeout)\s+)*"
     r"(bash|sh|zsh|dash|ksh|fish|python3?|node|perl|ruby|osascript)\b")
@@ -854,6 +881,23 @@ def script_body_effects(path, ecwd, depth, vars_, mode="auto", prog=None, seg=""
     return effs
 
 
+# A pipe sink given one of these flags takes its program from the argument, so stdin is data:
+# `| python3 -m json.tool`, `| node -e '...'`, `| perl -ne '...'`. Shells: any short flag with c.
+CODE_ARG_FLAGS = {"python": r"-[A-Za-z]*[cm]", "python3": r"-[A-Za-z]*[cm]",
+                  "node": r"-[A-Za-z]*[epc]\b|--(?:eval|print|check)\b", "perl": r"-[A-Za-z]*[eE]",
+                  "ruby": r"-[A-Za-z]*[ec]", "osascript": r"-[A-Za-z]*e"}
+FETCH_PROG = r"(?:sudo\s+(?:-\S+\s+)*)?(?:curl|wget|aria2c|fetch|https?|iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b"
+RUN_HEAD = r"(?:^|[\s;&|(])(?:sudo\s+(?:-\S+\s+)*)?(?:[\w./~-]*/)?"
+# `bash <(curl X)`, `source <(curl X)`: read on the quote-masked command, where a quoted `<(` is text
+PROC_SUBST_RUN_RE = re.compile(RUN_HEAD + r"(bash|sh|zsh|dash|ksh|fish|python[23]?|node|perl|ruby|source|\.)"
+                               r"\s+(?:-\S+\s+)*<\(\s*" + FETCH_PROG)
+# `sh -c "$(curl X)"`, `eval "$(wget -qO- X)"`, `python3 -c "$(curl X)"`: the head is read on the masked
+# command, then the substitution that follows it on the real one (it expands inside double quotes)
+CODE_SUBST_HEAD_RE = re.compile(RUN_HEAD + r"(?:(bash|sh|zsh|dash|ksh|fish)\s+(?:-\S+\s+)*?-\w*c\w*"
+                                r"|(python[23]?|perl|ruby|node|osascript)\s+(?:-\S+\s+)*?-[A-Za-z]*[ce]|(eval))\s+\"?")
+FETCH_SUBST_RE = re.compile(r"(?:\$\(|`)\s*" + FETCH_PROG)
+
+
 def analyze(cmd, cwd, depth=0, vars_=None):
     """Walk a shell command tracking cd and simple VAR=value, yielding effects (never executes anything)."""
     effects = []
@@ -879,30 +923,54 @@ def analyze(cmd, cwd, depth=0, vars_=None):
     for inner in SUBST_RE.findall(cmd):
         effects += analyze(inner[2:-1] if inner.startswith("$(") else inner[1:-1], state["cwd"], depth + 1, vars_)
     # pipe-to-interpreter: only when the interpreter reads its PROGRAM from the pipe
-    # (`curl X | sh`). `curl X | python3 -c 'code'` pipes data, not code -- benign.
-    for m in PIPE_SINK_RE.finditer(cmd):
+    # (`curl X | sh`). `curl X | python3 -c 'code'` pipes data, not code -- benign. A pipe inside
+    # quotes is text (a commit message, a README line), so the scan reads the quote-masked command.
+    masked = mask_quotes(cmd)
+    for m in PIPE_SINK_RE.finditer(masked):
         tail = cmd[m.end():cmd.find("\n", m.end()) if "\n" in cmd[m.end():] else len(cmd)]
         tail = re.split(r"[|;&]", tail)[0]
-        code_from_stdin = not re.search(r"\s-\w*c\w*\b|/dev/fd|<[)\w]", tail) and \
+        code_flag = CODE_ARG_FLAGS.get(m.group(1), r"-\w*c\w*\b")
+        code_from_stdin = not re.search(r"\s(?:%s)|/dev/fd|<[)\w]" % code_flag, tail) and \
             not re.search(r"^\s+[\w./~$]", tail)
         if code_from_stdin:
+            line_start = cmd.rfind("\n", 0, m.start()) + 1
             effects.append({"prog": m.group(1), "seg": m.group(0), "targets": [], "recursive": False,
                             "kind": "pipe-exec", "filtered": False, "unresolved": False, "flags": [],
-                            "args": [], "cwd": state["cwd"] or UNKNOWN_CWD, "writes": [], "text": m.group(0)})
+                            "args": [], "cwd": state["cwd"] or UNKNOWN_CWD, "writes": [],
+                            "text": cmd[line_start:m.end()]})
+    # a download run as the program with no pipe: `bash <(curl X)`, `sh -c "$(curl X)"`, `eval "$(wget -qO- X)"`
+    runs = [(m.group(1), m.start(), m.end()) for m in PROC_SUBST_RUN_RE.finditer(masked)]
+    runs += [(m.group(1) or m.group(2) or m.group(3), m.start(), m.end()) for m in CODE_SUBST_HEAD_RE.finditer(masked)
+             if FETCH_SUBST_RE.match(cmd, m.end())]
+    for prog, s, end in runs:
+        line_end = cmd.find("\n", end)
+        effects.append({"prog": prog, "seg": cmd[s:end].strip(), "targets": [], "recursive": False,
+                        "kind": "pipe-exec", "how": "run", "filtered": False, "unresolved": False, "flags": [],
+                        "args": [], "cwd": state["cwd"] or UNKNOWN_CWD, "writes": [],
+                        "text": cmd[cmd.rfind("\n", 0, s) + 1:line_end if line_end >= 0 else len(cmd)]})
     for decoded in decode_b64_text(cmd):
         effects += analyze(decoded, state["cwd"], depth + 1, vars_)
-    if FORK_BOMB_RE.search(cmd):
-        effects.append({"prog": ":()", "seg": cmd[:200], "targets": ["/"], "recursive": True, "kind": "delete",
+    if FORK_BOMB_RE.search(masked):                        # quoted, it is text; `sh -c '...'` is walked as its own command
+        effects.append({"prog": ":()", "seg": cmd[:200], "targets": [], "recursive": False, "kind": "fork-bomb",
                         "filtered": False, "unresolved": False, "flags": [], "args": [], "cwd": UNKNOWN_CWD,
                         "writes": [], "text": cmd[:200]})
     cmd = SUBST_RE.sub("__SUBST__", cmd)
+    for seg in split_segments(cmd):                     # `: > f`, `> f`, `truncate -s 0 f`, `cp /dev/null f`
+        m = TRUNCATE_RE.match(seg)
+        if m:
+            t = resolve(expand_vars(m.group("a") or m.group("b") or m.group("c"), vars_), state["cwd"])
+            effects.append({"prog": "truncate", "seg": seg, "targets": [t], "recursive": False, "kind": "truncate",
+                            "filtered": False, "unresolved": False, "flags": [], "args": [], "cwd": state["cwd"] or UNKNOWN_CWD,
+                            "writes": [], "text": seg})
     hd, cursor, feeder = 0, 0, None
     for seg in split_segments(cmd):
         nh = len(HEREDOC_RE.findall(seg))
         my_bodies, hd = bodies[hd:hd + nh], hd + nh
         toks = tokenize(expand_vars(seg, vars_))
-        while toks and toks[0] in KEYWORDS:
-            toks = toks[1:]
+        for _ in range(3):                                  # `if f() { rm ...`: keywords and function heads
+            while toks and toks[0] in KEYWORDS:
+                toks = toks[1:]
+            toks = strip_function_head(toks)
         if not toks or toks[0] in LOOP_HEADS:
             continue
         j = 0
@@ -995,6 +1063,10 @@ def analyze(cmd, cwd, depth=0, vars_=None):
             eff["kind"] = "delete"
             eff["recursive"] = has_flag(flags, "r") or has_flag(flags, "R") or "--recursive" in flags
             eff["targets"] = [t for t in resolve_targets([a for a in args if not (prog == "gio" and a == "trash")], ecwd)]
+            if prog in ("trash", "rip", "gio") and any(os.path.isdir(t) for t in eff["targets"]):
+                eff["recursive"] = True                     # sending a folder to the trash takes everything in it
+            if prog in ("shred", "srm") or prog == "rm" and "-P" in flags:
+                eff["unrecoverable"] = True
         elif prog in ("mv", "rename"):
             tv = [i for i, t in enumerate(rest) if t in ("-t", "--target-directory")]
             srcs = [a for a in args if a != rest[tv[0] + 1]] if tv else list(args)[:-1]
@@ -1329,6 +1401,96 @@ def write_hits(w, gate_files, verb="write to"):
     return hits
 
 
+NET_FETCH_RE = re.compile(r"\b(?:curl|wget|fetch|aria2c|http|https|iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b|https?://")
+REVSHELL_CODE_RE = re.compile(r"\bsocket\b|\bnet\.(?:Socket|connect|createConnection)\b|IO::Socket|TCPSocket")
+DB_RESET_PROGS = {"npx", "pnpm", "pnpx", "yarn", "bunx", "bun", "prisma", "rails", "rake", "bin/rails", "python",
+                  "python3", "php", "sequelize", "knex", "drizzle-kit", "dropdb", "mongosh", "mongo", "bundle"}
+DB_RESET_RE = re.compile(
+    r"\bprisma\s+(?:migrate\s+reset|db\s+push\b[^\n;|&]*--force-reset)|\b(?:rails|rake)\s+db:(?:drop|reset|purge|schema:load)\b"
+    r"|\bmanage\.py\s+(?:flush|reset_db)\b|\bartisan\s+(?:migrate:fresh|migrate:reset|db:wipe)\b"
+    r"|\bsequelize(?:-cli)?\s+db:drop\b|\bknex\s+migrate:rollback\b[^\n;|&]*--all|\bdrizzle-kit\s+drop\b"
+    r"|^dropdb\b|\bdropDatabase\s*\(")
+SYSTEM_DIRS = ("/", "/usr", "/etc", "/bin", "/sbin", "/System", "/Library", "/var", "/opt", "/private", "/Applications",
+               "/Users", "/home", "/root", "/boot", "/lib", "/lib64")
+
+
+def teardown_or_deploy(prog, args, flags):
+    """Production deploys and infrastructure teardown, one command at a time."""
+    a0, a = (args[:1] or [""])[0], args[:4]
+    return (prog == "railway" and a0 in ("up", "deploy", "down", "delete")
+            or prog == "netlify" and a0 == "deploy" and "--prod" in flags
+            or prog in ("terraform", "tofu", "terragrunt") and a0 in ("apply", "destroy")
+            or prog == "pulumi" and a0 in ("up", "update", "destroy")
+            or prog in ("cdk", "serverless", "sls") and a0 in ("deploy", "destroy", "remove")
+            or prog == "kubectl" and a0 in ("delete", "drain", "replace")
+            or prog == "helm" and a0 in ("uninstall", "delete")
+            or prog == "eksctl" and a0 == "delete"
+            or prog == "heroku" and bool(re.match(r"^(?:apps|pg):(?:destroy|reset)$", a0))
+            or prog == "aws" and (args[:2] == ["s3", "rb"] or args[:2] == ["s3", "rm"] and "--recursive" in flags
+                                  or any(re.match(r"^(?:delete|terminate|remove)-", x) for x in args[1:2]))
+            or prog in ("gcloud", "az", "doctl") and "delete" in a)
+
+
+def machine_wreck(prog, args, flags, ecwd):
+    """Raw disk writes, formats, volume erases and recursive permission or owner changes on system or home folders."""
+    if prog == "dd" and any(x.startswith("of=/dev/") for x in args):
+        return "dd writes the raw device %s" % [x for x in args if x.startswith("of=/dev/")][0][3:]
+    if re.match(r"^(?:mkfs(?:\..+)?|newfs(?:_\w+)?|wipefs|sfdisk|fdisk|gdisk|sgdisk|parted|mkswap)$", prog) \
+            and any(x.startswith("/dev/") for x in args):
+        return "%s rewrites the disk %s" % (prog, [x for x in args if x.startswith("/dev/")][0])
+    if prog == "diskutil" and args and (re.match(r"^(?:erase\w*|zeroDisk|randomDisk|secureErase|partitionDisk|reformat)$", args[0])
+                                        or args[0] == "apfs" and args[1:2] and args[1].startswith("delete")):
+        return "diskutil %s erases a volume" % args[0]
+    if prog in ("chmod", "chown", "chgrp") and (has_flag(flags, "R") or "--recursive" in flags):
+        for x in args[1:]:
+            t = resolve(x, ecwd)
+            if t in SYSTEM_DIRS or same_path(t, HOME):
+                return "%s -R on %s" % (prog, t)
+    return None
+
+
+def git_work_loss(sub, ga, where):
+    """What a git reset/clean/checkout/restore/stash would destroy that git cannot bring back, or None."""
+    def git(*a):
+        # read-only queries; fsmonitor off, so the repository's config cannot make the gate run a program
+        r = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", where or "."] + list(a),
+                           capture_output=True, text=True, timeout=2)
+        return r.returncode, r.stdout
+    try:
+        if sub == "reset" and "--hard" in ga:
+            rc, out = git("status", "--porcelain", "--untracked-files=no")
+            if rc != 0:
+                return None
+            if out.strip():
+                return "git reset --hard discards uncommitted changes to %s" % out.splitlines()[0][3:].strip()
+            target = [x for x in ga if not x.startswith("-")]
+            if target:
+                rc, n = git("rev-list", "--count", "%s..HEAD" % target[0])
+                if rc == 0 and n.strip().isdigit() and int(n) > 0:
+                    return "git reset --hard %s drops %s commit(s) from this branch" % (target[0], n.strip())
+        if sub == "clean" and any(re.match(r"^-[a-zA-Z]*f", x) or x == "--force" for x in ga):
+            dry = ["-n"] + [re.sub("f", "", x) for x in ga if x.startswith("-") and x != "--force" and re.sub("f", "", x) != "-"]
+            rc, out = git("clean", *(dry + [x for x in ga if not x.startswith("-")]))
+            gone = [l[len("Would remove "):] for l in out.splitlines() if l.startswith("Would remove ")]
+            kept = [g for g in gone if g.rstrip("/").split("/")[-1] not in BUILD_DIRS]
+            if rc == 0 and kept:
+                return "git clean deletes untracked files such as %s" % kept[0]
+        if sub in ("checkout", "restore") and ("--" in ga or ga[-1:] == ["."]) or sub == "restore" and ga \
+                and not ("--staged" in ga and "--worktree" not in ga):
+            paths = ga[ga.index("--") + 1:] if "--" in ga else [x for x in ga if not x.startswith("-")]
+            if paths:
+                rc, out = git("status", "--porcelain", "--untracked-files=no", "--", *paths)
+                if rc == 0 and out.strip():
+                    return "git %s discards uncommitted changes to %s" % (sub, out.splitlines()[0][3:].strip())
+        if sub == "stash" and ga[:1] in (["drop"], ["clear"]):
+            rc, out = git("stash", "list")
+            if rc == 0 and out.strip():
+                return "git stash %s deletes saved work" % ga[0]
+    except Exception:
+        return None
+    return None
+
+
 def classify_effect(e, cfg, cwd):
     """Yield (rule_id, reason_detail, rewrite_hint) for one effect."""
     hits = []
@@ -1340,9 +1502,22 @@ def classify_effect(e, cfg, cwd):
     for w in e.get("writes", []):
         hits += write_hits(w, gate_files)
 
+    if kind == "fork-bomb":
+        hits.append(("OP-014", "a fork bomb: it copies itself until the machine hangs",
+                     "Nothing an agent builds needs this; ask the owner."))
     if kind == "pipe-exec":
-        hits.append(("OP-S06", "code piped straight into %s" % e.get("prog"),
-                     "Download to a file, read it, then run it deliberately; the owner reviews the script."))
+        if NET_FETCH_RE.search(text):
+            hits.append(("OP-018", "a download %s %s" % ("run straight by" if e.get("how") == "run" else
+                                                        "piped straight into", e.get("prog")),
+                         "Download to a file, read it, then run it deliberately; the owner reviews the script."))
+        else:
+            hits.append(("OP-S06", "code piped straight into %s" % e.get("prog"),
+                         "Download to a file, read it, then run it deliberately; the owner reviews the script."))
+    if kind == "truncate":
+        for t in e["targets"]:
+            if os.path.isfile(t) and os.path.getsize(t) > 0 and not is_scratch(t) and not (ecwd and is_inside(t, ecwd)):
+                hits.append(("OP-011", "empties %s, which is outside the project" % t,
+                             "Copy it to a dated backup first, or ask the owner."))
 
     if kind == "invisible-chars":
         hits.append(("OP-S12", "zero-width/Bidi control characters in the command",
@@ -1357,9 +1532,27 @@ def classify_effect(e, cfg, cwd):
             DNS_TUNNEL_RE.search(text0):
         hits.append(("OP-009", "raw outbound shell/DNS channel",
                      "No agent task needs a reverse shell or DNS tunnel; ask the owner if connectivity is genuinely required."))
+    if REVSHELL_CODE_RE.search(text0) and re.search(r"\.connect\s*\(|net\.(?:Socket|connect|createConnection)", text0) \
+            and re.search(r"dup2|pty\.spawn|/bin/(?:ba|z)?sh\b|cmd\.exe|child_process|subprocess", text0):
+        hits.append(("OP-009", "code opens a socket and hands it a shell",
+                     "No agent task needs a reverse shell; ask the owner if connectivity is genuinely required."))
     if CLOUD_METADATA_RE.search(text0):
         hits.append(("OP-010", "queries a cloud metadata credential endpoint",
                      "Metadata endpoints mint instance credentials; fetch nothing from 169.254.169.254-class addresses."))
+    # one command, whatever kind of effect the walker gave it: teardown, resets, machine wreck, crontab -r
+    flags0, args0 = e.get("flags", []), e.get("args", [])
+    if "--dry-run" not in flags0 and teardown_or_deploy(prog0, args0, flags0):
+        hits.append(("OP-006", "%s %s" % (prog0, " ".join(args0[:2])),
+                     "Run the plan or a dry run first, then ask the owner for a one-time permit."))
+    if os.path.basename(prog0) in DB_RESET_PROGS and DB_RESET_RE.search(text0):
+        hits.append(("OP-007", "database reset (%s)" % DB_RESET_RE.search(text0).group(0).strip(),
+                     "Reset a throwaway database, or take a backup and ask the owner for a permit."))
+    wreck = machine_wreck(prog0, args0, flags0, ecwd)
+    if wreck:
+        hits.append(("OP-014", wreck, "Nothing an agent builds needs this; ask the owner."))
+    if prog0 == "crontab" and "-r" in flags0:
+        hits.append(("OP-011", "crontab -r deletes every scheduled job",
+                     "Edit the one entry with `crontab -e`, or ask the owner."))
     for w in e.get("writes", []):
         if "/.git/config" in w and GIT_ANCHOR_RE.search(text0):
             hits.append(("OP-S17", "git trust-anchor reconfiguration (%s)" % w,
@@ -1415,6 +1608,10 @@ def classify_effect(e, cfg, cwd):
                 if any(is_inside(t, d) for d in MEMORY_DIRS):
                     hits.append(("OP-002", "filtered delete inside the memory store %s" % t,
                                  "Use `vestige backup` first; erasure is not something an agent decides."))
+                elif not is_scratch(t) and (t == "/" or same_path(t, HOME) or t.count("/") <= 2 or ecwd is None
+                                            or not is_inside(t, ecwd)):
+                    hits.append(("OP-003", "deletes matching files under %s, outside the project" % t,
+                                 "Scope the find to a named folder inside the project, or ask the owner."))
                 elif any(is_same_or_ancestor(t, r) for r in roots):
                     hits.append(("OP-S01", "filtered mass delete inside workspace %s" % t,
                                  "Narrow the filter or delete named files; git protects committed work only."))
@@ -1429,11 +1626,23 @@ def classify_effect(e, cfg, cwd):
                 same_path(ecwd, pj(HOME, d)) for d in ("Developer", "Documents", "Downloads", "Desktop"))
             wide = [t for t in unsafe if t == "/" or same_path(t, HOME) or t.count("/") <= 2]
             outside = [t for t in unsafe if broad or not is_inside(t, ecwd)]
-            if (wide or outside) and not e["unresolved"] and \
+            working = [t for t in unsafe if ecwd and is_same_or_ancestor(t, ecwd)]
+            repos = [t for t in unsafe if os.path.isdir(pj(t, ".git"))]
+            known = e["targets"] and not (e["unresolved"] and e.get("prog") not in ("__SUBST__",) and "$" not in e.get("prog", "")
+                                          and not e.get("prog", "").startswith("__SUBST__"))
+            if (wide or outside or working) and known and \
                     not any(h[0] in ("OP-001", "OP-000", "OP-002") for h in hits):
-                hits.append(("OP-003", "recursive delete of %s" % (wide or outside)[0],
+                hits.append(("OP-003", "recursive delete of %s" % (wide or outside or working)[0],
                              "Move it to a dated folder under /tmp, or delete only build outputs "
                              "(target/, node_modules/, dist/)."))
+            elif repos and not any(h[0] in ("OP-001", "OP-000", "OP-002", "OP-004") for h in hits):
+                hits.append(("OP-004", "delete of the git repository %s" % repos[0],
+                             "Delete named files inside it, or ask the owner."))
+        if kind == "delete" and e.get("unrecoverable"):
+            gone = [t for t in e["targets"] if not is_scratch(t)]
+            if gone:
+                hits.append(("OP-011", "%s destroys %s beyond recovery" % (e.get("prog"), gone[0]),
+                             "Use rm on a copy you no longer need, or ask the owner."))
         if e["unresolved"] and kind in ("delete", "move") and not e["targets"]:
             hits.append(("OP-S05", "delete/move with targets from stdin", ""))
 
@@ -1465,7 +1674,10 @@ def classify_effect(e, cfg, cwd):
             if bad:
                 hits.append(("OP-004", "force push to a shared branch", "Push a new branch and open a PR; "
                              "never rewrite main/master."))
-        if sub == "reset" and "--hard" in ga or sub == "clean" and any(re.match(r"^-[a-z]*f", a) for a in ga) \
+        loss = git_work_loss(sub, ga, e.get("gdir") or ecwd or cwd)
+        if loss:
+            hits.append(("OP-011", loss, "Commit or stash the work first (`git stash`), or ask the owner."))
+        elif sub == "reset" and "--hard" in ga or sub == "clean" and any(re.match(r"^-[a-z]*f", a) for a in ga) \
                 or sub == "branch" and "-D" in ga or sub in ("stash",) and ga[:1] in (["drop"], ["clear"]) \
                 or sub in ("checkout", "restore") and ga[-1:] in (["."], ["--", "."]):
             hits.append(("OP-S01", "git %s %s" % (sub, " ".join(ga[:3])), ""))
@@ -1549,6 +1761,7 @@ INLINE_DELETE_CALL_RE = re.compile(
     r"\brmtree\s*\(|shutil\.move\s*\(|os\.(?:remove|unlink|rmdir|removedirs|rename|replace)\s*\(|\brmSync\s*\(|"
     r"\brimraf\s*\(|\bunlinkSync\s*\(|fs\.(?:rm|unlink|rename)\w*\s*\(|File\.delete\s*\(|FileUtils\.(?:rm|mv)\w*\s*\(|"
     r"\bremove_tree\s*\(|\bunlink\s*\(")
+INLINE_RECURSIVE_RE = re.compile(r"rmtree|rmSync|rimraf|remove_tree|rm_r|rm_rf|rmdirSync|^fs\.rm\b|fs\.promises\.rm|FileUtils\.rm")
 INLINE_MODE_RE = re.compile(r"^(?:mode\s*=\s*)?['\"][wax][+bt]*['\"]$")
 INLINE_LITERAL_RE = re.compile(r"^(?:os\.path\.expanduser\(|Path\(|pathlib\.Path\()?\s*(['\"])(.*?)\1\s*\)?$")
 INLINE_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*((?:os\.path\.expanduser\(|Path\(|pathlib\.Path\()?\s*(['\"]).*?\3\s*\)?)\s*$", re.M)
@@ -1584,8 +1797,27 @@ def _balanced_args(text, open_idx):
     return None                                              # unbalanced: unknown
 
 
+HOME_EXPR_RES = (
+    re.compile(r"^(?:require\(\s*['\"]os['\"]\s*\)|os)\.homedir\(\)\s*\+\s*(['\"])(/[^'\"]*)\1$"),
+    re.compile(r"^(?:process\.env\.HOME|os\.environ\[\s*['\"]HOME['\"]\s*\]|os\.getenv\(\s*['\"]HOME['\"]\s*\))\s*\+\s*(['\"])(/[^'\"]*)\1$"),
+)
+HOME_JOIN_RES = (
+    re.compile(r"^(?:path\.)?(?:join|resolve)\(\s*(?:require\(\s*['\"]os['\"]\s*\)|os)\.homedir\(\)\s*,\s*(['\"])([^'\"]*)\1\s*\)$"),
+    re.compile(r"^os\.path\.join\(\s*os\.path\.expanduser\(\s*(['\"])~\1\s*\)\s*,\s*(['\"])([^'\"]*)\2\s*\)$"),
+    re.compile(r"^(?:pathlib\.)?Path\.home\(\)\s*/\s*(['\"])([^'\"]*)\1$"),
+)
+
+
 def _literal_path(expr, literals):
     expr = (expr or "").strip()
+    for r in HOME_EXPR_RES:
+        m = r.match(expr)
+        if m:
+            return "~" + m.group(2)
+    for r in HOME_JOIN_RES:
+        m = r.match(expr)
+        if m:
+            return "~/" + m.group(m.lastindex).lstrip("/")
     m = INLINE_LITERAL_RE.match(expr)
     if m:
         return m.group(2)
@@ -1594,9 +1826,106 @@ def _literal_path(expr, literals):
     return None
 
 
+TEMPFILE_CALL_RE = re.compile(r"^tempfile\.(?:mkdtemp|mkstemp|TemporaryDirectory|NamedTemporaryFile|gettempdir)\s*\(")
+ANY_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*=(?!=)\s*(.+?)\s*$", re.M)
+
+
+def _temp_expr(expr, temp):
+    """True when expr is a fresh temp folder from tempfile, a name built only from one, or
+    os.path.join / dirname / abspath of one with plain relative literal parts."""
+    e = (expr or "").strip()
+    if TEMPFILE_CALL_RE.match(e) or e in temp:
+        return True
+    m = re.match(r"^os\.path\.(join|dirname|abspath|realpath)\(", e)
+    if not m:
+        return False
+    args = _balanced_args(e, m.end() - 1)
+    if not args or not _temp_expr(args[0], temp):
+        return False
+    for a in args[1:]:
+        lit = re.match(r"^(['\"])([^'\"]*)\1$", a)
+        if m.group(1) != "join" or not lit or lit.group(2).startswith(("/", "~", "\\")) or ".." in lit.group(2):
+            return False
+    return True
+
+
+def _code_of(text):
+    """The program text: the -c/-e argument of an interpreter call, or the text itself (a script body)."""
+    try:
+        toks = shlex.split(text, posix=True)
+    except ValueError:
+        return text
+    if toks and os.path.basename(toks[0]).rstrip("0123456789.") in INTERPRETERS:
+        for i, t in enumerate(toks[1:-1], 1):
+            if t in ("-c", "-e", "--eval") or (t.startswith("-") and not t.startswith("--") and t.endswith(("c", "e"))):
+                return toks[i + 1]
+    return text
+
+
+def _statements(text):
+    """Statements of the program, line by line: a `#` comment is dropped and `;` outside quotes
+    splits a line. Quote state never carries over a line, so one stray quote cannot hide the rest."""
+    out = []
+    for line in _code_of(text).split("\n"):
+        cur, q, i, n = [], None, 0, len(line)
+        while i < n:
+            c = line[i]
+            if q:
+                cur.append(c)
+                if c == "\\" and i + 1 < n:
+                    cur.append(line[i + 1]); i += 1
+                elif c == q:
+                    q = None
+            elif c in "'\"":
+                q = c; cur.append(c)
+            elif c == "#":
+                break
+            elif c == ";":
+                out.append("".join(cur)); cur = []
+            else:
+                cur.append(c)
+            i += 1
+        out.append("".join(cur))
+    return [s for s in out if s.strip()]
+
+
+REBIND_RES = (re.compile(r"\b([A-Za-z_]\w*)\s*(?:[-+*/%|&^@]|//|\*\*|<<|>>)=(?!=)"),
+              re.compile(r"\b([A-Za-z_]\w*)\s*:="),
+              re.compile(r"\bas\s+([A-Za-z_]\w*)"))
+REBIND_LIST_RES = (re.compile(r"\bfor\s+([^\n:]*?)\s+in\b"), re.compile(r"\bdef\s+\w+\s*\(([^)]*)\)"),
+                   re.compile(r"\blambda\s+([^:]*):"), re.compile(r"\bas\s*\(([^)]*)\)"),
+                   re.compile(r"^[ \t]*([A-Za-z_][\w \t,*()\[\]]*,[\w \t,*()\[\]]*)=(?!=)", re.M))
+
+
+def _temp_names(text):
+    """Names every binding of which is a fresh temp folder (see _temp_expr). A name rebound any
+    other way (`+=`, `:=`, `for x in`, `as x`, a parameter) is never treated as a temp folder."""
+    rhs, stmts = {}, _statements(text)
+    for s in stmts:
+        m = ANY_ASSIGN_RE.match(s)
+        if m:
+            rhs.setdefault(m.group(1), []).append(m.group(2))
+    code, rebound = "\n".join(stmts), set()
+    for r in REBIND_RES:
+        rebound |= set(r.findall(code))
+    for r in REBIND_LIST_RES:
+        for group in r.findall(code):
+            rebound |= set(re.findall(r"[A-Za-z_]\w*", group))
+    for name in rebound:
+        rhs.pop(name, None)
+    temp, changed = set(), True
+    while changed:
+        changed = False
+        for name, values in rhs.items():
+            if name not in temp and all(_temp_expr(v, temp) for v in values):
+                temp.add(name); changed = True
+    return temp
+
+
 def inline_file_calls(text, ecwd, roots, gate_files):
     """Judge each file-writing or file-deleting call in inline code by its own path operand.
     Returns (hits, unresolved_kind_or_None, mentions_gate_path)."""
+    temp = _temp_names(text)
     literals = {}
     for m in INLINE_ASSIGN_RE.finditer(text):
         lit = _literal_path(m.group(2), {})
@@ -1630,6 +1959,8 @@ def inline_file_calls(text, ecwd, roots, gate_files):
                 unresolved = "delete" if kind == "delete" else (unresolved or kind)
                 continue
             for op in operands:
+                if _temp_expr(op, temp):                     # a folder the code made with tempfile: scratch
+                    continue
                 lit = _literal_path(op, literals)
                 if lit is None:
                     unresolved = "delete" if kind == "delete" else (unresolved or kind)
@@ -1638,7 +1969,13 @@ def inline_file_calls(text, ecwd, roots, gate_files):
                 if kind == "write":
                     found += write_hits(target, gate_files, "inline code writes to")
                 else:
-                    found += target_hits("delete", target, True, roots, gate_files)
+                    own = target_hits("delete", target, True, roots, gate_files)
+                    found += own
+                    if not own and INLINE_RECURSIVE_RE.search(name) and not is_scratch(target) and (
+                            target == "/" or same_path(target, HOME) or target.count("/") <= 2 or not ecwd
+                            or not is_inside(target, ecwd) or is_same_or_ancestor(target, ecwd)):
+                        found.append(("OP-003", "inline code: recursive delete of %s" % target,
+                                      "Move it to a dated folder under /tmp, or ask the owner."))
     mentions_gate = any(touches_gate_home(resolve(q, ecwd)) or any(is_inside(resolve(q, ecwd), f) for f in gate_files)
                         for q in re.findall(r"(?:~|\$HOME|\$\{HOME\}|/)[^\s'\"),;\]]*", text))
     return found, unresolved, mentions_gate
@@ -1885,6 +2222,17 @@ def consume_permit(action_digest):
 # --------------------------------------------------------------------------- #
 # hook entrypoint
 # --------------------------------------------------------------------------- #
+def install_mode_line(mode):
+    """What install says about the mode it leaves the gate in."""
+    me = self_cmd()
+    if mode == "enforce":
+        return ("mode: enforce. The gate stops what its rules block, starting with your agent's next tool call. "
+                "To record without blocking: %s mode shadow" % me)
+    if mode == "shadow":
+        return ("mode: shadow. Nothing is blocked: the gate only records. To have it block: %s mode enforce" % me)
+    return "mode: %s. The gate checks nothing. To have it block: %s mode enforce" % (mode, me)
+
+
 def stop_lines(top, transforms, adigest, receipt):
     """The three lines every agent reads right after a stop: what was stopped
     (rule and receipt), what to do next, and who can allow it once."""
@@ -1970,8 +2318,8 @@ def hook_main(argv):
 
         # specificity ordering: rule class first (canary > self > memory > workspaces), then the
         # most specific target (deepest path) -- the hit reported to the agent is the one to act on.
-        priority = ["OP-CANARY", "OP-000", "OP-002", "OP-001", "OP-010", "OP-009", "OP-008", "OP-004",
-                    "OP-003", "OP-005", "OP-006", "OP-007",
+        priority = ["OP-CANARY", "OP-000", "OP-002", "OP-001", "OP-014", "OP-010", "OP-009", "OP-018", "OP-008",
+                    "OP-004", "OP-011", "OP-003", "OP-005", "OP-006", "OP-007",
                     "OP-S06", "OP-S17", "OP-S12", "OP-S13", "OP-S07", "OP-S08", "OP-S11", "OP-S01",
                     "OP-S02", "OP-S03", "OP-S04", "OP-S05", "OP-S14", "OP-S15", "OP-S16"]
 
@@ -2820,7 +3168,8 @@ def install_refusal(dst, src):
 
 
 def cmd_install(argv):
-    """Owner-side install: copies the gate to ~/.operator/gate and wires Claude Code. Mode starts SHADOW.
+    """Owner-side install: copies the gate to ~/.operator/gate and wires Claude Code. A fresh install starts
+    in enforce mode; an existing mode file is kept.
     It refuses to replace the paid gate or a newer gate unless the owner passes --force."""
     agent = agent_session()
     if agent:
@@ -2863,9 +3212,9 @@ def cmd_install(argv):
     os.chmod(dst, 0o755)
     ensure_dirs()
     mode_path = pj(OP_HOME, "mode")
-    if not os.path.exists(mode_path):
+    if not os.path.exists(mode_path):             # a fresh install blocks from the first call
         with open(mode_path, "w", encoding="utf-8") as f:
-            f.write("shadow\n")
+            f.write("enforce\n")
     # Claude Code PreToolUse hook: merge, never clobber. A settings.json that does not parse is the
     # owner's file in the middle of an edit; it is left exactly as it is.
     settings_path = pj(HOME, ".claude", "settings.json")
@@ -2917,7 +3266,7 @@ def cmd_install(argv):
         launcher = None
     if launcher:
         print("command: operator-gate (%s)" % launcher)
-    print("mode: %s. It records every verdict and blocks nothing until you run: %s mode enforce" % (global_mode(), self_cmd()))
+    print(install_mode_line(global_mode()))
     if "--no-replay" not in argv:                 # what this gate would have said about last month
         try:
             print()

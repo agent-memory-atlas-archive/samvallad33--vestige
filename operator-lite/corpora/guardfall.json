@@ -132,7 +132,7 @@
       "id": "GF-G1",
       "class": "fork-bomb",
       "cmd": ":(){ :|:& };:",
-      "expect": "OP-001"
+      "expect": "OP-014"
     },
     {
       "id": "GF-H1",

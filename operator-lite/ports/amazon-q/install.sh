@@ -9,7 +9,7 @@
 #      (downloads from GitHub unless an existing copy is same-or-newer;
 #      never overwrites a newer gate)
 #   2. installs the adapter next to it (q-wrapper.py)
-#   3. sets mode to shadow if no mode file exists yet
+#   3. sets mode to enforce if no mode file exists yet
 #   4. wires the preToolUse hook into Q's agent config:
 #        - your configured default agent's file, if `chat.defaultAgent`
 #          points at an agent file that exists, else
@@ -75,7 +75,10 @@ if [ -s "$TMP_GATE" ] && grep -q '^VERSION = ' "$TMP_GATE"; then
 else
     rm -f "$TMP_GATE"
 fi
-if [ "$SRC" = "" ] && [ -f "$REPO_GATE" ] && grep -q '^VERSION = ' "$REPO_GATE"; then
+# the checkout's own gate wins when it is newer than main's (a branch being tested, a release not yet merged)
+if [ -f "$REPO_GATE" ] && grep -q '^VERSION = ' "$REPO_GATE" && \
+    { [ "$SRC" = "" ] || ! version_ge "$(gate_version "$SRC")" "$(gate_version "$REPO_GATE")"; }; then
+    [ "$SRC" = "$TMP_GATE" ] && rm -f "$TMP_GATE"
     SRC="$REPO_GATE"
 fi
 
@@ -109,11 +112,11 @@ cp "$WRAPPER_SRC" "$WRAPPER_DST"
 chmod 755 "$WRAPPER_DST"
 say "amazon-q: adapter installed -> $WRAPPER_DST"
 
-# --- mode: shadow unless the owner already chose ----------------------------- #
+# --- mode: enforce unless the owner already chose ----------------------------- #
 MODE_DST="$OP_HOME/mode"
 if [ ! -f "$MODE_DST" ]; then
-    printf 'shadow\n' > "$MODE_DST"
-    say "operator-gate: mode=shadow (log-only). Flip with: echo enforce > $MODE_DST"
+    printf 'enforce\n' > "$MODE_DST"
+    say "operator-gate: mode=enforce (blocking). To record without blocking: echo shadow > $MODE_DST"
 else
     say "operator-gate: mode=$(cat "$MODE_DST") (existing mode kept)"
 fi
@@ -277,8 +280,8 @@ say "     Plain 'q chat' uses the wired default agent; other agents need the"
 say "     hooks entry added to their own file (fragment: $FRAGMENT)."
 say "  2. Prove it: sh $PORT_DIR/test.sh"
 say "  3. Review receipts: python3 $GATE_DST status ; python3 $GATE_DST verify"
-say "  4. When the shadow log looks right, flip to blocking:"
-say "        echo enforce > $MODE_DST"
+say "  4. To record without blocking instead:"
+say "        echo shadow > $MODE_DST"
 say "  5. To disable without uninstalling: remove the preToolUse entry (or set"
 say "     hooks: {}) from $AGENTS_DIR/q_cli_default.json -- a backup of the"
 say "     pre-install file is kept next to it."

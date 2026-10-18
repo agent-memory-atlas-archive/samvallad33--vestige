@@ -8,7 +8,7 @@
 #      (downloads from GitHub unless an existing copy is same-or-newer;
 #      never overwrites a newer gate)
 #   2. installs the Cursor adapter next to it (cursor-hook.py)
-#   3. sets mode to shadow if no mode file exists yet
+#   3. sets mode to enforce if no mode file exists yet
 #   4. merges the beforeShellExecution / beforeMCPExecution / preToolUse
 #      hooks into ~/.cursor/hooks.json (user scope; a timestamped backup is
 #      written first; existing hooks and settings are preserved; an invalid
@@ -70,7 +70,10 @@ if [ -s "$TMP_GATE" ] && grep -q '^VERSION = ' "$TMP_GATE"; then
 else
     rm -f "$TMP_GATE"
 fi
-if [ "$SRC" = "" ] && [ -f "$REPO_GATE" ] && grep -q '^VERSION = ' "$REPO_GATE"; then
+# the checkout's own gate wins when it is newer than main's (a branch being tested, a release not yet merged)
+if [ -f "$REPO_GATE" ] && grep -q '^VERSION = ' "$REPO_GATE" && \
+    { [ "$SRC" = "" ] || ! version_ge "$(gate_version "$SRC")" "$(gate_version "$REPO_GATE")"; }; then
+    [ "$SRC" = "$TMP_GATE" ] && rm -f "$TMP_GATE"
     SRC="$REPO_GATE"
 fi
 
@@ -104,11 +107,11 @@ cp "$WRAPPER_SRC" "$WRAPPER_DST"
 chmod 755 "$WRAPPER_DST"
 say "cursor: adapter installed -> $WRAPPER_DST"
 
-# --- mode: shadow unless the owner already chose ----------------------------- #
+# --- mode: enforce unless the owner already chose ----------------------------- #
 MODE_DST="$OP_HOME/mode"
 if [ ! -f "$MODE_DST" ]; then
-    printf 'shadow\n' > "$MODE_DST"
-    say "operator-gate: mode=shadow (log-only). Flip with: echo enforce > $MODE_DST"
+    printf 'enforce\n' > "$MODE_DST"
+    say "operator-gate: mode=enforce (blocking). To record without blocking: echo shadow > $MODE_DST"
 else
     say "operator-gate: mode=$(cat "$MODE_DST") (existing mode kept)"
 fi
@@ -202,10 +205,10 @@ say "     override per project.)"
 say "  2. Prove it: sh $PORT_DIR/test.sh"
 say "  3. Inside Cursor, ask the agent to run:"
 say "        echo OPERATOR_CANARY_STOP_7f3a"
-say "     Shadow mode logs the STOP to ~/.operator/receipts/ without blocking."
+say "     The gate stops it and writes a receipt to ~/.operator/receipts/."
 say "  4. Review receipts: python3 $GATE_DST status ; python3 $GATE_DST verify"
-say "  5. When the shadow log looks right, flip to blocking:"
-say "        echo enforce > $MODE_DST"
+say "  5. To record without blocking instead:"
+say "        echo shadow > $MODE_DST"
 say "  6. failClosed is true: if this adapter cannot run at all, Cursor blocks"
 say "     the action instead of allowing it. Remove the \"failClosed\": true"
 say "     lines in $HOOKS_TARGET to relax that."
