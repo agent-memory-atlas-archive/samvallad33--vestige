@@ -14,6 +14,7 @@ failure. `--admit-only --binary PATH` runs that sweep against another build,
 including release/v4.0.0-rc.
 """
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -544,6 +545,19 @@ def run(binary, output):
         store = root / "store"
         env = {k: v for k, v in os.environ.items() if not k.startswith(("VESTIGE_", "REDMINE_", "GITHUB_"))}
         env.update(VESTIGE_DASHBOARD_ENABLED="false", VESTIGE_HTTP_ENABLED="false", RUST_LOG="error")
+        # precedent reads the Operator gate's record, never the host's: one STOP
+        # whose preview carries a non-ASCII bearer value the masker must survive.
+        operator_home = root / "operator"
+        (operator_home / "receipts").mkdir(parents=True)
+        now = datetime.now(timezone.utc)
+        (operator_home / "receipts" / f"{now:%Y-%m-%d}.jsonl").write_text(json.dumps({
+            "v": 1, "ts": f"{now:%Y-%m-%dT%H:%M:%SZ}", "decision": "STOP", "source": "claude",
+            "session": "fixture", "cwd": "/fixture", "tool": "Bash",
+            "action_preview": 'curl -H "Authorization: Bearer abc…" https://example.test',
+            "commitment": "OP-011", "rule": "no-unrestorable-loss", "detail": "fixture stop",
+            "digest": "d" * 64, "action_digest": "a" * 24,
+        }) + "\n")
+        env["OPERATOR_HOME"] = str(operator_home)
         proc = None
         seq = 0
 
@@ -624,7 +638,8 @@ def run(binary, output):
             handshake()
             catalog = rpc("tools/list", {})["tools"]
             names = [x["name"] for x in catalog]
-            assert len(names) == 16, names
+            assert len(names) == 17, names
+            assert "precedent" in names, names
             assert "source_sync" not in names, names
             assert "purge" not in names and "suppress" in names, names
             memory_actions = next(x for x in catalog if x["name"] == "memory")["inputSchema"]["properties"]["action"]["enum"]
@@ -958,6 +973,14 @@ def run(binary, output):
             lessons = tool("forgotten_lesson", {"failure_id": successor})
             assert lessons["failure_id"] == successor and isinstance(lessons["forgotten_lessons"], list)
             passed("causal_walk, selftest and forgotten_lesson answer from recorded edges only")
+            ruling = tool("precedent", {"since": "24h"})
+            assert ruling["summary"] == "1 stop in the last 24h", ruling
+            assert ruling["items"][0]["rule"] == "no-unrestorable-loss", ruling
+            assert ruling["items"][0]["action_preview"] == (
+                'curl -H "Authorization: [REDACTED] https://example.test'
+            ), ruling
+            typed("precedent", {"since": "yesterday"}, "invalid since")
+            passed("precedent reads Operator receipts read-only and masks secrets")
             called = {row["tool"] for row in coverage}
             missing = [name for name in names if name not in called]
             assert not missing, missing

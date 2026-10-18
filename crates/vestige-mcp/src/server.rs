@@ -1373,14 +1373,14 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
             // ================================================================
             ToolDescription {
                 name: "precedent".to_string(),
-                title: Some("Vestige Stops".to_string()),
+                title: Some("Precedent".to_string()),
                 annotations: Some(ToolAnnotations {
                     read_only_hint: true,
                     destructive_hint: false,
                     idempotent_hint: true,
                     open_world_hint: false,
                 }),
-                description: Some("What Operator stopped and why: reads receipts and permits.".to_string()),
+                description: Some("Operator stops and why.".to_string()),
                 input_schema: tools::compact::of(&tools::precedent::schema()),
                 ..Default::default()
             },
@@ -4847,12 +4847,14 @@ mod tests {
         read_only.sort();
         destructive.sort();
         // w3d: `selftest` (writes only a temp copy) and `forgotten_lesson`
-        // (pure query) join the read-only set.
+        // (pure query) join the read-only set; `precedent` only reads the
+        // Operator gate's receipts and permits.
         assert_eq!(
             read_only,
             [
                 "forgotten_lesson",
                 "memory_status",
+                "precedent",
                 "selftest",
                 "session_start"
             ]

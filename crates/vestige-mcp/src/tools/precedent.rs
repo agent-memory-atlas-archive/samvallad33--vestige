@@ -21,7 +21,6 @@ const PERMIT_NOTE: &str =
 pub fn schema() -> Value {
     json!({
         "type": "object",
-        "description": "What Operator stopped and why: reads receipts and permits.",
         "properties": {
             "since": {"type": "string", "default": "24h", "description": "Window, e.g. 30m, 24h, 7d."},
             "cwd": {"type": "string", "description": "Only receipts whose cwd starts with this path."},
@@ -29,7 +28,7 @@ pub fn schema() -> Value {
             "session": {"type": "string", "description": "Exact session id."},
             "rule": {"type": "string", "description": "Commitment or rule id/name, e.g. OP-011."},
             "decision": {"type": "string", "description": "STOP, ALLOW, SHADOW_STOP, PASS, another recorded decision, or all. Default: STOP plus ALLOW."},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10, "description": "Newest records first."}
+            "limit": {"type": "integer", "default": 10, "description": "1 to 50, newest records first."}
         }
     })
 }
@@ -393,8 +392,8 @@ fn secret_at(s: &str, i: usize) -> Option<usize> {
             j += 1;
         }
         let mut k = j;
-        while s[k..].chars().next().is_some_and(|c| !c.is_whitespace()) {
-            k += 1;
+        while let Some(c) = s[k..].chars().next().filter(|c| !c.is_whitespace()) {
+            k += c.len_utf8();
         }
         if k > j {
             return Some(k);
@@ -402,8 +401,8 @@ fn secret_at(s: &str, i: usize) -> Option<usize> {
     }
     if b.len() - i >= 7 && b[i..i + 7].iter().zip(b"bearer ").all(|(a, c)| a.eq_ignore_ascii_case(c)) {
         let mut k = i + 7;
-        while s[k..].chars().next().is_some_and(|c| !c.is_whitespace()) {
-            k += 1;
+        while let Some(c) = s[k..].chars().next().filter(|c| !c.is_whitespace()) {
+            k += c.len_utf8();
         }
         if k > i + 7 {
             return Some(k);
@@ -579,6 +578,14 @@ mod tests {
         assert_eq!(mask_secrets("password: hunter2"), "[REDACTED]");
         assert_eq!(mask_secrets("a task-x and tokens stay"), "a task-x and tokens stay");
         assert_eq!(mask_secrets("sk-short stays"), "sk-short stays");
+    }
+
+    #[test]
+    fn secret_masking_survives_non_ascii_values() {
+        assert_eq!(mask_secrets("Authorization: Bearer abc… end"), "Authorization: [REDACTED] end");
+        assert_eq!(mask_secrets("token: café ok"), "[REDACTED] ok");
+        assert_eq!(mask_secrets("password=🔑🔑 x"), "[REDACTED] x");
+        assert_eq!(mask_secrets("Bearer é"), "[REDACTED]");
     }
 
     #[test]
