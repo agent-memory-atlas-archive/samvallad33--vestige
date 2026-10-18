@@ -341,24 +341,38 @@ fn is_handle_suffix(content: &str, start: usize) -> bool {
         .any(|prefix| before.ends_with(prefix))
 }
 
-/// The hex run `[i, j)` is a group of an 8-4-4-4-12 UUID.
+/// The hex run `[i, j)` is a group of an 8-4-4-4-12 UUID, including one
+/// written next to a hyphen (`run-<uuid>`, `<uuid>-retry`).
 fn in_uuid(chars: &[(usize, char)], i: usize, j: usize) -> bool {
+    // A UUID is 36 characters, so nothing further away can decide it. Looking
+    // no further keeps the scan linear on a long hyphenated run.
+    const UUID_LEN: usize = 36;
     let joined = |c: char| is_ascii_hex(c) || c == '-';
     let mut s = i;
-    while s > 0 && joined(chars[s - 1].1) {
+    while s > 0 && i - s < UUID_LEN && joined(chars[s - 1].1) {
         s -= 1;
     }
     let mut e = j;
-    while e < chars.len() && joined(chars[e].1) {
+    while e < chars.len() && e - j < UUID_LEN && joined(chars[e].1) {
         e += 1;
     }
+    // A group the window cut off is not a whole group.
+    let cut_left = s > 0 && joined(chars[s - 1].1);
+    let cut_right = e < chars.len() && joined(chars[e].1);
     let run: String = chars[s..e].iter().map(|&(_, c)| c).collect();
     let groups: Vec<&str> = run.split('-').collect();
-    groups.len() == 5
-        && groups
-            .iter()
-            .zip([8, 4, 4, 4, 12])
-            .all(|(group, len)| group.len() == len)
+    let first = usize::from(cut_left);
+    let last = groups.len() - usize::from(cut_right);
+    // The group [i, j) is the one after this many hyphens of the window.
+    let at = chars[s..i].iter().filter(|&&(_, c)| c == '-').count();
+    (at.saturating_sub(4)..=at).any(|w| {
+        w >= first
+            && w + 5 <= last
+            && groups[w..w + 5]
+                .iter()
+                .zip([8, 4, 4, 4, 12])
+                .all(|(group, len)| group.len() == len)
+    })
 }
 
 /// The word just before the hex run at char `i` (across up to three of
@@ -371,10 +385,16 @@ fn named_as_session(chars: &[(usize, char)], i: usize) -> bool {
         skipped += 1;
     }
     let end = k;
-    while k > 0 && (chars[k - 1].1.is_ascii_alphanumeric() || matches!(chars[k - 1].1, '_' | '-')) {
+    // No session word is longer than this, so a longer word is not one; not
+    // reading further keeps the scan linear on a long hyphenated run.
+    let longest = SESSION_WORDS.iter().map(|w| w.len()).max().unwrap_or(0);
+    while k > 0
+        && end - k <= longest
+        && (chars[k - 1].1.is_ascii_alphanumeric() || matches!(chars[k - 1].1, '_' | '-'))
+    {
         k -= 1;
     }
-    if k == end {
+    if k == end || end - k > longest {
         return false;
     }
     let word: String = chars[k..end]
@@ -777,8 +797,12 @@ mod tests {
             // Word fragments: hex letters only, no digit.
             "the deploy succeeded after feedback",
             "defaced cabbage",
-            // A UUID's groups.
+            // A UUID's groups, also next to a hyphen.
             "uuid 7562c514-1f2e-4a3b-9c8d-0123456789ab",
+            "run-7562c514-1f2e-4a3b-9c8d-0123456789ab",
+            "session-7562c514-1f2e-4a3b-9c8d-0123456789ab",
+            "7562c514-1f2e-4a3b-9c8d-0123456789ab-retry",
+            "abc-7562c514-1f2e-4a3b-9c8d-0123456789ab-cafe",
             // A session id, named as one.
             "Claude Code session 7562c514, verbatim",
             "session_id=7562c514",
@@ -787,6 +811,22 @@ mod tests {
             let shas = kinds_in(input, EntityKind::CommitSha);
             assert!(shas.is_empty(), "{input:?} gave CommitSha {shas:?}");
         }
+    }
+
+    /// Every hex group of a long hyphenated run is checked against a
+    /// window of fixed size, so the scan stays linear: all 5,000
+    /// seven-character groups are scanned (the output keeps the first
+    /// MAX_SPANS), and a sha-shaped group next to a UUID-shaped tail is not
+    /// mistaken for part of it.
+    #[test]
+    fn long_hyphenated_hex_runs_scan_in_linear_time() {
+        let input = "a1b2c3d-".repeat(5_000);
+        assert_eq!(kinds_in(&input, EntityKind::CommitSha).len(), MAX_SPANS);
+        let near = "deadbee1-7562c514-1f2e-4a3b-9c8d-0123456789ab";
+        assert_eq!(
+            kinds_in(near, EntityKind::CommitSha),
+            vec!["deadbee1".to_string()]
+        );
     }
 
     #[test]
