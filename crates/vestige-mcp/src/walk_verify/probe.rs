@@ -267,7 +267,7 @@ pub(super) fn run_test(test: &Test) -> anyhow::Result<TestRun> {
                 .context("cannot share the test's output pipe")?,
         )
         .stderr(writer);
-    let spawned = command.spawn();
+    let spawned = retry_while_busy(|| command.spawn());
     // The command holds the writing ends; the reader sees the end of the
     // stream only once they are closed here too.
     drop(command);
@@ -485,6 +485,24 @@ pub(super) fn probe_text(entry: &Entry, on_commit: bool) -> String {
     )
 }
 
+/// Run `spawn` again while it fails with ETXTBSY. On Linux an executable is
+/// refused while any process holds it open for writing, and a fork on another
+/// thread can inherit that descriptor for an instant (rust-lang/rust#114554),
+/// so a script written a moment ago can be busy for a few milliseconds.
+fn retry_while_busy<T>(mut spawn: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    const ETXTBSY: i32 = 26;
+    let mut attempt = 0u64;
+    loop {
+        match spawn() {
+            Err(err) if err.raw_os_error() == Some(ETXTBSY) && attempt < 5 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(10 * attempt));
+            }
+            other => return other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::json::tests::{FIRST_HASH, SECOND_HASH, first_entry, second_entry};
@@ -558,6 +576,31 @@ mod tests {
             worktree: dir.to_path_buf(),
             timeout,
         }
+    }
+
+    #[test]
+    fn a_busy_executable_is_retried_then_reported() {
+        let busy = || std::io::Error::from_raw_os_error(26);
+        let mut calls = 0;
+        let ok = retry_while_busy(|| {
+            calls += 1;
+            if calls < 3 { Err(busy()) } else { Ok(calls) }
+        });
+        assert_eq!(ok.unwrap(), 3);
+        let mut calls = 0;
+        let still = retry_while_busy(|| -> std::io::Result<()> {
+            calls += 1;
+            Err(busy())
+        });
+        assert_eq!(still.unwrap_err().raw_os_error(), Some(26));
+        assert_eq!(calls, 6, "one try and five retries");
+        let mut calls = 0;
+        let other = retry_while_busy(|| -> std::io::Result<()> {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert!(other.is_err());
+        assert_eq!(calls, 1, "other errors are not retried");
     }
 
     #[cfg(unix)]
@@ -664,7 +707,9 @@ mod tests {
             pid_file.display()
         );
         let started = Instant::now();
-        let run = run_test(&test_in(dir.path(), &body, Some(Duration::from_secs(1)))).unwrap();
+        // Three seconds, not one: on a loaded machine the shell may not have
+        // recorded its child's pid within a second.
+        let run = run_test(&test_in(dir.path(), &body, Some(Duration::from_secs(3)))).unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(20),
             "{:?}",
@@ -674,7 +719,7 @@ mod tests {
         assert_eq!(verdict_of(run.exit), "skip");
         assert_eq!(
             run.said,
-            "timed out after 1 seconds, counted as cannot test"
+            "timed out after 3 seconds, counted as cannot test"
         );
         // The child it started is gone too.
         let pid: libc::pid_t = fs::read_to_string(&pid_file)
