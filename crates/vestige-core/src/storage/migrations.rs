@@ -4122,4 +4122,6 @@ UPDATE fsrs_config
        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
  WHERE key = 'w20'
    AND (CAST(value AS REAL) <= 0.081 OR CAST(value AS REAL) >= 0.499);
+
+UPDATE schema_version SET version = 41, applied_at = datetime('now');
 "#;
