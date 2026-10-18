@@ -106,7 +106,7 @@ jobs:
           node-version: 22
       - run: pnpm install --frozen-lockfile && pnpm --filter @vestige/dashboard build
       - name: "@vestige/init: the PRECEDENT terminal journey"
-        run: node --test packages/vestige-init/test/
+        run: node --test packages/vestige-init/test/*.test.js
 
   coverage:
     name: Code Coverage
