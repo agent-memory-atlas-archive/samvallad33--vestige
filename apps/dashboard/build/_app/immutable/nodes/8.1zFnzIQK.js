@@ -1,1 +1,0 @@
-import{mt as e}from"../chunks/CvawvY3d.js";import{t}from"../chunks/B-nAq2Yv.js";var n=e({load:()=>r}),r=({url:e})=>t(`/contradictions`,e);export{n as universal};
