@@ -102,14 +102,41 @@ fn gh_json(args: &[&str]) -> Result<Value, String> {
 /// The issue's comments, oldest first. `repos/O/R/issues/N` is the issue
 /// itself (one object, never a list), so its comments come only from here.
 /// GitHub serves at most 100 per page.
-fn comments_endpoint(issue: &IssueRef, max_comments: usize) -> String {
+fn comments_endpoint(issue: &IssueRef, per_page: usize, page: usize) -> String {
     format!(
-        "repos/{}/{}/issues/{}/comments?per_page={}",
+        "repos/{}/{}/issues/{}/comments?per_page={}&page={}",
         issue.owner,
         issue.name,
         issue.number,
-        max_comments.clamp(1, 100)
+        per_page.clamp(1, 100),
+        page
     )
+}
+
+/// `owner/repo#N`, the form auto-connect reads as an issue identity. Every
+/// receipt of one hunt names it, so they stay joined to each other when the
+/// hub rule or the edge budget sets their shared tags aside.
+fn issue_ref(issue: &IssueRef) -> String {
+    format!("{}/{}#{}", issue.owner, issue.name, issue.number)
+}
+
+fn linked_pr_content(issue: &IssueRef, number: u64, title: &str) -> String {
+    format!(
+        "Linked pull request #{number} on issue {}: {title}",
+        issue_ref(issue)
+    )
+}
+
+fn failure_content(issue: &IssueRef, state: &str, title: &str, body: &str) -> String {
+    format!(
+        "Issue {} [{state}]: {title}. {}",
+        issue_ref(issue),
+        body.trim()
+    )
+}
+
+fn comment_content(issue: &IssueRef, author: &str, body: &str) -> String {
+    format!("Comment on issue {} by {author}: {body}", issue_ref(issue))
 }
 
 /// `(author, body)` for every comment with a non-blank body. Anything other
@@ -261,8 +288,17 @@ async fn run(
     let comment_bodies = if max_comments == 0 {
         Vec::new()
     } else {
-        let comments = gh_json(&["api", &comments_endpoint(&issue, max_comments)])?;
-        let mut bodies = comment_bodies(&comments);
+        // Pages of up to 100 until maxComments are in hand or GitHub runs out.
+        let per_page = max_comments.clamp(1, 100);
+        let mut bodies = Vec::new();
+        for page in 1.. {
+            let comments = gh_json(&["api", &comments_endpoint(&issue, per_page, page)])?;
+            let served = comments.as_array().map_or(0, Vec::len);
+            bodies.extend(comment_bodies(&comments));
+            if bodies.len() >= max_comments || served < per_page {
+                break;
+            }
+        }
         bodies.truncate(max_comments);
         bodies
     };
@@ -347,10 +383,7 @@ async fn run(
     let mut linked_pr_ids: Vec<String> = Vec::new();
     for (n, t) in &linked_prs {
         let node = write(
-            format!(
-                "Linked pull request #{n} on issue {}/{}/#{}: {t}",
-                issue.owner, issue.name, issue.number
-            ),
+            linked_pr_content(&issue, *n, t),
             vec![issue.name.clone(), "gather".into(), "linked-pr".into()],
             format!("github:{}/{}/#{}", issue.owner, issue.name, n),
         )
@@ -360,14 +393,7 @@ async fn run(
     }
 
     let failure_node = write(
-        format!(
-            "Issue {}/{}/#{} [{}]: {title}. {}",
-            issue.owner,
-            issue.name,
-            issue.number,
-            state,
-            body.trim()
-        ),
+        failure_content(&issue, &state, &title, &body),
         {
             let mut t = vec![issue.name.clone(), "failure".into(), "gather".into()];
             t.extend(labels);
@@ -386,10 +412,7 @@ async fn run(
     let mut comment_ids: Vec<String> = Vec::new();
     for (who, body) in &comment_bodies {
         let node = write(
-            format!(
-                "Comment on issue {}/{}/#{} by {}: {}",
-                issue.owner, issue.name, issue.number, who, body
-            ),
+            comment_content(&issue, who, body),
             vec![issue.name.clone(), "gather".into(), "comment".into()],
             format!("github:{}/{}/#{}", issue.owner, issue.name, issue.number),
         )
@@ -551,12 +574,12 @@ mod tests {
     fn comments_come_from_the_comments_endpoint() {
         let issue = parse_issue_url("https://github.com/acme/app/issues/7").unwrap();
         assert_eq!(
-            comments_endpoint(&issue, 50),
-            "repos/acme/app/issues/7/comments?per_page=50"
+            comments_endpoint(&issue, 50, 1),
+            "repos/acme/app/issues/7/comments?per_page=50&page=1"
         );
         assert_eq!(
-            comments_endpoint(&issue, 500),
-            "repos/acme/app/issues/7/comments?per_page=100"
+            comments_endpoint(&issue, 500, 3),
+            "repos/acme/app/issues/7/comments?per_page=100&page=3"
         );
         let issue_object = json!({"title": "t", "body": "b", "user": {"login": "x"}});
         assert!(comment_bodies(&issue_object).is_empty());
@@ -598,10 +621,11 @@ mod tests {
                 &["git-commit", "app"],
             );
         }
+        let issue = parse_issue_url("https://github.com/acme/app/issues/1").unwrap();
         let failure = scoped_write(
             storage,
             scope,
-            "Issue acme/app#1 [open]: crash in src/parser.rs",
+            &failure_content(&issue, "open", "crash", "in src/parser.rs"),
             &["app", "failure", "gather"],
         );
         let (edges, not_linked) = bridge(storage, scope, std::slice::from_ref(&failure));
@@ -612,6 +636,51 @@ mod tests {
             all.iter()
                 .all(|e| e.source_id == failure.0 || e.target_id == failure.0)
         );
+    }
+
+    /// A hunt with enough comments makes `app` and `gather` hub tags, so the
+    /// linked pull request and the issue share no tag the bridge joins on.
+    /// They still share the issue reference every receipt names, so the
+    /// failure keeps its edge to the pull request and the walk can reach it.
+    #[test]
+    fn a_linked_pull_request_stays_joined_to_the_issue_when_tags_are_hubs() {
+        let dir = tempfile::TempDir::new().expect("temp store dir");
+        let store = crate::strata_memory::open(dir.path()).expect("test store");
+        let storage: &Storage = &*store;
+        let issue = parse_issue_url("https://github.com/acme/app/pull/1").unwrap();
+        let scope = issue.scope.clone();
+        let pr = scoped_write(
+            storage,
+            &scope,
+            &linked_pr_content(&issue, 7, "fix the crash"),
+            &["app", "gather", "linked-pr"],
+        );
+        let failure = scoped_write(
+            storage,
+            &scope,
+            &failure_content(&issue, "open", "crash", "it broke"),
+            &["app", "failure", "gather"],
+        );
+        let mut records = vec![pr.clone(), failure.clone()];
+        for i in 0..20 {
+            records.push(scoped_write(
+                storage,
+                &scope,
+                &comment_content(&issue, "ann", &format!("seen it too ({i})")),
+                &["app", "gather", "comment"],
+            ));
+        }
+        let (edges, _) = bridge(storage, &scope, &records);
+        assert!(edges > 0);
+        let joined = storage
+            .get_all_connections()
+            .expect("edges")
+            .iter()
+            .any(|e| {
+                (e.source_id == pr.0 && e.target_id == failure.0)
+                    || (e.source_id == failure.0 && e.target_id == pr.0)
+            });
+        assert!(joined, "the pull request must stay joined to the issue");
     }
 
     /// The scope contract, as a test: every receipt gather writes (failure,
