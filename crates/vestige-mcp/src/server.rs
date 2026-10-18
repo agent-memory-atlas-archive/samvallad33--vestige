@@ -5017,16 +5017,19 @@ mod tests {
                 "purge"
             ]
         );
+        // `gather` reads a GitHub issue through the gh CLI, so it is open-world
+        // in every build; the connector sync joins it when connectors is on.
         if cfg!(feature = "connectors") {
             assert_eq!(
                 open_world,
-                ["source_sync"],
-                "only the connector sync leaves the local store"
+                ["gather", "source_sync"],
+                "only gather and the connector sync leave the local store"
             );
         } else {
-            assert!(
-                open_world.is_empty(),
-                "connectors is off, so no advertised tool leaves the local store: {open_world:?}"
+            assert_eq!(
+                open_world,
+                ["gather"],
+                "connectors is off, so only gather leaves the local store: {open_world:?}"
             );
         }
 
