@@ -5635,16 +5635,24 @@ mod tests {
         assert!(current_background().is_none());
         assert_eq!(background_yielded(), Duration::ZERO);
 
-        // A foreground caller holds the store for 50 ms.
+        // A foreground caller holds the store until the background thread is
+        // about to take it, and 100 ms more. A handshake, not a sleep: a busy
+        // runner can start the blocking thread after a fixed hold has ended,
+        // and it then waits only the rest of the grace (seen on macOS CI,
+        // 24.9 ms against the 30 ms floor).
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (taking_tx, taking_rx) = std::sync::mpsc::channel::<()>();
         let holder = {
             let memory = Arc::clone(&memory);
             std::thread::spawn(move || {
                 let store = memory.lock();
-                std::thread::sleep(Duration::from_millis(50));
+                held_tx.send(()).unwrap();
+                taking_rx.recv().unwrap();
+                std::thread::sleep(Duration::from_millis(100));
                 drop(store);
             })
         };
-        std::thread::sleep(Duration::from_millis(10));
+        held_rx.recv().unwrap();
 
         let yielded = as_background(async {
             let work = current_background();
@@ -5653,6 +5661,7 @@ mod tests {
             tokio::task::spawn_blocking(move || {
                 run_as_background(work, || {
                     assert!(current_background().is_some());
+                    taking_tx.send(()).unwrap();
                     drop(memory.lock());
                 })
             })
