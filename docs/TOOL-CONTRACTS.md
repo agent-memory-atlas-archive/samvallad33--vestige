@@ -76,9 +76,9 @@ Strata walk writes nothing.
 Find records by exact handle: `handle` is a record id, a unique id prefix (8+ characters)
 or an exact tag. Lookup order is exact id, then unique prefix, then exact tag.
 
-- A tag returns **every** live record carrying it, from every scope, with `nodes` and the
-  one-hop recorded `neighbors` (direction, `link_type`, strength; at most 20 edges). It
-  ignores `limit`.
+- A tag returns **every** live record carrying it, from every scope, with `nodes` (`id`,
+  `type`, `content`, `tags`, `createdAt`) and the one-hop recorded `neighbors` (direction,
+  `link_type`, strength; at most 20 edges). It ignores `limit`.
 - An ambiguous prefix is refused as `ambiguous`, with its `candidates`.
 - A miss is `handle_required` (with `candidates: []`), not an empty list. Free text is
   never split into words to look for a tag or an id inside it (4.2.0): only the whole
