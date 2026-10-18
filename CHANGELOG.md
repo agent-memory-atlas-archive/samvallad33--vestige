@@ -7,8 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Operator Lite 0.3.9. Version 0.3.8 is skipped: it was published to npm and
+Operator Lite 0.3.10. Version 0.3.8 is skipped: it was published to npm and
 withdrawn, so the number cannot be used again.
+
+### Added (0.3.10)
+
+- **Unset-variable root expansion (OP-001).** `rm -rf "$UNSET_DIR"/`,
+  `rm -rf "$BUILD_ROOT"/*`, and `rm -rf ${TARGET_DIR}/` resolve to `/` when the
+  variable is not set in the command or `TMPDIR`, stopping accidental root wipes
+  while keeping `TMPDIR` and set-variable scratch paths allowed.
+- **Hidden code in scripts, build runners, pipes, and loops (OP-001/OP-003/OP-007).**
+  The analyzer now inspects `npm`/`pnpm`/`yarn run <script>` (via `package.json`
+  `scripts`), `make <target>` recipes (via `Makefile`), short base64 payloads
+  piped to `base64 -d | sh`, static `echo`/`printf` arguments piped to `xargs`,
+  `awk` `system(...)` calls, `perl` `$ENV{HOME}` path expressions, and shell
+  `for var in ...; do ...; done` loops.
+- **File loss outside the project (OP-011).** Deleting (`rm`, `rm -f`) or
+  overwriting (`>`, `cp`) a non-empty file outside the project and outside
+  scratch directories (or under `~/.ssh`/`~/.gnupg`) is stopped under OP-011.
+- **Inside-project uncommitted work loss (OP-011).** Recursive delete of a
+  project directory containing tracked files with uncommitted git changes
+  (`rm -rf src`) is stopped under OP-011 while scratch/build directories and
+  clean or untracked paths continue to pass.
+- **Data store and volume destruction (OP-007).** Stops Docker volume destruction
+  (`docker system prune --volumes`, `docker volume rm`, `docker volume prune`,
+  `docker compose down -v`), unscoped SQL `UPDATE` without `WHERE`, tautological
+  `WHERE` clauses (`WHERE 1=1`, `WHERE true`), `mongosh` collection `.drop()`,
+  and migration resets (`flyway clean`, `alembic downgrade base`,
+  `npx typeorm schema:drop`, `liquibase dropAll`).
+- **Cloud bucket and project teardown (OP-006).** Stops `gsutil rm -r`,
+  `gsutil rb`, `rclone purge`/`delete`, `vercel rm`/`remove`,
+  `firebase *:delete`, and `supabase ... delete`.
+- **Git branch, reflog, and force-checkout loss (OP-004/OP-011).** Stops
+  colon-refspec remote shared branch deletion (`git push origin :main`) and
+  `git reflog expire`/`delete` under OP-004, and `git checkout -f`/`--force`
+  when the working tree has uncommitted changes under OP-011.
+- **Machine halt, reboot, and kill-all-processes (OP-014).** Stops `shutdown`
+  (without `-c`), `reboot`, `halt`, `poweroff`, and `kill` targeting `-1`.
 
 Upgrading Operator Lite: every install before 0.3.9 wrote `shadow` into
 `~/.operator/mode`, and shadow blocks nothing. The first 0.3.9 install

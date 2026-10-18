@@ -38,7 +38,7 @@ try:
 except ImportError:                                  # Windows: receipts lock through msvcrt instead
     fcntl = None
 
-VERSION = "0.3.9"
+VERSION = "0.3.10"
 EDITION = "lite"                 # the paid gate is "operator"; install never replaces a gate that outranks this one
 INTEGRITY = "reference_digest_not_signature"
 IS_WINDOWS = os.name == "nt"
@@ -181,13 +181,13 @@ RULES = {
     "OP-003": ("no-blind-recursive-delete", "STOP",
                "Recursive delete outside scratch/build directories needs the owner's approval."),
     "OP-004": ("no-history-destruction", "STOP",
-               "Force-pushing over a shared branch or deleting .git destroys history."),
+               "Force-pushing over or deleting a shared branch, expiring reflogs, or deleting .git destroys history."),
     "OP-005": ("no-unreviewed-publish", "STOP",
                "Publishing a release/package or deleting a public repo needs the owner's review."),
     "OP-006": ("no-paid-deploy", "STOP",
-               "Production deploys, infrastructure teardown, live database changes and live billing actions need the owner's approval."),
+               "Production deploys, infrastructure/bucket/project teardown, live database changes and live billing actions need the owner's approval."),
     "OP-007": ("no-destructive-sql", "STOP",
-               "DROP/TRUNCATE/unscoped DELETE or a framework database reset needs the owner's approval."),
+               "DROP/TRUNCATE, unscoped or tautological DELETE/UPDATE, database/schema resets, or Docker volume wipes need the owner's approval."),
     "OP-008": ("no-shell-init-write", "STOP",
                "Writing shell rc/init files plants commands that fire later; that is code execution by install."),
     "OP-009": ("no-reverse-shell", "STOP",
@@ -195,9 +195,9 @@ RULES = {
     "OP-010": ("no-cloud-metadata", "STOP",
                "Cloud metadata endpoints hand out instance credentials; an agent has no legitimate reason to query them."),
     "OP-011": ("no-unrestorable-loss", "STOP",
-               "Discarding uncommitted git work, shredding or emptying files outside the project, or wiping the crontab cannot be undone."),
+               "Discarding uncommitted git work, deleting/overwriting/shredding/emptying files outside the project, or wiping the crontab cannot be undone."),
     "OP-014": ("no-machine-wreck", "STOP",
-               "Writing a raw disk, formatting or erasing a volume, a fork bomb, or changing permissions or owners recursively on / or home wrecks the machine."),
+               "Writing a raw disk, formatting or erasing a volume, halting/rebooting, kill -1, a fork bomb, or changing permissions or owners recursively on / or home wrecks the machine."),
     "OP-018": ("no-blind-fetch-run", "STOP",
                "Piping a download straight into a shell or interpreter, or running it through <(...) or $(...), runs code nobody has read."),
     "OP-CANARY": ("canary", "STOP",
@@ -619,6 +619,7 @@ def tilde(v):
 
 BRACE_RE = re.compile(r"\{([^{}]*,[^{}]*)\}")
 GLOB_CHARS_RE = re.compile(r"[*?\[]")
+UNSET_ROOT_RE = re.compile(r"^(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*(?::-?)?\})+/\*?$")
 MAX_EXPANSIONS = 64
 
 
@@ -662,7 +663,9 @@ def resolve_targets(args, cwd):
     out = []
     for a in args or []:
         for variant in expand_braces(a):
-            if GLOB_CHARS_RE.search(variant) and cwd:
+            if UNSET_ROOT_RE.match(variant):
+                out.append("/")
+            elif GLOB_CHARS_RE.search(variant) and cwd:
                 out += [norm(h, cwd) for h in glob_targets(variant, cwd)]
             else:
                 out.append(resolve(variant, cwd))
@@ -753,18 +756,23 @@ FORK_BOMB_RE = re.compile(
 PIPE_SINK_RE = re.compile(
     r"\|\s*(?:(?:sudo|env|command|nohup|timeout)\s+)*"
     r"(bash|sh|zsh|dash|ksh|fish|python3?|node|perl|ruby|osascript)\b")
-B64_BLOB_RE = re.compile(r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/=]{24,})(?![A-Za-z0-9+/=])")
+B64_BLOB_RE = re.compile(r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{8,}={0,2})(?![A-Za-z0-9+/=])")
 
 
 def decode_b64_text(cmd):
     """Best-effort decode of base64-looking blobs, so `echo <b64> | base64 -d | sh` is analyzed."""
     out = []
+    has_b64_cmd = "base64" in cmd
     for m in B64_BLOB_RE.finditer(cmd):
         blob = m.group(1)
+        if len(blob) < 24 and not has_b64_cmd:
+            continue
         try:
             import base64
             dec = base64.b64decode(blob + "=" * (-len(blob) % 4), validate=False).decode("utf-8", "replace")
         except Exception:
+            continue
+        if "\ufffd" in dec:
             continue
         if any(c.isalpha() for c in dec) and any(k in dec for k in ("rm ", "sh ", "bash", "curl", "wget",
                                                                    "eval", "python", "chmod", "dd ", "mkfs")):
@@ -963,6 +971,152 @@ def script_body_effects(path, ecwd, depth, vars_, mode="auto", prog=None, seg=""
     return effs
 
 
+def npm_script_effects(prog, rest, ecwd, depth, vars_):
+    """Analyze package.json scripts invoked by `npm run <name>`, `npm test`, `pnpm/yarn/bun run <name>`."""
+    if not ecwd or depth + 1 > MAX_DEPTH:
+        return []
+    pkg_cwd, pargs, i = ecwd, [], 0
+    while i < len(rest):
+        t = rest[i]
+        if t in ("--prefix", "-C", "--cwd") and i + 1 < len(rest):
+            pkg_cwd = resolve(rest[i + 1], pkg_cwd)
+            i += 2; continue
+        if t.startswith(("--prefix=", "--cwd=")):
+            pkg_cwd = resolve(t.split("=", 1)[1], pkg_cwd)
+            i += 1; continue
+        if t == "--":
+            break
+        if not t.startswith("-"):
+            pargs.append(t)
+        i += 1
+    sname = None
+    if pargs[:1] in (["run"], ["run-script"]) and len(pargs) >= 2:
+        sname = pargs[1]
+    elif pargs[:1] in (["test"], ["t"], ["tst"], ["start"], ["stop"], ["restart"]):
+        sname = "test" if pargs[0] in ("t", "tst") else pargs[0]
+    elif prog in ("pnpm", "yarn") and pargs and pargs[0] not in (
+            "add", "install", "i", "publish", "dlx", "exec", "x", "init", "create", "remove",
+            "rm", "unlink", "link", "pack", "login", "logout", "version", "info", "why", "list",
+            "ls", "outdated", "audit", "config", "cache"):
+        sname = pargs[0]
+    if not sname:
+        return []
+    raw = sql_file_text(pj(pkg_cwd, "package.json"))
+    if not raw:
+        return []
+    try:
+        scripts = (json.loads(raw) or {}).get("scripts") or {}
+    except Exception:
+        return []
+    if not isinstance(scripts, dict):
+        return []
+    out = []
+    for k in ("pre" + sname, sname, "post" + sname):
+        body = scripts.get(k)
+        if isinstance(body, str) and body.strip():
+            for e in analyze(body, pkg_cwd, depth + 1, vars_):
+                e.setdefault("script_body", "package.json:%s" % k)
+                out.append(e)
+    return out
+
+
+def make_target_effects(rest, ecwd, depth, vars_):
+    """Analyze Makefile recipes for the target(s) `make` / `gmake` would run."""
+    if not ecwd or depth + 1 > MAX_DEPTH:
+        return []
+    make_cwd, mfile, targets, i = ecwd, None, [], 0
+    while i < len(rest):
+        t = rest[i]
+        if t in ("-n", "--dry-run", "--just-print", "--recon"):
+            return []
+        if t in ("-C", "--directory") and i + 1 < len(rest):
+            make_cwd = resolve(rest[i + 1], make_cwd); i += 2; continue
+        if t.startswith("--directory="):
+            make_cwd = resolve(t.split("=", 1)[1], make_cwd); i += 1; continue
+        if t in ("-f", "--file", "--makefile") and i + 1 < len(rest):
+            mfile = resolve(rest[i + 1], make_cwd); i += 2; continue
+        if t.startswith(("--file=", "--makefile=")):
+            mfile = resolve(t.split("=", 1)[1], make_cwd); i += 1; continue
+        if t in ("-j", "-l", "-I", "-o", "-W") and i + 1 < len(rest):
+            i += 2; continue
+        if not t.startswith("-") and "=" not in t:
+            targets.append(t)
+        i += 1
+    if not mfile:
+        for cand in ("Makefile", "makefile", "GNUmakefile"):
+            p = pj(make_cwd, cand)
+            if os.path.isfile(p):
+                mfile = p; break
+    if not mfile:
+        return []
+    raw = sql_file_text(mfile)
+    if not raw:
+        return []
+    mvars, recipes, deps, cur_targets, first_target = {}, {}, {}, [], None
+    lines, buf = [], ""
+    for line in raw.splitlines():
+        if buf:
+            buf = buf[:-1] + " " + line.lstrip()
+        else:
+            buf = line
+        if not buf.endswith("\\"):
+            lines.append(buf); buf = ""
+    if buf:
+        lines.append(buf)
+    for line in lines:
+        if line.startswith("\t") and cur_targets:
+            rline = line.lstrip("\t").lstrip("@-+").strip()
+            if rline and not rline.startswith("#"):
+                for ct in cur_targets:
+                    recipes.setdefault(ct, []).append(rline)
+            continue
+        stripped = line.split("#", 1)[0].rstrip()
+        if not stripped or stripped[0].isspace():
+            continue
+        vm = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(?::=|\?=|\+=|=)\s*(.*)$", stripped)
+        if vm:
+            cur_targets = []
+            mvars[vm.group(1)] = vm.group(2).strip()
+            continue
+        tm = re.match(r"^([A-Za-z0-9_./%+-][A-Za-z0-9_./%+ -]*?)\s*::?(?![=])\s*(.*)$", stripped)
+        if tm:
+            cur_targets = [x for x in tm.group(1).split() if x]
+            if first_target is None:
+                for ct in cur_targets:
+                    if not ct.startswith("."):
+                        first_target = ct; break
+            rhs = tm.group(2)
+            dep_part, semi, inline_r = rhs.partition(";")
+            for ct in cur_targets:
+                deps.setdefault(ct, []).extend(x for x in dep_part.split() if x)
+                if semi and inline_r.strip():
+                    recipes.setdefault(ct, []).append(inline_r.strip().lstrip("@-+").strip())
+    want = targets or ([first_target] if first_target else [])
+    seen, queue, out = set(), list(want), []
+    base = os.path.basename(mfile)
+    while queue:
+        t = queue.pop(0)
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        for d in deps.get(t, []):
+            if d not in seen:
+                queue.append(d)
+        for rline in recipes.get(t, []):
+            expanded = re.sub(r"\$(?:\(([A-Za-z_][A-Za-z0-9_]*)\)|\{([A-Za-z_][A-Za-z0-9_]*)\})",
+                              lambda m: mvars.get(m.group(1) or m.group(2), m.group(0)), rline)
+            for e in analyze(expanded, make_cwd, depth + 1, vars_):
+                e.setdefault("script_body", "%s:%s" % (base, t))
+                out.append(e)
+    return out
+
+
+FOR_LOOP_RE = re.compile(
+    r"(?:^|[;&|\n]\s*)for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]+?)\s*(?:;|\n)\s*do\b([\s\S]*?)(?:;|\n|\s)\bdone\b"
+)
+AWK_SYSTEM_RE = re.compile(r"\bsystem\s*\(\s*(['\"])(.*?)\1\s*\)")
+
+
 # A pipe sink given one of these flags takes its program from the argument, so stdin is data:
 # `| python3 -m json.tool`, `| node -e '...'`, `| perl -ne '...'`. Shells: any short flag with c.
 CODE_ARG_FLAGS = {"python": r"-[A-Za-z]*[cm]", "python3": r"-[A-Za-z]*[cm]",
@@ -985,7 +1139,12 @@ def analyze(cmd, cwd, depth=0, vars_=None):
     effects = []
     if depth > MAX_DEPTH or not cmd or not cmd.strip():
         return effects
-    vars_ = dict(vars_) if vars_ is not None else {"HOME": HOME, "USERPROFILE": HOME}
+    if vars_ is None:
+        vars_ = {"HOME": HOME, "USERPROFILE": HOME}
+        if os.environ.get("TMPDIR"):
+            vars_["TMPDIR"] = canon(os.environ["TMPDIR"].rstrip("/"))
+    else:
+        vars_ = dict(vars_)
     state = {"cwd": cwd}
     if INVISIBLE_RE.search(cmd):
         effects.append({"prog": "\u200b", "seg": cmd[:120], "targets": [], "recursive": False,
@@ -1032,6 +1191,16 @@ def analyze(cmd, cwd, depth=0, vars_=None):
                         "text": cmd[cmd.rfind("\n", 0, s) + 1:line_end if line_end >= 0 else len(cmd)]})
     for decoded in decode_b64_text(cmd):
         effects += analyze(decoded, state["cwd"], depth + 1, vars_)
+    for fm in FOR_LOOP_RE.finditer(masked):
+        lvar = cmd[fm.start(1):fm.end(1)].strip()
+        raw_items = tokenize(expand_vars(cmd[fm.start(2):fm.end(2)], vars_))
+        lbody = cmd[fm.start(3):fm.end(3)].strip()
+        items = []
+        for it in raw_items:
+            items += expand_braces(it)
+        for val in items[:16]:
+            if "$" not in val and "__SUBST__" not in val and lbody:
+                effects += analyze(lbody, state["cwd"], depth + 1, dict(vars_, **{lvar: tilde(val)}))
     if FORK_BOMB_RE.search(masked):                        # quoted, it is text; `sh -c '...'` is walked as its own command
         effects.append({"prog": ":()", "seg": cmd[:200], "targets": [], "recursive": False, "kind": "fork-bomb",
                         "filtered": False, "unresolved": False, "flags": [], "args": [], "cwd": UNKNOWN_CWD,
@@ -1053,6 +1222,10 @@ def analyze(cmd, cwd, depth=0, vars_=None):
             while toks and toks[0] in KEYWORDS:
                 toks = toks[1:]
             toks = strip_function_head(toks)
+        if toks and toks[0] == "for" and len(toks) >= 4 and toks[2] == "in":
+            if "$" not in toks[3] and "__SUBST__" not in toks[3]:
+                vars_[toks[1]] = tilde(toks[3])
+            continue
         if not toks or toks[0] in LOOP_HEADS:
             continue
         j = 0
@@ -1103,6 +1276,16 @@ def analyze(cmd, cwd, depth=0, vars_=None):
                     state["cwd"] = None
             continue
         flags, args = flags_and_args(rest)
+        if via_xargs and fed and fed[0] in ("echo", "printf"):
+            fed_words = [w for w in fed[1] if not REDIRECT_TOKEN_RE.match(w) and not (w.startswith("-") and len(w) <= 3)]
+            if fed[0] == "printf" and fed_words and "%" in fed_words[0]:
+                fed_words = fed_words[1:]
+            if fed_words and all("$" not in w and "__SUBST__" not in w for w in fed_words):
+                if "{}" in args:
+                    args = [fw if a == "{}" else a.replace("{}", fw) for a in args for fw in fed_words]
+                else:
+                    args = list(args) + fed_words
+                via_xargs = False
         ecwd = state["cwd"]
         eff = {"prog": prog, "seg": seg, "targets": [], "recursive": False, "kind": None, "filtered": False,
                "unresolved": via_xargs, "flags": flags, "args": args, "cwd": ecwd or UNKNOWN_CWD,
@@ -1218,9 +1401,19 @@ def analyze(cmd, cwd, depth=0, vars_=None):
                 fed_sql = ""
             if fed_sql:
                 eff["text"] += "\n" + fed_sql
+        elif prog in ("awk", "gawk", "mawk", "nawk"):
+            eff["kind"] = "inline"
+            for a in rest:
+                for sm in AWK_SYSTEM_RE.finditer(a):
+                    effects += analyze(sm.group(2), ecwd, depth + 1, vars_)
+        elif prog in ("make", "gmake"):
+            eff["kind"] = "cli"
+            effects += make_target_effects(rest, ecwd, depth, vars_)
         elif prog in ("fly", "flyctl", "stripe", "vercel", "wrangler", "netlify", "gh", "npm", "pnpm", "yarn",
                       "cargo", "twine", "docker", "vestige", "vestige-mcp", "operator-gate"):
             eff["kind"] = "cli"
+            if prog in ("npm", "pnpm", "yarn"):
+                effects += npm_script_effects(prog, rest, ecwd, depth, vars_)
         # anything that resolved into an unknown cwd cannot be judged statically
         for key in ("targets", "writes"):
             kept = [x for x in eff[key] if not x.startswith(UNKNOWN_CWD) and "$" not in x and "__SUBST__" not in x]
@@ -1486,12 +1679,15 @@ def write_hits(w, gate_files, verb="write to"):
 NET_FETCH_RE = re.compile(r"\b(?:curl|wget|fetch|aria2c|http|https|iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b|https?://")
 REVSHELL_CODE_RE = re.compile(r"\bsocket\b|\bnet\.(?:Socket|connect|createConnection)\b|IO::Socket|TCPSocket")
 DB_RESET_PROGS = {"npx", "pnpm", "pnpx", "yarn", "bunx", "bun", "prisma", "rails", "rake", "bin/rails", "python",
-                  "python3", "php", "sequelize", "knex", "drizzle-kit", "dropdb", "mongosh", "mongo", "bundle"}
+                  "python3", "php", "sequelize", "knex", "drizzle-kit", "dropdb", "mongosh", "mongo", "bundle",
+                  "flyway", "alembic", "typeorm", "liquibase"}
 DB_RESET_RE = re.compile(
     r"\bprisma\s+(?:migrate\s+reset|db\s+push\b[^\n;|&]*--force-reset)|\b(?:rails|rake)\s+db:(?:drop|reset|purge|schema:load)\b"
     r"|\bmanage\.py\s+(?:flush|reset_db)\b|\bartisan\s+(?:migrate:fresh|migrate:reset|db:wipe)\b"
     r"|\bsequelize(?:-cli)?\s+db:drop\b|\bknex\s+migrate:rollback\b[^\n;|&]*--all|\bdrizzle-kit\s+drop\b"
-    r"|^dropdb\b|\bdropDatabase\s*\(")
+    r"|\bflyway\b[^\n;|&]*\bclean\b|\balembic\b[^\n;|&]*\bdowngrade\s+base\b"
+    r"|\btypeorm\s+schema:drop\b|\bliquibase\b[^\n;|&]*\bdrop(?:-?all|All)\b"
+    r"|^dropdb\b|\bdropDatabase\s*\(|\bdb\.[\w.]+\.drop\s*\(")
 SYSTEM_DIRS = ("/", "/usr", "/etc", "/bin", "/sbin", "/System", "/Library", "/var", "/opt", "/private", "/Applications",
                "/Users", "/home", "/root", "/boot", "/lib", "/lib64")
 
@@ -1510,7 +1706,11 @@ def teardown_or_deploy(prog, args, flags):
             or prog == "heroku" and bool(re.match(r"^(?:apps|pg):(?:destroy|reset)$", a0))
             or prog == "aws" and (args[:2] == ["s3", "rb"] or args[:2] == ["s3", "rm"] and "--recursive" in flags
                                   or any(re.match(r"^(?:delete|terminate|remove)-", x) for x in args[1:2]))
-            or prog in ("gcloud", "az", "doctl") and "delete" in a)
+            or prog == "gsutil" and (a0 == "rb" or a0 == "rm")
+            or prog == "rclone" and a0 in ("purge", "delete") and "-n" not in flags
+            or prog == "vercel" and a0 in ("rm", "remove")
+            or prog == "firebase" and (bool(re.search(r":delete$", a0)) or a0 == "deploy")
+            or prog in ("gcloud", "az", "doctl", "supabase") and "delete" in a)
 
 
 def machine_wreck(prog, args, flags, ecwd):
@@ -1528,6 +1728,25 @@ def machine_wreck(prog, args, flags, ecwd):
             t = resolve(x, ecwd)
             if t in SYSTEM_DIRS or same_path(t, HOME):
                 return "%s -R on %s" % (prog, t)
+    if prog in ("shutdown", "reboot", "halt", "poweroff") and "-c" not in flags \
+            or prog in ("init", "telinit") and args[:1] in (["0"], ["6"]) \
+            or prog == "systemctl" and args[:1] in (["poweroff"], ["reboot"], ["halt"]):
+        return "%s halts or reboots the machine" % prog
+    if prog == "kill" and "-1" in flags and (len(flags) > 1 or not args):
+        return "kill -1 signals every process owned by the user"
+    return None
+
+
+def dirty_git_path(target, where):
+    """First tracked file with uncommitted changes under target in where's git repo, or None."""
+    try:
+        r = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", where,
+                            "status", "--porcelain", "--untracked-files=no", "--", target],
+                           capture_output=True, text=True, timeout=2)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.splitlines()[0][3:].strip()
+    except Exception:
+        pass
     return None
 
 
@@ -1557,6 +1776,10 @@ def git_work_loss(sub, ga, where):
             kept = [g for g in gone if g.rstrip("/").split("/")[-1] not in BUILD_DIRS]
             if rc == 0 and kept:
                 return "git clean deletes untracked files such as %s" % kept[0]
+        if sub in ("checkout", "switch") and any(x in ("-f", "--force", "--discard-changes") for x in ga):
+            rc, out = git("status", "--porcelain", "--untracked-files=no")
+            if rc == 0 and out.strip():
+                return "git %s -f discards uncommitted changes to %s" % (sub, out.splitlines()[0][3:].strip())
         if sub in ("checkout", "restore") and ("--" in ga or ga[-1:] == ["."]) or sub == "restore" and ga \
                 and not ("--staged" in ga and "--worktree" not in ga):
             paths = ga[ga.index("--") + 1:] if "--" in ga else [x for x in ga if not x.startswith("-")]
@@ -1583,6 +1806,10 @@ def classify_effect(e, cfg, cwd):
 
     for w in e.get("writes", []):
         hits += write_hits(w, gate_files)
+        if os.path.isfile(w) and os.path.getsize(w) > 0 and not is_scratch(w) and not (ecwd and is_inside(w, ecwd)) \
+                and not any(h[0] in ("OP-000", "OP-001", "OP-002", "OP-008", "OP-011") for h in hits):
+            hits.append(("OP-011", "overwrites %s, which is outside the project" % w,
+                         "Copy it to a dated backup first, or ask the owner."))
 
     if kind == "fork-bomb":
         hits.append(("OP-014", "a fork bomb: it copies itself until the machine hangs",
@@ -1725,6 +1952,21 @@ def classify_effect(e, cfg, cwd):
             if gone:
                 hits.append(("OP-011", "%s destroys %s beyond recovery" % (e.get("prog"), gone[0]),
                              "Use rm on a copy you no longer need, or ask the owner."))
+        if kind == "delete" and not e["recursive"] and not e.get("filtered"):
+            for t in e["targets"]:
+                if (os.path.isfile(t) and os.path.getsize(t) > 0 or "/.ssh/" in t or "/.gnupg/" in t) \
+                        and not is_scratch(t) and not (ecwd and is_inside(t, ecwd)) \
+                        and not any(h[0] in ("OP-000", "OP-001", "OP-002", "OP-003", "OP-004", "OP-011") for h in hits):
+                    hits.append(("OP-011", "deletes %s, which is outside the project" % t,
+                                 "Copy it to a dated backup first, or ask the owner."))
+        if kind == "delete" and ecwd and not e.get("filtered"):
+            for t in e["targets"]:
+                if not is_scratch(t) and is_inside(t, ecwd) \
+                        and not any(h[0] in ("OP-000", "OP-001", "OP-002", "OP-003", "OP-004", "OP-011") for h in hits):
+                    dirty = dirty_git_path(t, ecwd)
+                    if dirty:
+                        hits.append(("OP-011", "deletes %s with uncommitted changes to %s" % (t, dirty),
+                                     "Commit or stash the work first (`git stash`), or ask the owner."))
         if e["unresolved"] and kind in ("delete", "move") and not e["targets"]:
             hits.append(("OP-S05", "delete/move with targets from stdin", ""))
 
@@ -1763,8 +2005,12 @@ def classify_effect(e, cfg, cwd):
                 or sub == "branch" and "-D" in ga or sub in ("stash",) and ga[:1] in (["drop"], ["clear"]) \
                 or sub in ("checkout", "restore") and ga[-1:] in (["."], ["--", "."]):
             hits.append(("OP-S01", "git %s %s" % (sub, " ".join(ga[:3])), ""))
-        if sub in ("push",) and re.search(r"--delete|:refs/", " ".join(ga)) and "main" in " ".join(ga):
+        if sub in ("push",) and (
+                ("--delete" in ga or "-d" in ga) and any(re.search(r"(^|/)(main|master|trunk|release[/\-].*|prod.*)$", a) for a in ga)
+                or any(re.match(r"^:(?:refs/\w+/)?(main|master|trunk|release[/\-].*|prod.*)$", a) for a in ga)):
             hits.append(("OP-004", "delete of remote main", "Ask the owner."))
+        if sub == "reflog" and any(a in ("expire", "delete") for a in ga):
+            hits.append(("OP-004", "git reflog %s erases recovery history" % ga[0], "Ask the owner."))
 
     elif kind in ("cli", "db", "inline"):
         prog, flags, args = e["prog"], e["flags"], e["args"]
@@ -1784,6 +2030,12 @@ def classify_effect(e, cfg, cwd):
                         prog == "cargo" and args[:1] == ["publish"] or prog == "twine" and args[:1] == ["upload"] or
                         prog == "docker" and args[:1] == ["push"]):
             hits.append(("OP-005", "%s %s" % (prog, args[0]), "Dry-run only (`--dry-run`) and hand off to the owner."))
+        if not dry and prog in ("docker", "podman") and (
+                args[:2] in (["volume", "rm"], ["volume", "remove"], ["volume", "prune"])
+                or args[:2] == ["system", "prune"] and "--volumes" in flags
+                or args[:2] == ["compose", "down"] and (has_flag(flags, "v") or "--volumes" in flags)):
+            hits.append(("OP-007", "%s %s" % (prog, " ".join(args[:2])),
+                         "Removing volumes destroys container data stores; back up first or ask the owner."))
         fly_groups = {"apps", "app", "secrets", "machine", "machines", "postgres", "pg", "volumes", "volume", "certs",
                       "ips", "regions", "autoscale", "mpg", "redis", "extensions", "tokens", "orgs"}
         fly_mut = {"destroy", "create", "set", "unset", "import", "update", "run", "stop", "start", "restart",
@@ -1808,9 +2060,15 @@ def classify_effect(e, cfg, cwd):
         if prog in ("psql", "sqlite3", "mysql", "mariadb", "duckdb", "supabase", "mongosh", "redis-cli"):
             sql = re.sub(r"pragma\s+wal_checkpoint\s*(\(\s*\w+\s*\))?", "", lo)
             sql = re.sub(r"insert\s+into\s+(\w+)\s*\(\s*\1\s*\)\s*values\s*\(\s*'[a-z\-]+'\s*\)", "", sql)  # fts5 control
+            unscoped_update = any(not re.search(r"\bwhere\b", m.group(1))
+                                  for m in re.finditer(r"\bupdate\s+[\w.\"`]+\s+set\b([^;]*)", sql))
+            taut_where = bool(re.search(
+                r"\b(?:delete\s+from|update)\s+[\w.\"`]+\b[^;]*?\bwhere\s+(?:true\b|1\s*=\s*1\b|'(\w*)'\s*=\s*'\1'|\"(\w*)\"\s*=\s*\"\2\")",
+                sql))
             if re.search(r"\bdrop\s+(table|database|schema|index)\b|(?<![\w(])truncate\s+(table\s+)?[\w\"`]|"
-                         r"\bflush(all|db)\b|\bdropdatabase\b", sql) \
-                    or re.search(r"\bdelete\s+from\s+\w+\s*(;|\"|'|$)", sql):
+                         r"\bflush(all|db)\b|\bdropdatabase\b|\bdb\.[\w.]+\.drop\s*\(", sql) \
+                    or re.search(r"\bdelete\s+from\s+\w+\s*(;|\"|'|$)", sql) \
+                    or unscoped_update or taut_where:
                 hits.append(("OP-007", "destructive SQL", "Run it as a SELECT first, scope with WHERE, "
                              "and take a backup; ask the owner for a permit."))
             if prog == "sqlite3":
@@ -1882,6 +2140,9 @@ def _balanced_args(text, open_idx):
 HOME_EXPR_RES = (
     re.compile(r"^(?:require\(\s*['\"]os['\"]\s*\)|os)\.homedir\(\)\s*\+\s*(['\"])(/[^'\"]*)\1$"),
     re.compile(r"^(?:process\.env\.HOME|os\.environ\[\s*['\"]HOME['\"]\s*\]|os\.getenv\(\s*['\"]HOME['\"]\s*\))\s*\+\s*(['\"])(/[^'\"]*)\1$"),
+    re.compile(r"^\$ENV\{\s*['\"]?HOME['\"]?\s*\}\s*\.\s*(['\"])(/[^'\"]*)\1$"),
+    re.compile(r'^"\$ENV\{\s*HOME\s*\}(/[^"]*)"$'),
+    re.compile(r"^(?:ENV\[\s*['\"]HOME['\"]\s*\]|Dir\.home(?:\(\))?)\s*\+\s*(['\"])(/[^'\"]*)\1$"),
 )
 HOME_JOIN_RES = (
     re.compile(r"^(?:path\.)?(?:join|resolve)\(\s*(?:require\(\s*['\"]os['\"]\s*\)|os)\.homedir\(\)\s*,\s*(['\"])([^'\"]*)\1\s*\)$"),
@@ -2142,7 +2403,9 @@ def classify(payload, cfg):
     effects_out = []
     blob = json.dumps(ti, ensure_ascii=False)
 
-    if "OPERATOR_CANARY_STOP_7f3a" in blob:
+    # The canary is written as two adjacent literals, which Python joins, so this file never holds it
+    # whole: a host that sends a whole file through the gate (Cursor's StrReplace) can still edit it.
+    if "OPERATOR_CANARY_" "STOP_7f3a" in blob:
         hits.append(("OP-CANARY", "canary string present", "Nothing to fix: this proves the gate ran."))
 
     if tool in SHELL_TOOLS or "command" in ti and tool not in WRITE_TOOLS and not tool.startswith("mcp__"):
@@ -2339,7 +2602,7 @@ def stop(reason_lines):
 def degraded_hit(raw):
     """Gate crashed: fail closed only for text that plainly looks destructive, else fail open."""
     return bool(re.search(r"\brm\s+-[a-zA-Z]*[rR]|\bmv\s+\S*(vestige|Developer|\.zcode|\.claude)|"
-                          r"push\s+.*--force|\bDROP\s+TABLE|\.vestige/vestige\.db|fly\s+deploy|OPERATOR_CANARY_STOP_7f3a",
+                          r"push\s+.*--force|\bDROP\s+TABLE|\.vestige/vestige\.db|fly\s+deploy|OPERATOR_CANARY_" r"STOP_7f3a",
                           raw or "", re.I))
 
 
