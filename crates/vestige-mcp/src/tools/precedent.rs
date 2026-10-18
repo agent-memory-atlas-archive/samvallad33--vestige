@@ -2,15 +2,17 @@
 //!
 //! Reads the Operator gate's own record at `$OPERATOR_HOME` or `~/.operator`:
 //! `receipts/YYYY-MM-DD.jsonl` (one JSON object per line, UTC `ts`, hash-chained
-//! `digest`) and `permits/<action_digest>.json[.used|.expired]`. A stop links to
-//! its permit by `action_digest`, and by the permit's `stop_receipt` when the
-//! file carries one (older permits do not). Nothing here writes, approves,
-//! issues, or deletes anything; the hash chain is not verified in this version.
+//! `digest`) and `permits/<action_digest>.json[.used|.expired]`. A receipt links
+//! to the permit whose `stop_receipt` names it, or else to a permit for the same
+//! `action_digest` paired by grant time (older permits carry no `stop_receipt`).
+//! Day files that end before the window are not read. Nothing here writes,
+//! approves, issues, or deletes anything; the hash chain is not verified in this
+//! version.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Days, Local, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use vestige_core::Storage;
@@ -102,7 +104,14 @@ fn parse_decision(v: Option<&str>) -> Result<Option<Vec<String>>, String> {
     }
 }
 
+/// Records an agent gets per call: a page that fits in a context.
+const AGENT_LIMIT: usize = 50;
+
 fn parse_query(args: Option<Value>) -> Result<Query, String> {
+    parse_query_capped(args, AGENT_LIMIT)
+}
+
+fn parse_query_capped(args: Option<Value>, max_limit: usize) -> Result<Query, String> {
     let a: Args = match args {
         Some(v) => serde_json::from_value(v).map_err(|e| e.to_string())?,
         None => Args::default(),
@@ -115,7 +124,7 @@ fn parse_query(args: Option<Value>) -> Result<Query, String> {
         session: nonempty(a.session),
         rule: nonempty(a.rule),
         decisions: parse_decision(a.decision.as_deref())?,
-        limit: a.limit.unwrap_or(10).clamp(1, 50) as usize,
+        limit: a.limit.unwrap_or(10).clamp(1, max_limit.max(1) as i64) as usize,
         label,
     })
 }
@@ -155,6 +164,16 @@ fn read_receipts(home: &Path, cutoff: i64) -> (Vec<(i64, usize, Value)>, usize) 
             .collect(),
         Err(_) => return (Vec::new(), 0),
     };
+    // A day file holds that UTC day's receipts. Skip days that end before the
+    // cutoff, keeping one spare day in case a file was named by local date.
+    if let Some(first) = DateTime::from_timestamp(cutoff, 0).map(|t| t.date_naive() - Days::new(1)) {
+        files.retain(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                .is_none_or(|day| day >= first)
+        });
+    }
     files.sort();
     let mut out = Vec::new();
     let mut skipped = 0usize;
@@ -182,14 +201,16 @@ fn read_receipts(home: &Path, cutoff: i64) -> (Vec<(i64, usize, Value)>, usize) 
     (out, skipped)
 }
 
-/// Every permit file, each carrying its suffix status and the note.
+/// Every permit file in name order, each carrying its suffix status and the note.
 fn load_permits(home: &Path) -> Vec<Value> {
     let pdir = home.join("permits");
     let Ok(rd) = std::fs::read_dir(&pdir) else {
         return Vec::new();
     };
+    let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
     let mut out = Vec::new();
-    for e in rd.filter_map(|e| e.ok()) {
+    for e in entries {
         let Some(name) = e.file_name().to_str().map(str::to_string) else {
             continue;
         };
@@ -227,16 +248,43 @@ fn load_permits(home: &Path) -> Vec<Value> {
     out
 }
 
+/// The permit that answers this receipt. A permit for the same action naming
+/// the receipt as its `stop_receipt` is that receipt's. Otherwise permits for
+/// the same action are paired by grant time, in whole seconds: an ALLOW or
+/// PERMIT_GRANTED takes the latest granted at or before it, any other record
+/// the earliest granted at or after it that names no other stop. Ties go to
+/// the first file by name.
 fn find_permit<'a>(permits: &'a [Value], rec: &Value) -> Option<&'a Value> {
-    let ad = rec.get("action_digest").and_then(Value::as_str);
-    let dg = rec.get("digest").and_then(Value::as_str);
-    permits.iter().find(|p| {
-        p.get("action_digest").and_then(Value::as_str).is_some_and(|s| ad.is_some_and(|a| s == a))
-            || p
-                .get("stop_receipt")
-                .and_then(Value::as_str)
-                .is_some_and(|s| dg.is_some_and(|d| s == d))
-    })
+    fn field<'v>(v: &'v Value, k: &str) -> Option<&'v str> {
+        v.get(k).and_then(Value::as_str)
+    }
+    let ad = field(rec, "action_digest")?;
+    let same_action = permits.iter().filter(|p| field(p, "action_digest") == Some(ad));
+    if let Some(dg) = field(rec, "digest")
+        && let Some(p) = same_action.clone().find(|p| field(p, "stop_receipt") == Some(dg))
+    {
+        return Some(p);
+    }
+    let ts = field(rec, "ts").and_then(ts_unix)?;
+    let timed = same_action.filter_map(|p| {
+        Some((p.get("granted").and_then(Value::as_f64)?.floor() as i64, p))
+    });
+    if matches!(field(rec, "decision"), Some("ALLOW" | "PERMIT_GRANTED")) {
+        timed
+            .filter(|(g, _)| *g <= ts)
+            .fold(None, |best, (g, p)| match best {
+                Some((b, _)) if b >= g => best,
+                _ => Some((g, p)),
+            })
+    } else {
+        timed
+            .filter(|(g, p)| *g >= ts && p.get("stop_receipt").is_none())
+            .fold(None, |best, (g, p)| match best {
+                Some((b, _)) if b <= g => best,
+                _ => Some((g, p)),
+            })
+    }
+    .map(|(_, p)| p)
 }
 
 fn keep(rec: &Value, q: &Query) -> bool {
@@ -307,7 +355,17 @@ fn build_item(rec: &Value, permits: &[Value]) -> Value {
         "detail": rec.get("detail").cloned().unwrap_or(Value::Null),
         "digest": rec.get("digest").cloned().unwrap_or(Value::Null),
     });
-    for k in ["via", "action_digest", "commitment"] {
+    // `prev` is the digest this receipt chains to; `normalized` and
+    // `transforms` are what the gate saw through before it judged the call.
+    for k in [
+        "via",
+        "action_digest",
+        "commitment",
+        "prev",
+        "normalized",
+        "transforms",
+        "gate_version",
+    ] {
         if let Some(v) = rec.get(k) {
             item[k] = v.clone();
         }
@@ -469,6 +527,13 @@ pub async fn execute(_storage: &Arc<Storage>, args: Option<Value>) -> Result<Val
     run(&operator_home(), &q)
 }
 
+/// The same reader with a wider cap, for the dashboard: it draws every stop
+/// in a window, not one page of them. Agents keep the 50-record page.
+pub fn execute_wide(args: Option<Value>, max_limit: usize) -> Result<Value, String> {
+    let q = parse_query_capped(args, max_limit)?;
+    run(&operator_home(), &q)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,21 +550,92 @@ mod tests {
     }
 
     fn rec(ts: &str, decision: &str, extra: &str) -> String {
+        rec_with_digest(ts, decision, &"d".repeat(64), extra)
+    }
+
+    fn rec_with_digest(ts: &str, decision: &str, digest: &str, extra: &str) -> String {
         format!(
-            r#"{{"action_preview":"do a thing","commitments":[],"cwd":"/repo","decision":"{decision}","digest":"{digest}","gate_version":"0.3.13","session":"sess-1","source":"claude","tool":"Bash","ts":"{ts}","v":1{extra}}}"#,
-            digest = "d".repeat(64),
+            r#"{{"action_preview":"do a thing","commitments":[],"cwd":"/repo","decision":"{decision}","digest":"{digest}","gate_version":"0.3.13","session":"sess-1","source":"claude","tool":"Bash","ts":"{ts}","v":1{extra}}}"#
         )
+    }
+
+    fn day_file(ts: DateTime<Utc>) -> String {
+        format!("receipts/{}.jsonl", ts.format("%Y-%m-%d"))
+    }
+
+    /// Receipts filed the way the gate files them, by UTC day.
+    fn write_receipts(home: &Path, lines: &[(DateTime<Utc>, String)]) {
+        let mut days = std::collections::BTreeMap::<String, String>::new();
+        for (ts, line) in lines {
+            let body = days.entry(day_file(*ts)).or_default();
+            body.push_str(line);
+            body.push('\n');
+        }
+        for (rel, body) in days {
+            write(home, &rel, &body);
+        }
+    }
+
+    fn permit(action_digest: &str, granted: DateTime<Utc>, stop_receipt: Option<&str>) -> String {
+        let g = granted.timestamp() as f64 + 0.5;
+        let mut p = json!({
+            "action_digest": action_digest,
+            "granted": g,
+            "expires": g + 900.0,
+            "single_use": true,
+            "by": "owner-tty",
+        });
+        if let Some(s) = stop_receipt {
+            p["stop_receipt"] = json!(s);
+        }
+        p.to_string()
+    }
+
+    /// One action stopped, permitted, allowed and stopped again, as the gate
+    /// records it: STOP at 0s, ALLOW via permit at 60s, STOP at 120s.
+    /// Returns the home and the three receipt digests in that order.
+    fn stopped_twice(t0: DateTime<Utc>) -> (tempfile::TempDir, [String; 3]) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        let ad = r#","action_digest":"abab1212abab1212abab1212""#;
+        let digests = ["1".repeat(64), "2".repeat(64), "3".repeat(64)];
+        write_receipts(
+            dir.path(),
+            &[
+                (at(0), rec_with_digest(&iso(at(0)), "STOP", &digests[0], ad)),
+                (
+                    at(60),
+                    rec_with_digest(&iso(at(60)), "ALLOW", &digests[1], &format!(r#"{ad},"via":"permit""#)),
+                ),
+                (at(120), rec_with_digest(&iso(at(120)), "STOP", &digests[2], ad)),
+            ],
+        );
+        (dir, digests)
+    }
+
+    fn permit_status(out: &Value, digest: &str) -> Value {
+        let item = out["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["digest"] == digest)
+            .unwrap();
+        item.get("permit").map(|p| p["status"].clone()).unwrap_or(Value::Null)
     }
 
     fn fixture() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::TempDir::new().unwrap();
         let home = dir.path().to_path_buf();
         let now = Utc::now();
-        let fresh = iso(now - chrono::Duration::hours(2));
-        let stale = iso(now - chrono::Duration::days(3));
-        let stop = rec(
+        let (fresh_at, stale_at) = (now - chrono::Duration::hours(2), now - chrono::Duration::days(3));
+        let (fresh, stale) = (iso(fresh_at), iso(stale_at));
+        // Granted after the stops active_and_expired_permits_are_visible_via_all writes an hour ago.
+        let granted = (now - chrono::Duration::minutes(30)).timestamp();
+        // The stop the used permit below names as its stop_receipt.
+        let stop = rec_with_digest(
             &fresh,
             "STOP",
+            &"dddd4444".repeat(8),
             r#","action_digest":"aaaa1111aaaa1111aaaa1111","commitment":"OP-011","rule":"no-unrestorable-loss","detail":"git checkout discards uncommitted changes""#,
         );
         let allowed = rec(
@@ -509,12 +645,12 @@ mod tests {
         );
         write(
             &home,
-            "receipts/2026-10-12.jsonl",
+            &day_file(fresh_at),
             &format!("{stop}\nnot json at all\n\n{allowed}\n{}\n", rec(&fresh, "PASS", "")),
         );
         write(
             &home,
-            "receipts/2026-10-09.jsonl",
+            &day_file(stale_at),
             &format!(
                 "{}\n",
                 rec(&stale, "STOP", r#","action_digest":"cccc3333cccc3333cccc3333","commitment":"OP-003","rule":"no-blind-recursive-delete","detail":"old stop""#)
@@ -528,12 +664,18 @@ mod tests {
         write(
             &home,
             "permits/eeee5555eeee5555eeee5555.json",
-            r#"{"action_digest":"eeee5555eeee5555eeee5555","granted":1000000000.0,"expires":1000000900.0,"single_use":true,"by":"owner-tty"}"#,
+            &format!(
+                r#"{{"action_digest":"eeee5555eeee5555eeee5555","granted":{granted}.0,"expires":{}.0,"single_use":true,"by":"owner-tty"}}"#,
+                granted + 900
+            ),
         );
         write(
             &home,
             "permits/ffff6666ffff6666ffff6666.json.expired",
-            r#"{"action_digest":"ffff6666ffff6666ffff6666","granted":1000000000.0,"expires":1000000900.0,"single_use":true,"by":"owner-tty"}"#,
+            &format!(
+                r#"{{"action_digest":"ffff6666ffff6666ffff6666","granted":{granted}.0,"expires":{}.0,"single_use":true,"by":"owner-tty"}}"#,
+                granted + 900
+            ),
         );
         (dir, home)
     }
@@ -564,6 +706,31 @@ mod tests {
             Some(vec!["SHADOW_STOP".to_string()])
         );
         assert!(parse_decision(Some("maybe")).is_err());
+    }
+
+    #[test]
+    fn items_carry_the_chain_link_and_what_the_gate_saw_through() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path().to_path_buf();
+        let fresh_at = Utc::now() - chrono::Duration::minutes(5);
+        let fresh = iso(fresh_at);
+        let stop = rec(
+            &fresh,
+            "STOP",
+            r#","prev":"79ecb0a2a995efb2","normalized":"git checkout -- src/app.py","transforms":["variables-expanded","heredoc-extracted"],"commitment":"OP-011","rule":"no-unrestorable-loss","detail":"git checkout discards uncommitted changes token=hunter2""#,
+        );
+        // The receipt's own UTC day: a fixed date drops out of the window once
+        // the calendar passes it, and day files before the window are skipped.
+        let day = format!("receipts/{}.jsonl", fresh_at.format("%Y-%m-%d"));
+        write(&home, &day, &format!("{stop}\n"));
+        let out = run(&home, &query(json!({"since": "1h"}))).unwrap();
+        let item = &out["items"][0];
+        assert_eq!(item["prev"], "79ecb0a2a995efb2");
+        assert_eq!(item["normalized"], "git checkout -- src/app.py");
+        assert_eq!(item["transforms"], json!(["variables-expanded", "heredoc-extracted"]));
+        assert_eq!(item["gate_version"], "0.3.13");
+        // The pass-through fields go through the same masking as the rest.
+        assert_eq!(item["detail"], "git checkout discards uncommitted changes [REDACTED]");
     }
 
     #[test]
@@ -677,10 +844,12 @@ mod tests {
     #[test]
     fn active_and_expired_permits_are_visible_via_all() {
         let (_d, home) = fixture();
-        let h1 = iso(Utc::now() - chrono::Duration::hours(1));
+        let h1_at = Utc::now() - chrono::Duration::hours(1);
+        let h1 = iso(h1_at);
+        fs::remove_dir_all(home.join("receipts")).unwrap();
         write(
             &home,
-            "receipts/2026-10-12.jsonl",
+            &day_file(h1_at),
             &format!(
                 "{}\n{}\n{}\n",
                 rec(&h1, "STOP", r#","action_digest":"eeee5555eeee5555eeee5555","commitment":"OP-006","rule":"no-paid-deploy","detail":"x""#),
@@ -705,6 +874,14 @@ mod tests {
         );
         assert!(find("012345678901234567890123").get("permit").is_none());
         assert_eq!(out["summary"], "3 stops in the last 24h");
+    }
+
+    #[test]
+    fn wide_cap_reaches_past_the_agent_page() {
+        let q = parse_query_capped(Some(json!({"limit": 900})), 2000).unwrap();
+        assert_eq!(q.limit, 900);
+        let q = parse_query(Some(json!({"limit": 900}))).unwrap();
+        assert_eq!(q.limit, AGENT_LIMIT);
     }
 
     #[test]
@@ -736,5 +913,68 @@ mod tests {
         let out = run(&home, &query(json!({}))).unwrap();
         let items = out["items"].as_array().unwrap();
         assert_eq!(items[0]["ts_local"].as_str().unwrap().len(), 19);
+    }
+
+    #[test]
+    fn a_later_stop_does_not_show_the_permit_an_earlier_stop_used() {
+        let t0 = Utc::now() - chrono::Duration::hours(3);
+        let (dir, [first, allow, again]) = stopped_twice(t0);
+        let granted = t0 + chrono::Duration::seconds(30);
+        write(
+            dir.path(),
+            "permits/abab1212abab1212abab1212.json.used",
+            &permit("abab1212abab1212abab1212", granted, Some(&first)),
+        );
+        let out = run(dir.path(), &query(json!({}))).unwrap();
+        assert_eq!(permit_status(&out, &first), "used");
+        assert_eq!(permit_status(&out, &allow), "used");
+        assert_eq!(permit_status(&out, &again), Value::Null, "{out}");
+    }
+
+    #[test]
+    fn old_used_and_new_active_permits_pair_by_grant_time() {
+        // Older permit files carry no stop_receipt, so only grant time can say
+        // which stop each one answered.
+        let t0 = Utc::now() - chrono::Duration::hours(3);
+        let (dir, [first, allow, again]) = stopped_twice(t0);
+        let ad = "abab1212abab1212abab1212";
+        let secs = |s: i64| t0 + chrono::Duration::seconds(s);
+        write(dir.path(), &format!("permits/{ad}.json.used"), &permit(ad, secs(30), None));
+        write(dir.path(), &format!("permits/{ad}.json"), &permit(ad, secs(150), None));
+        let out = run(dir.path(), &query(json!({}))).unwrap();
+        assert_eq!(permit_status(&out, &first), "used");
+        assert_eq!(permit_status(&out, &allow), "used");
+        assert_eq!(permit_status(&out, &again), "active");
+    }
+
+    #[test]
+    fn stop_receipt_outranks_grant_time() {
+        // The owner answered the second stop first: its permit (granted at 125s)
+        // was used, then the first stop's permit was granted at 130s.
+        let t0 = Utc::now() - chrono::Duration::hours(3);
+        let (dir, [first, _, again]) = stopped_twice(t0);
+        let ad = "abab1212abab1212abab1212";
+        let secs = |s: i64| t0 + chrono::Duration::seconds(s);
+        write(dir.path(), &format!("permits/{ad}.json.used"), &permit(ad, secs(125), Some(&again)));
+        write(dir.path(), &format!("permits/{ad}.json"), &permit(ad, secs(130), Some(&first)));
+        let out = run(dir.path(), &query(json!({}))).unwrap();
+        assert_eq!(permit_status(&out, &first), "active");
+        assert_eq!(permit_status(&out, &again), "used");
+    }
+
+    #[test]
+    fn receipt_files_dated_before_the_window_are_not_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path();
+        let cutoff = DateTime::parse_from_rfc3339("2026-10-12T06:00:00Z").unwrap().timestamp();
+        // Every line is stamped inside the window, so only a file's date can keep it out.
+        let inside = rec("2026-10-12T07:00:00Z", "STOP", "");
+        for day in ["2026-10-10", "2026-10-11", "2026-10-12"] {
+            write(home, &format!("receipts/{day}.jsonl"), &format!("not json\n{inside}\n"));
+        }
+        write(home, "receipts/undated.jsonl", &format!("{inside}\n"));
+        let (recs, skipped) = read_receipts(home, cutoff);
+        assert_eq!(recs.len(), 3, "10-11 (one spare day), 10-12 and the undated file");
+        assert_eq!(skipped, 2, "the 10-10 file is never read");
     }
 }

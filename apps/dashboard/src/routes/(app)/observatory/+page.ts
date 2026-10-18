@@ -1,5 +1,5 @@
-// The Observatory is a WebGPU client-only surface: it reads
-// window.location for its ?demo= contract and boots a GPU device on mount.
-// SSR would 500 on `window` and can never render the field anyway.
-export const ssr = false;
-export const prerender = false;
+import type { PageLoad } from './$types';
+import { redirectAbsorbed } from '$lib/absorbed-redirect';
+
+// Absorbed by the condensed dashboard (see ABSORBED_ROUTES in os-routes.ts).
+export const load: PageLoad = ({ url }) => redirectAbsorbed('/observatory', url);

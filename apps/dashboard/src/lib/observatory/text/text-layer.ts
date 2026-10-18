@@ -312,7 +312,7 @@ export class TextLayerPass implements FramePass {
 				x1 = Math.max(x1, gx1);
 				y0 = Math.min(y0, gy0);
 				y1 = Math.max(y1, gy1);
-				packGlyph(packed, item, glyph, color, size, glyphIndex++);
+				packGlyph(packed, item, glyph, color, size, glyphIndex++ - glyphStart);
 			}
 			if (runGlyphs.length > 0) {
 				const id = item.id ?? `msdf-text:${itemIndex}`;
@@ -433,6 +433,8 @@ function packGlyph(
 	size: number,
 	glyphIndex: number
 ): void {
+	// Letters type in within their own run (glyphIndex counts from the run's start),
+	// so a late item in a long list is never held back by the items before it.
 	const ageFrame = (item.startFrame ?? 0) + glyphIndex * 2;
 	const revealSpan = item.revealSpan ?? 18;
 	out.push(

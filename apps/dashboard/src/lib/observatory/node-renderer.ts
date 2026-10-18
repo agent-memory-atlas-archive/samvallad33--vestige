@@ -76,6 +76,7 @@ export class NodeRenderer implements FramePass {
 	private edgeCapacityBytes = 0;
 	private edgeCount = 0;
 	private cameraRig: CameraRigState = { ...IDENTITY_RIG };
+	private frame = { scale: 1, x: 0, y: 0 };
 	private hoveredIndex = -1;
 
 	// Path edge wavefront (Increment 6)
@@ -244,6 +245,13 @@ export class NodeRenderer implements FramePass {
 	setCameraRig(rig: CameraRigState): void {
 		this.cameraRig = rig;
 	}
+	/**
+	 * Where the field sits on screen: `scale` < 1 pulls it back, `x`/`y`
+	 * move its centre (NDC), so a page can keep its words and the field apart.
+	 */
+	setFrame(frame: { scale: number; x: number; y: number }): void {
+		this.frame = frame;
+	}
 
 	setHovered(index: number): void {
 		this.hoveredIndex = index;
@@ -253,7 +261,17 @@ export class NodeRenderer implements FramePass {
 		const w = this.engine.params[6] || 1;
 		const h = this.engine.params[7] || 1;
 		const phase = this.engine.params[1];
-		return orbitWithRig(phase, w / h, ORBIT_DISTANCE, this.cameraRig);
+		const f = this.frame;
+		const orbit = orbitWithRig(phase, w / h, ORBIT_DISTANCE / f.scale, this.cameraRig);
+		if (f.x === 0 && f.y === 0) return orbit;
+		// Shift the whole picture on screen (clip.xy += offset * clip.w), so
+		// drawing and picking agree on where every node is.
+		const m = Float32Array.from(orbit.viewProj);
+		for (let c = 0; c < 4; c++) {
+			m[c * 4 + 0] += f.x * m[c * 4 + 3];
+			m[c * 4 + 1] += f.y * m[c * 4 + 3];
+		}
+		return { ...orbit, viewProj: m as unknown as typeof orbit.viewProj };
 	}
 
 	/**

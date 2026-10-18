@@ -193,6 +193,14 @@ fn build_guarded_router(state: AppState, guard: AccessGuard) -> (Router, AppStat
         .route("/api/receipts", get(handlers::list_receipts))
         .route("/api/receipts/{receipt_id}", get(handlers::get_receipt))
         // ============================================================
+        // OPERATOR STOPS — the Guard organ reads the gate's receipts
+        // ============================================================
+        .route("/api/stops", get(handlers::list_stops))
+        // ============================================================
+        // TOOL BRIDGE — every MCP tool through the agent's own path
+        // ============================================================
+        .route("/api/mcp/{tool}", post(handlers::call_tool))
+        // ============================================================
         // MEMORY HYGIENE + INTELLIGENCE (live-wire) — duplicates,
         // contradictions, cross-project patterns, per-memory audit
         // ============================================================
@@ -445,6 +453,10 @@ async fn guard_access(State(guard): State<AccessGuard>, request: Request, next: 
     }
 }
 
+/// The port this process's dashboard is serving on (0 until it binds), so
+/// links handed to agents point at the dashboard that is actually running.
+pub static SERVING_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
 /// Start the dashboard HTTP server (blocking — use in CLI mode)
 pub async fn start_dashboard(
     storage: Arc<Storage>,
@@ -466,6 +478,7 @@ pub async fn start_dashboard(
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    SERVING_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -705,6 +718,7 @@ async fn serve_until_stopped(
         }
     };
 
+    SERVING_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
     info!(
         "Dashboard available at http://127.0.0.1:{} (WebSocket at ws://127.0.0.1:{}/ws)",
         port, port

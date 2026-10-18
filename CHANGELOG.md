@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The dashboard, rebuilt on raw WebGPU.** The Palace is the front door: a
+  living brain under the VESTIGE logo, one organ per part of Vestige. A click
+  dives into the organ and bursts twice into its page, and the orbs of the
+  second burst form the page's words. Trace, Ledger, Guard, Healing, Causal,
+  System and Witness show every group of memories as a big round island of
+  orbs in their own world; a click opens an island to every memory in it, a
+  page at a time, at a URL an agent can open too. Field shows the whole mind
+  as a sphere of stars in a nebula, and Cinema keeps the flythrough.
+- **`POST /api/mcp/{tool}`** runs any MCP tool for the dashboard through the
+  same path an agent's call takes. **`GET /api/stops`** reads a whole window
+  of Operator receipts for Guard; agents keep their 50 record page.
+- **An agent can take its user inside a memory.** `memory` get with a
+  `reason` emits `MemoryShown`; every open dashboard goes to that memory and
+  shows the agent's words, and the reply carries the link.
+- **`gather`**: a GitHub issue hunt recorded as receipts in one scope (the
+  issue, its comments, linked pull requests and the commit window of a local
+  checkout), then ghostlink leads and `causal_walk` over the recorded edges.
+  It runs as background store work, so dashboard reads and other agents take
+  the store first.
+- **`ghostlink` heal mode** weaves verdicts from recorded events.
+- **Receipts and runs on Strata**: `/api/receipts` and `/api/traces` list
+  them from the log.
+
+### Changed
+
+- `tools/list` stays under its 22 KiB budget with one more tool: `gather` and
+  `purge` advertise compact schemas, and folded filter groups carry no text.
+  Every full schema is still one call deeper, through `memory_status` with
+  `view='tools'`.
+- The dream event counts only the connections that are new.
+
 ### Fixed
 
 - **Degenerate w20 personalization pinned at the optimizer bracket.**

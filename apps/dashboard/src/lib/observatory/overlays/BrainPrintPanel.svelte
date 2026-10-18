@@ -68,28 +68,23 @@
 		gap: 0.55rem;
 		margin-top: 0.15rem;
 	}
+	/* Bare words over the field, like every organ: no boxes. */
 	.obs-print-btn {
 		align-self: flex-start;
-		padding: 0.55rem 0.9rem;
-		border-radius: 0.65rem;
-		border: 1px solid rgba(34, 199, 222, 0.45);
-		background: rgba(8, 28, 32, 0.72);
-		color: #9ff8ec;
-		font-size: 0.82rem;
-		font-weight: 700;
-		letter-spacing: 0.06em;
+		padding: 0.2rem 0;
+		border: none;
+		border-bottom: 1px solid rgba(127, 243, 230, 0.5);
+		background: none;
+		color: #7ff3e6;
+		font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+		font-size: 0.7rem;
+		letter-spacing: 0.14em;
 		text-transform: uppercase;
 		cursor: pointer;
-		box-shadow: 0 0 18px -8px rgba(34, 199, 222, 0.7);
-		transition:
-			border-color 0.16s ease,
-			background 0.16s ease,
-			box-shadow 0.16s ease;
+		text-shadow: 0 0 22px rgba(2, 3, 7, 0.95), 0 1px 2px rgba(2, 3, 7, 0.9);
 	}
 	.obs-print-btn:hover:not(:disabled) {
-		border-color: rgba(92, 240, 166, 0.7);
-		background: rgba(10, 36, 40, 0.88);
-		box-shadow: 0 0 22px -6px rgba(92, 240, 166, 0.55);
+		color: #ffffff;
 	}
 	.obs-print-btn:focus-visible {
 		outline: 2px solid rgba(34, 199, 222, 0.7);
@@ -103,12 +98,9 @@
 		display: flex;
 		flex-direction: column;
 		gap: 0.4rem;
-		padding: 0.7rem 0.85rem;
-		border-radius: 0.7rem;
-		border: 1px solid rgba(140, 199, 219, 0.28);
-		background: rgba(6, 16, 20, 0.62);
-		-webkit-backdrop-filter: blur(8px);
-		backdrop-filter: blur(8px);
+		padding: 0.2rem 0 0.2rem 0.8rem;
+		border-left: 1px solid rgba(127, 243, 230, 0.2);
+		text-shadow: 0 0 22px rgba(2, 3, 7, 0.95), 0 1px 2px rgba(2, 3, 7, 0.9);
 	}
 	.obs-print-kicker {
 		font-size: 0.62rem;
@@ -132,13 +124,11 @@
 		list-style: none;
 	}
 	.obs-chip {
-		padding: 0.18rem 0.5rem;
-		border-radius: 999px;
-		border: 1px solid rgba(92, 240, 166, 0.35);
-		background: rgba(20, 48, 40, 0.45);
-		color: #c8ffe8;
-		font-size: 0.7rem;
-		letter-spacing: 0.02em;
+		padding: 0;
+		color: #9fdcc8;
+		font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+		font-size: 0.64rem;
+		letter-spacing: 0.08em;
 	}
 	.obs-print-copy {
 		align-self: flex-start;

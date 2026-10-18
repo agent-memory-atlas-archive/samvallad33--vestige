@@ -1,3 +1,4 @@
+import { typeColor } from '$lib/trace/trace-pass';
 import { describe, it, expect } from 'vitest';
 import { DemoClock } from '../demo-clock';
 import {
@@ -109,15 +110,22 @@ describe('buildNodeStateArray determinism', () => {
 });
 
 describe('meaning-layer palette (visual DNA §7.1)', () => {
-	it('maps FSRS retention buckets to the real dashboard palette', () => {
-		const active = toObservatoryNode(node({ id: 'a', retention: 0.9 }), 0);
-		const dormant = toObservatoryNode(node({ id: 'd', retention: 0.5 }), 1);
-		const silent = toObservatoryNode(node({ id: 's', retention: 0.2 }), 2);
-		const gone = toObservatoryNode(node({ id: 'u', retention: 0.01 }), 3);
-		expect(nodeBaseColor(active)).toEqual(hexToRgb01('#10b981')); // emerald
-		expect(nodeBaseColor(dormant)).toEqual(hexToRgb01('#f59e0b')); // amber
-		expect(nodeBaseColor(silent)).toEqual(hexToRgb01('#4A7D8C')); // fossil cyan — never purple
-		expect(nodeBaseColor(gone)).toEqual(hexToRgb01('#6b7280')); // slate
+	it('colours a node by its memory type, the palette every organ shares', () => {
+		const decision = toObservatoryNode(node({ id: 'a', type: 'decision', retention: 0.9 }), 0);
+		const correction = toObservatoryNode(node({ id: 'c', type: 'correction', retention: 0.9 }), 1);
+		const fact = toObservatoryNode(node({ id: 'f', type: 'fact', retention: 0.9 }), 2);
+		const event = toObservatoryNode(node({ id: 'e', type: 'event', retention: 0.9 }), 3);
+		expect(nodeBaseColor(decision)).toEqual(typeColor('decision')); // amber
+		expect(nodeBaseColor(correction)).toEqual(typeColor('correction')); // red
+		expect(nodeBaseColor(fact)).toEqual(typeColor('fact')); // cyan
+		expect(nodeBaseColor(event)).toEqual(typeColor('event')); // green
+		expect(new Set([decision, correction, fact, event].map((n) => nodeBaseColor(n).join(','))).size).toBe(4);
+	});
+
+	it('retention never changes the hue (the shader maps it to brightness)', () => {
+		const held = toObservatoryNode(node({ id: 'h', type: 'decision', retention: 0.95 }), 0);
+		const fading = toObservatoryNode(node({ id: 'g', type: 'decision', retention: 0.05 }), 1);
+		expect(nodeBaseColor(held)).toEqual(nodeBaseColor(fading));
 	});
 
 	it('aha tag overrides with gold', () => {

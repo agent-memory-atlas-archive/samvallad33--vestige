@@ -66,21 +66,21 @@ fn vs_text(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
 	let cursor_pre = vec2f(params.cursor_x, params.cursor_y);
 	let cursor_delta = cursor_pre - anchor;
 	let d = distance(anchor, cursor_pre);
-	// Wide influence radius so the field reacts when the cursor is anywhere NEAR
-	// the text, not only dead-on (v1 R=0.45 was too tight to feel).
-	let R = 0.75;
+	// A calm, local response: the text under the pointer leans in a little; text
+	// across the screen stays still, so reading never fights the cursor.
+	let R = 0.42;
 	let cursor_w = exp(-(d * d) / (R * R));
 	// Per-glyph SCALE-UP near the cursor: glyphs the pointer approaches swell toward
 	// you. Scaling the quad around its anchor is the most legible "alive" cue.
-	let grow = 1.0 + cursor_w * 0.55;
+	let grow = 1.0 + cursor_w * 0.12;
 	var pos = anchor + (quad_offset + corner * size) * grow;
 	// Depth → clip z. Trust (depth~1) floats forward (small z), low-trust sinks back.
 	// Cursor lifts a glyph forward, but z MUST stay > 0 or clip.z<0 clips the quad
 	// behind the near plane and the glyph vanishes (v1 bug: cursor made text disappear).
 	var z = mix(0.42, 0.10, depth);
-	z = clamp(z - cursor_w * 0.42, 0.04, 0.6);
+	z = clamp(z - cursor_w * 0.12, 0.04, 0.6);
 	let lean_dir = select(vec2f(0.0, 0.0), normalize(cursor_delta), length(cursor_delta) > 0.0001);
-	pos = pos + lean_dir * cursor_w * 0.04;
+	pos = pos + lean_dir * cursor_w * 0.012;
 	pos = pos + vec2f(sin(params.time * 0.6), cos(params.time * 0.5)) * ((1.0 - depth) * 0.006) * params.pulse;
 	// Keep glyphs square in BOTH orientations: normalize by the longer axis.
 	// Landscape (aspect>1): narrow x. Portrait (aspect<1): shrink y instead —
@@ -121,7 +121,10 @@ fn fs_text(in: VSOut) -> @location(0) vec4f {
 	let px_dist = screen_range_dof * (dist - 0.5 + weight_bias);
 	let coverage = clamp(px_dist + 0.5, 0.0, 1.0);
 	let reveal_span = max(1.0, in.info.y);
-	let reveal = clamp((params.frame - in.info.x) / reveal_span, 0.0, 1.0);
+	// The reveal runs on steady time (params.time is monotonic in live mode and
+	// the loop frame / 60 in capture), so text types in once instead of
+	// vanishing and re-typing at every 720-frame loop seam.
+	let reveal = clamp((params.time * 60.0 - in.info.x) / reveal_span, 0.0, 1.0);
 	let alpha = coverage * in.color.a * reveal;
 	if (alpha < 0.001) { discard; }
 	// Glow floor keeps EVERY line clearly lit at rest (even depth~0), depth adds

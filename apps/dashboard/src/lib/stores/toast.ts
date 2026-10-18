@@ -168,22 +168,26 @@ function createToastStore() {
 			}
 
 			case 'MemoryPromoted': {
+				// A 4.x promote/demote result carries no retention, and the
+				// event then reports 0: say what happened instead of "0%".
 				const r = Number(d.new_retention ?? 0);
 				return {
 					type: event.type,
 					title: 'Memory promoted',
-					body: `retention ${(r * 100).toFixed(0)}%`,
+					body: r > 0 ? `retention ${(r * 100).toFixed(0)}%` : 'recorded with a receipt',
 					color,
 					dwellMs: 4500,
 				};
 			}
 
 			case 'MemoryDemoted': {
+				// A 4.x promote/demote result carries no retention, and the
+				// event then reports 0: say what happened instead of "0%".
 				const r = Number(d.new_retention ?? 0);
 				return {
 					type: event.type,
 					title: 'Memory demoted',
-					body: `retention ${(r * 100).toFixed(0)}%`,
+					body: r > 0 ? `retention ${(r * 100).toFixed(0)}%` : 'recorded with a receipt',
 					color,
 					dwellMs: 4500,
 				};

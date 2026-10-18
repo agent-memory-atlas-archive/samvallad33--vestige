@@ -326,9 +326,10 @@ fn ghostlink_is_the_advertised_composition_tool() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 17, "{names:?}");
+    assert_eq!(names.len(), 18, "{names:?}");
     assert!(names.contains(&"ghostlink"), "{names:?}");
     assert!(names.contains(&"precedent"), "{names:?}");
+    assert!(names.contains(&"gather"), "{names:?}");
     assert!(
         !names.contains(&"graph"),
         "graph must be a hidden alias: {names:?}"

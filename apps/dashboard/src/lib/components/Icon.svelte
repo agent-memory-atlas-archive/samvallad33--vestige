@@ -31,6 +31,9 @@
 		| 'intentions'
 		| 'stats'
 		| 'settings'
+		| 'guard'
+		| 'cinema'
+		| 'trace'
 		| 'command'
 		| 'search'
 		| 'filter'
@@ -80,6 +83,11 @@
 		// Stacked vector planes — independent, non-comparable embedding spaces.
 		// Gear — settings.
 		settings: `<circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v2.6M12 18.9v2.6M21.5 12h-2.6M5.1 12H2.5M18.7 5.3l-1.9 1.9M7.2 16.8l-1.9 1.9M18.7 18.7l-1.9-1.9M7.2 7.2 5.3 5.3"/>`,
+		// Film frame with a play mark — Memory Cinema.
+		trace: `<path d="M3 17.5c3-2 6 2 9 0s6 2 9 0"/><path d="M12 15.6V9.4"/><circle cx="12" cy="6.6" r="2.4"/><path d="M7 12.4 9.6 10M17 12.4 14.4 10" opacity=".7"/>`,
+		cinema: `<rect x="3.5" y="5.5" width="17" height="13" rx="2"/><path d="M3.5 9h17M3.5 15h17M7 5.5v3.5M7 15v3.5M17 5.5v3.5M17 15v3.5"/><path d="m10.6 10.4 3.4 1.6-3.4 1.6z" fill="currentColor" stroke="none"/>`,
+		// Shield with a stopped arrow — the Operator boundary outside the agent.
+		guard: `<path d="M12 3 19.5 6v5.6c0 4.4-3.1 8-7.5 9.4-4.4-1.4-7.5-5-7.5-9.4V6z"/><path d="M8.5 12h5.2"/><path d="M15.6 9.6v4.8" stroke-width="2.2"/>`,
 
 		// ── UI utility glyphs (not nav, but part of the system) ──
 		command: `<path d="M9 6.5A2.5 2.5 0 1 0 6.5 9H9V6.5ZM9 9v6M9 9h6M15 9V6.5A2.5 2.5 0 1 1 17.5 9H15ZM15 15h2.5A2.5 2.5 0 1 1 15 17.5V15ZM15 15H9M9 15v2.5A2.5 2.5 0 1 1 6.5 15H9Z"/>`,

@@ -279,6 +279,9 @@ export type VestigeEventType =
 	| 'TraceEvent'
 	| 'MemoryPrOpened'
 	| 'MemoryPrDecided'
+	// An agent read a memory with a reason: it is showing that memory to its
+	// user. Every open dashboard goes inside it (lib/inside) with the words.
+	| 'MemoryShown'
 	| 'Heartbeat'
 	// The server's broadcast buffer overflowed for this socket: `data.missed`
 	// events were dropped. Explicit, never silent; consumers refetch state.

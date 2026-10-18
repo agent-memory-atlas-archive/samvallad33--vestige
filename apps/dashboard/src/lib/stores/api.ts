@@ -95,6 +95,28 @@ export const api = {
 			fetcher<UnsuppressResult>(`/memories/${id}/unsuppress`, { method: 'POST' })
 	},
 
+	/**
+	 * Run any Vestige MCP tool through the dashboard's tool bridge
+	 * (POST /api/mcp/{tool}). The call takes the same path an agent's call
+	 * takes — Strata withholding, trace, review gate, receipt, live events —
+	 * and resolves to the tool's structured result. A refusal rejects with the
+	 * tool's own words.
+	 */
+	/**
+	 * Operator receipts (the vestige_stops reader) for a whole window: up to
+	 * 2,000 records, where an agent's tool call gets a 50-record page.
+	 */
+	stops: (q: { since?: string; decision?: string; rule?: string; session?: string; limit?: number } = {}) => {
+		const params = new URLSearchParams();
+		for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== '') params.set(k, String(v));
+		return fetcher<{ items?: Record<string, unknown>[]; summary?: string; skipped_lines?: number }>(`/stops?${params}`);
+	},
+	tool: <T = Record<string, unknown>>(name: string, args: Record<string, unknown> = {}) =>
+		fetcher<T>(`/mcp/${encodeURIComponent(name)}`, {
+			method: 'POST',
+			body: JSON.stringify(args)
+		}),
+
 	// Search
 	search: (q: string, limit = 20) =>
 		fetcher<SearchResult>(`/search?q=${encodeURIComponent(q)}&limit=${limit}`),

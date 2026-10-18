@@ -326,12 +326,13 @@ fn compact_root_properties(properties: &Value) -> Value {
             out.insert(name.clone(), compact(schema, 1, is_selector));
         }
     }
+    // A group's name says what it holds (`filters`, `source`); every member
+    // is optional, so the group carries no text of its own on the wire.
     for (group, members) in groups {
         out.insert(
             group,
             json!({
                 "type": "object",
-                "description": "Optional filters, grouped.",
                 "properties": Value::Object(members),
             }),
         );
@@ -428,6 +429,7 @@ pub fn full_schema(name: &str) -> Option<Value> {
         "selftest" => selftest::schema(),
         "forgotten_lesson" => forgotten_lesson::schema(),
         "precedent" => precedent::schema(),
+        "gather" => gather::schema(),
         "purge" => memory_unified::purge_schema(),
         _ => return None,
     })
@@ -453,6 +455,7 @@ const ALL_TOOLS: &[&str] = &[
     "selftest",
     "forgotten_lesson",
     "precedent",
+    "gather",
 ];
 
 #[cfg(test)]
