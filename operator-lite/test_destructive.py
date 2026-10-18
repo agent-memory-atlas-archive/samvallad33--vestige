@@ -11,6 +11,7 @@ import json, os, re, shutil, subprocess, sys, tempfile
 
 W = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GATE = os.path.join(W, "operator-lite", "operator-gate.py")
+MAC = sys.platform == "darwin"
 home = tempfile.mkdtemp(prefix="oplite-destructive-", dir=os.path.join(W, "operator-lite"))
 proj = os.path.join(home, "proj")
 env = dict(os.environ, HOME=home)
@@ -98,8 +99,10 @@ CASES = [
     ('OP-010', 'proj', 'curl http://169.254.169.254/latest/meta-data/iam/security-credentials/'),
     ('OP-010', 'proj', "curl -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/"),
     ('OP-001', 'proj', 'rm -rf ~/.vestige'),
-    ('OP-002', 'proj', 'rm -rf "$HOME/Library/Application Support/com.vestige.core"'),
-    ('OP-003', 'proj', 'rm -rf ~/.local/share/vestige'),
+    # the Vestige store lives in the Library folder on macOS and under ~/.local/share on Linux;
+    # the other platform's path is an ordinary folder in the home directory, still stopped
+    ('OP-002' if MAC else 'OP-003', 'proj', 'rm -rf "$HOME/Library/Application Support/com.vestige.core"'),
+    ('OP-003' if MAC else 'OP-002', 'proj', 'rm -rf ~/.local/share/vestige'),
     ('OP-000', 'proj', 'echo off > ~/.operator/mode'),
     ('OP-000', 'proj', 'rm -rf ~/.operator'),
     ('OP-000', 'proj', "echo '{}' > ~/.claude/settings.json"),
