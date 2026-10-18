@@ -124,8 +124,10 @@ text: `fact`, `concept`, `event`, `person`, `place`, `note`, `pattern`, `decisio
 - **Auto-connect.** The new record is joined by `touched` edges to the records of its
   scope that record the same exact identity (a tag, a file path, a commit sha, an issue
   reference, a URL; never a word). All of one save's edges land as one write behind one
-  receipt. The response's `autoConnect` block lists the edges with the identity each is
-  joined on, `receiptId`, and `skipped`: every tag that did not join, its carriers out of
+  receipt. The response's `autoConnect` block gives `edges` (how many were written),
+  `pairs` (at most 5, strongest first, each with the identity it is joined on), `pairsTotal` and
+  `pairsShown` (when `pairsTotal` is larger, the rest are in the receipt), `receiptId`
+  (its receipt lists every edge), and `skipped`: every tag that did not join, its carriers out of
   the scope and the reason (a hub tag more than half the scope carries, or more pairs than
   the 100-edge budget of one write).
 - **`links`.** Up to 16 typed edges from the new record to existing records in the same
@@ -393,11 +395,14 @@ A GitHub issue hunt recorded as receipts in one scope, then the walk (5.0.0). Fi
      directory name. Commits go first so the walk can reach them from the issue.
   2. One record per pull request that cross-references the issue in the first 100
      events of its timeline, tagged `<repo>`, `gather` and `linked-pr`.
-  3. The issue, `Issue <owner>/<repo>/#<n> [<state>]: <title>. <body>`, tagged `<repo>`,
+  3. The issue, `Issue <owner>/<repo>#<n> [<state>]: <title>. <body>`, tagged `<repo>`,
      `failure`, `gather` and the issue's labels. This is the failure record.
   4. One record per comment with a non-blank body, oldest first, up to `maxComments`
-     (one page of `repos/<owner>/<repo>/issues/<n>/comments`, at most 100), tagged
+     (read from `repos/<owner>/<repo>/issues/<n>/comments` in pages of up to 100), tagged
      `<repo>`, `gather` and `comment`.
+     The pull request, issue and comment records all name the issue as
+     `<owner>/<repo>#<n>`, an issue identity auto-connect joins on whatever the hub rule
+     does to their shared tags.
   5. `touched` edges from each record it wrote in steps 2 to 4, through the same pass
      `smart_ingest` runs at ingest: to the records of the scope that share an exact
      identity with it (a tag, a file path, a commit sha, an issue reference or a URL),
