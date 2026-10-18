@@ -1,4 +1,4 @@
-//! `vestige_stops` MCP tool — what Operator stopped, and why. Read-only.
+//! `precedent` MCP tool — what the Operator gate ruled, and why. Read-only.
 //!
 //! Reads the Operator gate's own record at `$OPERATOR_HOME` or `~/.operator`:
 //! `receipts/YYYY-MM-DD.jsonl` (one JSON object per line, UTC `ts`, hash-chained
@@ -425,7 +425,7 @@ fn run(home: &Path, q: &Query) -> Result<Value, String> {
     let rdir = home.join("receipts");
     if !rdir.is_dir() {
         return Ok(json!({
-            "tool": "vestige_stops",
+            "tool": "precedent",
             "summary": format!("Operator receipts not found at {}", rdir.display()),
             "items": [],
             "skipped_lines": 0
@@ -458,7 +458,7 @@ fn run(home: &Path, q: &Query) -> Result<Value, String> {
         ));
     }
     Ok(json!({
-        "tool": "vestige_stops",
+        "tool": "precedent",
         "summary": summary,
         "items": hits.into_iter().map(|(_, _, i)| i).take(q.limit).collect::<Vec<_>>(),
         "skipped_lines": skipped

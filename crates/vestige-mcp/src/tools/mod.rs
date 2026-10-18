@@ -114,9 +114,9 @@ pub mod causal_walk;
 pub mod forgotten_lesson;
 pub mod selftest;
 
-// vestige_stops: what the Operator gate stopped, and why — a read-only view
+// precedent: what the Operator gate stopped, and why — a read-only view
 // of ~/.operator receipts and permits. Touches no store state.
-pub mod stops;
+pub mod precedent;
 
 // Internal/backwards-compat tools still dispatched by server.rs for specific
 // tool names. Each module below has live callers via string dispatch in

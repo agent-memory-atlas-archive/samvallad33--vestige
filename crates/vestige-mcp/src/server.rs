@@ -1372,7 +1372,7 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
             // no store state, approves nothing, issues nothing.
             // ================================================================
             ToolDescription {
-                name: "vestige_stops".to_string(),
+                name: "precedent".to_string(),
                 title: Some("Vestige Stops".to_string()),
                 annotations: Some(ToolAnnotations {
                     read_only_hint: true,
@@ -1381,7 +1381,7 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
                     open_world_hint: false,
                 }),
                 description: Some("What Operator stopped and why: reads receipts and permits.".to_string()),
-                input_schema: tools::compact::of(&tools::stops::schema()),
+                input_schema: tools::compact::of(&tools::precedent::schema()),
                 ..Default::default()
             },
             ]
@@ -1974,8 +1974,8 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
             "forgotten_lesson" => {
                 tools::forgotten_lesson::execute(&self.storage, request.arguments).await
             }
-            "vestige_stops" => {
-                tools::stops::execute(&self.storage, request.arguments).await
+            "precedent" => {
+                tools::precedent::execute(&self.storage, request.arguments).await
             }
 
             // ================================================================
