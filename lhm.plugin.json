@@ -7,7 +7,7 @@
   "category": "developer",
   "homepage": "https://github.com/samvallad33/vestige",
   "icon": "🧠",
-  "description": "Vestige 5.0.0: the Causal Proof Engine and operating system for AI agents. Its kernel is Strata, an append-only signed log on your machine: zero vectors, zero RAG, and every answer carries its proof. Recall by exact handle, every write admitted through a gate with a receipt, GhostLink proposals of never-composed pairs with a proof from recorded edges, intentions, code records whose anchors check themselves against source, causal walks over recorded edges, and vestige prove, which bisects a failure to the commit that caused it with your own test and receipts every run. 16 MCP tools; purge is withheld until real erasure ships. Upgrading from v3 imports your records, links, intentions and code anchors on first launch and keeps the v3 file. Install the v5.0.0 binary from the GitHub Release, Homebrew (samvallad33/tap/vestige) or npm (npx -y vestige-mcp-server). Binaries: macOS Apple Silicon/Intel, Linux x64/ARM64, Windows x64. Data stays on your machine.",
+  "description": "Vestige 5.0.0: the Causal Proof Engine and operating system for AI agents. Its kernel is Strata, an append-only signed log on your machine: zero vectors, zero RAG, and every answer carries its proof. Recall by exact handle, every write admitted through a gate with a receipt, GhostLink proposals of never-composed pairs with a proof from recorded edges, intentions, code records whose anchors check themselves against source, causal walks over recorded edges, vestige prove, which bisects a failure to the commit that caused it with your own test and receipts every run, and precedent, which reads what the Operator gate stopped or allowed, under which rule, and which permit answered each stop. 18 MCP tools; purge is withheld until real erasure ships. Upgrading from v3 imports your records, links, intentions and code anchors on first launch and keeps the v3 file. Install the v5.0.0 binary from the GitHub Release, Homebrew (samvallad33/tap/vestige) or npm (npx -y vestige-mcp-server). Binaries: macOS Apple Silicon/Intel, Linux x64/ARM64, Windows x64. Data stays on your machine.",
   "tags": [
     "memory",
     "agent-memory",
@@ -336,6 +336,37 @@
       }
     },
     {
+      "name": "gather",
+      "description": "A GitHub issue's evidence as receipts, then the walk.",
+      "inputSchema": {
+        "description": "Record a GitHub issue hunt's evidence as labeled receipts",
+        "properties": {
+          "brokeIn": {
+            "type": "string"
+          },
+          "maxComments": {
+            "type": "integer"
+          },
+          "repoPath": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "workedIn": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      }
+    },
+    {
       "name": "ghostlink",
       "description": "Never-composed memory pairs, each with its proof from recorded edges only. Modes: propose (lens bridge|divergent), bounty, weave (write), map, inspect, explore, predict, harden (write).",
       "inputSchema": {
@@ -428,7 +459,8 @@
               "inspect",
               "explore",
               "predict",
-              "harden"
+              "harden",
+              "heal"
             ],
             "type": "string"
           },
@@ -800,7 +832,6 @@
             "type": "boolean"
           },
           "filters": {
-            "description": "Optional filters, grouped.",
             "properties": {
               "min_retention": {
                 "type": "number"
@@ -998,6 +1029,36 @@
       }
     },
     {
+      "name": "precedent",
+      "description": "Operator stops and why.",
+      "inputSchema": {
+        "properties": {
+          "cwd": {
+            "type": "string"
+          },
+          "decision": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "rule": {
+            "type": "string"
+          },
+          "session": {
+            "type": "string"
+          },
+          "since": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
       "name": "project",
       "description": "Project the durable subset of a scope (decisions, patterns, rule-tagged facts) into a fenced region of CLAUDE.md or MEMORY.md, one memory id per line. 'preview' (default) shows the diff; 'write' needs confirm=true and replaces only the fence.",
       "inputSchema": {
@@ -1014,7 +1075,6 @@
             "type": "boolean"
           },
           "filters": {
-            "description": "Optional filters, grouped.",
             "properties": {
               "min_retention": {
                 "type": "number"
@@ -1078,7 +1138,6 @@
             "type": "string"
           },
           "filters": {
-            "description": "Optional filters, grouped.",
             "properties": {
               "concrete": {
                 "type": "boolean"
@@ -1157,7 +1216,6 @@
             "type": "string"
           },
           "source": {
-            "description": "Optional filters, grouped.",
             "properties": {
               "source_author": {
                 "type": "string"
@@ -1272,7 +1330,6 @@
             "type": "object"
           },
           "filters": {
-            "description": "Optional filters, grouped.",
             "properties": {
               "token_budget": {
                 "type": "integer"
