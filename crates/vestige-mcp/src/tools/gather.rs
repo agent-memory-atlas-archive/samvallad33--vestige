@@ -56,13 +56,18 @@ struct IssueRef {
 }
 
 fn parse_issue_url(url: &str) -> Result<IssueRef, String> {
-    let trimmed = url.trim().trim_end_matches('/');
+    let trimmed = url.trim();
+    let trimmed = trimmed
+        .split(['#', '?'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
     let parts: Vec<&str> = trimmed.split('/').collect();
     let (owner, name, num) = match parts.as_slice() {
-        [.., o, n, "issues", num] | [.., o, n, "pulls", num] => (*o, *n, *num),
+        [.., o, n, "issues" | "pull" | "pulls", num] => (*o, *n, *num),
         _ => {
             return Err(
-                "url must be a GitHub issue URL like https://github.com/owner/repo/issues/123"
+                "url must be a GitHub issue URL like https://github.com/owner/repo/issues/123, or a pull request URL like https://github.com/owner/repo/pull/123"
                     .into(),
             );
         }
@@ -92,6 +97,92 @@ fn gh_json(args: &[&str]) -> Result<Value, String> {
     }
     serde_json::from_slice(&out.stdout)
         .map_err(|e| format!("gh {} returned invalid JSON: {e}", args.join(" ")))
+}
+
+/// The issue's comments, oldest first. `repos/O/R/issues/N` is the issue
+/// itself (one object, never a list), so its comments come only from here.
+/// GitHub serves at most 100 per page.
+fn comments_endpoint(issue: &IssueRef, per_page: usize, page: usize) -> String {
+    format!(
+        "repos/{}/{}/issues/{}/comments?per_page={}&page={}",
+        issue.owner,
+        issue.name,
+        issue.number,
+        per_page.clamp(1, 100),
+        page
+    )
+}
+
+/// `owner/repo#N`, the form auto-connect reads as an issue identity. Every
+/// receipt of one hunt names it, so they stay joined to each other when the
+/// hub rule or the edge budget sets their shared tags aside.
+fn issue_ref(issue: &IssueRef) -> String {
+    format!("{}/{}#{}", issue.owner, issue.name, issue.number)
+}
+
+fn linked_pr_content(issue: &IssueRef, number: u64, title: &str) -> String {
+    format!(
+        "Linked pull request #{number} on issue {}: {title}",
+        issue_ref(issue)
+    )
+}
+
+fn failure_content(issue: &IssueRef, state: &str, title: &str, body: &str) -> String {
+    format!(
+        "Issue {} [{state}]: {title}. {}",
+        issue_ref(issue),
+        body.trim()
+    )
+}
+
+fn comment_content(issue: &IssueRef, author: &str, body: &str) -> String {
+    format!("Comment on issue {} by {author}: {body}", issue_ref(issue))
+}
+
+/// `(author, body)` for every comment with a non-blank body. Anything other
+/// than a list of comments yields none.
+fn comment_bodies(comments: &Value) -> Vec<(String, String)> {
+    comments
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| {
+                    let who = c["user"]["login"].as_str()?.to_string();
+                    let body = c["body"].as_str()?.trim().to_string();
+                    (!body.is_empty()).then_some((who, body))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Join each record gather wrote to the scope's memories it shares an exact
+/// identity with, through the same pass smart_ingest runs at ingest: hub tags
+/// are skipped, and each record writes at most
+/// [`crate::auto_connect::MAX_AUTO_EDGES`] edges in one write. Returns
+/// `(edges written, candidates the budget left unlinked)`.
+///
+/// Records are joined one at a time, never every pair of the scope: commits
+/// that only share their commit tag stay unjoined, so a commit window of n
+/// commits costs nothing here rather than n * (n - 1) / 2 edges on a log that
+/// cannot drop them.
+fn bridge(
+    storage: &Storage,
+    scope: &str,
+    records: &[(String, String, Vec<String>)],
+) -> (usize, usize) {
+    let mut edges = 0usize;
+    let mut not_linked = 0usize;
+    for (id, content, tags) in records {
+        match crate::auto_connect::auto_connect_new_memory(storage, id, scope, content, tags) {
+            Ok(report) => {
+                edges += report.edges;
+                not_linked += report.not_linked;
+            }
+            Err(err) => tracing::warn!("gather: {err}"),
+        }
+    }
+    (edges, not_linked)
 }
 
 /// Run one ingest_repo page and return `(summary, pageBackRev)`.
@@ -129,7 +220,7 @@ pub fn schema() -> Value {
         "type": "object",
         "description": "Record a GitHub issue hunt's evidence as labeled receipts in one scope (the issue, its comments, cross-referenced PRs, and the commit window of a local checkout through ingest_repo paging), then run ghostlink leads and causal_walk over the recorded edges. Causes are hypotheses; missingReceipts names the next receipt class to fetch.",
         "properties": {
-            "url": {"type": "string", "description": "GitHub issue URL (…/issues/N)"},
+            "url": {"type": "string", "description": "GitHub issue or pull request URL (…/issues/N or …/pull/N)"},
             "repoPath": {"type": "string", "description": "local checkout of the same repository; its commit window is ingested before the failure record"},
             "workedIn": {"type": "string", "description": "good version tag for the window"},
             "brokeIn": {"type": "string", "description": "bad version tag for the window"},
@@ -140,8 +231,8 @@ pub fn schema() -> Value {
     })
 }
 
-/// A hunt writes a commit window and then one edge per entity-sharing pair,
-/// back to back, each holding the store for a gated write. It runs as
+/// A hunt writes a commit window, its receipts, and a bounded batch of edges
+/// per receipt, each holding the store for a gated write. It runs as
 /// background store work so dashboard reads and other agents' calls take the
 /// store first; what it records, and in what order, is unchanged.
 pub async fn execute(
@@ -194,34 +285,23 @@ async fn run(
         }
     }
 
-    let comments = gh_json(&[
-        "api",
-        &format!(
-            "repos/{}/{}/issues/{}?per_page={}",
-            issue.owner, issue.name, issue.number, max_comments
-        ),
-    ])
-    .or_else(|_| {
-        gh_json(&[
-            "api",
-            &format!(
-                "repos/{}/{}/issues/{}/comments?per_page={}",
-                issue.owner, issue.name, issue.number, max_comments
-            ),
-        ])
-    })?;
-    let comment_bodies: Vec<(String, String)> = comments
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|c| {
-                    let who = c["user"]["login"].as_str()?.to_string();
-                    let body = c["body"].as_str()?.trim().to_string();
-                    (!body.is_empty()).then_some((who, body))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let comment_bodies = if max_comments == 0 {
+        Vec::new()
+    } else {
+        // Pages of up to 100 until maxComments are in hand or GitHub runs out.
+        let per_page = max_comments.clamp(1, 100);
+        let mut bodies = Vec::new();
+        for page in 1.. {
+            let comments = gh_json(&["api", &comments_endpoint(&issue, per_page, page)])?;
+            let served = comments.as_array().map_or(0, Vec::len);
+            bodies.extend(comment_bodies(&comments));
+            if bodies.len() >= max_comments || served < per_page {
+                break;
+            }
+        }
+        bodies.truncate(max_comments);
+        bodies
+    };
 
     let mut linked_prs: Vec<(u64, String)> = Vec::new();
     if let Ok(timeline) = gh_json(&[
@@ -299,29 +379,21 @@ async fn run(
         )
     };
 
+    let mut bridge_records: Vec<(String, String, Vec<String>)> = Vec::new();
     let mut linked_pr_ids: Vec<String> = Vec::new();
     for (n, t) in &linked_prs {
         let node = write(
-            format!(
-                "Linked pull request #{n} on issue {}/{}/#{}: {t}",
-                issue.owner, issue.name, issue.number
-            ),
+            linked_pr_content(&issue, *n, t),
             vec![issue.name.clone(), "gather".into(), "linked-pr".into()],
             format!("github:{}/{}/#{}", issue.owner, issue.name, n),
         )
         .map_err(|e| format!("linked PR #{n} was not admitted: {e}"))?;
+        bridge_records.push((node.id.clone(), node.content.clone(), node.tags.clone()));
         linked_pr_ids.push(node.id);
     }
 
     let failure_node = write(
-        format!(
-            "Issue {}/{}/#{} [{}]: {title}. {}",
-            issue.owner,
-            issue.name,
-            issue.number,
-            state,
-            body.trim()
-        ),
+        failure_content(&issue, &state, &title, &body),
         {
             let mut t = vec![issue.name.clone(), "failure".into(), "gather".into()];
             t.extend(labels);
@@ -331,88 +403,32 @@ async fn run(
     )
     .map_err(|e| format!("the failure record was not admitted: {e}"))?;
     let failure_id = failure_node.id.clone();
+    bridge_records.push((
+        failure_node.id.clone(),
+        failure_node.content.clone(),
+        failure_node.tags.clone(),
+    ));
 
     let mut comment_ids: Vec<String> = Vec::new();
     for (who, body) in &comment_bodies {
         let node = write(
-            format!(
-                "Comment on issue {}/{}/#{} by {}: {}",
-                issue.owner, issue.name, issue.number, who, body
-            ),
+            comment_content(&issue, who, body),
             vec![issue.name.clone(), "gather".into(), "comment".into()],
             format!("github:{}/{}/#{}", issue.owner, issue.name, issue.number),
         )
         .map_err(|e| format!("a comment record was not admitted: {e}"))?;
+        bridge_records.push((node.id.clone(), node.content.clone(), node.tags.clone()));
         comment_ids.push(node.id);
     }
 
     // ---- Bridge (deterministic, exact entities only) ----------------------
     // The commit records were written by ingest_repo and the receipts by the
-    // scoped write above; neither pass runs the full-scan connect. Run it
-    // here so exact shared identities (a tag, a file path, a commit sha, an
-    // issue or a URL) wire failure-to-commit `touched` edges the walk can
-    // follow. Same identities as `vestige connect`: no similarity, no guesses.
-    let bridge_edges = {
-        let mut nodes = storage
-            .get_all_nodes_in_scope(&scope, 10_000, 0)
-            .map_err(|e| format!("connect scan could not read scope {scope}: {e}"))?;
-        nodes.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-        let entity_sets: Vec<std::collections::HashSet<String>> = nodes
-            .iter()
-            .map(|n| {
-                crate::auto_connect::extract_identities(&n.content, &n.tags)
-                    .into_iter()
-                    .map(|identity| identity.to_string())
-                    .collect()
-            })
-            .collect();
-        let joined: std::collections::HashSet<(String, String)> = storage
-            .get_all_connections()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|e| {
-                if e.source_id < e.target_id {
-                    (e.source_id.clone(), e.target_id.clone())
-                } else {
-                    (e.target_id.clone(), e.source_id.clone())
-                }
-            })
-            .collect();
-        let now = chrono::Utc::now();
-        let mut written = 0usize;
-        for i in 0..nodes.len() {
-            for j in (i + 1)..nodes.len() {
-                let shared: Vec<String> = entity_sets[i]
-                    .intersection(&entity_sets[j])
-                    .cloned()
-                    .collect();
-                if shared.is_empty() {
-                    continue;
-                }
-                let key = if nodes[i].id < nodes[j].id {
-                    (nodes[i].id.clone(), nodes[j].id.clone())
-                } else {
-                    (nodes[j].id.clone(), nodes[i].id.clone())
-                };
-                if joined.contains(&key) {
-                    continue;
-                }
-                let edge = vestige_core::ConnectionRecord {
-                    source_id: key.0.clone(),
-                    target_id: key.1.clone(),
-                    strength: 0.5,
-                    link_type: "touched".to_string(),
-                    created_at: now,
-                    last_activated: now,
-                    activation_count: 0,
-                };
-                if storage.save_connection(&edge).is_ok() {
-                    written += 1;
-                }
-            }
-        }
-        written
-    };
+    // scoped write above, without auto-connect. Join each receipt here on the
+    // exact identities it shares with the scope (a tag, a file path, a commit
+    // sha, an issue or a URL), so the walk can follow failure-to-commit
+    // `touched` edges. No similarity, no guesses, and a bounded number of
+    // edges per receipt.
+    let (bridge_edges, bridge_not_linked) = bridge(storage.as_ref(), &scope, &bridge_records);
 
     // ---- Judge (deterministic, recorded edges only) ----------------------
     // GhostLink proposes never-composed pairs among the new receipts (leads
@@ -487,6 +503,7 @@ async fn run(
             "commitsCreated": commits_created,
             "commitsCovered": commits_covered,
             "bridgeEdges": bridge_edges,
+            "bridgeNotLinked": bridge_not_linked,
         },
         "leads": {
             "ghostlinkPairs": ghostlink_pairs,
@@ -504,6 +521,168 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn scoped_write(
+        storage: &Storage,
+        scope: &str,
+        content: &str,
+        tags: &[&str],
+    ) -> (String, String, Vec<String>) {
+        let input = vestige_core::IngestInput {
+            content: content.into(),
+            node_type: "event".to_string(),
+            source: None,
+            sentiment_score: 0.0,
+            sentiment_magnitude: 0.0,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            valid_from: None,
+            valid_until: None,
+            validity_inferred: false,
+            source_envelope: None,
+        };
+        let node = storage
+            .ingest_in_scope_with_secret_policy(input, scope, vestige_core::SecretPolicy::Reject)
+            .expect("scoped write");
+        (node.id, node.content, node.tags)
+    }
+
+    #[test]
+    fn issue_and_pull_request_urls_parse() {
+        for url in [
+            "https://github.com/acme/app/issues/12",
+            "https://github.com/acme/app/pull/12",
+            "https://github.com/acme/app/pulls/12/",
+            "https://github.com/acme/app/issues/12#issuecomment-99",
+            "https://github.com/acme/app/pull/12?w=1",
+        ] {
+            let issue = parse_issue_url(url).unwrap_or_else(|e| panic!("{url}: {e}"));
+            assert_eq!(
+                (issue.owner.as_str(), issue.name.as_str(), issue.number),
+                ("acme", "app", 12),
+                "{url}"
+            );
+            assert_eq!(issue.scope, "acme-app-12");
+        }
+        assert!(parse_issue_url("https://github.com/acme/app/commit/12").is_err());
+        assert!(parse_issue_url("https://github.com/acme/app/pull/12/files").is_err());
+    }
+
+    /// The issue endpoint returns the issue, so comments must come from the
+    /// comments endpoint, and an issue object must never read as comments.
+    #[test]
+    fn comments_come_from_the_comments_endpoint() {
+        let issue = parse_issue_url("https://github.com/acme/app/issues/7").unwrap();
+        assert_eq!(
+            comments_endpoint(&issue, 50, 1),
+            "repos/acme/app/issues/7/comments?per_page=50&page=1"
+        );
+        assert_eq!(
+            comments_endpoint(&issue, 500, 3),
+            "repos/acme/app/issues/7/comments?per_page=100&page=3"
+        );
+        let issue_object = json!({"title": "t", "body": "b", "user": {"login": "x"}});
+        assert!(comment_bodies(&issue_object).is_empty());
+        let list = json!([
+            {"user": {"login": "ann"}, "body": " first "},
+            {"user": {"login": "bo"}, "body": "   "},
+            {"user": {"login": "cy"}, "body": "third"}
+        ]);
+        assert_eq!(
+            comment_bodies(&list),
+            vec![
+                ("ann".to_string(), "first".to_string()),
+                ("cy".to_string(), "third".to_string())
+            ]
+        );
+    }
+
+    /// 40 commit records share their commit tag. The old bridge joined every
+    /// pair of them (780 edges, each its own log write). The bridge joins
+    /// only gather's own records, on identities that are not hubs: the
+    /// failure reaches the four commits (0, 13, 26, 39) that touched the
+    /// file it names.
+    #[test]
+    fn the_bridge_joins_receipts_not_every_commit_pair() {
+        let dir = tempfile::TempDir::new().expect("temp store dir");
+        let store = crate::strata_memory::open(dir.path()).expect("test store");
+        let storage: &Storage = &*store;
+        let scope = "acme-app-1";
+        for i in 0..40 {
+            let path = if i % 13 == 0 {
+                "src/parser.rs".to_string()
+            } else {
+                format!("src/mod_{i}.rs")
+            };
+            scoped_write(
+                storage,
+                scope,
+                &format!("commit {i}: change {path}"),
+                &["git-commit", "app"],
+            );
+        }
+        let issue = parse_issue_url("https://github.com/acme/app/issues/1").unwrap();
+        let failure = scoped_write(
+            storage,
+            scope,
+            &failure_content(&issue, "open", "crash", "in src/parser.rs"),
+            &["app", "failure", "gather"],
+        );
+        let (edges, not_linked) = bridge(storage, scope, std::slice::from_ref(&failure));
+        assert_eq!((edges, not_linked), (4, 0));
+        let all = storage.get_all_connections().expect("edges");
+        assert_eq!(all.len(), 4, "only the failure's edges: {all:?}");
+        assert!(
+            all.iter()
+                .all(|e| e.source_id == failure.0 || e.target_id == failure.0)
+        );
+    }
+
+    /// A hunt with enough comments makes `app` and `gather` hub tags, so the
+    /// linked pull request and the issue share no tag the bridge joins on.
+    /// They still share the issue reference every receipt names, so the
+    /// failure keeps its edge to the pull request and the walk can reach it.
+    #[test]
+    fn a_linked_pull_request_stays_joined_to_the_issue_when_tags_are_hubs() {
+        let dir = tempfile::TempDir::new().expect("temp store dir");
+        let store = crate::strata_memory::open(dir.path()).expect("test store");
+        let storage: &Storage = &*store;
+        let issue = parse_issue_url("https://github.com/acme/app/pull/1").unwrap();
+        let scope = issue.scope.clone();
+        let pr = scoped_write(
+            storage,
+            &scope,
+            &linked_pr_content(&issue, 7, "fix the crash"),
+            &["app", "gather", "linked-pr"],
+        );
+        let failure = scoped_write(
+            storage,
+            &scope,
+            &failure_content(&issue, "open", "crash", "it broke"),
+            &["app", "failure", "gather"],
+        );
+        let mut records = vec![pr.clone(), failure.clone()];
+        for i in 0..20 {
+            records.push(scoped_write(
+                storage,
+                &scope,
+                &comment_content(&issue, "ann", &format!("seen it too ({i})")),
+                &["app", "gather", "comment"],
+            ));
+        }
+        let (edges, _) = bridge(storage, &scope, &records);
+        assert!(edges > 0);
+        let joined = storage
+            .get_all_connections()
+            .expect("edges")
+            .iter()
+            .any(|e| {
+                (e.source_id == pr.0 && e.target_id == failure.0)
+                    || (e.source_id == failure.0 && e.target_id == pr.0)
+            });
+        assert!(joined, "the pull request must stay joined to the issue");
+    }
+
     /// The scope contract, as a test: every receipt gather writes (failure,
     /// comment) must land in the gather scope. If the writer ever drifts
     /// back to the default scope, the scoped walk goes blind and this fails.
