@@ -53,6 +53,12 @@ being used until the new folder holds one.
 - **`ghostlink` heal mode** weaves verdicts from recorded events.
 - **Receipts and runs on Strata**: `/api/receipts` and `/api/traces` list
   them from the log.
+- **The PRECEDENT terminal journey in `@vestige/init`.** `vestige-init
+  precedent` follows one real Operator stop around the loop: the stop, the
+  record re-derived from its own bytes, the memory, the precedent, the
+  aftermath and the verdict card. `intro`, `play <code>` and `episodes` open
+  the story intro and the episode player; any other argument runs the setup
+  wizard as before.
 - **Rules that survive the compact: `vestige hook session-start`.** A plain
   Claude Code `SessionStart` command hook, with no shell or Python wrapper.
   Register it for `startup|resume|clear|compact`
