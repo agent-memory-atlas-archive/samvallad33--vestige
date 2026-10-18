@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A stop tells the agent what to do next, in three lines.** Operator Lite's
+  refusal now reads: what was stopped, with the rule and the receipt id; next,
+  do not retry it or try a workaround, take the rule's compliant path, and
+  call `precedent(rule=...)` to see why and whether a permit exists; and, if
+  it is really needed, ask the owner for ALLOW ONCE. Every agent reads a
+  refusal, so no new hook is needed. What the gate saw through stays on the
+  first line, and the normalized command stays in the receipt, where
+  `precedent` returns it.
+
 ## [5.0.0] - 2026-10-18
 
 PRECEDENT. Vestige reads its own enforcement record: `precedent` shows what

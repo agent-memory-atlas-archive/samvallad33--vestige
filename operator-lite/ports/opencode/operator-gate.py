@@ -1885,6 +1885,21 @@ def consume_permit(action_digest):
 # --------------------------------------------------------------------------- #
 # hook entrypoint
 # --------------------------------------------------------------------------- #
+def stop_lines(top, transforms, adigest, receipt):
+    """The three lines every agent reads right after a stop: what was stopped
+    (rule and receipt), what to do next, and who can allow it once."""
+    def sentence(text):
+        text = (text or "").strip()
+        return text if text[-1:] in ".!?" else text + "."
+    seen = " (seen through: %s)" % ", ".join(transforms) if transforms else ""
+    return ["OPERATOR: STOPPED (%s %s): %s%s. Receipt: %s"
+            % (top[0], top[1], redact(top[3] or "").strip().rstrip("."), seen, (receipt or "unavailable")[:16]),
+            "Next: do not retry it or try a workaround.%s Call precedent(rule=\"%s\") to see why and whether a permit exists."
+            % ((" " + sentence(top[4])) if top[4] else "", top[0]),
+            "If it is really needed, ask the owner for ALLOW ONCE. Only they can grant it, from their own terminal: %s approve %s"
+            % (self_cmd(), adigest)]
+
+
 def stop(reason_lines):
     sys.stderr.write("\n".join(reason_lines) + "\n")
     sys.stderr.flush()
@@ -1977,18 +1992,7 @@ def hook_main(argv):
             top = enforce_hits[0]
             rd = write_receipt(dict(base_rec, decision="STOP", commitment=top[0], rule=top[1],
                                     commitments=[h[0] for h in enforce_hits], detail=redact(top[3])))
-            lines = ["OPERATOR: STOPPED (%s %s)" % (top[0], top[1]),
-                     "Why: %s -- %s." % (top[2], top[3])]
-            if top[4]:
-                lines.append("Compliant path: %s" % top[4])
-            if meta.get("transforms"):
-                lines.append("Gate saw through: %s." % ", ".join(meta["transforms"]))
-            if meta.get("normalized") and meta["normalized"] != preview:
-                lines.append("Normalized form: %s" % redact(meta["normalized"]))
-            lines += ["No action was taken. Do not retry this action or a variation of it.",
-                      "Only the owner can allow it once, from their own terminal: %s approve %s" % (self_cmd(), adigest),
-                      "Receipt: %s" % ((rd or "unavailable")[:16])]
-            stop(lines)
+            stop(stop_lines(top, meta.get("transforms"), adigest, rd))
         if shadow_hits:
             write_receipt(dict(base_rec, decision="SHADOW_STOP", commitments=[h[0] for h in shadow_hits],
                                detail=redact("; ".join(h[3] for h in shadow_hits))))

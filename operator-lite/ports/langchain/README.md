@@ -28,10 +28,9 @@ and the source — not inferred:
   `ToolMessage` is deterministic, and its `content` is what the LLM sees:
 
   ```
-  Operator Lite blocked: OPERATOR: STOPPED (OP-003 no-blind-recursive-delete)
-  Why: Recursive delete outside scratch/build directories needs ...
-  No action was taken. Do not retry this action or a variation of it.
-  Only the owner can allow it once ... operator-gate approve <digest>
+  Operator Lite blocked: OPERATOR: STOPPED (OP-003 no-blind-recursive-delete): recursive delete of ~/Documents. Receipt: <receipt>
+  Next: do not retry it or try a workaround. Move it to a dated folder ... Call precedent(rule="OP-003") to see why and whether a permit exists.
+  If it is really needed, ask the owner for ALLOW ONCE. Only they can grant it, from their own terminal: operator-gate approve <digest>
   ```
 
 - **Attachment** — `create_agent(model, tools, middleware=[...])`

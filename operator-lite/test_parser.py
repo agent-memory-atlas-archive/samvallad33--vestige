@@ -3,7 +3,7 @@
 writes it must still stop. Runs the gate as a hook in enforce mode with a throwaway OPERATOR_HOME.
 Classification only: no sample command is ever executed.
 Usage: python3 operator-lite/test_parser.py [repo-root]"""
-import json, os, shutil, subprocess, sys, tempfile
+import json, os, re, shutil, subprocess, sys, tempfile
 
 W = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GATE = os.path.join(W, "operator-lite", "operator-gate.py")
@@ -123,6 +123,25 @@ stop("a command substitution in an assignment is still analyzed", "x=$(rm -rf ~/
 stop("force-push", "git push --force origin main", "OP-004")
 stop("recursive delete of a home folder", "rm -rf ~/Documents", "OP-003")
 allow("plain build command", "cargo check 2>&1 | tail -5")
+
+# the stop message an agent reads right after a stop: three lines, the rule and the receipt,
+# what to do next (no retry, ask precedent), and who can allow it once
+p = subprocess.run([sys.executable, GATE, "hook", "--source", "claude"],
+                   input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "rm${IFS}-rf ~/Documents"},
+                                     "cwd": work, "session_id": "t"}),
+                   capture_output=True, text=True, env=env)
+msg = p.stderr.strip().splitlines()
+for name, ok in [
+        ("stop message is three lines", p.returncode == 2 and len(msg) == 3),
+        ("line 1 names the rule", bool(msg) and msg[0].startswith("OPERATOR: STOPPED (OP-003 ")),
+        ("line 1 ends with the receipt", bool(msg) and re.search(r"\. Receipt: [0-9a-f]{16}$", msg[0]) is not None),
+        ("line 1 says what the gate saw through", bool(msg) and "(seen through: variables-expanded)" in msg[0]),
+        ("line 2 says do not retry and names precedent",
+         len(msg) > 1 and msg[1].startswith("Next: do not retry") and 'precedent(rule="OP-003")' in msg[1]),
+        ("line 3 is the owner's ALLOW ONCE", len(msg) > 2 and "ALLOW ONCE" in msg[2] and " approve " in msg[2])]:
+    print("%s  stop message: %s" % ("ok " if ok else "BAD", name) + ("" if ok else "   -> %r" % msg))
+    if not ok:
+        fails.append(name)
 
 shutil.rmtree(op_home, ignore_errors=True)
 shutil.rmtree(work, ignore_errors=True)
