@@ -72,7 +72,7 @@ Open Cursor's AI chat and ask:
 
 > "What MCP tools do you have access to?"
 
-You should see Vestige's 16 tools listed, including `smart_ingest`, `recall` and `receipt`.
+You should see Vestige's 18 tools listed, including `smart_ingest`, `recall` and `receipt`.
 
 ---
 

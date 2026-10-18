@@ -209,7 +209,7 @@ Write-up: [docs/SCIENCE.md](docs/SCIENCE.md).
 
 ## The tools
 
-`tools/list` advertises these 16 tools, sorted by name. The list is compact: every field a call can send is on the wire with its type, prose and deep structure move one call deeper, and filter fields are grouped under `filters` and `source` (sent either grouped or flat). The serialized catalog is about 20 KiB. `memory_status` with `view=tools` lists every tool; set `tool` to a name for that tool's full input schema. Actions a Strata log cannot honor are left out of the schema and refused with the reason.
+`tools/list` advertises these 18 tools, sorted by name. The list is compact: every field a call can send is on the wire with its type, prose and deep structure move one call deeper, and filter fields are grouped under `filters` and `source` (sent either grouped or flat). The serialized catalog is about 20 KiB. `memory_status` with `view=tools` lists every tool; set `tool` to a name for that tool's full input schema. Actions a Strata log cannot honor are left out of the schema and refused with the reason.
 
 | Tool | Purpose |
 |---|---|
@@ -217,11 +217,13 @@ Write-up: [docs/SCIENCE.md](docs/SCIENCE.md).
 | `codebase` | Remember a pattern or decision with code anchors, fetch context marked current or stale (with every scope that holds the codebase's patterns, decisions and change records), `verify` anchors against source (saying what `limit` left unchecked), `reanchor`, and `ingest_repo`: the commits of a checkout, read from the top of its working tree, as anchored change records in their own scope (previews first) |
 | `dedup` | `scan` for duplicates, `undo` a recorded operation, `tag_rename` and `tag_merge` with a preview, `policy` |
 | `forgotten_lesson` | Faded fix or lesson memories behind a failure, over recorded edges |
+| `gather` | Record a GitHub issue hunt as receipts in one scope (the issue, its comments, the pull requests that cross-reference it, and with `repoPath` the commit window of a local checkout), then propose GhostLink leads and run `causal_walk` from the issue. `missingReceipts` names what was missing. It reads GitHub through the `gh` CLI, the one open-world tool |
 | `ghostlink` | Never-composed memory pairs, each with its proof from recorded edges only. `propose` with lens `bridge` (within three typed-edge hops, never woven) or `divergent` (no recorded edge at all; a forced juxtaposition when nothing can be measured), `weave` an outcome (a write with receipts), `inspect` woven compositions, `explore` typed paths, `map`, `bounty`, `predict`, and `harden` to seed invariant laws once. `graph` still answers as a hidden alias |
 | `intention` | `set`, `check`, `update`, `list`. `graph` runs the evidence-aware plan |
 | `maintain` | `dream`, `dream_compile`, `gc` (dry run unless you turn it off), `importance_score`, `backup`, `export`. `consolidate` is refused on a Strata log, where every phase is a no-op |
 | `memory` | `get`, `get_batch`, `state`, `promote`, `demote`, `edit`. Demote does not delete. An edit admits a successor and keeps its code anchors |
 | `memory_status` | `health`, `retention`, `timeline`, `changelog`, `provenance`, `coverage`, `stats`, `tools` |
+| `precedent` | What the Operator gate stopped or allowed, under which rule, and the permit that answered each stop, read from its receipts and permits in `$OPERATOR_HOME` or `~/.operator`. Filter by `since`, `cwd`, `source`, `session`, `rule` and `decision`. It writes nothing and cannot issue a permit |
 | `project` | Preview a fenced region of `CLAUDE.md` or `MEMORY.md`. `write` needs `confirm=true` and replaces only the fence |
 | `recall` | Find memories by exact handle: id, unique prefix, or exact tag |
 | `receipt` | `get` a receipt, or `replay` it against the log |

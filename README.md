@@ -78,9 +78,13 @@ Flagged in shadow, recorded and not stopped:
 
 Operator Lite receipts are hash-chained digests, not signatures. It only blocks what is routed through hooked tools.
 
+Any agent connected to the memory server can read that record with `precedent`: what the gate stopped or allowed, under which rule, and which permit answered each stop. It writes nothing and cannot issue a permit.
+
 ## Causal root cause
 
 `causal_walk` walks backward only over recorded edges: commits, tool calls, and memory writes. It does not use embeddings or keyword matching. With no start point it returns `needs_report` and names what is missing; a walk that finds no cause says why in `emptyBecause`, from the edges the log holds.
+
+`gather` starts that walk from a GitHub issue. It records the issue, its comments, the pull requests that cross-reference it and, given a local checkout, its commit window as receipts in one scope, then runs `causal_walk` from the issue. It reads GitHub through the `gh` CLI. When something was missing, `missingReceipts` names it instead of guessing a cause.
 
 <a id="install"></a>
 ## Memory server

@@ -49,8 +49,9 @@ core product promise is:
 - a call the Strata log cannot honor says so with a reason code
   (`unavailable_in_4_0`, `similarity_disabled`, `pending_strata`) instead of
   returning zeros
-- 16 tools, listed by `memory_status` with `view='tools'`: causal walks,
-  GhostLink, receipts, code anchors, intentions, suppression and maintenance
+- 18 tools, listed by `memory_status` with `view='tools'`: causal walks,
+  GitHub issue hunts (`gather`), GhostLink, receipts, Operator gate stops
+  (`precedent`), code anchors, intentions, suppression and maintenance
 
 ## Working Rules
 

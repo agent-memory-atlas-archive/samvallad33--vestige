@@ -119,7 +119,7 @@ It comes back, with its memory id. Vestige 4.x finds a memory by an exact handle
 
 ## Important: Tool Limit
 
-Windsurf has a **hard cap of 100 tools** across all MCP servers. Vestige uses 16 tools, leaving plenty of room for other servers.
+Windsurf has a **hard cap of 100 tools** across all MCP servers. Vestige uses 18 tools, leaving plenty of room for other servers.
 
 ---
 
