@@ -67,7 +67,7 @@ fn parse_issue_url(url: &str) -> Result<IssueRef, String> {
         [.., o, n, "issues" | "pull" | "pulls", num] => (*o, *n, *num),
         _ => {
             return Err(
-                "url must be a GitHub issue or pull request URL like https://github.com/owner/repo/issues/123"
+                "url must be a GitHub issue URL like https://github.com/owner/repo/issues/123, or a pull request URL like https://github.com/owner/repo/pull/123"
                     .into(),
             );
         }
