@@ -20,7 +20,7 @@ static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// deterministic even though libtest runs tests on parallel threads.
 static SERIAL_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn serialize() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn serialize() -> std::sync::MutexGuard<'static, ()> {
     match SERIAL_TESTS.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
