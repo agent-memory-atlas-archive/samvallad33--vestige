@@ -35,6 +35,27 @@ replaced gate in `~/.operator/install-backups/`. `install` and `uninstall` refus
 a shell Claude Code's agent started (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`) or one that sets
 `OPERATOR_AGENT_SESSION`; other agents' shells are not recognized.
 
+## Check every claim yourself
+
+Each claim below comes with the command that checks it on your own machine. Run them
+before you trust the gate, and again after any upgrade.
+
+| Claim | Check it | It prints |
+|---|---|---|
+| It blocks from your agent's first tool call | `operator-gate status` | `Operator Lite 0.3.9   mode: enforce (blocking)   Claude Code hook: registered` |
+| What it stops is a closed list you can read | `operator-gate status --rules` | all 30 rules: 15 STOP, 15 SHADOW |
+| It sees through 46 adapted GuardFall bypass cases | `npx operator-lite test` | `corpus=guardfall cases=46 passed=46 failed=0` |
+| A fresh install stops 91 destructive commands and lets 22 normal ones run | `python3 operator-lite/test_destructive.py`, from a clone | `failures: 0 of 113` |
+| An upgrade from 0.3.7 blocks too | `python3 operator-lite/test_upgrade.py`, from a clone | `all upgrade checks passed` |
+| Every decision is on record, in order | `operator-gate verify` | `receipts=<count> chain=OK integrity=reference_digest_not_signature` |
+
+`operator-gate` is the command `install` puts on your PATH; without it, run
+`python3 ~/.operator/gate/operator-gate.py` instead. Nothing in these checks runs a
+destructive command: the gate classifies each one and executes none. CI runs the same
+checks on every change ([test.yml](../.github/workflows/test.yml)): the destructive
+commands and the corpus on Linux and macOS, and the upgrade and the receipt chain on Linux,
+macOS and Windows. What the gate cannot see is stated under [Honest boundary](#honest-boundary).
+
 ## Other hosts, or by hand
 
 The `cp` below checks nothing: if `~/.operator/gate/operator-gate.py` already exists, use
@@ -201,8 +222,9 @@ form that works on your machine.
 `verify` walks the receipt hash chain. `corpus guardfall` replays 46 adapted
 GuardFall bypass cases (must pass 46/46). `upgrade` describes the paid Operator
 gate and where to get it. `python3 test_parser.py` and `python3 test_replay.py`
-run the tests; CI runs them on Linux and macOS. `corpus` needs a clone: the corpus
-file ships in the repository, not with the single gate file. Every verdict appends to
+run the tests; CI runs them on Linux and macOS. `corpus` reads the corpus file beside
+the gate: it ships in the repository and in the npm package (`npx operator-lite test`),
+not with the single gate file the one-line install copies. Every verdict appends to
 `~/.operator/receipts/<date>.jsonl`.
 
 ## Honest boundary

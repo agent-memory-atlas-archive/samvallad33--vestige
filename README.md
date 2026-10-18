@@ -47,7 +47,7 @@ OpenClaw:
 clawhub install vestige-operator-lite
 ```
 
-Install copies the gate to `~/.operator/gate`, registers the Claude Code hook, and starts in enforce mode: from your agent's next tool call, every command a STOP rule matches is stopped before it runs. It then replays your last 30 days of Claude Code history through the same rules. Nothing in that history is executed. An existing `~/.operator/mode` file is kept as it is; `mode shadow` records without blocking, and `mode enforce` blocks again.
+Install copies the gate to `~/.operator/gate`, registers the Claude Code hook, and starts in enforce mode: from your agent's next tool call, every command a STOP rule matches is stopped before it runs. It then replays your last 30 days of Claude Code history through the same rules. Nothing in that history is executed. An existing `~/.operator/mode` file is kept, except the `shadow` every install before 0.3.9 wrote, which becomes `enforce` once; `mode shadow` records without blocking, and `mode enforce` blocks again.
 
 ## Proof
 
@@ -79,6 +79,8 @@ Flagged in shadow, recorded and not stopped:
 - Shell obfuscation: quote reassembly (`r''m`), `$IFS`, `$(echo rm)` as the program, ANSI-C `$'\x72m'`, base64-decoded pipelines, brace and glob expansion against the live filesystem, subshell time-bombs, session variables, `cd` tracking, heredocs, and fork bombs.
 
 Operator Lite receipts are hash-chained digests, not signatures. It only blocks what is routed through hooked tools.
+
+Every claim above has a command that checks it on your own machine, with what it prints: [check every claim yourself](operator-lite/README.md#check-every-claim-yourself). `npx operator-lite test` replays the bypass corpus with the gate the package carries.
 
 Any agent connected to the memory server can read that record with `precedent`: what the gate stopped or allowed, under which rule, and which permit answered each stop. It writes nothing and cannot issue a permit.
 

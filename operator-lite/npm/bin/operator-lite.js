@@ -124,9 +124,12 @@ function main() {
   if (!args.length || args[0].startsWith("-")) return install(py, args);   // bare, or flags only
   if (args[0] === "install") return install(py, args.slice(1));
   // Every other command goes to the installed gate, or the bundled one before the first install.
-  // Say which, on stderr, so the output of the command itself is unchanged. A host hook never
-  // comes through here (hooks call python3 directly), but `hook` stays silent all the same.
-  const installed = fs.existsSync(INSTALLED_GATE);
+  // `test` and `corpus` replay the corpora this package carries, so they always run the bundled
+  // gate, which has them beside it. Say which, on stderr, so the output of the command itself is
+  // unchanged. A host hook never comes through here (hooks call python3 directly), but `hook`
+  // stays silent all the same.
+  const replay = args[0] === "test" || args[0] === "corpus";
+  const installed = !replay && fs.existsSync(INSTALLED_GATE);
   const gate = installed ? INSTALLED_GATE : GATE;
   if (args[0] !== "hook") {
     console.error("operator-lite: running " + (installed ? "the installed gate, " : "the gate in this package, ") +

@@ -25,6 +25,10 @@ record without blocking again: `operator-gate mode shadow`.
   every `ports/*/install.sh` write `enforce` to `~/.operator/mode` when there
   is no mode file, so a STOP rule stops a command from the agent's next tool
   call. `mode shadow` still records without blocking.
+- **Check every claim yourself.** Right after Install, the Operator Lite README
+  has a table: each claim, the command that checks it on your own machine, and
+  what it prints. The npm package now carries the corpora, and `npx operator-lite test`
+  replays them with the packaged gate, after an install too.
 - **An upgrade from 0.3.7 blocks too.** The `shadow` an older installer wrote
   becomes `enforce` once (see the upgrade note above). `operator-gate mode
   --settle` does that step for the port installers, and
