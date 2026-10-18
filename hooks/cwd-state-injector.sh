@@ -34,9 +34,10 @@ if ! /usr/bin/git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
   exit 0
 fi
 
-# Cache for 60s
+# Cache for 60s, in the user's temp directory
 CACHE_KEY="$(printf '%s' "$CWD" | /usr/bin/shasum | awk '{print $1}')"
-CACHE_FILE="/tmp/cwd-state-${CACHE_KEY}.json"
+CACHE_DIR="${TMPDIR:-/tmp}"
+CACHE_FILE="${CACHE_DIR%/}/cwd-state-${CACHE_KEY}.json"
 if [ -f "$CACHE_FILE" ]; then
   MTIME=$(stat -f %m "$CACHE_FILE" 2>/dev/null || stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
   NOW=$(date +%s)
@@ -55,7 +56,8 @@ HEAD_AUTHOR="$(/usr/bin/git log -1 --format='%an' 2>/dev/null)"
 STAGED_COUNT="$(/usr/bin/git diff --cached --name-only 2>/dev/null | /usr/bin/wc -l | awk '{print $1}')"
 UNSTAGED_COUNT="$(/usr/bin/git diff --name-only 2>/dev/null | /usr/bin/wc -l | awk '{print $1}')"
 UNTRACKED_COUNT="$(/usr/bin/git ls-files --others --exclude-standard 2>/dev/null | /usr/bin/wc -l | awk '{print $1}')"
-AHEAD_BEHIND="$(/usr/bin/git rev-list --left-right --count HEAD...@{upstream} 2>/dev/null | awk '{printf "ahead=%s behind=%s", $1, $2}' || echo "no-upstream")"
+AHEAD_BEHIND="$(/usr/bin/git rev-list --left-right --count HEAD...@{upstream} 2>/dev/null | awk '{printf "ahead=%s behind=%s", $1, $2}')"
+[ -n "$AHEAD_BEHIND" ] || AHEAD_BEHIND="no-upstream"
 
 # GitHub state (only if gh CLI available + remote configured)
 CI_STATE=""
@@ -96,19 +98,19 @@ if [ -n "$PR_COUNT" ] && [ -n "$ISSUE_COUNT" ]; then
   CONTEXT_LINES+=("  open: PRs=$PR_COUNT issues=$ISSUE_COUNT")
 fi
 
-# Format as JSON additionalContext
-JSON_OUT="$(/usr/bin/python3 <<PYEOF
+# Format as JSON additionalContext. The lines reach Python through the
+# environment, never through its source: a commit subject, author or branch
+# name comes from the repository and is data, not code.
+JSON_OUT="$(VESTIGE_CWD_STATE="$(printf '%s\n' "${CONTEXT_LINES[@]}")" /usr/bin/python3 -I -c '
 import json, os
-lines = """$(printf '%s\n' "${CONTEXT_LINES[@]}")""".strip().split("\n")
-ctx = "\n".join(lines)
+ctx = os.environ.get("VESTIGE_CWD_STATE", "").strip()
 print(json.dumps({
     "hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
         "additionalContext": ctx
     }
 }))
-PYEOF
-)"
+')"
 
 # Cache and emit
 printf '%s' "$JSON_OUT" > "$CACHE_FILE"

@@ -43,9 +43,11 @@ try:
                         text += block.get("text", "") + "\n"
             elif isinstance(content, str):
                 text = content
-            if role == "user":
+            # A tool result is a user-role row with no text: it is not the
+            # user's prompt, so it must not replace it.
+            if role == "user" and text.strip():
                 last_user = text
-            elif role == "assistant":
+            elif role == "assistant" and text.strip():
                 last_assistant = text
 except Exception:
     sys.exit(0)
