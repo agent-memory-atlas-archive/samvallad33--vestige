@@ -604,7 +604,7 @@ mod tests {
             "Issue acme/app#1 [open]: crash in src/parser.rs",
             &["app", "failure", "gather"],
         );
-        let (edges, not_linked) = bridge(storage, scope, &[failure.clone()]);
+        let (edges, not_linked) = bridge(storage, scope, std::slice::from_ref(&failure));
         assert_eq!((edges, not_linked), (4, 0));
         let all = storage.get_all_connections().expect("edges");
         assert_eq!(all.len(), 4, "only the failure's edges: {all:?}");
