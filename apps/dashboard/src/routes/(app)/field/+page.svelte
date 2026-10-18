@@ -1,4 +1,6 @@
 <script lang="ts">
+	import '$lib/trace/trace-organ.css';
+	import { alive } from '$lib/trace/alive';
 	import { onDestroy, onMount } from 'svelte';
 	import { browser } from '$app/environment';
 	import { goto } from '$app/navigation';
@@ -9,9 +11,17 @@
 	import { DEMO_MODES, isDemoMode, type DemoMode } from '$lib/observatory/types';
 	import { TextLayerPass, type TextLayerItem } from '$lib/observatory/text/text-layer';
 	import { LivingFieldPass } from '$lib/observatory/field/living-field-pass';
+	import { NebulaPass } from '$lib/observatory/field/nebula-pass';
 	import { layoutGalaxy, type FieldDatum } from '$lib/observatory/field/cell-layout';
 	import { saliencePalette, salienceEnergy } from '$lib/observatory/cognitive-palette';
 	import { api, receiptBackfill, type Receipt } from '$stores/api';
+	import { loadMindGraph } from '$lib/observatory/mind-graph';
+	import { enterMemory, memoryHref } from '$lib/inside/enter';
+	import { markVeilReadyAfterPaint, veil } from '$lib/trace/handoff';
+	import { get } from 'svelte/store';
+	import { eventFeed } from '$stores/websocket';
+	import { typeColor } from '$lib/trace/trace-pass';
+	import { headline } from '$lib/trace/trace-data';
 	import {
 		exportLoopMp4,
 		downloadClip,
@@ -62,6 +72,7 @@
 	let engineRef: ObservatoryEngine | null = null;
 	let textPass: TextLayerPass | null = null;
 	let fieldPass: LivingFieldPass | null = null;
+	let nebulaPass: NebulaPass | null = null;
 	let graphData: GraphResponse | null = $state(null);
 	let receipt = $state<Receipt | null>(null);
 	let receiptError: string | null = $state(null);
@@ -88,13 +99,21 @@
 		voteTimers = [];
 		textPass?.dispose();
 		fieldPass?.dispose();
+		nebulaPass?.dispose();
 		textPass = null;
 		fieldPass = null;
+		nebulaPass = null;
 		engineRef = null;
 	});
 
 	async function handleReady(engine: ObservatoryEngine) {
 		engineRef = engine;
+		// The Field's own universe: a nebula in the memory kinds' colours,
+		// gathered round the sphere, stirring under the pointer.
+		nebulaPass?.dispose();
+		nebulaPass = new NebulaPass(engine);
+		placeNebula();
+		engine.addPass(nebulaPass);
 		// Field FIRST (renders behind) — the real 200-memory cortex galaxy on top
 		// of the recall-path scene. Then the MSDF text HUD on top of that.
 		const field = new LivingFieldPass(engine);
@@ -125,6 +144,7 @@
 		pass.setText(buildTextItems());
 		engine.addPass(pass);
 		engine.demoClock.reset();
+		if (!loading) markVeilReadyAfterPaint();
 	}
 
 	/**
@@ -296,7 +316,7 @@
 					edgeCount: edges.length
 				};
 			} else {
-				graphData = await api.graph({ max_nodes: 200, depth: 3, sort: 'connected' });
+				graphData = await loadMindGraph();
 			}
 		} catch (err) {
 			graphData = null;
@@ -306,6 +326,8 @@
 			textPass?.setText(buildTextItems());
 			igniteVote();
 			engineRef?.demoClock.reset();
+			// Arriving from the Palace: the veil lifts on the field with its memories in it.
+			if (engineRef) markVeilReadyAfterPaint();
 		}
 	}
 
@@ -708,8 +730,113 @@
 		{ mode: 'firewall', label: 'Firewall', blurb: 'A contradiction is caught and quarantined.' }
 	];
 	const demoCards = DEMO_CARDS.filter((c) => DEMO_MODES.includes(c.mode));
+	// On a wide screen the field sits between the title (left) and the moments
+	// column (right), a little lower than centre, so no words touch it.
+	let viewport = $state({ w: 1440, h: 900 });
+	onMount(() => {
+		const set = () => (viewport = { w: innerWidth, h: innerHeight });
+		set();
+		addEventListener('resize', set);
+		return () => removeEventListener('resize', set);
+	});
+	// The memory page's grammar: the form on the left, its words in their own
+	// column on the right; on a narrow or tall screen the form sits above them.
+	const wide = $derived(viewport.w >= 900 && viewport.w >= viewport.h);
+	// Arriving from a Palace burst, the stars start spread across the whole
+	// screen, where the explosion threw them, and gather into the mind.
+	let gather = $state(1);
+	onMount(() => {
+		if (!get(veil)) return;
+		gather = 0;
+		const t0 = performance.now();
+		const step = (now: number) => {
+			const k = Math.min(1, (now - t0) / 2000);
+			gather = 1 - Math.pow(1 - k, 2);
+			if (k < 1) requestAnimationFrame(step);
+		};
+		requestAnimationFrame(step);
+	});
+	const fieldFrame = $derived.by(() => {
+		const f = wide ? { scale: 0.74, x: -0.3, y: 0.02 } : { scale: 0.5, x: 0, y: 0.47 };
+		return { scale: f.scale * (3.4 - 2.4 * gather), x: f.x * gather, y: f.y * gather };
+	});
+	function placeNebula() {
+		const f = fieldFrame;
+		nebulaPass?.setCentre(f.x, f.y, 0.95 * f.scale);
+	}
+	$effect(() => {
+		void fieldFrame;
+		placeNebula();
+	});
+	// The time rail stands under the form, never under the words; a narrow
+	// screen has no room for it beside them.
+	const rail = $derived(
+		wide ? { left: -0.72, right: 0.12, y: -0.8, show: true } : { left: -0.8, right: 0.8, y: -0.7, show: false }
+	);
+
+	// ── What the column says ────────────────────────────────────────────────
+	/** The memories the agent leans on hardest (from the stage: receipts, else retention). */
+	let top = $state<{ id: string; recalls: number; label: string }[]>([]);
+	let topSource = $state<'recalls' | 'retention'>('retention');
+	/** What each live event an agent caused did, in words. */
+	const LIVE_WORDS: Partial<Record<string, string>> = {
+		MemoryCreated: 'wrote',
+		MemoryUpdated: 'changed',
+		MemoryPromoted: 'promoted',
+		MemoryDemoted: 'demoted',
+		MemorySuppressed: 'suppressed',
+		SearchPerformed: 'recalled',
+		DeepReferenceCompleted: 'reasoned over',
+		DreamCompleted: 'dreamed',
+		ConnectionDiscovered: 'linked',
+		CausalReceipt: 'walked back from',
+		BackfillFired: 'walked back from',
+		MemoryShown: 'showed',
+		HookVerdictRecorded: 'met the gate',
+		MemoryPrOpened: 'opened a review of',
+		MemoryPrDecided: 'decided a review of'
+	};
+	const text = (v: unknown) => (typeof v === 'string' && v.trim() ? v : null);
+	const happened = $derived(
+		$eventFeed
+			.filter((e) => LIVE_WORDS[e.type])
+			.slice(0, 9)
+			.map((e, i) => {
+				const d = (e.data ?? {}) as Record<string, unknown>;
+				const ids = Array.isArray(d.result_ids) ? (d.result_ids as unknown[]).filter((x): x is string => typeof x === 'string') : [];
+				const id = text(d.id) ?? text(d.primary_id) ?? text(d.source_id) ?? ids[0] ?? null;
+				const what =
+					e.type === 'SearchPerformed'
+						? `${text(d.query) ?? 'a handle'} · ${d.result_count ?? ids.length} found`
+						: e.type === 'DreamCompleted'
+							? `${d.memories_replayed ?? 0} memories replayed · ${d.connections_found ?? 0} links found`
+							: e.type === 'HookVerdictRecorded'
+								? `${text(d.verdict) ?? ''} ${text(d.reason) ?? ''}`
+								: (text(d.content_preview) ?? text(d.reason) ?? text(d.query) ?? text(d.connection_type) ?? '');
+				const ts = text(d.timestamp);
+				return {
+					key: `${e.type}:${id ?? ''}:${ts ?? i}`,
+					verb: LIVE_WORDS[e.type]!,
+					by: text(d.by),
+					id,
+					what: headline(what, 90),
+					tone: text(d.node_type) ?? (e.type === 'MemorySuppressed' ? 'correction' : 'fact'),
+					when: ts ? new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : ''
+				};
+			})
+	);
+	const rgb = (t: string) => {
+		const [r, g, b] = typeColor(t);
+		return `rgb(${Math.round(r * 255)} ${Math.round(g * 255)} ${Math.round(b * 255)})`;
+	};
+
+	/** The centre memory in its own words (a 4.0 id's first characters say nothing). */
 	function centerShort(): string {
-		return graphData?.center_id?.slice(0, 8) ?? '—';
+		const id = graphData?.center_id;
+		if (!id) return '—';
+		const label = graphData?.nodes.find((n) => n.id === id)?.label ?? '';
+		const words = label.replace(/\s+/g, ' ').trim();
+		return words ? (words.length > 34 ? `${words.slice(0, 33)}…` : words) : `…${id.slice(-6)}`;
 	}
 
 	function pickDemo(mode: DemoMode) {
@@ -862,7 +989,7 @@
 			return;
 		}
 		if (item?.action === 'exit') {
-			await goto(`${base}/graph`);
+			await goto(`${base}/palace`);
 			return;
 		}
 		// Fall through to the cortex itself: every salience cell is a real
@@ -870,7 +997,7 @@
 		// (click-as-incision: the home canvas is an instrument, not a poster).
 		const cell = fieldPass?.pickAt(ndc.x, ndc.y);
 		if (cell && typeof cell.id === 'string') {
-			await goto(`${base}/memories?memory=${encodeURIComponent(cell.id)}`);
+			await enterMemory(cell.id, { canvas: hostEl?.querySelector('canvas') ?? null, focus: ndc });
 		}
 	}
 </script>
@@ -894,7 +1021,14 @@
 			focusIds={receiptIds}
 			{backfillEvidence}
 			onready={handleReady}
-			onexit={() => goto(`${base}/graph`)}
+			onpick={(memoryId, at) => void enterMemory(memoryId, { canvas: hostEl?.querySelector('canvas') ?? null, focus: at, engine: engineRef })}
+			{fieldFrame}
+			{rail}
+			ontop={(list, source) => {
+				top = list;
+				topSource = source;
+			}}
+			onexit={() => goto(`${base}/palace`)}
 		/>
 	{/key}
 </div>
@@ -905,88 +1039,76 @@
 	number is real /api/graph data; each card drives the same switchDemo() the
 	canvas used, so the interaction is honest and now discoverable.
 -->
-<div class="obs-ui">
-	<header class="obs-head">
-		<h1 class="obs-title">{backfillEvidence ? 'Backfill Replay' : receipt ? 'Memory Replay' : 'Cognitive Observatory'}</h1>
-		<p class="obs-sub">
-			{#if backfillEvidence}
-				This field replays only the recorded Backfill candidate evidence in receipt <code>{receipt?.receipt_id}</code>.
-			{:else if receipt}
-				This field contains only memories named by receipt <code>{receipt.receipt_id}</code>.
-			{:else}
-				Your agent's live memory field. Play a cognitive moment and watch the mind react.
-			{/if}
-		</p>
-		<div class="obs-stats">
-			{#if receipt}
-				<span class="obs-stat obs-proof"><b>Proven:</b> retrieved in this run</span>
-				<span class="obs-stat obs-attributed"><b>Attributed:</b> likely influence</span>
-			{:else if receiptError}
-				<span class="obs-stat obs-err"><b>!</b> {receiptError}</span>
-			{/if}
-			{#if loading}
-				<span class="obs-stat"><b>…</b> loading field</span>
-			{:else if error}
-				<span class="obs-stat obs-err"><b>!</b> {error}</span>
-			{:else if graphData}
-				<span class="obs-stat"><b>{graphData.nodeCount.toLocaleString()}</b> memories</span>
-				<span class="obs-stat"><b>{graphData.edgeCount.toLocaleString()}</b> connections</span>
-				<span class="obs-stat"><b>{centerShort()}</b> center</span>
-			{/if}
-		</div>
-	</header>
 
-	<nav class="obs-demos" aria-label={receipt ? 'Receipt evidence' : 'Cognitive moments'}>
-		{#if receipt}
-			<span class="obs-demos-label">Receipt evidence only</span>
-			<span class="obs-card is-active receipt-scope">
-				<span class="obs-card-label">{receipt.retrieved.length} retrieved · {receipt.suppressed.length} suppressed</span>
-				<span class="obs-card-blurb">This proves memory retrieval. It does not claim an answer changed.</span>
-			</span>
+<!--
+	The words live in one column, beside the field, never on it (the memory
+	page's grammar). The column says what the field is, what agents are doing
+	to it right now, and which memories they lean on.
+-->
+<aside class="obs-col" class:narrow={!wide} aria-live="polite">
+	<p class="obs-eyebrow" use:alive={{ text: 'Field', glow: true }}></p>
+	<!-- svelte-ignore a11y_missing_content (alive renders the text and its aria-label) -->
+	<h1 class="obs-title" use:alive={{ text: backfillEvidence ? 'Backfill replay' : receipt ? 'One receipt, replayed' : 'Your mind, live.', glow: true }}></h1>
+	<p class="obs-sub">
+		{#if backfillEvidence}
+			Only the candidate evidence recorded in receipt <code>{receipt?.receipt_id}</code>.
+		{:else if receipt}
+			Only the memories named by receipt <code>{receipt.receipt_id}</code>: {receipt.retrieved.length} retrieved, {receipt.suppressed.length} suppressed.
 		{:else}
-			<span class="obs-demos-label">Play a moment</span>
-			{#each demoCards as card (card.mode)}
-				<button
-					type="button"
-					class="obs-card {card.mode === demo ? 'is-active' : ''}"
-					aria-pressed={card.mode === demo}
-					onclick={() => pickDemo(card.mode)}
-				>
-					<span class="obs-card-label">{card.label}</span>
-					<span class="obs-card-blurb">{card.blurb}</span>
-				</button>
+			Every star is one of your memories, coloured by kind. Lit paths replay your agents' real recalls; whatever an agent does now plays here on the memories it touches.
+		{/if}
+	</p>
+	<p class="obs-stats">
+		{#if loading}
+			Reading the field…
+		{:else if error}
+			<span class="obs-err">{error}</span>
+		{:else if graphData}
+			<b use:alive={{ text: graphData.nodeCount.toLocaleString(), count: true }}></b> memories ·
+			<b use:alive={{ text: graphData.edgeCount.toLocaleString(), count: true }}></b> recorded links
+		{/if}
+		{#if receiptError}<span class="obs-err"> · {receiptError}</span>{/if}
+	</p>
+
+	{#if !receipt}
+		<p class="obs-kicker">Live from your agents</p>
+		{#if happened.length}
+			{#each happened as h (h.key)}
+				{#if h.id}
+					<a class="obs-item" href={memoryHref(h.id)} style:--tone={rgb(h.tone)}>
+						<span class="obs-item-head">{h.when ? `${h.when} · ` : ''}{h.by ? `${h.by} ` : ''}{h.verb}</span>
+						<span class="obs-item-text">{h.what || 'a memory'}</span>
+					</a>
+				{:else}
+					<p class="obs-item" style:--tone={rgb(h.tone)}>
+						<span class="obs-item-head">{h.when ? `${h.when} · ` : ''}{h.by ? `${h.by} ` : ''}{h.verb}</span>
+						<span class="obs-item-text">{h.what}</span>
+					</p>
+				{/if}
 			{/each}
+		{:else}
+			<p class="obs-note">Nothing yet while this page has been open. The next recall, write, dream or contradiction any agent makes appears here, and lights the memories it touched.</p>
 		{/if}
-		<BrainPrintPanel
-			print={brainPrint}
-			{activePrintId}
-			{printing}
-			error={printError}
-			copied={permalinkCopied}
-			disabled={loading || exporting || wrapping}
-			onprint={startBrainPrint}
-			oncopy={copyPrintPermalink}
-		/>
-		<button class="obs-exit" onclick={startWrappedCard} disabled={wrapping || exporting} type="button">
-			{wrapping ? 'Rendering report…' : 'Memory report PNG'}
+	{/if}
+
+	{#if top.length}
+		<p class="obs-kicker">{topSource === 'recalls' ? 'Most recalled' : 'Held strongest'}</p>
+		{#each top as m, i (m.id)}
+			<a class="obs-item" href={memoryHref(m.id)}>
+				<span class="obs-item-head">{i + 1} · {m.recalls}{topSource === 'recalls' ? ' recalls' : '% retained'}</span>
+				<span class="obs-item-text">{headline(m.label, 90)}</span>
+			</a>
+		{/each}
+	{/if}
+
+	<p class="obs-note">Hover a star to read it; click it to go inside.</p>
+	<div class="obs-actions">
+		<button class="obs-act" onclick={startWrappedCard} disabled={wrapping || exporting} type="button">
+			{wrapping ? 'Rendering report…' : 'Memory report (PNG)'}
 		</button>
-		<button class="obs-exit" onclick={startExport} disabled={exporting} type="button">
-			{exporting
-				? exportProgress
-					? exportProgress.stage === 'finalize'
-						? 'Sealing clip…'
-						: `Rendering ${exportProgress.done}/${exportProgress.total}`
-					: 'Preparing…'
-				: receipt
-					? 'Export receipt replay ↓'
-					: 'Export loop ↓'}
-		</button>
-		{#if exportError}
-			<span class="obs-export-error">{exportError}</span>
-		{/if}
-		<a class="obs-exit" href="{base}/graph">Open full graph →</a>
-	</nav>
-</div>
+		<a class="obs-act" href="{base}/graph">What shaped each decision →</a>
+	</div>
+</aside>
 
 {#if exporting}
 	<!-- Hidden export stage: fixed 1920×1080, DPR 1, deterministic (live off),
@@ -1014,150 +1136,159 @@
 {/if}
 
 <style>
-	/* The DOM control layer. Sits above the WebGPU canvas (z 0) but its container
-	   is pointer-events:none so the field still receives hover/clicks in the gaps;
-	   only the actual controls capture the pointer. Normal cursor everywhere. */
-	.obs-ui {
+	/* One column of words beside the field (the memory page's grammar): on a
+	   wide screen it stands on the right, clear of the form; on a narrow or
+	   tall one it sits under the form. Nothing is written on the field. */
+	.obs-col {
 		position: fixed;
-		inset: 0;
 		z-index: 10;
-		pointer-events: none;
+		top: 1.6rem;
+		right: 1.8rem;
+		bottom: 3.4rem;
+		width: min(25rem, 30vw);
+		overflow-y: auto;
+		scrollbar-width: none;
 		display: flex;
 		flex-direction: column;
-		justify-content: space-between;
-		padding: 1.5rem clamp(1rem, 3vw, 2.5rem);
+		gap: 0.55rem;
+		padding-left: 1.1rem;
+		border-left: 1px solid rgba(127, 243, 230, 0.14);
 		cursor: auto;
 	}
-	.obs-ui > * {
-		pointer-events: auto;
+	.obs-col.narrow {
+		top: auto;
+		left: 1rem;
+		right: 1rem;
+		bottom: calc(4.2rem + env(safe-area-inset-bottom));
+		width: auto;
+		max-height: 44dvh;
+		padding: 1rem 0.2rem 0.4rem;
+		border-left: none;
+		border-top: 1px solid rgba(127, 243, 230, 0.12);
 	}
-
-	.obs-head {
-		max-width: 34rem;
+	@media (min-width: 768px) {
+		.obs-col.narrow {
+			left: 6.2rem;
+			bottom: 1.2rem;
+		}
+	}
+	.obs-eyebrow {
+		margin: 0;
+		font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+		font-size: 0.66rem;
+		letter-spacing: 0.34em;
+		text-transform: uppercase;
+		color: #5dcaa5;
+		text-shadow: 0 0 12px rgba(93, 202, 165, 0.6);
 	}
 	.obs-title {
 		margin: 0;
-		font-size: clamp(1.6rem, 3.4vw, 2.4rem);
-		font-weight: 700;
-		letter-spacing: 0.01em;
-		color: #eafffb;
-		text-shadow: 0 0 26px rgba(34, 199, 222, 0.35);
+		font-size: clamp(1.5rem, 2.2vw, 2.1rem);
+		font-weight: 300;
+		letter-spacing: -0.01em;
+		color: #f4fbfa;
+		/* The Field's universe glows in its memories' colours. */
+		text-shadow:
+			0 0 18px rgba(127, 243, 230, 0.5),
+			0 0 44px rgba(184, 158, 255, 0.32);
 	}
 	.obs-sub {
-		margin: 0.35rem 0 0;
-		font-size: clamp(0.85rem, 1.4vw, 1rem);
+		margin: 0;
+		font-size: 0.86rem;
 		line-height: 1.5;
 		color: rgba(190, 224, 226, 0.82);
 	}
 	.obs-stats {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.4rem 1.1rem;
-		margin-top: 0.85rem;
-	}
-	.obs-stat {
+		margin: 0.1rem 0 0.4rem;
 		font-size: 0.78rem;
-		letter-spacing: 0.02em;
-		color: rgba(150, 190, 195, 0.7);
+		color: rgba(150, 190, 195, 0.75);
 	}
-	.obs-stat b {
+	.obs-stats b {
 		color: #7ff3e6;
+		text-shadow: 0 0 12px rgba(127, 243, 230, 0.6);
 		font-weight: 700;
 		font-variant-numeric: tabular-nums;
 	}
-	.obs-err b {
+	.obs-err {
 		color: #ff6b5e;
 	}
-
-	.obs-demos {
-		display: flex;
-		flex-direction: column;
-		gap: 0.5rem;
-		width: min(24rem, 84vw);
-	}
-	.obs-demos-label {
-		font-size: 0.7rem;
+	.obs-kicker {
+		margin: 0.7rem 0 0.1rem;
+		font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+		font-size: 0.6rem;
+		letter-spacing: 0.22em;
 		text-transform: uppercase;
-		letter-spacing: 0.18em;
-		color: rgba(140, 175, 180, 0.6);
-		margin-bottom: 0.15rem;
+		color: #c9a35a;
+		text-shadow: 0 0 12px rgba(255, 190, 90, 0.5);
 	}
-	.obs-card {
+	/* A line of words, never a card: a hairline in the memory's colour. */
+	.obs-item {
 		display: flex;
 		flex-direction: column;
-		gap: 0.15rem;
-		text-align: left;
-		padding: 0.7rem 0.9rem;
-		border-radius: 0.7rem;
-		border: 1px solid rgba(120, 160, 165, 0.22);
-		background: rgba(6, 16, 20, 0.55);
-		-webkit-backdrop-filter: blur(8px);
-		backdrop-filter: blur(8px);
-		color: #dff6f4;
-		cursor: pointer;
+		gap: 0.12rem;
+		margin: 0;
+		padding: 0.2rem 0 0.2rem 0.7rem;
+		border-left: 1px solid color-mix(in srgb, var(--tone, #7ff3e6) 45%, transparent);
+		color: inherit;
+		text-decoration: none;
 		transition:
 			border-color 0.16s ease,
-			background 0.16s ease,
 			transform 0.16s ease;
 	}
-	.obs-card:hover {
-		border-color: rgba(34, 199, 222, 0.55);
-		background: rgba(10, 26, 30, 0.72);
+	a.obs-item:hover,
+	a.obs-item:focus-visible {
+		border-left-color: var(--tone, #7ff3e6);
 		transform: translateX(3px);
 	}
-	.obs-card:focus-visible {
-		outline: 2px solid rgba(34, 199, 222, 0.7);
-		outline-offset: 2px;
+	.obs-item-head {
+		font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+		font-size: 0.6rem;
+		letter-spacing: 0.1em;
+		text-transform: uppercase;
+		color: color-mix(in srgb, var(--tone, #7ff3e6) 70%, #9fb3b0);
+		text-shadow: 0 0 10px color-mix(in srgb, var(--tone, #7ff3e6) 55%, transparent);
 	}
-	.obs-card.is-active {
-		border-color: rgba(34, 199, 222, 0.85);
-		background: rgba(16, 40, 46, 0.8);
-		box-shadow: 0 0 22px -6px rgba(34, 199, 222, 0.6);
-	}
-	.obs-card-label {
-		font-size: 0.98rem;
-		font-weight: 700;
-		letter-spacing: 0.03em;
-		color: #9ff8ec;
-	}
-	.obs-card.is-active .obs-card-label {
-		color: #eafffb;
-	}
-	.obs-card-blurb {
-		font-size: 0.76rem;
-		line-height: 1.35;
-		color: rgba(180, 210, 212, 0.72);
-	}
-	.obs-exit {
-		margin-top: 0.35rem;
-		align-self: flex-start;
+	.obs-item-text {
 		font-size: 0.8rem;
-		letter-spacing: 0.02em;
+		line-height: 1.4;
+		color: #dfeeed;
+		text-shadow: 0 0 10px color-mix(in srgb, var(--tone, #7ff3e6) 28%, transparent);
+	}
+	.obs-note {
+		margin: 0.2rem 0 0;
+		font-size: 0.76rem;
+		line-height: 1.45;
+		color: rgba(160, 190, 192, 0.7);
+	}
+	.obs-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.4rem 1.2rem;
+		margin-top: auto;
+		padding-top: 0.8rem;
+	}
+	.obs-act {
+		padding: 0 0 0.15rem;
+		border: none;
+		border-bottom: 1px solid rgba(127, 243, 230, 0.3);
+		background: none;
+		font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+		font-size: 0.62rem;
+		letter-spacing: 0.14em;
+		text-transform: uppercase;
 		color: #7ff3e6;
 		text-decoration: none;
 		cursor: pointer;
 	}
-	.obs-exit:hover {
-		text-decoration: underline;
+	.obs-act:hover {
+		color: #fff;
 	}
-	.obs-exit:disabled {
-		opacity: 0.45;
-		cursor: not-allowed;
-		text-decoration: none;
+	.obs-act:disabled {
+		opacity: 0.5;
+		cursor: default;
 	}
-
-	@media (max-aspect-ratio: 85/100) {
-		.obs-ui {
-			padding: 1rem 1rem 5.5rem;
-		}
-		.obs-demos {
-			width: 100%;
-		}
-	}
-
-	.obs-export-error {
-		color: #ff6a5e;
-		font-size: 0.72rem;
-		max-width: 22rem;
+	code {
+		font-size: 0.78em;
+		color: #9fe9df;
 	}
 </style>

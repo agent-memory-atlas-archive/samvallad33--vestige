@@ -32,15 +32,17 @@ export interface OrganRegion {
  * Memory Cinema live inside Observatory/Graph and are not separate regions here.
  */
 export const ORGAN_REGIONS: OrganRegion[] = [
-	{ href: '/observatory', label: 'OBSERVATORY', family: 'system', center: true },
-	{ href: '/graph', label: 'GRAPH', family: 'memory' },
-	{ href: '/memories', label: 'MEMORIES', family: 'memory' },
-	{ href: '/timeline', label: 'TIMELINE', family: 'temporal' },
-	{ href: '/feed', label: 'FEED', family: 'signal' },
-	{ href: '/explore', label: 'EXPLORE', family: 'reasoning' },
-	{ href: '/reasoning', label: 'REASONING', family: 'reasoning' },
-	{ href: '/blackbox', label: 'BLACK BOX', family: 'signal' },
-	{ href: '/contradictions', label: 'CONTRADICTIONS', family: 'immune' }
+	// The organs of the condensed dashboard (2026-10-17): every one is a live
+	// organ with its own story, and each shape leads exactly where it says.
+	{ href: '/trace', label: 'TRACE', family: 'memory', center: true },
+	{ href: '/field', label: 'FIELD', family: 'system' },
+	{ href: '/ledger', label: 'LEDGER', family: 'temporal' },
+	{ href: '/guard', label: 'GUARD', family: 'immune' },
+	{ href: '/healing', label: 'HEALING', family: 'signal' },
+	{ href: '/causal', label: 'CAUSAL', family: 'reasoning' },
+	{ href: '/system', label: 'SYSTEM', family: 'system' },
+	{ href: '/cinema', label: 'CINEMA', family: 'signal' },
+	{ href: '/graph', label: 'WITNESS', family: 'reasoning' }
 ];
 
 /**

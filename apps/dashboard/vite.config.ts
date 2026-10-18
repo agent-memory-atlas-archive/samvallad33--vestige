@@ -8,6 +8,14 @@ import { defineConfig } from 'vite';
 // makes every data-backed organ fail with a 404.
 const dashboardApiTarget = process.env.VESTIGE_API_TARGET ?? 'http://127.0.0.1:3931';
 
+// The dashboard server only accepts writes and WebSockets from its own origin.
+// In dev the page is served by Vite on another port, so the proxy presents the
+// backend's own origin (it already rewrites Host with changeOrigin). Dev only:
+// the shipped dashboard is served by the backend itself.
+const presentBackendOrigin = {
+	headers: { origin: dashboardApiTarget }
+};
+
 export default defineConfig({
 	plugins: [tailwindcss(), sveltekit()],
 	server: {
@@ -19,15 +27,19 @@ export default defineConfig({
 			'/dashboard/api': {
 				target: dashboardApiTarget,
 				changeOrigin: true,
+				...presentBackendOrigin,
 				rewrite: (path) => path.replace(/^\/dashboard/, '')
 			},
 			'/api': {
 				target: dashboardApiTarget,
-				changeOrigin: true
+				changeOrigin: true,
+				...presentBackendOrigin
 			},
 			'/ws': {
 				target: dashboardApiTarget.replace('http', 'ws'),
-				ws: true
+				ws: true,
+				changeOrigin: true,
+				...presentBackendOrigin
 			}
 		}
 	},

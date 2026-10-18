@@ -66,20 +66,17 @@ fn spectral(w_in: f32) -> vec3<f32> {
 	return mix(a, b, frac);
 }
 
-// Incoming semantic colors predate Fossil Light and include blue/violet
-// states. Keep a trace of that information, but chromatically ground it so the
-// field cannot fall back into the old purple-neon visual language.
+// The node's own colour is its memory type (the palette every organ shares).
+// Retention is how strongly it is held right now: a well-held memory shows its
+// type at full saturation; as it fades it loses saturation and sinks toward a
+// cool ash, so forgetting reads as light going out, not as a different hue.
 fn fossil_tone(source: vec3<f32>, retention: f32) -> vec3<f32> {
-	let amber = vec3<f32>(0.66, 0.30, 0.10);
-	let jade = vec3<f32>(0.30, 0.74, 0.52);
-	let retained = smoothstep(0.16, 0.92, clamp(retention, 0.0, 1.0));
-	let physical = mix(amber, jade, retained);
-	let grounded_source = vec3<f32>(
-		clamp(source.r, 0.0, 1.0),
-		max(clamp(source.g, 0.0, 1.0), clamp(source.b, 0.0, 1.0) * 0.70),
-		min(clamp(source.b, 0.0, 1.0), clamp(source.g, 0.0, 1.0) + 0.08)
-	);
-	return mix(physical, grounded_source, 0.14);
+	let held = smoothstep(0.08, 0.9, clamp(retention, 0.0, 1.0));
+	let src = clamp(source, vec3<f32>(0.0), vec3<f32>(1.0));
+	let luma = dot(src, vec3<f32>(0.299, 0.587, 0.114));
+	let saturated = mix(vec3<f32>(luma), src, mix(0.28, 1.0, held));
+	let ash = vec3<f32>(0.16, 0.19, 0.26);
+	return mix(ash, saturated, mix(0.3, 1.0, held));
 }
 
 struct VSOut {
@@ -221,7 +218,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 		* (1.0 - depth_scatter * 0.72);
 	let scattered_tissue = halo * (0.015 + 0.11 * depth_scatter) * (0.82 + 0.18 * params.pulse);
 	let tone = fossil_tone(in.color, retention);
-	let soma_tone = mix(tone, vec3<f32>(0.90, 0.96, 0.84), consolidated * 0.48);
+	// A well-held soma warms toward white at its very core but keeps its type colour.
+	let soma_tone = mix(tone, vec3<f32>(0.96, 0.97, 0.94), consolidated * 0.22);
 	var color = soma_tone * soma * (0.34 + 0.98 * consolidated)
 		+ tone * neurites
 		+ tone * scattered_tissue;
@@ -260,7 +258,11 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 		let ember = clamp(recall, 0.0, 1.0);                  // afterglow presence
 		// GCaMP fluorophore green, warming to yellow-green as the transient
 		// saturates (nonlinear summation on rapid re-fire).
-		let gcamp = mix(vec3<f32>(0.16, 1.00, 0.42), vec3<f32>(0.62, 1.00, 0.30), clamp(recall - 0.6, 0.0, 1.0));
+		// The recalled memory fires in its OWN type colour (brightened), so a
+		// recall path across a decision, a fact and a correction reads as three
+		// different lights, not one green wave.
+		let own = tone / max(0.001, max(tone.r, max(tone.g, tone.b)));
+		let gcamp = mix(own, vec3<f32>(1.0, 0.98, 0.9), clamp(recall - 0.6, 0.0, 1.0) * 0.6);
 		// The spectral band survives as the traveling-wave shimmer, but dialed
 		// under the calcium green so the biology reads first.
 		let band = spectral(0.1 + params.loop_phase + d * 0.35);

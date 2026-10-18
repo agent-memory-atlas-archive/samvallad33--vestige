@@ -17,26 +17,42 @@ export const BASE = '/dashboard';
  * so it's asserted as a canvas like the rest, not as DOM controls.
  */
 export const ROUTES: { path: string; label: string; webgpu: boolean }[] = [
-	{ path: '/graph', label: 'Graph', webgpu: true },
 	{ path: '/palace', label: 'Memory Palace', webgpu: true },
-	{ path: '/observatory', label: 'Observatory', webgpu: true },
-	{ path: '/reasoning', label: 'Reasoning', webgpu: true },
-	{ path: '/contradictions', label: 'Contradictions', webgpu: true },
-	{ path: '/blackbox', label: 'Black Box', webgpu: true },
-	{ path: '/timeline', label: 'Timeline', webgpu: true },
-	{ path: '/duplicates', label: 'Duplicates', webgpu: true },
-	{ path: '/memory-prs', label: 'Memory PRs', webgpu: true },
-	{ path: '/memories', label: 'Memories', webgpu: true },
-	{ path: '/feed', label: 'Feed', webgpu: true },
-	{ path: '/explore', label: 'Explore', webgpu: true },
-	{ path: '/activation', label: 'Activation', webgpu: true },
-	{ path: '/dreams', label: 'Dreams', webgpu: true },
-	{ path: '/schedule', label: 'Schedule', webgpu: true },
-	{ path: '/importance', label: 'Importance', webgpu: true },
-	{ path: '/patterns', label: 'Patterns', webgpu: true },
-	{ path: '/intentions', label: 'Intentions', webgpu: true },
-	{ path: '/stats', label: 'Stats', webgpu: true },
-	{ path: '/settings', label: 'Settings', webgpu: true }
+	{ path: '/trace', label: 'Trace', webgpu: true },
+	{ path: '/guard', label: 'Guard', webgpu: true },
+	{ path: '/field', label: 'Field', webgpu: true },
+	{ path: '/ledger', label: 'Ledger', webgpu: true },
+	{ path: '/healing', label: 'Healing', webgpu: true },
+	{ path: '/causal', label: 'Causal', webgpu: true },
+	{ path: '/system', label: 'System', webgpu: true },
+	{ path: '/cinema', label: 'Memory Cinema', webgpu: true },
+	{ path: '/graph', label: 'Witness', webgpu: true }
+];
+
+/**
+ * Routes the 2026-10-15 condensation folded into an organ. Each must redirect
+ * to its organ with the query string intact (mirrors ABSORBED_ROUTES in
+ * src/lib/os-routes.ts).
+ */
+export const ABSORBED: { path: string; to: string }[] = [
+	{ path: '/observatory', to: '/field' },
+	{ path: '/memories', to: '/field' },
+	{ path: '/explore', to: '/field' },
+	{ path: '/activation', to: '/field' },
+	{ path: '/importance', to: '/field' },
+	{ path: '/schedule', to: '/field' },
+	{ path: '/stats', to: '/field' },
+	{ path: '/timeline', to: '/ledger' },
+	{ path: '/blackbox', to: '/ledger' },
+	{ path: '/feed', to: '/ledger' },
+	{ path: '/dreams', to: '/ledger' },
+	{ path: '/memory-prs', to: '/ledger' },
+	{ path: '/intentions', to: '/ledger' },
+	{ path: '/contradictions', to: '/healing' },
+	{ path: '/duplicates', to: '/healing' },
+	{ path: '/patterns', to: '/healing' },
+	{ path: '/reasoning', to: '/causal' },
+	{ path: '/settings', to: '/system' }
 ];
 
 /** WebGPU-field routes only (the ones with a living canvas). */
