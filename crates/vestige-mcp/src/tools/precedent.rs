@@ -594,13 +594,17 @@ mod tests {
     fn items_carry_the_chain_link_and_what_the_gate_saw_through() {
         let dir = tempfile::TempDir::new().unwrap();
         let home = dir.path().to_path_buf();
-        let fresh = iso(Utc::now() - chrono::Duration::minutes(5));
+        let fresh_at = Utc::now() - chrono::Duration::minutes(5);
+        let fresh = iso(fresh_at);
         let stop = rec(
             &fresh,
             "STOP",
             r#","prev":"79ecb0a2a995efb2","normalized":"git checkout -- src/app.py","transforms":["variables-expanded","heredoc-extracted"],"commitment":"OP-011","rule":"no-unrestorable-loss","detail":"git checkout discards uncommitted changes token=hunter2""#,
         );
-        write(&home, "receipts/2026-10-16.jsonl", &format!("{stop}\n"));
+        // The receipt's own UTC day: a fixed date drops out of the window once
+        // the calendar passes it, and day files before the window are skipped.
+        let day = format!("receipts/{}.jsonl", fresh_at.format("%Y-%m-%d"));
+        write(&home, &day, &format!("{stop}\n"));
         let out = run(&home, &query(json!({"since": "1h"}))).unwrap();
         let item = &out["items"][0];
         assert_eq!(item["prev"], "79ecb0a2a995efb2");
