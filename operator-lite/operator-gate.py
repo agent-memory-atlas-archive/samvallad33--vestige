@@ -424,9 +424,10 @@ UNKNOWN_CWD = "/__unknown_cwd__"
 
 
 def vestige_data_dirs(env, home, platform):
-    """Where Vestige 4.x keeps its Strata store, the way its ProjectDirs("com", "vestige", "core") resolves
-    it: VESTIGE_DATA_DIR first, then the platform default (docs/STORAGE.md). Pure, so every platform's
-    answer can be tested anywhere."""
+    """Where Vestige keeps its Strata store: VESTIGE_DATA_DIR first, then the platform default
+    (docs/STORAGE.md). On Linux, 5.0 stores live in $XDG_DATA_HOME/vestige, and a 4.x store in
+    $XDG_DATA_HOME/core keeps being used until the new folder holds one, so both are guarded. Pure, so
+    every platform's answer can be tested anywhere."""
     dirs = []
     custom = (env.get("VESTIGE_DATA_DIR") or "").strip()
     if custom:
@@ -437,7 +438,8 @@ def vestige_data_dirs(env, home, platform):
         dirs.append(canon_windows(env.get("APPDATA") or home + "/AppData/Roaming").rstrip("/") + "/vestige/core/data")
     else:
         xdg = env.get("XDG_DATA_HOME") or ""
-        dirs.append((xdg.rstrip("/") if xdg.startswith("/") else home + "/.local/share") + "/core")
+        base = xdg.rstrip("/") if xdg.startswith("/") else home + "/.local/share"
+        dirs += [base + "/vestige", base + "/core"]
     return dirs
 
 
