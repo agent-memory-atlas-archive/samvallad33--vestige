@@ -140,7 +140,7 @@ sh ports/crewai/test.sh                    # optional: proves the chain end-to-e
   that does not parse)
 - installs the adapter to `~/.operator/ports/crewai/operator_hooks.py`
   (backing up any previous copy) and smoke-checks that it resolves the gate
-- sets `~/.operator/mode` to `enforce` if no mode file exists yet
+- sets `~/.operator/mode` to `enforce` if no mode file exists yet, and switches the `shadow` an install before 0.3.9 wrote to `enforce`, once
 - prints the wiring snippet and next steps; requires `python3`
 
 There is no hooks.json to merge: CrewAI hooks are registered from Python, so

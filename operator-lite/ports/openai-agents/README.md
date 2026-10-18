@@ -61,7 +61,8 @@ sh ports/openai-agents/install.sh
 
 Installs the gate to `~/.operator/gate/` (never overwrites a newer copy),
 the module to `~/.operator/ports/openai-agents/`, and sets **enforce mode**
-(blocking) unless you already chose a mode.
+(blocking) unless you already chose a mode; the `shadow` an install before 0.3.9
+wrote becomes `enforce`, once.
 
 ## Minimal usage
 

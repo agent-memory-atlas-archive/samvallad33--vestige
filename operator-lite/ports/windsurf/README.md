@@ -147,7 +147,7 @@ sh ports/windsurf/test.sh                   # optional: proves the chain end-to-
   copy is same-or-newer; never overwrites a newer gate; refuses to wire a gate
   that does not parse)
 - installs the adapter to `~/.operator/gate/windsurf-wrapper.py`
-- sets `~/.operator/mode` to `enforce` if no mode file exists yet
+- sets `~/.operator/mode` to `enforce` if no mode file exists yet, and switches the `shadow` an install before 0.3.9 wrote to `enforce`, once
 - merges the three pre-hooks into `~/.codeium/windsurf/hooks.json` (or the
   workspace's `.windsurf/hooks.json` / existing `.devin/hooks.json`): existing
   hooks are preserved, the original file is backed up to

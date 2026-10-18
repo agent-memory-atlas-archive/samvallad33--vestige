@@ -19,7 +19,7 @@ sh ports/gemini-cli/test.sh                  # optional: proves the chain end-to
   GitHub, or uses this checkout's copy when it is newer; never overwrites an
   existing same-or-newer copy)
 - installs the adapter to `~/.operator/gate/gemini-wrapper.py`
-- sets `~/.operator/mode` to `enforce` if no mode file exists yet
+- sets `~/.operator/mode` to `enforce` if no mode file exists yet, and switches the `shadow` an install before 0.3.9 wrote to `enforce`, once
 - merges the `BeforeTool` hook into `~/.gemini/settings.json` (a timestamped
   backup is written first; existing settings and existing hooks are preserved;
   an invalid existing file is left untouched and manual steps are printed)

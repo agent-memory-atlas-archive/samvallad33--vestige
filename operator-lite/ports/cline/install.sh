@@ -3,7 +3,8 @@
 #
 #   1. ensures the gate at ~/.operator/gate/operator-gate.py
 #      (downloaded from the Vestige repo if missing; never overwritten)
-#   2. sets enforce mode (blocking) if no mode file exists yet
+#   2. sets enforce mode (blocking) if no mode file exists yet; a shadow an install
+#      before 0.3.9 wrote becomes enforce, once
 #   3. installs the PreToolUse hook to ~/.cline/hooks/PreToolUse
 #      (an existing different file is backed up, never clobbered)
 #   4. if a `cline` CLI is present, also attempts the SDK plugin install;
@@ -61,13 +62,26 @@ else
 fi
 
 # --- 2. mode (enforce unless already set) ------------------------------------------
-if [ -f "$GATE_ROOT/mode" ]; then
-    note "mode:      $(cat "$GATE_ROOT/mode") (existing file left untouched)"
-else
+NEW_MODE=""
+if [ ! -f "$GATE_ROOT/mode" ]; then
     mkdir -p "$GATE_ROOT" 2>/dev/null
     echo enforce > "$GATE_ROOT/mode"
-    note "mode:      enforce (blocking). To record without blocking: echo shadow > $GATE_ROOT/mode"
+    NEW_MODE=1
 fi
+# Installs before 0.3.9 wrote shadow, which blocks nothing. The gate settles the mode once (a shadow the
+# owner chose with its mode command stays) and records that it did, so a later `echo shadow` is kept.
+SETTLED=""
+if grep -q '^EDITION = "lite"' "$GATE" 2>/dev/null; then
+    SETTLED=$(python3 -I "$GATE" mode --settle 2>/dev/null) || SETTLED=""
+fi
+case "$SETTLED" in
+    *"("*) note "mode:      $SETTLED. To record without blocking: echo shadow > $GATE_ROOT/mode" ;;
+    *) if [ -n "$NEW_MODE" ]; then
+           note "mode:      enforce (blocking). To record without blocking: echo shadow > $GATE_ROOT/mode"
+       else
+           note "mode:      $(cat "$GATE_ROOT/mode") (existing file left untouched)"
+       fi ;;
+esac
 
 # --- 3. PreToolUse hook --------------------------------------------------------
 mkdir -p "$HOOK_DIR" || die "cannot create $HOOK_DIR"

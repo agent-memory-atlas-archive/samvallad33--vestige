@@ -121,7 +121,7 @@ sh ports/crush/test.sh                       # optional: proves the chain end-to
   GitHub, or uses this checkout's copy when it is newer, unless an existing
   copy is same-or-newer; never overwrites a newer gate; refuses to wire a gate
   that does not parse)
-- sets `~/.operator/mode` to `enforce` if no mode file exists yet
+- sets `~/.operator/mode` to `enforce` if no mode file exists yet, and switches the `shadow` an install before 0.3.9 wrote to `enforce`, once
 - merges the `PreToolUse` hook into `<project-dir>/crush.json`: existing keys
   are preserved, the original file is backed up to
   `crush.json.bak-<timestamp>` first, and a file that is not valid JSON is

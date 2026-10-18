@@ -62,6 +62,8 @@ jobs:
       - if: runner.os != 'Windows'
         name: a fresh install stops every clearly destructive command
         run: python3 operator-lite/test_destructive.py
+      - name: an upgrade from 0.3.7 blocks
+        run: python operator-lite/test_upgrade.py
       - if: runner.os != 'Windows'
         name: the npm package carries this gate at its own version
         run: node operator-lite/npm/test.js

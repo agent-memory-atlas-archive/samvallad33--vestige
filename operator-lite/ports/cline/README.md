@@ -98,7 +98,7 @@ then the hook, so the hook never runs without a gate behind it.
 ## Enforce and shadow
 
 The gate starts in **enforce** mode: it stops what a STOP rule matches and
-receipts every call. An existing `~/.operator/mode` file is kept.
+receipts every call. An existing `~/.operator/mode` file is kept, except the `shadow` every install before 0.3.9 wrote, which becomes `enforce` once; a shadow you choose with `operator-gate mode shadow` stays.
 
 ```sh
 echo shadow  > ~/.operator/mode     # log-only: nothing is blocked

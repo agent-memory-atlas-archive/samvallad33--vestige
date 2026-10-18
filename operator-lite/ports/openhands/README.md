@@ -19,7 +19,7 @@ sh ports/openhands/test.sh                   # optional: proves the chain end-to
   GitHub, or uses this checkout's copy when it is newer; never overwrites an
   existing same-or-newer copy)
 - installs the adapter to `~/.operator/gate/openhands-wrapper.py`
-- sets `~/.operator/mode` to `enforce` if no mode file exists yet
+- sets `~/.operator/mode` to `enforce` if no mode file exists yet, and switches the `shadow` an install before 0.3.9 wrote to `enforce`, once
 - merges the hook into `<project>/.openhands/hooks.json` (existing hooks are
   preserved; an invalid existing file is left untouched and reported)
 

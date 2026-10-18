@@ -86,7 +86,8 @@ sh operator-lite/ports/goose/install.sh
 The script installs the gate to `~/.operator/gate/` (downloaded from the
 Vestige repo if no local copy exists; never overwrites an existing gate),
 copies the hook plugin into `~/.agents/plugins/operator-lite/`, sets
-**enforce mode** if no mode file exists, and prints next steps. Requires
+**enforce mode** if no mode file exists (the `shadow` an install before 0.3.9
+wrote becomes `enforce`, once), and prints next steps. Requires
 goose v1.41.0+ and `python3` on PATH.
 
 Verify the wiring:

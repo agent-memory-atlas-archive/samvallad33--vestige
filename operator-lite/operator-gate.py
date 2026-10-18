@@ -320,6 +320,88 @@ def global_mode():
     return m if m in ("enforce", "shadow", "off") else "enforce"
 
 
+# Every Lite install before 0.3.9 (the gate's own and each port's) wrote `shadow` into the mode file, and
+# shadow blocks nothing. The mode is settled once per gate home, by the first install, `mode` command or
+# hook call of 0.3.9 or later; this file records that it was.
+MODE_SETTLED = "mode-settled.json"
+
+
+def owner_chose_shadow():
+    """True when the owner's last word on the mode, a MODE_SET receipt from the `mode` command in their
+    terminal (0.3.8 and later), chose shadow."""
+    rdir = pj(OP_HOME, "receipts")
+    try:
+        days = sorted((n for n in os.listdir(rdir) if n.endswith(".jsonl")), reverse=True)
+    except Exception:
+        return False
+    for name in days:
+        last = None
+        try:
+            with open(pj(rdir, name), encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if "MODE_SET" not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("decision") == "MODE_SET" and rec.get("source") == "owner-tty":
+                        last = rec.get("mode")
+        except Exception:
+            continue
+        if last:
+            return last == "shadow"
+    return False
+
+
+def installed_gates():
+    return sorted({pj(OP_HOME, "gate", "operator-gate.py"), pj(HOME, ".operator", "gate", "operator-gate.py")})
+
+
+def record_settled(by, mode, switched):
+    try:
+        ensure_dirs()
+        with open(pj(OP_HOME, "state", MODE_SETTLED), "w", encoding="utf-8") as f:
+            json.dump({"by": by, "gate_version": VERSION, "mode": mode, "switched": switched,
+                       "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, f)
+    except Exception:
+        pass
+
+
+def settle_mode(by):
+    """Settle the mode file once, and return (mode, switched). A `shadow` that an install before 0.3.9
+    left becomes enforce, with a MODE_SET receipt whose source is "upgrade". A shadow the owner chose with
+    the `mode` command stays, and every choice made after the settling stays. Where the paid gate is
+    installed it owns the mode, and nothing is changed.
+    by="hook" settles only when an installed gate shows that an installer ran here: with none, a shadow
+    file is the owner's own `echo shadow`, and it stays. Never raises."""
+    try:
+        with open(pj(OP_HOME, "mode"), encoding="utf-8") as f:
+            current = f.read().strip()
+    except Exception:
+        current = None
+    try:
+        if os.path.exists(pj(OP_HOME, "state", MODE_SETTLED)):
+            return current, False
+        gates = [g for g in installed_gates() if os.path.isfile(g)]
+        if any(gate_identity(g)[0] == "operator" for g in gates):
+            return current, False
+        switched = current == "shadow" and (by != "hook" or bool(gates)) and not owner_chose_shadow()
+        if switched:
+            with open(pj(OP_HOME, "mode"), "w", encoding="utf-8") as f:
+                f.write("enforce\n")
+            write_receipt({"decision": "MODE_SET", "mode": "enforce", "was": "shadow", "source": "upgrade", "by": by})
+            current = "enforce"
+        record_settled(by, current or "enforce", switched)
+        return current, switched
+    except Exception:
+        return current, False
+
+
+SETTLED_NOTE = ("Operator Lite before 0.3.9 installed in shadow mode, which blocks nothing; "
+                "the gate now blocks what its rules stop")
+
+
 # --------------------------------------------------------------------------- #
 # shell parsing (closed, conservative)
 # --------------------------------------------------------------------------- #
@@ -2292,7 +2374,10 @@ def hook_main(argv):
     raw = ""
     try:
         raw = read_stdin()
-        if os.path.exists(pj(OP_HOME, "DISABLED")) or global_mode() == "off":
+        if os.path.exists(pj(OP_HOME, "DISABLED")):
+            return 0
+        settle_mode("hook")                         # once: a shadow an older installer left becomes enforce
+        if global_mode() == "off":
             return 0
         payload = json.loads(raw) if raw.strip() else {}
         cfg = load_config()
@@ -2516,6 +2601,14 @@ def cmd_status(argv):
     says = {"enforce": "enforce (blocking)", "shadow": "shadow (recording, not blocking)",
             "off": "off (nothing is checked)"}[mode]
     print("Operator Lite %s   mode: %s   Claude Code hook: %s" % (VERSION, says, "registered" if wired else "NOT registered"))
+    try:
+        with open(pj(OP_HOME, "state", MODE_SETTLED), encoding="utf-8") as f:
+            settled = json.load(f)
+    except Exception:
+        settled = {}
+    if isinstance(settled, dict) and settled.get("switched") and mode == "enforce":
+        print("Switched from shadow to enforce on %s: Operator Lite before 0.3.9 installed in shadow mode, which "
+              "blocks nothing. To record without blocking: %s mode shadow" % (str(settled.get("ts"))[:10], me))
     if not wired:
         print("Register it: %s install" % me)
     recs = recent_receipts(7)
@@ -2578,6 +2671,12 @@ def cmd_mode(argv):
     if not argv:
         print("mode is %s. To change it: %s mode enforce|shadow|off" % (global_mode(), self_cmd()))
         return 0
+    if argv[0] == "--settle":
+        # The port installers' call: settle the mode once (settle_mode), then print it. It can only
+        # turn an older installer's shadow into enforce, so it needs no terminal.
+        mode, switched = settle_mode("installer")
+        print("mode=%s%s" % (mode or "enforce", " (%s)" % SETTLED_NOTE if switched else ""))
+        return 0
     if argv[0] not in ("enforce", "shadow", "off"):
         print("usage: %s mode enforce|shadow|off" % self_cmd())
         return 2
@@ -2588,6 +2687,7 @@ def cmd_mode(argv):
     with open(pj(OP_HOME, "mode"), "w", encoding="utf-8") as f:
         f.write(argv[0] + "\n")
     write_receipt({"decision": "MODE_SET", "mode": argv[0], "source": "owner-tty"})
+    record_settled("owner", argv[0], False)
     print({"enforce": "The gate now blocks what its rules stop.",
            "shadow": "The gate now records and blocks nothing.",
            "off": "The gate is off: nothing is checked or recorded."}[argv[0]])
@@ -3169,7 +3269,8 @@ def install_refusal(dst, src):
 
 def cmd_install(argv):
     """Owner-side install: copies the gate to ~/.operator/gate and wires Claude Code. A fresh install starts
-    in enforce mode; an existing mode file is kept.
+    in enforce mode; an existing mode file is kept, except the shadow an install before 0.3.9 wrote,
+    which becomes enforce once (settle_mode).
     It refuses to replace the paid gate or a newer gate unless the owner passes --force."""
     agent = agent_session()
     if agent:
@@ -3215,6 +3316,7 @@ def cmd_install(argv):
     if not os.path.exists(mode_path):             # a fresh install blocks from the first call
         with open(mode_path, "w", encoding="utf-8") as f:
             f.write("enforce\n")
+    _, switched = settle_mode("install")          # an upgrade: the shadow an older install wrote becomes enforce
     # Claude Code PreToolUse hook: merge, never clobber. A settings.json that does not parse is the
     # owner's file in the middle of an edit; it is left exactly as it is.
     settings_path = pj(HOME, ".claude", "settings.json")
@@ -3266,6 +3368,8 @@ def cmd_install(argv):
         launcher = None
     if launcher:
         print("command: operator-gate (%s)" % launcher)
+    if switched:
+        print("%s." % SETTLED_NOTE)
     print(install_mode_line(global_mode()))
     if "--no-replay" not in argv:                 # what this gate would have said about last month
         try:

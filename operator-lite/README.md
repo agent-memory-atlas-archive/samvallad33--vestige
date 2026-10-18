@@ -26,7 +26,7 @@ From a clone, `python3 operator-gate.py install` does the same. It copies the ga
 `~/.operator/gate`, registers the Claude Code hook, starts in enforce mode (every
 command a STOP rule matches is stopped, from your agent's next tool call) and then
 replays your last 30 days of Claude Code history through the rules. Nothing in that
-history is executed. An existing `~/.operator/mode` file is kept as it is.
+history is executed. An existing `~/.operator/mode` file is kept, except the `shadow` every install before 0.3.9 wrote, which becomes `enforce` once; a shadow you choose with `operator-gate mode shadow` stays.
 
 `install` never replaces a gate that outranks it: when `~/.operator/gate/operator-gate.py`
 is the paid Operator gate or a newer version, it prints both versions and the path, changes

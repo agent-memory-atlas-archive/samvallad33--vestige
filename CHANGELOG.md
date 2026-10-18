@@ -10,10 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Operator Lite 0.3.9. Version 0.3.8 is skipped: it was published to npm and
 withdrawn, so the number cannot be used again.
 
-Upgrading Operator Lite: install keeps an existing `~/.operator/mode` file. An
-install that 0.3.7 or earlier set to `shadow` stays in shadow, which blocks
-nothing, until the owner runs `operator-gate mode enforce` (or
-`npx operator-lite mode enforce`).
+Upgrading Operator Lite: every install before 0.3.9 wrote `shadow` into
+`~/.operator/mode`, and shadow blocks nothing. The first 0.3.9 install
+(`install`, `npx operator-lite`, a port's `install.sh`) or the first tool call
+it checks switches that file to `enforce`, once, records the switch as a
+`MODE_SET` receipt, and says so in install's output and in `status`. A shadow
+chosen with `operator-gate mode shadow`, a shadow set after 0.3.9 first ran,
+and the mode of a machine running the paid Operator gate stay as they are. To
+record without blocking again: `operator-gate mode shadow`.
 
 ### Changed
 
@@ -21,6 +25,11 @@ nothing, until the owner runs `operator-gate mode enforce` (or
   every `ports/*/install.sh` write `enforce` to `~/.operator/mode` when there
   is no mode file, so a STOP rule stops a command from the agent's next tool
   call. `mode shadow` still records without blocking.
+- **An upgrade from 0.3.7 blocks too.** The `shadow` an older installer wrote
+  becomes `enforce` once (see the upgrade note above). `operator-gate mode
+  --settle` does that step for the port installers, and
+  `operator-lite/test_upgrade.py` installs the real 0.3.7 gate and upgrades it
+  each way.
 - **Fifteen STOP rules, up from twelve.** OP-011 no-unrestorable-loss:
   `git reset --hard`, `git clean -f`, `git checkout -- <path>` and
   `git stash drop`/`clear` when they would discard work git cannot bring back,

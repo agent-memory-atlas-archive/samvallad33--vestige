@@ -19,7 +19,8 @@
 #   2. installs the shim dispatcher to ~/.operator/shim/lib/
 #   3. generates shims into ~/.operator/shim/bin/ with absolute real-binary
 #      paths baked in (binaries missing on this machine are skipped and noted)
-#   4. sets mode to enforce if no mode file exists yet
+#   4. sets mode to enforce if no mode file exists yet; a shadow an install
+#      before 0.3.9 wrote becomes enforce, once
 #   5. prints how to run aider under the shims
 #
 # Installs are run by the owner in their own terminal -- same guard as the gate.
@@ -216,12 +217,22 @@ else
 fi
 
 # --- 4. mode: enforce unless the owner already chose ------------------------------- #
-if [ ! -f "$MODE_DST" ]; then
-    printf 'enforce\n' > "$MODE_DST"
-    MODE_MSG="mode=enforce (blocking). To record without blocking: echo shadow > $MODE_DST"
-else
-    MODE_MSG="mode=$(cat "$MODE_DST") (existing mode kept)"
+NEW_MODE=""
+[ -f "$MODE_DST" ] || { printf 'enforce\n' > "$MODE_DST"; NEW_MODE=1; }
+# Installs before 0.3.9 wrote shadow, which blocks nothing. The gate settles the mode once (a shadow the
+# owner chose with its mode command stays) and records that it did, so a later `echo shadow` is kept.
+SETTLED=""
+if grep -q '^EDITION = "lite"' "$GATE_DST" 2>/dev/null; then
+    SETTLED=$(python3 -I "$GATE_DST" mode --settle 2>/dev/null) || SETTLED=""
 fi
+case "$SETTLED" in
+    *"("*) MODE_MSG="$SETTLED. To record without blocking: echo shadow > $MODE_DST" ;;
+    *) if [ -n "$NEW_MODE" ]; then
+           MODE_MSG="mode=enforce (blocking). To record without blocking: echo shadow > $MODE_DST"
+       else
+           MODE_MSG="mode=$(cat "$MODE_DST") (existing mode kept)"
+       fi ;;
+esac
 say "operator-gate: $MODE_MSG"
 
 # --- 5. how to run aider under the gate ------------------------------------------- #

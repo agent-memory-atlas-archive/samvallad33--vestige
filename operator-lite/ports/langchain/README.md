@@ -121,7 +121,7 @@ sh ports/langchain/test.sh                    # optional: proves the chain end-t
   copy is same-or-newer; never overwrites a newer gate; refuses to wire a gate
   that does not parse)
 - installs the middleware to `~/.operator/ports/langchain/operator_middleware.py`
-- sets `~/.operator/mode` to `enforce` if no mode file exists yet
+- sets `~/.operator/mode` to `enforce` if no mode file exists yet, and switches the `shadow` an install before 0.3.9 wrote to `enforce`, once
 - prints the usage snippet and next steps; requires `python3` (the gate and
   the adapter are stdlib-only — no `pip install` of anything)
 

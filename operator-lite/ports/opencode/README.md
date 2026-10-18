@@ -77,12 +77,13 @@ sh test.sh               # 11-check harness, expect "11 passed, 0 failed"
 `install.sh` puts the gate at `~/.operator/gate/operator-gate.py` (bundled copy
 preferred, otherwise downloaded from the main repo; never overwrites an
 existing gate), copies `index.js` to `~/.config/opencode/plugin/operator-lite.js`,
-writes `enforce` to `~/.operator/mode` when there is no mode file yet, and prints
+writes `enforce` to `~/.operator/mode` when there is no mode file yet (the `shadow`
+an install before 0.3.9 wrote becomes `enforce`, once), and prints
 next steps. Requires `python3` on PATH.
 
 The gate starts in **enforce** mode: every command a STOP rule matches is
 blocked before it runs, and every decision is written to `~/.operator/receipts/`
-as a hash-chained digest log. An existing mode file is kept. One file sets the mode:
+as a hash-chained digest log. An existing `~/.operator/mode` file is kept, except the `shadow` every install before 0.3.9 wrote, which becomes `enforce` once; a shadow you choose with `operator-gate mode shadow` stays. One file sets the mode:
 
 ```sh
 echo shadow  > ~/.operator/mode     # record without blocking

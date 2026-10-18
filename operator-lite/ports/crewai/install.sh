@@ -9,7 +9,8 @@
 #      never overwrites a newer gate)
 #   2. copies this port's adapter to ~/.operator/ports/crewai/operator_hooks.py
 #      (any existing copy is backed up first)
-#   3. sets mode to enforce if no mode file exists yet
+#   3. sets mode to enforce if no mode file exists yet; a shadow an install
+#      before 0.3.9 wrote becomes enforce, once
 #   4. prints next steps
 #
 # CrewAI has no hooks.json to merge: hooks are execution hooks registered from
@@ -124,12 +125,22 @@ say "operator_hooks: adapter installed -> $MODULE_DST"
 
 # --- mode: enforce unless the owner already chose ----------------------------- #
 MODE_DST="$OP_HOME/mode"
-if [ ! -f "$MODE_DST" ]; then
-    printf 'enforce\n' > "$MODE_DST"
-    say "operator-gate: mode=enforce (blocking). To record without blocking: echo shadow > $MODE_DST"
-else
-    say "operator-gate: mode=$(cat "$MODE_DST") (existing mode kept)"
+NEW_MODE=""
+[ -f "$MODE_DST" ] || { printf 'enforce\n' > "$MODE_DST"; NEW_MODE=1; }
+# Installs before 0.3.9 wrote shadow, which blocks nothing. The gate settles the mode once (a shadow the
+# owner chose with its mode command stays) and records that it did, so a later `echo shadow` is kept.
+SETTLED=""
+if grep -q '^EDITION = "lite"' "$GATE_DST" 2>/dev/null; then
+    SETTLED=$(python3 -I "$GATE_DST" mode --settle 2>/dev/null) || SETTLED=""
 fi
+case "$SETTLED" in
+    *"("*) say "operator-gate: $SETTLED. To record without blocking: echo shadow > $MODE_DST" ;;
+    *) if [ -n "$NEW_MODE" ]; then
+           say "operator-gate: mode=enforce (blocking). To record without blocking: echo shadow > $MODE_DST"
+       else
+           say "operator-gate: mode=$(cat "$MODE_DST") (existing mode kept)"
+       fi ;;
+esac
 
 # --- smoke: the adapter resolves the gate and reports its wiring -------------- #
 python3 - "$MODULE_DST" "$GATE_DST" <<'PYEOF' || die "adapter smoke check failed"

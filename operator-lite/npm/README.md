@@ -7,7 +7,7 @@ A deterministic pre-tool gate for coding agents. One command, the same on macOS,
 It installs the gate to `~/.operator/gate`, wires Claude Code, then wires every other agent it
 finds on the machine (Cursor, Gemini CLI, Windsurf, Cline, Goose, opencode, Amazon Q). It starts in
 enforce mode: from your agent's next tool call, every command a STOP rule matches is stopped before
-it runs, and every verdict gets a hash-chained receipt. An existing `~/.operator/mode` file is kept.
+it runs, and every verdict gets a hash-chained receipt. An existing `~/.operator/mode` file is kept, except the `shadow` every install before 0.3.9 wrote, which becomes `enforce` once; a shadow you choose with `operator-gate mode shadow` stays.
 To record without blocking:
 
     npx operator-lite mode shadow

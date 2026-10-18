@@ -138,7 +138,7 @@ sh ports/cursor/test.sh                  # optional: proves the chain end-to-end
   GitHub, or uses this checkout's copy when it is newer; never overwrites an
   existing same-or-newer copy)
 - installs the adapter to `~/.operator/gate/cursor-hook.py`
-- sets `~/.operator/mode` to `enforce` if no mode file exists yet
+- sets `~/.operator/mode` to `enforce` if no mode file exists yet, and switches the `shadow` an install before 0.3.9 wrote to `enforce`, once
 - merges the three hooks into `~/.cursor/hooks.json` (user scope, every
   project; a timestamped backup is written first; existing hooks and settings
   are preserved; an invalid existing file is left untouched and manual steps

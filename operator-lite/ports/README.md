@@ -8,8 +8,9 @@ host-agnostic by contract:
   host surfaces it to the model, which must change course)
 - writes its own hash-chained receipts under `~/.operator/receipts/`
 - enforce vs shadow is a file: `~/.operator/mode`. A missing file means enforce, and
-  every installer writes `enforce` when there is no mode file yet; `shadow` records
-  without blocking
+  every installer writes `enforce` when there is no mode file yet, and switches the
+  `shadow` an install before 0.3.9 wrote to `enforce`, once; `shadow` records without
+  blocking
 
 Every port in this directory is a thin adapter that carries that contract to
 a different agent host. No port contains rule logic. No port re-implements
@@ -53,8 +54,9 @@ sh ports/<host>/install.sh
 
 Every install.sh installs the gate to `~/.operator/gate/` (never
 overwrites a newer copy), wires the host hook, and writes `enforce` to
-`~/.operator/mode` when there is no mode file yet; an existing mode file is
-kept. The gate comes from GitHub main, or from this checkout when its copy
+`~/.operator/mode` when there is no mode file yet. An existing mode file is
+kept, except the `shadow` every install before 0.3.9 wrote, which becomes
+`enforce` once (the gate's `mode --settle`); a shadow chosen after that stays. The gate comes from GitHub main, or from this checkout when its copy
 is newer. cline, goose and opencode install the copy that ships with them
 (the checkout's, or opencode's own identical copy) and download only when
 there is none. To record without blocking: `echo shadow > ~/.operator/mode`.

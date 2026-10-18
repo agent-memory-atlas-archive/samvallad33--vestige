@@ -108,7 +108,7 @@ regenerate. Re-run `install.sh` any time to pick up new binaries (idempotent).
 ## Enforce and shadow
 
 Install starts in **enforce**: every shimmed command is judged and receipted,
-and what a STOP rule matches is blocked. An existing mode file is kept.
+and what a STOP rule matches is blocked. An existing `~/.operator/mode` file is kept, except the `shadow` every install before 0.3.9 wrote, which becomes `enforce` once; a shadow you choose with `operator-gate mode shadow` stays.
 
 ```sh
 python3 ~/.operator/gate/operator-gate.py status     # rules + mode
