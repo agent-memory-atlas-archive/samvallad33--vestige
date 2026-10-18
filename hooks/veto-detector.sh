@@ -19,7 +19,7 @@
 set -u
 
 INPUT="$(cat)"
-TRANSCRIPT_PATH="$(printf '%s' "$INPUT" | /usr/bin/python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("transcript_path",""))' 2>/dev/null || printf '')"
+TRANSCRIPT_PATH="$(printf '%s' "$INPUT" | /usr/bin/python3 -I -c 'import sys,json;d=json.load(sys.stdin);print(d.get("transcript_path",""))' 2>/dev/null || printf '')"
 
 if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
   exit 0
@@ -127,26 +127,29 @@ if not hits:
 # Emit the VESTIGE VETO message. Newest/highest-retention hit leads.
 hits.sort(key=lambda x: x["retention"], reverse=True)
 top = hits[0]
-nid = top["id"][:8] if len(top["id"]) >= 8 else top["id"]
+# The full id: a Strata id (mem-<16 hex>) cut to 8 characters is "mem-0000",
+# which memory(action='get') refuses and recall finds ambiguous.
+nid = top["id"]
 trigger = top["trigger"]
 retention_pct = int(top["retention"] * 100)
 
-print(f"VETO_HIT:{nid}:{trigger}:{retention_pct}")
+# Tab-separated: a trigger phrase may itself contain ':'.
+print(f"VETO_HIT\t{nid}\t{trigger}\t{retention_pct}")
 VETO_PYEOF
 
-RESULT="$(/usr/bin/python3 "$VETO_SCRIPT" 2>/dev/null || printf '')"
+RESULT="$(/usr/bin/python3 -I "$VETO_SCRIPT" 2>/dev/null || printf '')"
 
 if [ -z "$RESULT" ]; then
   exit 0
 fi
 
 # Parse the result
-NODE_ID="$(printf '%s' "$RESULT" | /usr/bin/awk -F: '{print $2}')"
-TRIGGER="$(printf '%s' "$RESULT" | /usr/bin/awk -F: '{print $3}')"
-RETENTION="$(printf '%s' "$RESULT" | /usr/bin/awk -F: '{print $4}')"
+NODE_ID="$(printf '%s' "$RESULT" | /usr/bin/awk -F'\t' '{print $2}')"
+TRIGGER="$(printf '%s' "$RESULT" | /usr/bin/awk -F'\t' '{print $3}')"
+RETENTION="$(printf '%s' "$RESULT" | /usr/bin/awk -F'\t' '{print $4}')"
 
 cat >&2 <<VETO_MSG
-[VESTIGE VETO — synthesis-composer subagent rejected draft]
+[VESTIGE VETO — veto-pattern trigger phrase matched in the draft]
 
 Contradicts suppressed memory node #${NODE_ID} (trust ${RETENTION}%).
 Trigger phrase detected: "${TRIGGER}"

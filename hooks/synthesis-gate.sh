@@ -8,12 +8,12 @@
 set -euo pipefail
 
 INPUT="$(cat)"
-PROMPT="$(printf '%s' "$INPUT" | /usr/bin/python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("prompt","") or d.get("user_prompt",""))' 2>/dev/null || printf '')"
+PROMPT="$(printf '%s' "$INPUT" | /usr/bin/python3 -I -c 'import sys,json;d=json.load(sys.stdin);print(d.get("prompt","") or d.get("user_prompt",""))' 2>/dev/null || printf '')"
 
 DECISION_REGEX='(submit|submission|final|ship|launch|deploy|commit|decide|decision|recommend|should i|what should|purchase|buy|invest|architect|architecture|strategy|prep|prioriti|compose|tradeoff|trade-off|config|which (should|model|approach|one)|pick|choose|benchmark|competition|perform)'
 
 if printf '%s' "$PROMPT" | /usr/bin/grep -qiE "$DECISION_REGEX"; then
-  /usr/bin/python3 <<'PYEOF'
+  /usr/bin/python3 -I <<'PYEOF'
 import json
 
 msg = (

@@ -15,13 +15,13 @@
 # Saves ~500 tokens per prompt (Claude no longer asks "what state are we in?")
 # and prevents stale-state reasoning errors.
 #
-# Cached in /tmp/cwd-state-{hash}.json for 60s to keep hook fast.
+# Cached in ${TMPDIR:-/tmp}/cwd-state-{hash}.json for 60s to keep hook fast.
 # Fails open: if gh or git unavailable, emits partial context.
 
 set -u
 
 INPUT="$(cat)"
-CWD="$(printf '%s' "$INPUT" | /usr/bin/python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("cwd",""))' 2>/dev/null || printf '')"
+CWD="$(printf '%s' "$INPUT" | /usr/bin/python3 -I -c 'import sys,json;d=json.load(sys.stdin);print(d.get("cwd",""))' 2>/dev/null || printf '')"
 
 # Fallback to PWD if cwd not in input
 if [ -z "$CWD" ] || [ ! -d "$CWD" ]; then
@@ -34,14 +34,17 @@ if ! /usr/bin/git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
   exit 0
 fi
 
-# Cache for 60s
+# Cache for 60s, in the user's temp directory
 CACHE_KEY="$(printf '%s' "$CWD" | /usr/bin/shasum | awk '{print $1}')"
-CACHE_FILE="/tmp/cwd-state-${CACHE_KEY}.json"
+CACHE_DIR="${TMPDIR:-/tmp}"
+CACHE_FILE="${CACHE_DIR%/}/cwd-state-${CACHE_KEY}.json"
 if [ -f "$CACHE_FILE" ]; then
-  MTIME=$(stat -f %m "$CACHE_FILE" 2>/dev/null || stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
+  # GNU stat first: on Linux, `stat -f` prints filesystem details and succeeds.
+  MTIME=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)
+  case "$MTIME" in ''|*[!0-9]*) MTIME=0 ;; esac
   NOW=$(date +%s)
   AGE=$((NOW - MTIME))
-  if [ "$AGE" -lt 60 ] && [ -s "$CACHE_FILE" ]; then
+  if [ "$AGE" -ge 0 ] && [ "$AGE" -lt 60 ] && [ -s "$CACHE_FILE" ]; then
     cat "$CACHE_FILE"
     exit 0
   fi
@@ -55,7 +58,8 @@ HEAD_AUTHOR="$(/usr/bin/git log -1 --format='%an' 2>/dev/null)"
 STAGED_COUNT="$(/usr/bin/git diff --cached --name-only 2>/dev/null | /usr/bin/wc -l | awk '{print $1}')"
 UNSTAGED_COUNT="$(/usr/bin/git diff --name-only 2>/dev/null | /usr/bin/wc -l | awk '{print $1}')"
 UNTRACKED_COUNT="$(/usr/bin/git ls-files --others --exclude-standard 2>/dev/null | /usr/bin/wc -l | awk '{print $1}')"
-AHEAD_BEHIND="$(/usr/bin/git rev-list --left-right --count HEAD...@{upstream} 2>/dev/null | awk '{printf "ahead=%s behind=%s", $1, $2}' || echo "no-upstream")"
+AHEAD_BEHIND="$(/usr/bin/git rev-list --left-right --count HEAD...@{upstream} 2>/dev/null | awk '{printf "ahead=%s behind=%s", $1, $2}')"
+[ -n "$AHEAD_BEHIND" ] || AHEAD_BEHIND="no-upstream"
 
 # GitHub state (only if gh CLI available + remote configured)
 CI_STATE=""
@@ -64,15 +68,15 @@ ISSUE_COUNT=""
 if /usr/bin/which gh > /dev/null 2>&1 && /usr/bin/git config --get remote.origin.url > /dev/null 2>&1; then
   # Last CI run on current branch
   CI_JSON="$(gh run list --branch "$BRANCH" --limit 1 --json status,conclusion,name,headSha 2>/dev/null || echo '[]')"
-  CI_STATE="$(printf '%s' "$CI_JSON" | /usr/bin/python3 -c 'import sys,json
+  CI_STATE="$(printf '%s' "$CI_JSON" | /usr/bin/python3 -I -c 'import sys,json
 try:
   d=json.load(sys.stdin)
-  if d: r=d[0]; print(f"{r.get(\"name\",\"?\")}:{r.get(\"status\",\"?\")}:{r.get(\"conclusion\") or \"...\"}")
+  if d: r=d[0]; print("%s:%s:%s" % (r.get("name","?"), r.get("status","?"), r.get("conclusion") or "..."))
 except: pass' 2>/dev/null)"
-  PR_COUNT="$(gh pr list --state open --json number 2>/dev/null | /usr/bin/python3 -c 'import sys,json
+  PR_COUNT="$(gh pr list --state open --json number 2>/dev/null | /usr/bin/python3 -I -c 'import sys,json
 try: print(len(json.load(sys.stdin)))
 except: print("?")' 2>/dev/null)"
-  ISSUE_COUNT="$(gh issue list --state open --json number 2>/dev/null | /usr/bin/python3 -c 'import sys,json
+  ISSUE_COUNT="$(gh issue list --state open --json number 2>/dev/null | /usr/bin/python3 -I -c 'import sys,json
 try: print(len(json.load(sys.stdin)))
 except: print("?")' 2>/dev/null)"
 fi
@@ -96,19 +100,19 @@ if [ -n "$PR_COUNT" ] && [ -n "$ISSUE_COUNT" ]; then
   CONTEXT_LINES+=("  open: PRs=$PR_COUNT issues=$ISSUE_COUNT")
 fi
 
-# Format as JSON additionalContext
-JSON_OUT="$(/usr/bin/python3 <<PYEOF
+# Format as JSON additionalContext. The lines reach Python through the
+# environment, never through its source: a commit subject, author or branch
+# name comes from the repository and is data, not code.
+JSON_OUT="$(VESTIGE_CWD_STATE="$(printf '%s\n' "${CONTEXT_LINES[@]}")" /usr/bin/python3 -I -c '
 import json, os
-lines = """$(printf '%s\n' "${CONTEXT_LINES[@]}")""".strip().split("\n")
-ctx = "\n".join(lines)
+ctx = os.environb.get(b"VESTIGE_CWD_STATE", b"").decode("utf-8", "replace").strip()
 print(json.dumps({
     "hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
         "additionalContext": ctx
     }
 }))
-PYEOF
-)"
+')"
 
 # Cache and emit
 printf '%s' "$JSON_OUT" > "$CACHE_FILE"

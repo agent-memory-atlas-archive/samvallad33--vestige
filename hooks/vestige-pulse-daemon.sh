@@ -28,7 +28,7 @@ LAST_FIRE_FILE="$STATE_DIR/last_fire"
 SESSION_ID_FILE="$STATE_DIR/session_id"
 
 INPUT="$(cat)"
-SESSION_ID="$(printf '%s' "$INPUT" | /usr/bin/python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("session_id",""))' 2>/dev/null || printf '')"
+SESSION_ID="$(printf '%s' "$INPUT" | /usr/bin/python3 -I -c 'import sys,json;d=json.load(sys.stdin);print(d.get("session_id",""))' 2>/dev/null || printf '')"
 
 # Rate limit: 20 minutes between fires per session
 MIN_INTERVAL_SEC=1200
@@ -62,7 +62,7 @@ if [ -z "$RESULT" ]; then
   exit 0
 fi
 
-INSIGHT="$(VESTIGE_CHANGELOG_JSON="$RESULT" /usr/bin/python3 <<'PYEOF'
+INSIGHT="$(VESTIGE_CHANGELOG_JSON="$RESULT" /usr/bin/python3 -I <<'PYEOF'
 import json, os, sys
 
 
