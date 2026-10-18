@@ -3372,6 +3372,14 @@ impl MemoryStoreSend for StrataMemory {
         Ok(Vec::new())
     }
 
+    fn get_state_transitions(
+        &self,
+        _memory_id: &str,
+        _limit: i32,
+    ) -> Result<Vec<StateTransitionRecord>, StorageError> {
+        Ok(Vec::new())
+    }
+
     fn coverage_snapshot(&self) -> Result<CoverageSnapshot, StorageError> {
         let store = self.lock();
         let mut counts: BTreeMap<String, u64> = BTreeMap::new();

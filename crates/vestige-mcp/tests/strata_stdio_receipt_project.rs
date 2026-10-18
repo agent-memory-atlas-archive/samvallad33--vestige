@@ -413,3 +413,41 @@ fn receipt_replay_and_project_complete_over_real_stdio() {
         assert!(known, "unexpected frame kind {}", frame.kind);
     }
 }
+
+#[test]
+fn memory_status_changelog_reads_a_strata_memory_over_real_stdio() {
+    let data = tempfile::tempdir().expect("data dir");
+    let mut server = StdioServer::spawn(data.path());
+    server.handshake();
+
+    let id = ingest(&mut server, "Changelog fixture memory", "fact", &["changelog-fixture"]);
+    assert!(id.starts_with("mem-"), "{id}");
+
+    let log = server.tool("memory_status", json!({"view": "changelog", "memoryId": id}));
+    assert_eq!(log["mode"], "per_memory", "{log}");
+    assert_eq!(log["memoryId"], id.as_str(), "{log}");
+    assert!(log["transitions"].is_array(), "{log}");
+    let operations = log["operations"].as_array().expect("operations");
+    assert!(!operations.is_empty(), "the memory's own write is in its changelog: {log}");
+    assert!(
+        operations[0]["operationId"]
+            .as_str()
+            .is_some_and(|op| op.starts_with("op-")),
+        "{log}"
+    );
+
+    let malformed = server.tool_err(
+        "memory_status",
+        json!({"view": "changelog", "memoryId": "mem-zzzz"}),
+    );
+    assert!(canonical(&malformed).contains("Invalid memory_id"), "{malformed}");
+
+    let absent = server.tool_err(
+        "memory_status",
+        json!({"view": "changelog", "memoryId": "mem-00000000000000ff"}),
+    );
+    assert!(canonical(&absent).contains("not found"), "{absent}");
+
+    server.shutdown();
+    assert_no_sqlite(data.path());
+}

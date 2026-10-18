@@ -105,15 +105,23 @@ fn parse_iso_bound(raw: Option<&str>, field: &str) -> Result<Option<DateTime<Utc
     }
 }
 
+/// How many of the newest reflog operations the per-memory view scans for
+/// ones that touched the memory.
+const PER_MEMORY_OPERATION_WINDOW: usize = 1000;
+
 /// Per-memory changelog: state transition audit trail
 fn execute_per_memory(
     storage: &Arc<Storage>,
     memory_id: &str,
     limit: i32,
 ) -> Result<Value, String> {
-    // Validate UUID format
-    Uuid::parse_str(memory_id)
-        .map_err(|_| format!("Invalid memory_id '{}'. Must be a valid UUID.", memory_id))?;
+    // SQLite ids are UUIDs. Strata ids are `mem-` + 16 hex chars.
+    if Uuid::parse_str(memory_id).is_err() && !super::review::is_strata_memory_id(memory_id) {
+        return Err(format!(
+            "Invalid memory_id '{}'. Must be a memory id (mem- followed by 16 hex characters) or a UUID.",
+            memory_id
+        ));
+    }
 
     // Get the memory for context
     let node = storage
@@ -139,6 +147,30 @@ fn execute_per_memory(
         })
         .collect();
 
+    // Reflog operations that touched this memory. On Strata this is the
+    // memory's write history (create, edit, undo); it has no state machine,
+    // so transitions are always empty there.
+    let operations: Vec<Value> = storage
+        .list_merge_operations(PER_MEMORY_OPERATION_WINDOW)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|op| {
+            op.survivor_id.as_deref() == Some(memory_id)
+                || op.affected_ids.iter().any(|id| id == memory_id)
+        })
+        .take(limit.max(0) as usize)
+        .map(|op| {
+            serde_json::json!({
+                "operationId": op.id,
+                "opType": op.op_type,
+                "status": op.status,
+                "timestamp": op.created_at,
+                "revertedAt": op.reverted_at,
+                "reason": op.reason,
+            })
+        })
+        .collect();
+
     Ok(serde_json::json!({
         "tool": "memory_changelog",
         "mode": "per_memory",
@@ -148,6 +180,8 @@ fn execute_per_memory(
         "currentRetention": node.retention_strength,
         "totalTransitions": formatted_transitions.len(),
         "transitions": formatted_transitions,
+        "totalOperations": operations.len(),
+        "operations": operations,
     }))
 }
 
