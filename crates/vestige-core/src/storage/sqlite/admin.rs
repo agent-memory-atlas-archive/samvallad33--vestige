@@ -64,11 +64,11 @@ impl SqliteMemoryStore {
             return Self::prepare_data_dir(data_dir);
         }
 
-        let proj_dirs = ProjectDirs::from("com", "vestige", "core").ok_or_else(|| {
+        let data_dir = crate::data_dir::default_data_dir().ok_or_else(|| {
             StorageError::Init("Could not determine project directories".to_string())
         })?;
 
-        Self::prepare_data_dir(proj_dirs.data_dir().to_path_buf())
+        Self::prepare_data_dir(data_dir)
     }
 
     /// Apply PRAGMAs and optional encryption to a connection.

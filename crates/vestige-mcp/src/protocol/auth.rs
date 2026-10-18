@@ -14,7 +14,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use directories::ProjectDirs;
 use tracing::{info, warn};
 
 /// Minimum recommended token length when provided via env var.
@@ -42,9 +41,8 @@ fn resolve_token_dir(
     if let Some(dir) = env_dir.filter(|value| !value.is_empty()) {
         return Ok(expand_home(PathBuf::from(dir)));
     }
-    let dirs = ProjectDirs::from("com", "vestige", "core")
-        .ok_or("could not determine project directories")?;
-    Ok(dirs.data_dir().to_path_buf())
+    Ok(vestige_core::data_dir::default_data_dir()
+        .ok_or("could not determine project directories")?)
 }
 
 /// A leading `~` in `VESTIGE_DATA_DIR` is the home directory, as it is for the
@@ -62,7 +60,7 @@ fn expand_home(dir: PathBuf) -> PathBuf {
 /// The token file in the platform default data directory, where every
 /// version before 4.1.2 kept it whatever data directory was in use.
 fn default_token_path() -> Option<PathBuf> {
-    ProjectDirs::from("com", "vestige", "core").map(|dirs| dirs.data_dir().join("auth_token"))
+    vestige_core::data_dir::legacy_default_data_dir().map(|dir| dir.join("auth_token"))
 }
 
 /// Return the auth token file path inside the Vestige data directory.

@@ -241,13 +241,12 @@ fn default_strata_dir() -> io::Result<PathBuf> {
         fs::create_dir_all(&data_dir)?;
         return Ok(data_dir);
     }
-    let proj = directories::ProjectDirs::from("com", "vestige", "core").ok_or_else(|| {
+    let dir = vestige_core::data_dir::default_data_dir().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "Could not determine project directories",
         )
     })?;
-    let dir = proj.data_dir().to_path_buf();
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
