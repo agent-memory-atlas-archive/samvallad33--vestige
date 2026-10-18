@@ -19,7 +19,7 @@
 set -u
 
 INPUT="$(cat)"
-TRANSCRIPT_PATH="$(printf '%s' "$INPUT" | /usr/bin/python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("transcript_path",""))' 2>/dev/null || printf '')"
+TRANSCRIPT_PATH="$(printf '%s' "$INPUT" | /usr/bin/python3 -I -c 'import sys,json;d=json.load(sys.stdin);print(d.get("transcript_path",""))' 2>/dev/null || printf '')"
 
 if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
   exit 0
@@ -137,7 +137,7 @@ retention_pct = int(top["retention"] * 100)
 print(f"VETO_HIT\t{nid}\t{trigger}\t{retention_pct}")
 VETO_PYEOF
 
-RESULT="$(/usr/bin/python3 "$VETO_SCRIPT" 2>/dev/null || printf '')"
+RESULT="$(/usr/bin/python3 -I "$VETO_SCRIPT" 2>/dev/null || printf '')"
 
 if [ -z "$RESULT" ]; then
   exit 0

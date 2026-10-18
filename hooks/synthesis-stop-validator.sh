@@ -8,7 +8,7 @@
 set -euo pipefail
 
 INPUT="$(cat)"
-TRANSCRIPT_PATH="$(printf '%s' "$INPUT" | /usr/bin/python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("transcript_path",""))' 2>/dev/null || printf '')"
+TRANSCRIPT_PATH="$(printf '%s' "$INPUT" | /usr/bin/python3 -I -c 'import sys,json;d=json.load(sys.stdin);print(d.get("transcript_path",""))' 2>/dev/null || printf '')"
 
 if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
   exit 0
@@ -96,7 +96,7 @@ if summary_hits >= 3 and composition_hits == 0:
 print("PASS")
 PYEOF
 
-RESULT="$(/usr/bin/python3 "$PYFILE")"
+RESULT="$(/usr/bin/python3 -I "$PYFILE")"
 
 case "$RESULT" in
   BLOCK_SUMMARY)

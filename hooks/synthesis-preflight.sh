@@ -24,7 +24,7 @@ set -u
 INPUT="$(cat)"
 
 # Extract prompt from JSON stdin. Fall back to empty if parse fails.
-PROMPT="$(printf '%s' "$INPUT" | /usr/bin/python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("prompt",""))' 2>/dev/null || printf '')"
+PROMPT="$(printf '%s' "$INPUT" | /usr/bin/python3 -I -c 'import sys,json;d=json.load(sys.stdin);print(d.get("prompt",""))' 2>/dev/null || printf '')"
 
 if [ -z "$PROMPT" ]; then
   exit 0
@@ -60,7 +60,7 @@ print(json.dumps({"query": prompt, "depth": 15}))
 BODY_PYEOF
 
 export VPRE_PROMPT="$PROMPT"
-DR_BODY="$(/usr/bin/python3 "$BODY_SCRIPT")"
+DR_BODY="$(/usr/bin/python3 -I "$BODY_SCRIPT")"
 
 # Single POST to deep_reference. Timeout 5s — deep_reference takes ~1-3s.
 DR_RESP="$(/usr/bin/curl -fsS -m 5 -X POST "${BASE}/api/deep_reference" \
@@ -148,7 +148,7 @@ print("\n".join(out))
 COMPOSE_PYEOF
 
 export VPRE_DR_RESP="$DR_RESP"
-SYNTHESIS="$(/usr/bin/python3 "$COMPOSE_SCRIPT")"
+SYNTHESIS="$(/usr/bin/python3 -I "$COMPOSE_SCRIPT")"
 
 if [ -z "$SYNTHESIS" ]; then
   exit 0
@@ -168,5 +168,5 @@ print(json.dumps({
 }))
 EMIT_PYEOF
 export VPRE_SYNTHESIS_CTX="$SYNTHESIS"
-/usr/bin/python3 "$EMIT_SCRIPT"
+/usr/bin/python3 -I "$EMIT_SCRIPT"
 exit 0

@@ -15,13 +15,13 @@
 # Saves ~500 tokens per prompt (Claude no longer asks "what state are we in?")
 # and prevents stale-state reasoning errors.
 #
-# Cached in /tmp/cwd-state-{hash}.json for 60s to keep hook fast.
+# Cached in ${TMPDIR:-/tmp}/cwd-state-{hash}.json for 60s to keep hook fast.
 # Fails open: if gh or git unavailable, emits partial context.
 
 set -u
 
 INPUT="$(cat)"
-CWD="$(printf '%s' "$INPUT" | /usr/bin/python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("cwd",""))' 2>/dev/null || printf '')"
+CWD="$(printf '%s' "$INPUT" | /usr/bin/python3 -I -c 'import sys,json;d=json.load(sys.stdin);print(d.get("cwd",""))' 2>/dev/null || printf '')"
 
 # Fallback to PWD if cwd not in input
 if [ -z "$CWD" ] || [ ! -d "$CWD" ]; then
@@ -39,10 +39,12 @@ CACHE_KEY="$(printf '%s' "$CWD" | /usr/bin/shasum | awk '{print $1}')"
 CACHE_DIR="${TMPDIR:-/tmp}"
 CACHE_FILE="${CACHE_DIR%/}/cwd-state-${CACHE_KEY}.json"
 if [ -f "$CACHE_FILE" ]; then
-  MTIME=$(stat -f %m "$CACHE_FILE" 2>/dev/null || stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
+  # GNU stat first: on Linux, `stat -f` prints filesystem details and succeeds.
+  MTIME=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)
+  case "$MTIME" in ''|*[!0-9]*) MTIME=0 ;; esac
   NOW=$(date +%s)
   AGE=$((NOW - MTIME))
-  if [ "$AGE" -lt 60 ] && [ -s "$CACHE_FILE" ]; then
+  if [ "$AGE" -ge 0 ] && [ "$AGE" -lt 60 ] && [ -s "$CACHE_FILE" ]; then
     cat "$CACHE_FILE"
     exit 0
   fi
@@ -66,15 +68,15 @@ ISSUE_COUNT=""
 if /usr/bin/which gh > /dev/null 2>&1 && /usr/bin/git config --get remote.origin.url > /dev/null 2>&1; then
   # Last CI run on current branch
   CI_JSON="$(gh run list --branch "$BRANCH" --limit 1 --json status,conclusion,name,headSha 2>/dev/null || echo '[]')"
-  CI_STATE="$(printf '%s' "$CI_JSON" | /usr/bin/python3 -c 'import sys,json
+  CI_STATE="$(printf '%s' "$CI_JSON" | /usr/bin/python3 -I -c 'import sys,json
 try:
   d=json.load(sys.stdin)
-  if d: r=d[0]; print(f"{r.get(\"name\",\"?\")}:{r.get(\"status\",\"?\")}:{r.get(\"conclusion\") or \"...\"}")
+  if d: r=d[0]; print("%s:%s:%s" % (r.get("name","?"), r.get("status","?"), r.get("conclusion") or "..."))
 except: pass' 2>/dev/null)"
-  PR_COUNT="$(gh pr list --state open --json number 2>/dev/null | /usr/bin/python3 -c 'import sys,json
+  PR_COUNT="$(gh pr list --state open --json number 2>/dev/null | /usr/bin/python3 -I -c 'import sys,json
 try: print(len(json.load(sys.stdin)))
 except: print("?")' 2>/dev/null)"
-  ISSUE_COUNT="$(gh issue list --state open --json number 2>/dev/null | /usr/bin/python3 -c 'import sys,json
+  ISSUE_COUNT="$(gh issue list --state open --json number 2>/dev/null | /usr/bin/python3 -I -c 'import sys,json
 try: print(len(json.load(sys.stdin)))
 except: print("?")' 2>/dev/null)"
 fi
@@ -103,7 +105,7 @@ fi
 # name comes from the repository and is data, not code.
 JSON_OUT="$(VESTIGE_CWD_STATE="$(printf '%s\n' "${CONTEXT_LINES[@]}")" /usr/bin/python3 -I -c '
 import json, os
-ctx = os.environ.get("VESTIGE_CWD_STATE", "").strip()
+ctx = os.environb.get(b"VESTIGE_CWD_STATE", b"").decode("utf-8", "replace").strip()
 print(json.dumps({
     "hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",

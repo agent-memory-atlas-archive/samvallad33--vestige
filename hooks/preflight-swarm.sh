@@ -45,8 +45,8 @@ fi
 
 # === READ PROMPT FROM STDIN JSON ===
 INPUT="$(cat)"
-PROMPT="$(printf '%s' "$INPUT" | /usr/bin/python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("prompt",""))' 2>/dev/null || printf '')"
-SESSION_ID="$(printf '%s' "$INPUT" | /usr/bin/python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("session_id",""))' 2>/dev/null || printf '')"
+PROMPT="$(printf '%s' "$INPUT" | /usr/bin/python3 -I -c 'import sys,json;d=json.load(sys.stdin);print(d.get("prompt",""))' 2>/dev/null || printf '')"
+SESSION_ID="$(printf '%s' "$INPUT" | /usr/bin/python3 -I -c 'import sys,json;d=json.load(sys.stdin);print(d.get("session_id",""))' 2>/dev/null || printf '')"
 
 if [ -z "$PROMPT" ]; then
   exit 0
@@ -213,5 +213,5 @@ print(json.dumps({
 }))
 EMIT_PYEOF
 
-/usr/bin/python3 "$EMIT_SCRIPT"
+/usr/bin/python3 -I "$EMIT_SCRIPT"
 exit 0

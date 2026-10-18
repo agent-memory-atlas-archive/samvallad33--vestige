@@ -34,7 +34,7 @@ load_vestige_sanhedrin_env() {
         export "$key=$value"
         ;;
     esac
-  done < <(python3 - "$1" <<'PY'
+  done < <(python3 -I - "$1" <<'PY'
 import shlex
 import sys
 
@@ -103,14 +103,14 @@ fi
 if [ -z "$PYTHON_BIN" ]; then
   PYTHON_BIN="/usr/bin/python3"
 fi
-if ! "$PYTHON_BIN" -c 'import sys' >/dev/null 2>&1; then
+if ! "$PYTHON_BIN" -I -c 'import sys' >/dev/null 2>&1; then
   exit 0
 fi
 
 record_sanhedrin_fail_open() {
   REASON="$1"
   DETAIL="${2:-}"
-  "$PYTHON_BIN" - "$REASON" "$DETAIL" <<'PY' 2>/dev/null || true
+  "$PYTHON_BIN" -I - "$REASON" "$DETAIL" <<'PY' 2>/dev/null || true
 import json
 import os
 import sys
@@ -137,7 +137,7 @@ PY
 
 # === READ STOP HOOK INPUT ===
 INPUT="$(cat)"
-TRANSCRIPT_PATH="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c 'import sys,json;d=json.load(sys.stdin);print(d.get("transcript_path",""))' 2>/dev/null || printf '')"
+TRANSCRIPT_PATH="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -I -c 'import sys,json;d=json.load(sys.stdin);print(d.get("transcript_path",""))' 2>/dev/null || printf '')"
 
 if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
   exit 0
@@ -213,7 +213,7 @@ if len(stripped) > 4000:
 print(stripped)
 DRAFT_PYEOF
 
-DRAFT="$("$PYTHON_BIN" "$DRAFT_SCRIPT" 2>/dev/null || printf '')"
+DRAFT="$("$PYTHON_BIN" -I "$DRAFT_SCRIPT" 2>/dev/null || printf '')"
 
 if [ -z "$DRAFT" ]; then
   exit 0
@@ -238,7 +238,7 @@ export VESTIGE_SANHEDRIN_RUN_ID="${VESTIGE_SANHEDRIN_RUN_ID:-$(date +%s)-$$}"
 export VESTIGE_EXECUTIONER_ACTIVE=1
 
 (
-  printf '%s\n' "$DRAFT" | "$PYTHON_BIN" "$BRIDGE" > "$OUTPUT_FILE" 2>/dev/null
+  printf '%s\n' "$DRAFT" | "$PYTHON_BIN" -I "$BRIDGE" > "$OUTPUT_FILE" 2>/dev/null
 ) &
 
 EXEC_PID=$!
@@ -270,7 +270,7 @@ EXECUTIONER_OUTPUT="$(cat "$OUTPUT_FILE" 2>/dev/null || printf '')"
 # === PARSE VERDICT ===
 sanhedrin_veto() {
   REASON="$1"
-  REASON="$(printf '%s' "$REASON" | "$PYTHON_BIN" -c 'import sys; print(sys.stdin.read().strip())' 2>/dev/null || printf '%s' "$REASON")"
+  REASON="$(printf '%s' "$REASON" | "$PYTHON_BIN" -I -c 'import sys; print(sys.stdin.read().strip())' 2>/dev/null || printf '%s' "$REASON")"
 
   if printf '%s' "$REASON" | /usr/bin/grep -qi 'Receipt Lock'; then
     cat >&2 <<SANHEDRIN_RECEIPT_MSG
@@ -311,7 +311,7 @@ SANHEDRIN_MSG
 }
 
 if [ "${VESTIGE_SANHEDRIN_OUTPUT:-}" = "json" ]; then
-  JSON_PARSED="$(printf '%s' "$EXECUTIONER_OUTPUT" | "$PYTHON_BIN" -c '
+  JSON_PARSED="$(printf '%s' "$EXECUTIONER_OUTPUT" | "$PYTHON_BIN" -I -c '
 import json
 import sys
 
@@ -361,7 +361,7 @@ print(reason.strip())
 ' 2>/dev/null || printf '')"
 
   if [ -n "$JSON_PARSED" ]; then
-    JSON_DECISION="$(printf '%s\n' "$JSON_PARSED" | /usr/bin/sed -n '1p' | "$PYTHON_BIN" -c 'import sys; print(sys.stdin.read().strip().lower())' 2>/dev/null || printf '')"
+    JSON_DECISION="$(printf '%s\n' "$JSON_PARSED" | /usr/bin/sed -n '1p' | "$PYTHON_BIN" -I -c 'import sys; print(sys.stdin.read().strip().lower())' 2>/dev/null || printf '')"
     JSON_REASON="$(printf '%s\n' "$JSON_PARSED" | /usr/bin/sed '1d')"
 
     case "$JSON_DECISION" in
