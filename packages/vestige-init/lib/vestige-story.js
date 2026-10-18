@@ -56,14 +56,21 @@ const SECRET_SHAPES = [
   ['jwt', /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}/],
   ['bearer', /\bbearer\s+[A-Za-z0-9._~+/=-]{8,}/i],
   ['auth-header', /\bauthorization\s*[:=]/i],
-  ['credential-flag', /--(?:password|passwd|secret|token|api-?key)(?:=|\s+)\S+/i],
-  ['credential-assignment', /(?:pass(?:word|wd)?|secret|token|api[_-]?key|access[_-]?key)["']?\s*[:=]\s*["']?[^\s"']{3,}/i],
+  ['credential-flag', /--(?:pass(?:word|wd|phrase)?|secret|token|api-?key|[\w-]*(?:secret|token|password|api-?key)(?![a-z])[\w-]*)(?:=|\s+)\S+/i],
+  ['credential-assignment', /(?:pass(?:word|wd)?|pwd|secret|token|api[_-]?key|access[_-]?key)["']?\s*[:=]\s*["']?[^\s"']{3,}/i],
+  // passwords given on a command line in the forms the tools themselves take (security review 2026-10-18)
+  ['cli-password', /\b(?:mysql\w*|mariadb\w*)\b.*\s-p\S|\bsshpass\b|\bsudo\b[^|;&]*\s-S\b|\bredis-cli\b.*\s-a\s|\blogin\b.*\s-p\s|\s(?:-u|--user)\s+\S+:\S/i],
+  ['api-key-header', /\bx-api-key\b/i],
   ['url-credentials', /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/i],
 ];
 
 const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 function collapsePath(lead, rest) {
+  // a standard-base64 secret can hold '/', and collapsing it would cut it into short runs the
+  // long-token pass no longer catches, so such a token is redacted whole instead
+  const whole = lead + rest;
+  if (/^[A-Za-z0-9+/=]{24,}$/.test(whole) && /[A-Za-z]/.test(whole) && /\d/.test(whole)) return '<redacted>';
   const base = rest.slice(rest.lastIndexOf('/') + 1);
   return `${lead}/…/${base}`;
 }

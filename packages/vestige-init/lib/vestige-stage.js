@@ -11,7 +11,10 @@ const chars = (text) => [...String(text)];
 // Characters that some terminal draws two cells wide (emoji, CJK, wide symbols) would push the rest of
 // the row out of place, so the canvas never holds one.
 const WIDE = /[ᄀ-ᅟ〈〉⌚⌛⏩-⏬⏰⏳◽◾☔☕♈-♓♿⚓⚡⚪⚫⚽⚾⛄⛅⛎⛔⛪⛲-⛵⛺⛽✅✊✋✨❌❎❓-❕❗➕-➗➰➿⬛⬜⭐⭕⺀-〾ぁ-㏿㐀-䶿一-鿿ꀀ-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]|[\ud83c-\ud83e][\udc00-\udfff]|️/;
-const safeChar = (ch) => (ch.length === 1 && ch >= ' ' && !WIDE.test(ch) ? ch : (WIDE.test(ch) || ch < ' ' ? '?' : ch));
+// C0, DEL, C1 (U+0080-U+009F, which some terminals act on as CSI/OSC), zero-width, bidi and other
+// format characters never reach the terminal from the canvas (security review 2026-10-18)
+const UNSAFE = /[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
+const safeChar = (ch) => (WIDE.test(ch) || UNSAFE.test(ch) ? '?' : ch);
 
 class Canvas {
   constructor(cols, rows) {
@@ -168,7 +171,8 @@ const reducedMotion = (env = process.env, argv = process.argv) => env.VESTIGE_RE
 //   that never stops), the whole group gets SIGSTOP, which nothing can catch;
 // - otherwise the group gets SIGTSTP with its default action, the stop a terminal sends itself;
 // - with no job-control shell above (an orphaned group: exec from a login shell, a tmux window,
-//   setsid) the kernel discards SIGTSTP, so the program takes the screen back instead of freezing.
+//   setsid, an IDE task) nothing could ever send SIGCONT, so the program takes the screen back
+//   instead of stopping. Under npm that check comes first: SIGSTOP would freeze the group for good.
 // The shell's fg sends SIGCONT to the group, and the caller's resume takes the screen again.
 function parentCatchesStop() {
   try {
@@ -177,8 +181,33 @@ function parentCatchesStop() {
     return /(^|\/)(npm|npx|node|pnpm|yarn|bun)(\s|$)|npm exec|npm-cli|npx-cli/.test(comm);
   } catch { return false; }
 }
-function stopJob(resumeIfNotStopped) {
+// Whether a job-control shell can resume this process: the first ancestor outside its process group
+// must be on the same terminal (a shell that made it a job). Reads only pids, groups and terminals.
+// null when ps cannot say; then the SIGTSTP path's own check decides.
+function jobShellAbove(table) {
+  try {
+    const out = table || require('child_process').execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid=,tty='], { encoding: 'utf8', timeout: 1000 });
+    const procs = new Map();
+    for (const line of out.split('\n')) {
+      const [pid, ppid, pgid, tty] = line.trim().split(/\s+/);
+      if (pid && tty) procs.set(pid, { ppid, pgid, tty });
+    }
+    const me = procs.get(String(process.pid));
+    if (!me) return null;
+    if (/^(\?+|-)$/.test(me.tty)) return false;
+    let at = me.ppid;
+    for (let hops = 0; hops < 64 && at && at !== '0'; hops++) {
+      const p = procs.get(at);
+      if (!p) return null;
+      if (p.pgid !== me.pgid) return p.tty === me.tty;
+      at = p.ppid;
+    }
+    return false;
+  } catch { return null; }
+}
+function stopJob(resumeIfNotStopped, shellAbove = jobShellAbove) {
   const asked = Date.now();
+  if (shellAbove() === false) { setTimeout(resumeIfNotStopped, 0); return; }
   if (parentCatchesStop()) {
     try { process.kill(0, 'SIGSTOP'); } catch { try { process.kill(process.pid, 'SIGSTOP'); } catch {} }
     return;
@@ -237,7 +266,8 @@ class Term {
   restore() {
     if (!this.opened) return;
     this.opened = false;
-    try { this.out.write('\x1b[0m' + SYNC_OFF + '\x1b[?7h\x1b[?25h\x1b[?1049l'); } catch {}
+    // modes a stray sequence could have turned on (mouse reporting, reverse screen) go off too
+    try { this.out.write('\x1b[0m' + SYNC_OFF + '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?9l\x1b[?5l\x1b[?7h\x1b[?25h\x1b[?1049l'); } catch {}
     try { if (this.input.isTTY) this.input.setRawMode(this.wasRaw); } catch {}
     this.input.off('data', this.onData);
     this.input.pause();
@@ -328,4 +358,4 @@ function seeded(seed) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-module.exports = { stopJob, parentCatchesStop, Canvas, mix, chars, safeChar, renderRow, asciiOnly, asciiOf, sgrFor, colorMode, reducedMotion, Term, parseKeys, seeded, sleep, to256, nearest16, SYNC_ON, SYNC_OFF };
+module.exports = { UNSAFE, stopJob, jobShellAbove, parentCatchesStop, Canvas, mix, chars, safeChar, renderRow, asciiOnly, asciiOf, sgrFor, colorMode, reducedMotion, Term, parseKeys, seeded, sleep, to256, nearest16, SYNC_ON, SYNC_OFF };

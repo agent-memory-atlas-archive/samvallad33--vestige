@@ -43,7 +43,7 @@ function armSkip() {
   const wasRaw = Boolean(process.stdin.isRaw);
   const onData = (buffer) => {
     const key = buffer.toString('utf8');
-    if (key.includes('\x03')) { process.stdout.write('\x1b[0m\x1b[?25h\x1b[?1049l'); try { process.stdin.setRawMode(wasRaw); } catch {} process.exit(130); }
+    if (key.includes('\x03')) { process.stdout.write(SCREEN_OFF); try { process.stdin.setRawMode(wasRaw); } catch {} process.exit(130); }
     if (key.includes('\x1a')) { suspendIntro(); return; }
     if (key === 'q' || key === '\x1b') { skipAll = true; if (inTitle) titleAnswer = 'q'; }
     // a burst of keys (a paste, or a held key) fast-forwards to the title
@@ -68,7 +68,8 @@ function disarmSkip() {
 
 // The terminal is given back on every way out: a quit signal, ctrl-z (and taken again on resume).
 const SCREEN_ON = '\x1b[?1049h\x1b[?25l';
-const SCREEN_OFF = '\x1b[0m\x1b[?25h\x1b[?1049l';
+// ?5l: the lightbulb flash turns on reverse screen for 90 ms; no exit may leave it on
+const SCREEN_OFF = '\x1b[0m\x1b[?5l\x1b[?25h\x1b[?1049l';
 let screenTaken = false;
 function onQuitSignal(signal) {
   if (screenTaken) process.stdout.write(SCREEN_OFF);
@@ -457,9 +458,8 @@ async function playIntro({ skipToEnd = false, waitAtTitle = true, keepScreen = f
     }
   } finally {
     disarmSkip();
-    guardSignals(false);
-    screenTaken = false;
-    if (!keepScreen) process.stdout.write('\x1b[0m\x1b[?25h\x1b[?1049l');
+    // with keepScreen the guard stays on until whatever takes the screen next has its own
+    if (!keepScreen) { guardSignals(false); screenTaken = false; process.stdout.write(SCREEN_OFF); }
   }
   return key;
 }
@@ -564,9 +564,13 @@ async function standalone(argv = process.argv.slice(2)) {
     let journey = null;
     try { journey = require('./vestige-journey.js'); } catch {}
     if (process.env.VESTIGE_ENTRY) process.env.VESTIGE_ENTRY = process.env.VESTIGE_ENTRY.replace(/ intro$/, ' precedent');
-    if (journey) return journey.main([]);
+    // the journey takes the screen and its signals synchronously inside main(); only then does the
+    // intro let go of its own guard, so a ctrl-c while the journey loads still restores the terminal
+    if (journey) { try { return journey.main([]); } finally { guardSignals(false); screenTaken = false; } }
   }
-  process.stdout.write('\x1b[0m\x1b[?25h\x1b[?1049l');
+  guardSignals(false);
+  screenTaken = false;
+  process.stdout.write(SCREEN_OFF);
   if (process.stdin.isTTY) {
     const via = /^npx /.test(process.env.VESTIGE_ENTRY || '') ? ['npx @vestige/init intro', 'npx @vestige/init precedent'] : ['node vestige-intro.js', 'node vestige-journey.js'];
     process.stdout.write('\n  ' + DIM + `watch again: ${via[0]} · the journey: ${via[1]}` + R + '\n');
@@ -578,4 +582,4 @@ if (require.main === module) {
   standalone().then((code) => process.exit(code || 0)).catch((error) => { process.stdout.write('\x1b[0m\x1b[?25h\x1b[?1049l'); console.error('vestige intro: ' + error.message); process.exit(1); });
 }
 
-module.exports = { playIntro, playQuickIntro, standalone };
+module.exports = { playIntro, playQuickIntro, standalone, SCREEN_OFF };

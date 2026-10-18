@@ -157,6 +157,14 @@ async function playEpisode(ep, { during, verdictLine, verdict, pendingLine, wait
       .then((value) => { workResult = value; }, (error) => { workError = error; })
       .then(() => { workDone = true; settle(); });
   };
+  // a quit signal gives the screen back too (security review 2026-10-18)
+  const onSignal = (signal) => {
+    if (signal === 'SIGINT') { if (!interrupted) { interrupted = true; if (onInterrupt) onInterrupt(); } skipped = true; return; }
+    disarmSkip();
+    process.stdout.write('\x1b[0m\x1b[?25h\x1b[?1049l');
+    process.exit(signal === 'SIGTERM' ? 143 : 129);
+  };
+  for (const s of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(s, onSignal);
   process.stdout.write('\x1b[?1049h\x1b[?25l\x1b[2J');
   try {
     const attemptPlain = ep.attempt;
@@ -210,6 +218,7 @@ async function playEpisode(ep, { during, verdictLine, verdict, pendingLine, wait
       await pause(700);
     }
   } finally {
+    for (const s of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(s, onSignal);
     disarmSkip();
     process.stdout.write('\x1b[0m\x1b[?25h\x1b[?1049l');
     if (state) Object.assign(state, { skipped, interrupted });

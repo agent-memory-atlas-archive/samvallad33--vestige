@@ -176,3 +176,46 @@ test('real log: every story is safe to show (counts only)', { skip: !fs.existsSy
   assert.equal(leaks, 0);
   console.log(`real log: ${stories.length} stories checked, 0 contain the home path or user name`);
 });
+
+// Security review 2026-10-18, finding 1: passwords in the forms CLI tools take refuse the card.
+test('command-line credential forms refuse the card', () => {
+  const secret = 'Hunter2xyz';
+  const leaks = [
+    `mysql -u root -p${secret} -e "DROP DATABASE prod"`,
+    `mariadb -uroot -p${secret} prod`,
+    `redis-cli -h cache.internal -a ${secret} FLUSHALL`,
+    `curl -u admin:${secret} -X DELETE https://api.example.com/v1/projects/42`,
+    `echo ${secret} | sudo -S rm -rf /var/lib/postgresql`,
+    `sshpass -p ${secret} ssh deploy@host rm -rf /srv/app`,
+    `docker login -u bob -p ${secret} registry.example.com`,
+    `openconnect --user bob --pass ${secret} vpn.acme.corp`,
+    `MYSQL_PWD=${secret} mysql -e "drop table x"`,
+    `pwd=${secret} ./deploy.sh`,
+    `curl -H "X-API-KEY ${secret}" https://api.example.com`,
+    `aws s3 sync . s3://b --s3-secret-access-key ${secret}`,
+    `gpg --passphrase ${secret} --decrypt x.gpg`,
+    `gh auth login --github-token ${secret}`,
+    `tool --auth_token=${secret}`,
+  ];
+  for (const command of leaks) {
+    const out = red(command);
+    assert.equal(out.refused, true, command);
+    assert.ok(!JSON.stringify(out).includes(secret), 'the reason never repeats the secret');
+  }
+  // ordinary destructive commands still make cards
+  for (const ok of ['llm --max_tokens=100 run', 'tool --github-tokens-list', 'rm -rf ~', 'mkdir -p ~/a/b && rm -rf ~/a', 'git push --force origin main', 'sudo rm -rf /', 'cd $(pwd) && rm -rf build', 'psql -c "drop table x"', 'git reset --hard HEAD~3', 'git push -u origin main']) {
+    assert.equal(red(ok).refused, false, ok);
+  }
+});
+
+// Security review 2026-10-18, finding 7: a base64 secret holding '/' is redacted whole, not cut like a path.
+test('slash-holding secrets are redacted whole; real paths still collapse', () => {
+  const key = 'wJalr/XUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
+  const out = red(`aws configure set aws_secret_access_key ${key}`);
+  assert.equal(out.refused, false);
+  assert.ok(!out.text.includes('bPxRfiCYEXAMPLEKEY') && !out.text.includes('wJalr'), out.text);
+  assert.ok(out.text.includes('<redacted>'), out.text);
+  assert.equal(red(`echo "${key}" | docker login --password-stdin`).text.includes('EXAMPLEKEY'), false);
+  assert.equal(red('cat ~/Developer/vestige/src/main.rs').text, 'cat ~/…/main.rs');
+  assert.equal(red('node /usr/local/lib/node_modules/a/b.js').text, 'node /…/b.js');
+});

@@ -4,6 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const crypto = require('crypto');
 const cinema = require('./vestige-cinema.js');
 
 function outDir(env = process.env, home = os.homedir()) {
@@ -17,7 +18,11 @@ function saveArtifact(buffer, fileName, env = process.env) {
   const dir = outDir(env);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, fileName);
-  fs.writeFileSync(file, buffer);
+  // write a fresh file opened exclusively, then rename it over the name: rename replaces the
+  // directory entry itself, so a planted symlink or hard link there is never written through
+  const tmp = path.join(dir, `.${fileName}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.part`);
+  fs.writeFileSync(tmp, buffer, { flag: 'wx', mode: 0o644 });
+  try { fs.renameSync(tmp, file); } catch (error) { try { fs.unlinkSync(tmp); } catch {} throw error; }
   return file;
 }
 

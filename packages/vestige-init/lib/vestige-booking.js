@@ -321,6 +321,15 @@ async function playStory(story, { state } = {}) {
   try {
     if (stdin.isTTY) { stdin.setRawMode(true); stdin.resume(); stdin.on('data', onData); armed = true; }
   } catch {}
+  // a quit signal gives the screen back too (security review 2026-10-18): SIGINT ends the play the
+  // way the ctrl-c byte does, SIGTERM and SIGHUP restore and exit
+  const onSignal = (signal) => {
+    if (signal === 'SIGINT') { interrupted = true; skipped = true; return; }
+    if (armed) { try { stdin.setRawMode(wasRaw); } catch {} }
+    out.write('\x1b[0m\x1b[?25h\x1b[?1049l');
+    process.exit(signal === 'SIGTERM' ? 143 : 129);
+  };
+  for (const s of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(s, onSignal);
   out.write('\x1b[?1049h\x1b[?25l\x1b[2J');
   try {
     const started = Date.now();
@@ -337,6 +346,7 @@ async function playStory(story, { state } = {}) {
     }
     if (!skipped) { const until = Date.now() + 500; while (!skipped && Date.now() < until) await sleep(30); }
   } finally {
+    for (const s of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(s, onSignal);
     if (armed) { stdin.off('data', onData); try { stdin.setRawMode(wasRaw); } catch {} stdin.pause(); }
     out.write('\x1b[0m\x1b[?25h\x1b[?1049l');
     if (state) Object.assign(state, { skipped, interrupted });

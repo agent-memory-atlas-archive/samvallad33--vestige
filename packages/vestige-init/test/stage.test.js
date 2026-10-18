@@ -69,3 +69,54 @@ test('reserved cells keep decoration off words', () => {
   assert.equal(cv.free(6, 1), true);
   assert.equal(cv.free(-1, 0), false);
 });
+
+// Security review 2026-10-18, finding 2: C1 controls, DEL, bidi and format characters never reach the terminal.
+test('the canvas turns C1, DEL, bidi and format characters into ?', () => {
+  const cv = new stage.Canvas(16, 1);
+  cv.put(0, 0, 'a\u009b2jb\u009dc\u007fd‮e​f⁦');
+  const row = stage.renderRow(cv, 0, 'truecolor');
+  assert.ok(!/[\u0080-\u009f\u007f‪-‮​-‏⁦-⁩]/.test(row), JSON.stringify(row));
+  assert.equal(cv.text()[0].trimEnd(), 'a?2jb?c?d?e?f?');
+  // ordinary drawing characters are untouched
+  const ok = new stage.Canvas(8, 1);
+  ok.put(0, 0, '╭─●…✔✗█');
+  assert.equal(ok.text()[0].trimEnd(), '╭─●…✔✗█');
+});
+
+test('every way out of the screen also turns off reverse video and mouse modes', () => {
+  const writes = [];
+  const out = { isTTY: true, columns: 80, rows: 24, write: (s) => { writes.push(s); return true; }, on() {}, off() {}, getColorDepth: () => 24 };
+  const input = { isTTY: false, isRaw: false, resume() {}, pause() {}, on() {}, off() {}, setRawMode() {} };
+  const term = new stage.Term({ out, input, env: { COLORTERM: 'truecolor' } });
+  term.open();
+  term.restore();
+  const last = writes[writes.length - 1];
+  for (const mode of ['?5l', '?1000l', '?1002l', '?1003l', '?1006l', '?9l', '?25h', '?1049l']) assert.ok(last.includes(`\x1b[${mode}`), mode);
+  assert.ok(require('../lib/vestige-intro.js').SCREEN_OFF.includes('\x1b[?5l'), 'the intro resets its flash on every exit');
+});
+
+// 2026-10-18: npx run with no shell above it (tmux new-window 'npx ...', exec npx, an IDE task) froze for good on
+// ctrl-z, because the npm path sent SIGSTOP to a group nothing could ever resume.
+test('ctrl-z stops the job only when a job-control shell above can resume it', () => {
+  const me = process.pid, up = process.ppid;
+  const table = (rows) => rows.map((r) => r.join(' ')).join('\n');
+  // node -> npm (same group) -> interactive shell (own group, same terminal)
+  assert.equal(stage.jobShellAbove(table([[me, up, 500, 'ttys003'], [up, 400, 500, 'ttys003'], [400, 300, 400, 'ttys003']])), true);
+  // node -> npm as the session leader of a tmux pane -> the tmux server, which has no terminal
+  assert.equal(stage.jobShellAbove(table([[me, up, 500, 'ttys003'], [up, 77, 500, 'ttys003'], [77, 1, 77, '??']])), false);
+  // a parent group on another terminal is not a shell that can bring this job back
+  assert.equal(stage.jobShellAbove(table([[me, up, 500, 'pts/4'], [up, 9, 600, 'pts/1']])), false);
+  // no terminal at all, and a table that does not list this process
+  assert.equal(stage.jobShellAbove(table([[me, up, 500, '?']])), false);
+  assert.equal(stage.jobShellAbove(table([[1, 0, 1, '??']])), null);
+
+  const sent = [];
+  const kill = process.kill;
+  process.kill = (pid, sig) => { sent.push([pid, sig]); return true; };
+  let resumed = 0;
+  try {
+    stage.stopJob(() => { resumed++; }, () => false);
+  } finally { process.kill = kill; }
+  assert.deepEqual(sent, [], 'no stop signal when nobody could send SIGCONT');
+  return new Promise((done) => setTimeout(() => { assert.equal(resumed, 1, 'the screen is taken back'); done(); }, 20));
+});

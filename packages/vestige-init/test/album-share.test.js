@@ -71,3 +71,21 @@ test('clipboard commands are built as argument lists, never shell strings', () =
   assert.deepEqual(share.copyFile(real, { platform: 'linux', run: record }), { ok: true, via: 'wl-copy' });
   assert.equal(calls.at(-1)[2].input, 'file://' + real.split('/').map(encodeURIComponent).join('/') + '\n');
 });
+
+// Security review 2026-10-18, finding 3: an export never writes through a planted link.
+test('a planted symlink at the export name is replaced, never written through', () => {
+  const dir = path.join(OUT, 'symlink');
+  fs.mkdirSync(dir, { recursive: true });
+  const victim = path.join(dir, 'victim.txt');
+  fs.writeFileSync(victim, 'keep me');
+  const name = 'vestige-rem-0123abcd.png';
+  fs.symlinkSync(victim, path.join(dir, name));
+  const file = share.saveArtifact(Buffer.from('PNGDATA'), name, { VESTIGE_REM_OUT: dir });
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'keep me', 'the link target is untouched');
+  assert.equal(fs.lstatSync(file).isSymbolicLink(), false, 'the export is a regular file now');
+  assert.equal(fs.readFileSync(file, 'utf8'), 'PNGDATA');
+  assert.equal(fs.readdirSync(dir).filter((n) => n.endsWith('.part')).length, 0, 'no temp file is left');
+  // a second export replaces the first, as before
+  share.saveArtifact(Buffer.from('AGAIN'), name, { VESTIGE_REM_OUT: dir });
+  assert.equal(fs.readFileSync(file, 'utf8'), 'AGAIN');
+});
