@@ -504,8 +504,6 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// The scope contract, as a test: every receipt gather writes (failure,
     /// comment) must land in the gather scope. If the writer ever drifts
     /// back to the default scope, the scoped walk goes blind and this fails.
