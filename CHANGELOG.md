@@ -7,19 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-10-18
+
+PRECEDENT. Vestige reads its own enforcement record: `precedent` shows what
+the Operator gate stopped or allowed, under which rule, and which permit
+answered each stop. 5.0.0 advertises 18 tools, up from 16, and adds
+`precedent` and `gather`.
+
+Upgrading: a 4.2.0 Strata log opens unchanged; no Strata migration.
+The shipped binaries never open a SQLite store for writing: `vestige-upgrade`
+reads a v3 file read-only and imports its `w20` unchanged, pinned value
+included. A build with the `legacy-sqlite` feature runs migration V41, which
+resets a `w20` pinned at the optimizer's bracket edge. On Linux, new installs
+keep their data in `$XDG_DATA_HOME/vestige`; an existing store in
+`$XDG_DATA_HOME/core` (`~/.local/share/core` by default) keeps being used
+until the new folder holds one.
+
 ### Added
 
-- **The dashboard, rebuilt on raw WebGPU.** The Palace is the front door: a
-  living brain under the VESTIGE logo, one organ per part of Vestige. A click
-  dives into the organ and bursts twice into its page, and the orbs of the
-  second burst form the page's words. Trace, Ledger, Guard, Healing, Causal,
-  System and Witness show every group of memories as a big round island of
-  orbs in their own world; a click opens an island to every memory in it, a
-  page at a time, at a URL an agent can open too. Field shows the whole mind
-  as a sphere of stars in a nebula, and Cinema keeps the flythrough.
-- **`POST /api/mcp/{tool}`** runs any MCP tool for the dashboard through the
-  same path an agent's call takes. **`GET /api/stops`** reads a whole window
-  of Operator receipts for Guard; agents keep their 50 record page.
+- **`precedent`**, a read-only tool over the Operator gate's own record at
+  `$OPERATOR_HOME` or `~/.operator`: the day's receipt files and the permits
+  beside them. Filter by `since` (default `24h`), `cwd` prefix, `source`,
+  `session`, `rule` and `decision` (default STOP plus ALLOW); `limit` is 1 to
+  50, newest first. Each stop is paired with the permit whose `stop_receipt`
+  names that receipt or, failing that, with the first permit for the same
+  action granted at or after it that names no stop (older permits carry no
+  `stop_receipt`). Day files dated more than a day before the window are not
+  read. Nothing is written.
+- **The dashboard, rebuilt on raw WebGPU**, except Cinema, which keeps its
+  three.js flythrough. The Palace is the home page (a first visit opens Trace
+  first, later visits open the Palace): a living brain under the VESTIGE logo,
+  one organ per part of Vestige. A click dives into the organ and bursts twice
+  into its page, and the orbs of the second burst form the page's words.
+  Trace, Ledger, Healing, Causal, System and Witness show each group of
+  memories, up to 12 groups, as a big round island of orbs in their own world;
+  a click opens an island to every memory in it, a page at a time, at a URL an
+  agent can open too. Guard shows the Operator gate's receipts the same way:
+  one island for its stops and one per agent for the rest. Field shows the
+  whole mind as a sphere of stars in a nebula.
+- **`POST /api/mcp/{tool}`** runs MCP tools for the dashboard through the same
+  path an agent's call takes; `receipt` replay is refused there (501
+  `too_slow_for_dashboard`) and stays agent-only. **`GET /api/stops`** reads
+  up to 2,000 Operator receipts in a window for Guard, newest first; agents
+  keep their 50 record page.
 - **An agent can take its user inside a memory.** `memory` get with a
   `reason` emits `MemoryShown`; every open dashboard goes to that memory and
   shows the agent's words, and the reply carries the link.
@@ -27,22 +57,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   issue, its comments, linked pull requests and the commit window of a local
   checkout), then ghostlink leads and `causal_walk` over the recorded edges.
   It runs as background store work, so dashboard reads and other agents take
-  the store first.
+  the store first. Each issue, comment and linked pull request record it
+  writes joins the scope through the same auto-connect pass `smart_ingest`
+  runs, hub tags skipped and at most 100 edges per record; the commit records
+  keep the edges `ingest_repo` writes. It takes `/issues/N`, `/pull/N` and
+  `/pulls/N` URLs.
 - **`ghostlink` heal mode** weaves verdicts from recorded events.
 - **Receipts and runs on Strata**: `/api/receipts` and `/api/traces` list
   them from the log.
+- **The PRECEDENT terminal journey in `@vestige/init`.** `vestige-init
+  precedent` (alias `journey`) follows one real Operator stop around the
+  loop: the stop, the record re-derived from its own bytes, the memory, the
+  precedent, the aftermath and the verdict card. `intro`, `play <code>` and
+  `episodes` open the story intro and the episode player; any other argument
+  runs the setup wizard as before. This release does not publish the package
+  to npm; run the journey from a checkout with
+  `node packages/vestige-init/bin/init.js precedent`.
+- **Rules that survive the compact: `vestige hook session-start`.** A plain
+  Claude Code `SessionStart` command hook, with no shell or Python wrapper.
+  Register it for `startup|resume|clear|compact`
+  (`hooks/settings.rules.fragment.json`, guide in
+  `docs/integrations/claude-code-rules-hook.md`). It lists the `decision` and
+  `correction` memories under exact tags: `pinned` and each line of
+  `.vestige-rules`, plus the repository name of the session's `cwd` with
+  `--repo-tag` (off by default). Each line carries its memory id, newest
+  first, at most 8 entries and 4 KB. It reads through the running Vestige
+  server or the log, and writes nothing. It never searches. No store, no
+  match, an error or its 5 s limit print nothing and exit 0. Opt-in; nothing
+  is enabled by default.
+- `recall` handle results carry each node's `createdAt`.
 
 ### Changed
 
-- `tools/list` stays under its 22 KiB budget with one more tool: `gather` and
-  `purge` advertise compact schemas, and folded filter groups carry no text.
-  Every full schema is still one call deeper, through `memory_status` with
-  `view='tools'`.
+- `tools/list` advertises 18 tools on a Strata log, and the full 19-tool
+  catalog, including the `purge` tool that Strata withholds, stays under its
+  22 KiB budget: `gather`, `precedent` and `purge` carry compact schemas, and
+  folded filter groups carry no text. Every full schema is still one call
+  deeper, through `memory_status` with `view='tools'`.
 - The dream event counts only the connections that are new.
+
+### Security
+
+- **A commit subject could run as Python in the opt-in cwd-state hook.**
+  `hooks/cwd-state-injector.sh` (installed by `vestige sandwich install
+  --enable-preflight`) pasted the last commit's subject, author and branch
+  name into Python source through an unquoted heredoc. A subject that closed
+  the string ran as Python each time the hook rebuilt its 60-second cache in
+  that repository. The text now reaches `python3 -I` through the environment,
+  and the cache sits in `$TMPDIR`.
+- **Every hook script in `hooks/` runs Python isolated.** The hook scripts
+  called `python3` without `-I`, so a `json.py` in the repository a hook ran
+  in was imported and executed on every prompt or stop. Every call now passes
+  `-I`. Replace installed copies with `vestige sandwich install --force` and
+  the same layer flags you installed with: `--enable-preflight` for the
+  preflight hooks, `--enable-sanhedrin` for the Sanhedrin Stop hooks (with
+  `--sanhedrin-endpoint` and `--sanhedrin-model`, or their environment
+  variables), `--enable-sandwich` for both, and `--with-launchd` if you run
+  the local MLX verifier. The install rewrites `~/.claude/settings.json` and
+  unwires every Vestige hook layer it is not told to enable.
 
 ### Fixed
 
-- **Degenerate w20 personalization pinned at the optimizer bracket.**
+- **Linux keeps Vestige data in its own folder (#433).** The data directory
+  was `$XDG_DATA_HOME/core`, a generic name other software can share. Every
+  binary now asks one resolver: new Linux installs use
+  `$XDG_DATA_HOME/vestige`, and an existing store in the old folder keeps
+  being used until the new one holds a store. macOS and Windows are
+  unchanged.
+- **`memory_status` `view='changelog'` reads 4.x memory ids passed as
+  `memoryId`.** A `mem-` id was refused as "not a valid UUID", and the Strata
+  backend then failed because it did not implement per-memory state
+  transitions. It now returns an empty `transitions` list (Strata records no
+  state transitions), and the per-memory view lists the merge operations that
+  name the memory. The advertised `memory_id` field is still refused on Strata
+  (`unavailable_in_4_0`).
+- **`causal_walk` keeps a recorded `derived_from` commit as a cause** when no
+  stack frame or file resolved, instead of reporting no recorded edge.
+- **Operator Lite closes its install, store, hook and force-push gaps.**
+  `npx operator-lite` no longer overwrites the paid gate or a newer Lite,
+  install never rewrites a `settings.json` it cannot parse, a missing gate
+  file no longer blocks every tool call, and OP-002 protects the Strata store
+  on macOS, Linux (both `$XDG_DATA_HOME/vestige` and the 4.x `core` folder)
+  and Windows.
+- A refusal reads as itself. `similarity_disabled`, `unavailable_in_4_0` and
+  `pending_strata` were wrapped as "Initialization error: ..." and now start
+  with their code (new `StorageError::Refused` / `MemoryStoreError::Refused`).
+- `receipt get` on a Strata write no longer calls it a "legacy receipt"; its
+  `claimBoundary` states what a Strata effect receipt records.
+- Entity extraction is `hand-scanners-v2`. A CommitSha needs a digit as well
+  as a hex letter, so word fragments like `cceeded` are out. These are also not
+  commits: the hex suffix of `mem-`, `eff-` and `wr_` handles, UUID groups, and
+  a token named as a session id (`session 7562c514`). Tallies like `6/6.` are
+  not file paths, and measurements like `2.3 s` or `12.5%` are not versions.
+  Auto-connect no longer joins memories on `commit:<id>` for a hex id the word
+  before it names as a session id (`session`, `session_id`, `session-id`,
+  `sessionid`).
+- `smart_ingest`'s `autoConnect` lists at most 5 pairs, with `pairsTotal` and
+  `pairsShown`. Every edge is still written, and `receiptId` lists them all.
+- `veto-detector.sh` keeps a Strata memory's full id instead of cutting it to
+  `mem-0000`, and `synthesis-stop-validator.sh` no longer takes a tool result
+  for the user's prompt.
+- **Degenerate w20 personalization pinned at the optimizer bracket (#473).**
   `optimize_w20_if_ready` trained on time-since-creation instead of time
   since the previous review, which made its loss monotone in w20 on agent
   access logs; the golden-section search then returned the bracket edge as
@@ -50,8 +165,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure-heavy variant rides the bracket to its upper bound). The
   optimizer now measures elapsed from the previous access, refuses an
   optimum at either bracket edge (keeping the current value and logging),
-  caps the bracket at 0.5, and migration V41 resets bound-pinned values to
-  the FSRS-6 default (0.1542).
+  caps the bracket at 0.5, and, in the legacy SQLite engine, migration V41
+  resets bound-pinned values to the FSRS-6 default (0.1542).
 
 ## [4.2.0] - 2026-10-06
 

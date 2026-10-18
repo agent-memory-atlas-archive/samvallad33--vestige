@@ -39,7 +39,7 @@ Start Codex and ask:
 
 > "What MCP tools do you have access to?"
 
-You should see Vestige's 16 tools listed, including `session_start`, `recall`, `smart_ingest`, `memory` and `receipt`.
+You should see Vestige's 18 tools listed, including `session_start`, `recall`, `smart_ingest`, `memory` and `receipt`.
 
 ---
 
