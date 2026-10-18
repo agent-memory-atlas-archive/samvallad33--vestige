@@ -5569,14 +5569,16 @@ mod tests {
         eprintln!("15 reads behind a bulk writer: queued {queued:?}, yielded {yielded:?}");
         // 15 reads x 40 ms holds: queued reads pay roughly one hold each
         // (about 600 ms); yielded reads pay one at most, plus their own
-        // 15 x 2 ms of work.
+        // 15 x 2 ms of work. A slower machine stretches both runs alike, so
+        // the yield is judged against the queueing measured in this same
+        // run, not against a wall-clock number.
         assert!(
             queued >= Duration::from_millis(300),
             "reads behind a foreground writer took {queued:?}; the test no longer reproduces the queueing"
         );
         assert!(
-            yielded < Duration::from_millis(160),
-            "reads behind a background writer took {yielded:?} (queued: {queued:?})"
+            yielded * 3 < queued,
+            "reads behind a background writer took {yielded:?}, not under a third of the queued {queued:?}"
         );
     }
 
