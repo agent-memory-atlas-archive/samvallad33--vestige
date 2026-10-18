@@ -89,8 +89,12 @@ being used until the new folder holds one.
   name into Python source through an unquoted heredoc. A subject that closed
   the string ran as Python on every prompt in that repository. The text now
   reaches `python3 -I` through the environment, and the cache sits in
-  `$TMPDIR`. Replace an installed copy with
-  `vestige sandwich install --enable-preflight --force`.
+  `$TMPDIR`.
+- **Every hook runs Python isolated.** The hook scripts called `python3`
+  without `-I`, so a `json.py` in the repository a hook ran in was imported
+  and executed on every prompt or stop. Every call now passes `-I`. Replace
+  installed copies with `vestige sandwich install --force` (plus
+  `--enable-preflight` for the preflight hooks).
 
 ### Fixed
 
