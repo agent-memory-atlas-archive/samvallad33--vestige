@@ -861,7 +861,28 @@ async function main() {
   print('Docs: https://github.com/samvallad33/vestige');
 }
 
-main().catch((error) => {
-  console.error(`vestige init: ${error.message}`);
-  process.exitCode = 1;
-});
+
+// "precedent" is the v5 journey round the loop; "play <code>" replays a shared REM episode;
+// "episodes ..." is the episode player; "intro" is the story intro. Anything else is setup.
+const SUBCOMMAND = process.argv[2];
+if (SUBCOMMAND === 'precedent' || SUBCOMMAND === 'journey') {
+  process.env.VESTIGE_ENTRY = process.env.VESTIGE_ENTRY || 'npx @vestige/init precedent';
+  require('../lib/vestige-journey.js').main(process.argv.slice(3))
+    .then((code) => process.exit(code || 0))
+    .catch((error) => { console.error('vestige precedent: ' + error.message); process.exit(1); });
+} else if (SUBCOMMAND === 'intro') {
+  process.env.VESTIGE_ENTRY = process.env.VESTIGE_ENTRY || 'npx @vestige/init intro';
+  require('../lib/vestige-intro.js').standalone(process.argv.slice(3))
+    .then((code) => process.exit(code || 0))
+    .catch((error) => { process.stdout.write('\x1b[0m\x1b[?25h\x1b[?1049l'); console.error('vestige intro: ' + error.message); process.exit(1); });
+} else if (SUBCOMMAND === 'play' || SUBCOMMAND === 'episodes') {
+  if (SUBCOMMAND === 'episodes') process.argv.splice(2, 1);
+  require('../lib/vestige-episodes.js').main()
+    .then((code) => process.exit(code || 0))
+    .catch((error) => { console.error('vestige episodes: ' + error.message); process.exit(1); });
+} else {
+  main().catch((error) => {
+    console.error(`vestige init: ${error.message}`);
+    process.exitCode = 1;
+  });
+}
