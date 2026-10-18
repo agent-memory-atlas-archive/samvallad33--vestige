@@ -106,6 +106,41 @@ enum SandwichCommands {
 }
 
 #[derive(Subcommand)]
+enum HookCommands {
+    /// Claude Code SessionStart hook: re-inject pinned rules by exact tag
+    ///
+    /// Reads the hook payload (`session_id`, `cwd`, `source`) on stdin and
+    /// prints `{"hookSpecificOutput": {"hookEventName": "SessionStart",
+    /// "additionalContext": ...}}` listing the decision and correction
+    /// memories under the exact tag `pinned` and each line of
+    /// `<cwd>/.vestige-rules` (and, with `--repo-tag`, the git repository
+    /// name of `cwd`). Each line carries its memory id. Register it for
+    /// `startup|resume|clear|compact` so the rules come back after every
+    /// compaction.
+    ///
+    /// It reads through the Vestige server that holds the store, or the log
+    /// directly when none does, and writes nothing. It fails open: no store,
+    /// no matching rule, an error or the time limit prints nothing and exits
+    /// 0, so it never blocks a session.
+    SessionStart {
+        /// Most memories listed
+        #[arg(long, default_value_t = vestige_mcp::rules_hook::DEFAULT_MAX_ITEMS)]
+        max_items: usize,
+        /// Most bytes of context (Claude Code caps a hook's context at 10,000 characters)
+        #[arg(long, default_value_t = vestige_mcp::rules_hook::DEFAULT_MAX_BYTES)]
+        max_bytes: usize,
+        /// Give up after this many milliseconds: print nothing and exit 0
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u64,
+        /// Also read the git repository name of `cwd` (and its lowercase
+        /// spelling) as an exact tag. Off by default: a store that tags every
+        /// memory with its project holds far more than rules under that tag
+        #[arg(long)]
+        repo_tag: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// Show store statistics
     Stats {
@@ -572,6 +607,12 @@ enum Commands {
         json: bool,
     },
 
+    /// Command hooks for agent harnesses: plain commands, no shell or Python wrapper
+    Hook {
+        #[command(subcommand)]
+        command: HookCommands,
+    },
+
     /// Compose: list NEVER-COMPOSED memory pairs as leads, not findings
     ///
     /// On a Strata log (4.0) this is GhostLink `propose`. The bridge lens
@@ -863,6 +904,14 @@ fn main() -> anyhow::Result<()> {
             depth,
             json,
         } => run_recall(query, handle, depth, json),
+        Commands::Hook { command } => match command {
+            HookCommands::SessionStart {
+                max_items,
+                max_bytes,
+                timeout_ms,
+                repo_tag,
+            } => run_hook_session_start(max_items, max_bytes, timeout_ms, repo_tag),
+        },
         Commands::Compose {
             limit,
             lens,
@@ -4100,6 +4149,16 @@ fn print_auto_connect(value: &serde_json::Value) {
                     .unwrap_or_default();
                 println!("  {source} -[touched]-> {target}  joined on: {joined}");
             }
+            let total = report
+                .get("pairsTotal")
+                .and_then(|total| total.as_u64())
+                .unwrap_or(pairs.len() as u64);
+            if total > pairs.len() as u64 {
+                println!(
+                    "  ... and {} more pair(s); the receipt lists every edge",
+                    total - pairs.len() as u64
+                );
+            }
         }
         if let Some(receipt_id) = report.get("receiptId").and_then(|id| id.as_str()) {
             println!("Auto-connect receipt: {receipt_id} (one write for the {edges} edge(s))");
@@ -5432,6 +5491,129 @@ fn fetch_nodes_in_scope(
     }
 
     Ok(all_nodes)
+}
+
+/// `vestige hook session-start`. Fail open by construction: the work runs on
+/// its own thread and only a finished answer within `timeout_ms` is printed;
+/// anything else prints nothing. The process always exits 0, so a harness
+/// never sees this hook fail.
+fn run_hook_session_start(
+    max_items: usize,
+    max_bytes: usize,
+    timeout_ms: u64,
+    repo_tag: bool,
+) -> anyhow::Result<()> {
+    let limits = vestige_mcp::rules_hook::Limits {
+        max_items: max_items.max(1),
+        // Under the harness's 10,000-character context cap.
+        max_bytes: max_bytes.clamp(512, 9_000),
+    };
+    let budget = std::time::Duration::from_millis(timeout_ms.clamp(100, 60_000));
+    let deadline = std::time::Instant::now() + budget;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(session_start_output(limits, deadline, repo_tag));
+    });
+    if let Ok(Some(line)) = rx.recv_timeout(budget) {
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "{line}");
+        let _ = stdout.flush();
+    }
+    std::process::exit(0)
+}
+
+/// The hook's stdout line, or `None` for nothing to say (or nothing that
+/// could be read).
+fn session_start_output(
+    limits: vestige_mcp::rules_hook::Limits,
+    deadline: std::time::Instant,
+    repo_tag: bool,
+) -> Option<String> {
+    use std::io::Read;
+    use vestige_mcp::rules_hook;
+
+    let mut raw = String::new();
+    std::io::stdin()
+        .take(1 << 20)
+        .read_to_string(&mut raw)
+        .ok()?;
+    let input = rules_hook::parse_input(&raw)?;
+    let cwd = input.cwd.clone().or_else(|| env::current_dir().ok())?;
+    let tags = rules_hook::rule_tags(&cwd, repo_tag);
+    let data_dir = cli_data_dir().ok()?;
+    // Never create a store: no log, no rules.
+    if !data_dir.join("log").is_dir() {
+        return None;
+    }
+    let resolved = resolve_rule_tags(&data_dir, &tags, deadline)?;
+    let context = rules_hook::render_context(&resolved, &input.source, limits)?;
+    serde_json::to_string(&rules_hook::hook_output(&context)).ok()
+}
+
+/// Each tag through `recall` `handle`, exactly as the MCP tool resolves it:
+/// through the server that holds the store, or the log directly when no
+/// process does. A tag that does not resolve as a tag contributes nothing.
+fn resolve_rule_tags(
+    data_dir: &Path,
+    tags: &[String],
+    deadline: std::time::Instant,
+) -> Option<Vec<(String, Vec<vestige_mcp::rules_hook::RuleNode>)>> {
+    use vestige_mcp::rules_hook::nodes_from_recall;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    let mut resolved = Vec::with_capacity(tags.len());
+    if take_cli_lock(data_dir).ok()? {
+        // No server holds the store: this process is its reader. Opened
+        // directly, never through `open_storage`, so no v3 upgrade runs.
+        let storage = vestige_mcp::strata_memory::open(data_dir).ok()?;
+        let cognitive = Arc::new(tokio::sync::Mutex::new(
+            vestige_mcp::cognitive::CognitiveEngine::new(),
+        ));
+        for tag in tags {
+            let value = rt
+                .block_on(vestige_mcp::tools::recall::execute(
+                    &storage,
+                    &cognitive,
+                    &vestige_core::OutputConfig::default(),
+                    Some(serde_json::json!({ "handle": tag })),
+                ))
+                .unwrap_or_default();
+            resolved.push((tag.clone(), nodes_from_recall(&value)));
+        }
+        return Some(resolved);
+    }
+    // A server holds the store. One that has just started may not take
+    // attaches yet, so a refused attach is retried until the deadline.
+    for tag in tags {
+        let value = loop {
+            let left = deadline.checked_duration_since(std::time::Instant::now())?;
+            // The timer is made inside the runtime: it needs its reactor.
+            let answer = rt.block_on(async {
+                tokio::time::timeout(
+                    left,
+                    vestige_mcp::attach::call_tool(
+                        data_dir,
+                        "recall",
+                        serde_json::json!({ "handle": tag }),
+                    ),
+                )
+                .await
+            });
+            match answer {
+                Ok(Ok(value)) => break value,
+                Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotConnected => {
+                    std::thread::sleep(left.min(std::time::Duration::from_millis(200)));
+                }
+                Ok(Err(_)) => break serde_json::Value::Null,
+                Err(_) => return None,
+            }
+        };
+        resolved.push((tag.clone(), nodes_from_recall(&value)));
+    }
+    Some(resolved)
 }
 
 /// Recall by exact handle (both stores), or by free text through the real

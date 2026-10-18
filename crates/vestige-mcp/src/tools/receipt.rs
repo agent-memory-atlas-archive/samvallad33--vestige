@@ -203,11 +203,21 @@ fn validate_args(args: &ReceiptArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn claim_boundary_for_receipt(receipt: &Receipt) -> &'static str {
+/// What a Strata effect receipt with no typed evidence claims: one admitted
+/// write. Before 4.2.1 such a receipt was labelled with the legacy boundary
+/// ("retrieval metadata only") next to an attestation of `strata_effect`.
+const STRATA_WRITE_RECEIPT_CLAIM_BOUNDARY: &str = concat!(
+    "This Strata effect receipt records one write the gate admitted to the hash-chained log: ",
+    "what it changed (mutations) and its payload digest. See attestation.verification for what ",
+    "was re-checked. It carries no controlled-replay or synaptic-capture claim."
+);
+
+fn claim_boundary_for_receipt(receipt: &Receipt, strata: bool) -> &'static str {
     match &receipt.evidence {
         Some(ReceiptEvidence::CounterfactualReplay { .. }) => REPLAY_CLAIM_BOUNDARY,
         Some(ReceiptEvidence::SynapticCapture(_)) => SYNAPTIC_CAPTURE_CLAIM_BOUNDARY,
         Some(ReceiptEvidence::Backfill { .. }) => BACKFILL_RECEIPT_CLAIM_BOUNDARY,
+        None if strata => STRATA_WRITE_RECEIPT_CLAIM_BOUNDARY,
         None => LEGACY_RECEIPT_CLAIM_BOUNDARY,
     }
 }
@@ -243,7 +253,10 @@ fn execute_get(storage: &Arc<Storage>, receipt_id: &str) -> Result<Value, String
     let capsule = storage
         .get_retrieval_replay_capsule(receipt_id)
         .map_err(|error| safe_storage_error("lookup", &error))?;
-    let claim_boundary = claim_boundary_for_receipt(&receipt);
+    let claim_boundary = claim_boundary_for_receipt(
+        &receipt,
+        crate::strata_memory::is_strata_backend(storage.as_ref()),
+    );
     let attestation = receipt_attestation_view(storage, receipt_id)?;
     Ok(json!({
         "action": "get",
@@ -935,7 +948,7 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(
-            claim_boundary_for_receipt(&legacy),
+            claim_boundary_for_receipt(&legacy, false),
             LEGACY_RECEIPT_CLAIM_BOUNDARY
         );
 
@@ -971,7 +984,7 @@ mod tests {
             },
         ));
         assert_eq!(
-            claim_boundary_for_receipt(&synaptic),
+            claim_boundary_for_receipt(&synaptic, false),
             SYNAPTIC_CAPTURE_CLAIM_BOUNDARY,
             "the public boundary must be the canonical typed-evidence boundary"
         );
@@ -1581,6 +1594,26 @@ mod strata_replay {
                 verification["framesVerified"].as_u64().unwrap() >= 2,
                 "{got}"
             );
+        }
+    }
+
+    /// A fresh Strata write is not a legacy receipt. Before 4.2.1 its
+    /// `claimBoundary` read "This legacy receipt records retrieval metadata
+    /// only", next to an attestation of `status: strata_effect`.
+    #[tokio::test]
+    async fn get_on_a_fresh_strata_write_states_the_strata_claim_not_the_legacy_one() {
+        let (storage, _dir) = open();
+        let node = ingest(&storage, "fresh strata write fixture");
+        let receipt = storage.get_receipt(&node.id).unwrap().unwrap();
+        for id in [node.id.as_str(), receipt.receipt_id.as_str()] {
+            let got = execute(&storage, Some(json!({"action": "get", "receipt_id": id})))
+                .await
+                .unwrap();
+            let boundary = got["claimBoundary"].as_str().unwrap();
+            assert!(!boundary.to_lowercase().contains("legacy"), "{got}");
+            assert!(boundary.contains("Strata"), "{got}");
+            assert!(!boundary.contains("retrieval metadata"), "{got}");
+            assert_eq!(got["attestation"]["status"], "strata_effect", "{got}");
         }
     }
 

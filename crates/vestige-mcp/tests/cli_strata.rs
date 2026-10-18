@@ -1982,17 +1982,51 @@ fn ingest_joins_a_full_path_named_only_in_the_texts() {
         .expect("node id")
         .trim()
         .to_string();
-    for commit in &touching {
+    // The response names the strongest 5 pairs and counts the rest (4.2.1);
+    // the store holds all 15 joins.
+    let shown: Vec<&str> = ingest
+        .stdout
+        .lines()
+        .filter(|line| line.contains(" -[touched]-> "))
+        .collect();
+    assert_eq!(shown.len(), 5, "{}", ingest.text());
+    for line in &shown {
         assert!(
-            ingest.stdout.contains(&format!(
-                "  {commit} -[touched]-> {failure}  joined on: path:modules/mono/csharp_script.cpp\n"
-            )),
+            touching.iter().any(|commit| *line
+                == format!(
+                    "  {commit} -[touched]-> {failure}  joined on: path:modules/mono/csharp_script.cpp"
+                )),
             "{}",
             ingest.text()
         );
     }
+    assert!(
+        ingest
+            .stdout
+            .contains("  ... and 10 more pair(s); the receipt lists every edge\n"),
+        "{}",
+        ingest.text()
+    );
     assert!(!ingest.stdout.contains(&elsewhere), "{}", ingest.text());
     assert_eq!(edge_count(dir.path()), 15);
+    let storage = open(dir.path());
+    let mut joined: Vec<String> = storage
+        .get_connections_for_memory(&failure)
+        .expect("edges")
+        .into_iter()
+        .map(|edge| {
+            if edge.source_id == failure {
+                edge.target_id
+            } else {
+                edge.source_id
+            }
+        })
+        .collect();
+    drop(storage);
+    joined.sort();
+    let mut want = touching.clone();
+    want.sort();
+    assert_eq!(joined, want, "every touching commit is joined");
 
     let scan = vestige(
         dir.path(),

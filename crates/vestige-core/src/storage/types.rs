@@ -47,6 +47,12 @@ pub enum StorageError {
     /// Initialization error
     #[error("Initialization error: {0}")]
     Init(String),
+    /// The store refuses this kind of operation by design, not because it
+    /// failed. The message starts with its stable code (for example
+    /// `similarity_disabled: ...`), which callers match on, and is shown as
+    /// is: never prefixed as an initialization failure.
+    #[error("{0}")]
+    Refused(String),
     /// A likely credential was detected before any write side effect.
     #[error(
         "Refused to store probable credential(s): {kinds:?}. Secret bytes were not stored, logged, or returned. Redact the value or use an explicit allow-secrets override only when intentional."

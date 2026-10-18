@@ -893,7 +893,9 @@ pub fn distinct_values(identities: &[Identity]) -> usize {
 /// auto-connect: its tags, and the file paths, commit shas, issue references
 /// and URLs that appear as whole tokens in its text or as tags. Sorted (tags
 /// first) and deduplicated. No ML, no similarity, no words: the same memory
-/// always yields the same identities, and a prose word never is one.
+/// always yields the same identities, and a prose word never is one. A
+/// sha-shaped token right after the word `session` (or `session_id`, ...)
+/// is a session id, not a commit (4.2.1).
 pub fn extract_identities(content: &str, tags: &[String]) -> Vec<Identity> {
     let mut identities: BTreeSet<Identity> = BTreeSet::new();
     for tag in tags {
@@ -905,10 +907,34 @@ pub fn extract_identities(content: &str, tags: &[String]) -> Vec<Identity> {
         identities.insert(Identity::new(IdentityKind::Tag, tag.clone()));
         identities.extend(classify_token(tag));
     }
+    let mut previous: Option<&str> = None;
     for token in content.split_whitespace() {
-        identities.extend(classify_token(token));
+        let found = classify_token(token);
+        if previous.is_some_and(names_a_session) {
+            // `session 7562c514`: a session id, not a commit.
+            identities.extend(
+                found
+                    .into_iter()
+                    .filter(|identity| identity.kind != IdentityKind::Commit),
+            );
+        } else {
+            identities.extend(found);
+        }
+        previous = Some(token);
     }
     identities.into_iter().collect()
+}
+
+/// A token that names the next one as a session id: `session`,
+/// `session_id`, `session-id` or `sessionid`, any case, with surrounding
+/// quotes, brackets and a trailing `:` or `=` ignored.
+fn names_a_session(token: &str) -> bool {
+    let word = token
+        .trim_start_matches(['"', '\'', '`', '(', '[', '{', '<'])
+        .trim_end_matches([':', '=', ',']);
+    ["session", "session_id", "session-id", "sessionid"]
+        .iter()
+        .any(|name| word.eq_ignore_ascii_case(name))
 }
 
 /// Could this raw token be an identity at all? A cheap necessary condition
@@ -1312,6 +1338,38 @@ mod tests {
         assert_eq!(
             rendered("1234567 defaced abc123 x6c231e84 6c231e84-dirty", &[]),
             Vec::<String>::new()
+        );
+    }
+
+    /// A hex token the word before it names as a session id is not a commit
+    /// (4.2.1). Before, every memory that quoted "Claude Code session
+    /// 7562c514" shared the identity `commit:7562c514`, and auto-connect
+    /// joined them on it.
+    #[test]
+    fn a_session_id_named_as_one_is_not_a_commit() {
+        for text in [
+            "Claude Code session 7562c514, verbatim",
+            "(session: 7562c514)",
+            "Session 7562c514.",
+            "session_id 7562c514",
+        ] {
+            assert_eq!(rendered(text, &[]), Vec::<String>::new(), "{text}");
+        }
+        assert!(
+            shared(
+                ("decision in session 7562c514", &[]),
+                ("event from session 7562c514", &[])
+            )
+            .is_empty()
+        );
+        // The same token anywhere else is still a commit.
+        assert_eq!(
+            rendered("bisected to 7562c514", &[]),
+            vec!["commit:7562c514"]
+        );
+        assert_eq!(
+            rendered("session ended at commit 7562c514", &[]),
+            vec!["commit:7562c514"]
         );
     }
 

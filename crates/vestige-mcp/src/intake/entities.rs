@@ -17,8 +17,12 @@
 //!   `.` + a TLD of 2+ ASCII letters.
 //! * **CommitSha**: a maximal hex run of 7..=40 chars, boundary-delimited
 //!   (the chars on each side of a maximal run are not hex by construction),
-//!   containing at least one a-f/A-F letter (pure numbers are rejected), and
-//!   not preceded by `#`.
+//!   containing at least one a-f/A-F letter AND one digit (pure numbers and
+//!   hex-spelled word fragments like `cceeded` or `feedbac` are rejected),
+//!   not preceded by `#`, and not one of these (v2): the suffix of a Vestige
+//!   handle (`mem-`, `eff-`, `wr_`), a group of a UUID (8-4-4-4-12), or a
+//!   run named as a session id by the word before it (`session`,
+//!   `session_id`, `session-id`, `sessionid`, then up to three of ` :=`).
 //! * **IssueRef**: `[A-Z][A-Z0-9]{1,}-\d+` (e.g. `GH-42`), or `#\d+` where
 //!   the `#` is not preceded by another `#` or an ASCII alnum, or
 //!   `[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d+` (`owner/repo#123`; leading `/`
@@ -26,9 +30,13 @@
 //!   and must not end with `/`).
 //! * **Version**: `v?\d+\.\d+(\.\d+)*` with ASCII word boundaries on both
 //!   ends (a word char is `[A-Za-z0-9_]`). Bare form only — no leading `@`.
+//!   A bare two-part number followed by `%` or by a time unit (`2.3 s`,
+//!   `1.5 seconds`, `12.5%`) is a measurement, not a Version (v2).
 //! * **FilePath**: a whitespace-delimited token with byte length >= 3, no
 //!   whitespace, containing `/` AND a `.` in the final (post-last-`/`)
-//!   segment, whose first char is an ASCII alnum or one of `.`, `~`, `/`;
+//!   segment, and at least one ASCII letter (so a tally like `6/6.` or
+//!   `11/11.` is not a path, v2), whose first char is an ASCII alnum or one
+//!   of `.`, `~`, `/`;
 //!   tokens that look like a Url (contain `://`) or like a whole-token
 //!   Version are rejected (checker order Url > Email > CommitSha > IssueRef
 //!   > Version > FilePath). Trailing punctuation is NOT trimmed from paths —
@@ -42,7 +50,22 @@
 //! exact same-start-and-length ties. The result is sorted by `byte_start`
 //! and capped at 64 spans.
 
-pub const EXTRACTOR_VERSION: &str = "hand-scanners-v1";
+/// v2 (4.2.1): CommitSha needs a digit and skips Vestige handle suffixes,
+/// UUID groups and named session ids; tallies are not paths; measurements
+/// are not versions.
+pub const EXTRACTOR_VERSION: &str = "hand-scanners-v2";
+
+/// Prefixes of Vestige's own handles whose hex suffix is never a commit.
+const HANDLE_PREFIXES: [&str; 3] = ["mem-", "eff-", "wr_"];
+
+/// Words that name the hex run after them as a session id, lowercase.
+const SESSION_WORDS: [&str; 4] = ["session", "session_id", "session-id", "sessionid"];
+
+/// Units that make a bare two-part number a measurement, lowercase.
+const MEASURE_UNITS: [&str; 18] = [
+    "ns", "us", "µs", "ms", "s", "sec", "secs", "second", "seconds", "min", "mins", "minute",
+    "minutes", "h", "hr", "hrs", "hour", "hours",
+];
 
 /// Maximum number of spans [`extract_typed_spans`] may return.
 const MAX_SPANS: usize = 64;
@@ -271,7 +294,8 @@ fn scan_emails(content: &str, chars: &[(usize, char)], out: &mut Vec<EntitySpan>
 }
 
 /// CommitSha scanner: maximal hex runs, 7..=40 long, containing at least one
-/// a-f/A-F letter, not immediately preceded by `#`.
+/// a-f/A-F letter and one digit, not immediately preceded by `#`, and not a
+/// Vestige handle suffix, a UUID group or a named session id.
 fn scan_commit_shas(content: &str, chars: &[(usize, char)], out: &mut Vec<EntitySpan>) {
     let mut i = 0;
     while i < chars.len() {
@@ -287,7 +311,15 @@ fn scan_commit_shas(content: &str, chars: &[(usize, char)], out: &mut Vec<Entity
         let len = j - i;
         let prev_is_hash = i > 0 && chars[i - 1].1 == '#';
         let has_hex_letter = chars[i..j].iter().any(|&(_, c)| c.is_ascii_alphabetic());
-        if (7..=40).contains(&len) && has_hex_letter && !prev_is_hash {
+        let has_digit = chars[i..j].iter().any(|&(_, c)| c.is_ascii_digit());
+        if (7..=40).contains(&len)
+            && has_hex_letter
+            && has_digit
+            && !prev_is_hash
+            && !is_handle_suffix(content, chars[i].0)
+            && !in_uuid(chars, i, j)
+            && !named_as_session(chars, i)
+        {
             push_span(
                 out,
                 EntityKind::CommitSha,
@@ -298,6 +330,78 @@ fn scan_commit_shas(content: &str, chars: &[(usize, char)], out: &mut Vec<Entity
         }
         i = j;
     }
+}
+
+/// The hex run starting at byte `start` is the suffix of one of Vestige's
+/// own handles (`mem-…`, `eff-…`, `wr_…`).
+fn is_handle_suffix(content: &str, start: usize) -> bool {
+    let before = &content[..start];
+    HANDLE_PREFIXES
+        .iter()
+        .any(|prefix| before.ends_with(prefix))
+}
+
+/// The hex run `[i, j)` is a group of an 8-4-4-4-12 UUID, including one
+/// written next to a hyphen (`run-<uuid>`, `<uuid>-retry`).
+fn in_uuid(chars: &[(usize, char)], i: usize, j: usize) -> bool {
+    // A UUID is 36 characters, so nothing further away can decide it. Looking
+    // no further keeps the scan linear on a long hyphenated run.
+    const UUID_LEN: usize = 36;
+    let joined = |c: char| is_ascii_hex(c) || c == '-';
+    let mut s = i;
+    while s > 0 && i - s < UUID_LEN && joined(chars[s - 1].1) {
+        s -= 1;
+    }
+    let mut e = j;
+    while e < chars.len() && e - j < UUID_LEN && joined(chars[e].1) {
+        e += 1;
+    }
+    // A group the window cut off is not a whole group.
+    let cut_left = s > 0 && joined(chars[s - 1].1);
+    let cut_right = e < chars.len() && joined(chars[e].1);
+    let run: String = chars[s..e].iter().map(|&(_, c)| c).collect();
+    let groups: Vec<&str> = run.split('-').collect();
+    let first = usize::from(cut_left);
+    let last = groups.len() - usize::from(cut_right);
+    // The group [i, j) is the one after this many hyphens of the window.
+    let at = chars[s..i].iter().filter(|&&(_, c)| c == '-').count();
+    (at.saturating_sub(4)..=at).any(|w| {
+        w >= first
+            && w + 5 <= last
+            && groups[w..w + 5]
+                .iter()
+                .zip([8, 4, 4, 4, 12])
+                .all(|(group, len)| group.len() == len)
+    })
+}
+
+/// The word just before the hex run at char `i` (across up to three of
+/// ` :=`) names it as a session id.
+fn named_as_session(chars: &[(usize, char)], i: usize) -> bool {
+    let mut k = i;
+    let mut skipped = 0;
+    while k > 0 && skipped < 3 && matches!(chars[k - 1].1, ' ' | '\t' | ':' | '=') {
+        k -= 1;
+        skipped += 1;
+    }
+    let end = k;
+    // No session word is longer than this, so a longer word is not one; not
+    // reading further keeps the scan linear on a long hyphenated run.
+    let longest = SESSION_WORDS.iter().map(|w| w.len()).max().unwrap_or(0);
+    while k > 0
+        && end - k <= longest
+        && (chars[k - 1].1.is_ascii_alphanumeric() || matches!(chars[k - 1].1, '_' | '-'))
+    {
+        k -= 1;
+    }
+    if k == end || end - k > longest {
+        return false;
+    }
+    let word: String = chars[k..end]
+        .iter()
+        .map(|&(_, c)| c.to_ascii_lowercase())
+        .collect();
+    SESSION_WORDS.contains(&word.as_str())
 }
 
 /// IssueRef scanner: form 1 (`[A-Z][A-Z0-9]{1,}-\d+`, anchored on `-`) and
@@ -442,6 +546,10 @@ fn scan_versions(content: &str, chars: &[(usize, char)], out: &mut Vec<EntitySpa
         if j < chars.len() && is_word_char(chars[j].1) {
             continue; // trailing word boundary
         }
+        let dots = chars[i..j].iter().filter(|&&(_, c)| c == '.').count();
+        if !v_start && dots == 1 && followed_by_measure(chars, j) {
+            continue; // `2.3 s`, `12.5%`: a measurement, not a version
+        }
         push_span(
             out,
             EntityKind::Version,
@@ -450,6 +558,30 @@ fn scan_versions(content: &str, chars: &[(usize, char)], out: &mut Vec<EntitySpa
             char_end(chars, j),
         );
     }
+}
+
+/// After char `j`: `%`, or one optional space then a time unit word that
+/// ends at a non-word char (or the end).
+fn followed_by_measure(chars: &[(usize, char)], j: usize) -> bool {
+    let mut k = j;
+    if k < chars.len() && chars[k].1 == ' ' {
+        k += 1;
+    }
+    if k < chars.len() && chars[k].1 == '%' {
+        return true;
+    }
+    let start = k;
+    while k < chars.len() && chars[k].1.is_alphabetic() {
+        k += 1;
+    }
+    if k == start || (k < chars.len() && is_word_char(chars[k].1)) {
+        return false;
+    }
+    let unit: String = chars[start..k]
+        .iter()
+        .flat_map(|&(_, c)| c.to_lowercase())
+        .collect();
+    MEASURE_UNITS.contains(&unit.as_str())
 }
 
 /// FilePath scanner: whitespace-delimited tokens passing the path rules.
@@ -494,6 +626,10 @@ fn is_file_path_token(token: &str) -> bool {
     if token.contains("://") {
         return false;
     }
+    // A path names something: `6/6.` and `11/11.` are tallies (v2).
+    if !token.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
     // Reject tokens that are exactly a Version.
     if is_version_token(token) {
         return false;
@@ -533,7 +669,7 @@ mod tests {
 
     #[test]
     fn extractor_version_is_pinned() {
-        assert_eq!(EXTRACTOR_VERSION, "hand-scanners-v1");
+        assert_eq!(EXTRACTOR_VERSION, "hand-scanners-v2");
     }
 
     #[test]
@@ -638,6 +774,117 @@ mod tests {
         assert_eq!(got[0].surface, "ABCDEF12");
         // A non-hex, non-'#' prefix is fine.
         assert_eq!(spans("ref xa1b2c3d end").len(), 1);
+    }
+
+    fn kinds_in(input: &str, kind: EntityKind) -> Vec<String> {
+        spans(input)
+            .into_iter()
+            .filter(|span| span.kind == kind)
+            .map(|span| span.surface)
+            .collect()
+    }
+
+    /// Hex runs that are not commits (hand-scanners-v2). Each of these was
+    /// a CommitSha under v1, and auto-connect and the proof surface treated
+    /// it as a shared commit.
+    #[test]
+    fn hex_runs_that_are_not_commits() {
+        for input in [
+            // Vestige's own handles: a memory id, a receipt, a walk receipt.
+            "see mem-000000000009c193 now",
+            "receipt eff-00000000000a26ab ok",
+            "walk wr_0123456789abcdef01234567 ok",
+            // Word fragments: hex letters only, no digit.
+            "the deploy succeeded after feedback",
+            "defaced cabbage",
+            // A UUID's groups, also next to a hyphen.
+            "uuid 7562c514-1f2e-4a3b-9c8d-0123456789ab",
+            "run-7562c514-1f2e-4a3b-9c8d-0123456789ab",
+            "session-7562c514-1f2e-4a3b-9c8d-0123456789ab",
+            "7562c514-1f2e-4a3b-9c8d-0123456789ab-retry",
+            "abc-7562c514-1f2e-4a3b-9c8d-0123456789ab-cafe",
+            // A session id, named as one.
+            "Claude Code session 7562c514, verbatim",
+            "session_id=7562c514",
+            "Session: 7562c514",
+        ] {
+            let shas = kinds_in(input, EntityKind::CommitSha);
+            assert!(shas.is_empty(), "{input:?} gave CommitSha {shas:?}");
+        }
+    }
+
+    /// Every hex group of a long hyphenated run is checked against a
+    /// window of fixed size, so the scan stays linear: all 5,000
+    /// seven-character groups are scanned (the output keeps the first
+    /// MAX_SPANS), and a sha-shaped group next to a UUID-shaped tail is not
+    /// mistaken for part of it.
+    #[test]
+    fn long_hyphenated_hex_runs_scan_in_linear_time() {
+        let input = "a1b2c3d-".repeat(5_000);
+        assert_eq!(kinds_in(&input, EntityKind::CommitSha).len(), MAX_SPANS);
+        let near = "deadbee1-7562c514-1f2e-4a3b-9c8d-0123456789ab";
+        assert_eq!(
+            kinds_in(near, EntityKind::CommitSha),
+            vec!["deadbee1".to_string()]
+        );
+    }
+
+    #[test]
+    fn real_shas_still_extract() {
+        for (input, sha) in [
+            ("commit a1b2c3d landed", "a1b2c3d"),
+            ("fix in e852cac2: keep setup", "e852cac2"),
+            ("bisected to (6c231e84)", "6c231e84"),
+            (
+                "reverts 6c231e84aa0f6c1d5e0d3b7a9c1f2e3d4b5a6978.",
+                "6c231e84aa0f6c1d5e0d3b7a9c1f2e3d4b5a6978",
+            ),
+            ("HEAD is now at e852cac2 fix", "e852cac2"),
+        ] {
+            assert_eq!(
+                kinds_in(input, EntityKind::CommitSha),
+                vec![sha],
+                "{input:?}"
+            );
+        }
+    }
+
+    /// Test tallies and measurements are not paths or versions (v2).
+    #[test]
+    fn ratios_and_durations_are_not_paths_or_versions() {
+        for input in [
+            "tests 6/6. passed",
+            "and 11/11. green",
+            "ratio 3/4 held",
+            "took 2.3 s total",
+            "took 2.3 ms total",
+            "1.5 seconds later",
+            "cpu at 12.5% now",
+            "run 0.25 sec",
+        ] {
+            let paths = kinds_in(input, EntityKind::FilePath);
+            let versions = kinds_in(input, EntityKind::Version);
+            assert!(paths.is_empty(), "{input:?} gave FilePath {paths:?}");
+            assert!(versions.is_empty(), "{input:?} gave Version {versions:?}");
+        }
+        // Versions and paths keep working, a bare two-part version included.
+        assert_eq!(
+            kinds_in("rust 1.98 toolchain", EntityKind::Version),
+            vec!["1.98"]
+        );
+        assert_eq!(
+            kinds_in("bump v2.1.0 now", EntityKind::Version),
+            vec!["v2.1.0"]
+        );
+        assert_eq!(kinds_in("1.2.3 s", EntityKind::Version), vec!["1.2.3"]);
+        assert_eq!(
+            kinds_in("edit migrations/001.sql now", EntityKind::FilePath),
+            vec!["migrations/001.sql"]
+        );
+        assert_eq!(
+            kinds_in("see docs/2026/10.md now", EntityKind::FilePath),
+            vec!["docs/2026/10.md"]
+        );
     }
 
     #[test]
@@ -791,7 +1038,7 @@ mod tests {
     // paragraph (kinds, surfaces and byte offsets).
     #[test]
     fn golden_mixed_paragraph() {
-        assert_eq!(EXTRACTOR_VERSION, "hand-scanners-v1");
+        assert_eq!(EXTRACTOR_VERSION, "hand-scanners-v2");
         let input = "see GH-42 and https://github.com/vestige/core/commit/deadbeef12345 in src/store.py plus #7, v2.1.0, a1b2c3d and bob@example.io";
         let got = spans(input);
         let expected_kinds = [

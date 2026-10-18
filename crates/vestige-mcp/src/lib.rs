@@ -21,6 +21,7 @@ pub mod protocol;
 #[cfg(all(test, not(feature = "legacy-sqlite")))]
 mod protocol_stdio_store;
 pub mod resources;
+pub mod rules_hook;
 pub mod server;
 pub mod strata_memory;
 pub mod tools;

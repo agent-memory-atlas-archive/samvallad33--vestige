@@ -644,8 +644,11 @@ fn map_store(err: strata_store::StoreError) -> StorageError {
     }
 }
 
+/// A refusal, not a failure: the message starts with `similarity_disabled`
+/// and is shown as is (before 4.2.1 it was an `Init` error and read
+/// "Initialization error: similarity_disabled: ...").
 fn similarity(op: &str) -> StorageError {
-    StorageError::Init(format!(
+    StorageError::Refused(format!(
         "similarity_disabled: {op}: embeddings, cosine, BM25, FTS, Jaccard, and keyword or name matching are not Strata operations; pass an exact handle"
     ))
 }
@@ -662,11 +665,11 @@ pub fn withheld_message(what: &str) -> String {
 }
 
 fn withheld(what: &str) -> StorageError {
-    StorageError::Init(withheld_message(what))
+    StorageError::Refused(withheld_message(what))
 }
 
 fn pending(op: &str) -> StorageError {
-    StorageError::Init(format!(
+    StorageError::Refused(format!(
         "pending_strata: {op} is not admitted on the Strata log yet"
     ))
 }
@@ -707,11 +710,11 @@ fn projection_rank(node_type: &str) -> u8 {
 }
 
 fn sim_async(op: &str) -> MemoryStoreError {
-    MemoryStoreError::Init(similarity(op).to_string())
+    MemoryStoreError::Refused(similarity(op).to_string())
 }
 
 fn pending_async(op: &str) -> MemoryStoreError {
-    MemoryStoreError::Init(pending(op).to_string())
+    MemoryStoreError::Refused(pending(op).to_string())
 }
 
 fn dt_ms(ms: i64) -> Result<DateTime<Utc>, StorageError> {
@@ -4023,6 +4026,38 @@ mod tests {
     use serde_json::json;
     use vestige_core::IngestInput;
     use vestige_core::SourceEnvelope;
+
+    /// Every by-design refusal reads as itself, starting with its code, on
+    /// both the sync and the async store error (4.2.1).
+    #[test]
+    fn refusals_start_with_their_code_and_never_read_as_init_failures() {
+        let sync = [similarity("recall"), withheld("purge"), pending("op")];
+        let codes = [
+            "similarity_disabled: ",
+            "unavailable_in_4_0: ",
+            "pending_strata: ",
+        ];
+        for (err, code) in sync.into_iter().zip(codes) {
+            assert!(matches!(err, StorageError::Refused(_)), "{err:?}");
+            let text = err.to_string();
+            assert!(text.starts_with(code), "{text}");
+            assert!(
+                !text.to_lowercase().contains("initialization error"),
+                "{text}"
+            );
+        }
+        for (err, code) in [sim_async("search"), pending_async("op")]
+            .into_iter()
+            .zip(["similarity_disabled: ", "pending_strata: "])
+        {
+            let text = err.to_string();
+            assert!(text.starts_with(code), "{text}");
+            assert!(
+                !text.to_lowercase().contains("initialization error"),
+                "{text}"
+            );
+        }
+    }
 
     fn no_sqlite(dir: &Path) -> bool {
         let mut stack = vec![dir.to_path_buf()];
