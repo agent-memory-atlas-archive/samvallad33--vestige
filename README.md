@@ -4,7 +4,7 @@
 
 # Vestige
 
-Vestige is a fail-closed runtime firewall for AI agents. The model proposes, a deterministic gate decides, and every action leaves a receipt. When something breaks, `causal_walk` finds the real cause.
+Vestige gives AI agents a memory you can check and a guard that stops them before they do damage. Memory lives in Strata, an append-only log where every write passes a gate and leaves a receipt, and a memory is found by its exact id or tag, never by vector similarity. The guard runs outside the model on every tool call, stops destructive commands before they run, keeps a receipt of every decision, and lets a stopped command through only after the owner approves that exact command from their own terminal, so an old yes is never treated as permission to act now. When something breaks, `causal_walk` follows the recorded history back to the real cause.
 
 [![Release](https://img.shields.io/github/v/release/samvallad33/vestige?color=06b6d4)](https://github.com/samvallad33/vestige/releases/latest)
 [![Tests](https://img.shields.io/github/actions/workflow/status/samvallad33/vestige/ci.yml?branch=main&label=CI)](https://github.com/samvallad33/vestige/actions)
@@ -15,13 +15,26 @@ Vestige is a fail-closed runtime firewall for AI agents. The model proposes, a d
 
 Agents run `rm -rf`, force-push, drop tables, and overwrite `.env` on their own, and nothing stops them. When something breaks, similarity search finds lookalikes, not causes.
 
+## What's new in v5
+
+[5.0.0 PRECEDENT](https://github.com/samvallad33/vestige/releases/tag/v5.0.0) shipped on October 18, 2026. Vestige now reads its own enforcement record.
+
+- **`precedent`.** Any connected agent can ask what the gate stopped or allowed, under which rule, and which permit answered each stop. It reads the gate's own receipts, writes nothing and cannot issue a permit, so a stopped agent can see why instead of retrying.
+- **18 tools and no vectors.** The memory server advertises 18 MCP tools, adds `precedent` and `gather`, and ships no embedding runtime. Free-text recall returns `similarity_disabled`; a memory is found by its exact id or tag.
+- **`gather`.** Point it at a GitHub issue and it records the issue, its comments, the linked pull requests and the commit window as receipts, then walks back toward the cause.
+- **Rules that survive compaction.** `vestige hook session-start` brings your pinned decisions and corrections back after every compaction. It is opt-in; see the [rules hook guide](docs/integrations/claude-code-rules-hook.md).
+- **The PRECEDENT journey.** `npx @vestige/init precedent` follows one real stop from your machine around the loop: the stop, its receipt re-derived from its own bytes, the precedent and the verdict.
+- **A rebuilt dashboard** on WebGPU, with the gate's receipts in its Guard view.
+- **Operator Lite 0.3.10.** It blocks from install with 30 rules, reads the shell commands inside `python -c` and `node -e` code, sees through wrappers such as `sudo -u root`, `env -S` and `busybox`, and stops an agent from throwing away uncommitted git work.
+- **Tested end to end.** [`full_flow_stdio.rs`](crates/vestige-mcp/tests/full_flow_stdio.rs) runs the whole loop on the shipped binaries in CI on Linux and macOS: the gate stops a call, the stop is recorded, a second agent recalls it and walks it back to its rule, and an ALLOW ONCE runs exactly once.
+
 ## Vestige Operator
 
 [![Watch Vestige Operator stop what Operator Lite lets through](operator-lite/media/from-lite-to-operator.gif)](operator-lite/media/from-lite-to-operator.mp4)
 
 Click the picture to watch the full film.
 
-Operator Lite is free and stays free. Vestige Operator is the owner's version of the same gate: $149 once, and every later version is yours at no charge, with laws you write, a Board of today's stops, and a weekly Letter of what your agents tried and what stopped them. You download a small archive the moment you pay; from an installed Operator Lite, `upgrade --install <the archive you downloaded>` unpacks it and starts the wizard.
+Operator Lite is free and stays free. Vestige Operator is the owner's version of the same gate: $149 once, and every later version is yours at no charge, with laws you write, a Board of today's stops, and a weekly Letter of what your agents tried and what stopped them. Operator also judges the chain of steps in a session, so an agent that reads `.env` and later posts a file to an outside host is stopped with the earlier step's time and receipt, and it carries six more stop rules than Lite. You download a small archive the moment you pay; from an installed Operator Lite, `upgrade --install <the archive you downloaded>` unpacks it and starts the wizard.
 
 [Buy Vestige Operator](https://payhip.com/b/d4xvu)
 
@@ -93,7 +106,7 @@ Any agent connected to the memory server can read that record with `precedent`: 
 <a id="install"></a>
 ## Memory server
 
-The memory server is a Strata signed append-only log. Every write is gated and returns a receipt. Install the latest signed release with one command:
+The memory server keeps everything in Strata, an append-only log. Each frame carries the BLAKE3 hash of the frame before it, sealed segments carry an Ed25519 signature (a segment is sealed at backup, nightly by default), and `vestige strata-verify` checks all of it while the server keeps running. Every write passes a gate and returns a receipt. Install the latest release with one command:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/install.sh | sh
@@ -147,7 +160,9 @@ codex mcp add vestige -- vestige-mcp
 
 ## Choose your environment
 
-The installer gives you the local binaries. Choose one of the guides below to
+The installer gives you the local binaries. `npx @vestige/init` detects and wires
+Claude Code, Claude Desktop, Cursor, VS Code with Copilot, OpenCode, Xcode,
+JetBrains and Windsurf for you, or choose one of the guides below to
 connect the **Vestige memory server** to the client you use. MCP connection
 makes Strata's durable records and receipts available; it does not itself add
 an execution gate.
