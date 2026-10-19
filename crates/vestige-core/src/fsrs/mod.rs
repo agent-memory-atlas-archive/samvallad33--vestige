@@ -15,7 +15,6 @@
 //! - Interval: t = S/FACTOR * (R^(1/w20) - 1)
 
 mod algorithm;
-mod optimizer;
 mod scheduler;
 
 pub use algorithm::{
@@ -51,5 +50,3 @@ pub use algorithm::{
 pub use scheduler::{
     FSRSParameters, FSRSScheduler, FSRSState, LearningState, PreviewResults, Rating, ReviewResult,
 };
-
-pub use optimizer::{FSRSOptimizer, ReviewLog};

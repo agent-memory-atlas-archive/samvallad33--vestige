@@ -21,12 +21,11 @@ pub const SYNAPTIC_CAPTURE_UNAVAILABLE: &str = "synaptic_capture_unavailable";
 /// existing tag means comparing tag names, so there is nothing to report and
 /// nothing failed: tags are stored exactly as given.
 pub fn tag_suggestions_on_strata(scope: &str) -> Value {
-    let mut out = part(
-        SIMILARITY_DISABLED,
-        "Tag suggestions compare tag names, which a Strata log does not do. Tags are stored exactly as given.",
-    );
-    out["scope"] = Value::String(scope.to_string());
-    out
+    json!({
+        "status": "unavailable",
+        "reason": SIMILARITY_DISABLED,
+        "scope": scope,
+    })
 }
 
 /// The `synapticCapture` of a save on a Strata log. The write itself was

@@ -17,8 +17,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use vestige_core::Storage;
 
-const PERMIT_NOTE: &str =
-    "history, not permission. Permits are single-use and cannot be reused or issued through this tool.";
+const PERMIT_NOTE: &str = "history, not permission. Permits are single-use and cannot be reused or issued through this tool.";
 
 pub fn schema() -> Value {
     json!({
@@ -90,11 +89,18 @@ fn parse_decision(v: Option<&str>) -> Result<Option<Vec<String>>, String> {
     match d.map(str::to_uppercase) {
         None => Ok(Some(vec!["STOP".into(), "ALLOW".into()])),
         Some(x) if x == "ALL" => Ok(None),
-        Some(x) if matches!(
-            x.as_str(),
-            "STOP" | "ALLOW" | "SHADOW_STOP" | "SHADOW_TASTE" | "SHADOW_TASTE_MULTI"
-                | "PASS" | "PERMIT_GRANTED" | "GATE_ERROR"
-        ) =>
+        Some(x)
+            if matches!(
+                x.as_str(),
+                "STOP"
+                    | "ALLOW"
+                    | "SHADOW_STOP"
+                    | "SHADOW_TASTE"
+                    | "SHADOW_TASTE_MULTI"
+                    | "PASS"
+                    | "PERMIT_GRANTED"
+                    | "GATE_ERROR"
+            ) =>
         {
             Ok(Some(vec![x]))
         }
@@ -166,7 +172,8 @@ fn read_receipts(home: &Path, cutoff: i64) -> (Vec<(i64, usize, Value)>, usize) 
     };
     // A day file holds that UTC day's receipts. Skip days that end before the
     // cutoff, keeping one spare day in case a file was named by local date.
-    if let Some(first) = DateTime::from_timestamp(cutoff, 0).map(|t| t.date_naive() - Days::new(1)) {
+    if let Some(first) = DateTime::from_timestamp(cutoff, 0).map(|t| t.date_naive() - Days::new(1))
+    {
         files.retain(|p| {
             p.file_stem()
                 .and_then(|s| s.to_str())
@@ -259,16 +266,19 @@ fn find_permit<'a>(permits: &'a [Value], rec: &Value) -> Option<&'a Value> {
         v.get(k).and_then(Value::as_str)
     }
     let ad = field(rec, "action_digest")?;
-    let same_action = permits.iter().filter(|p| field(p, "action_digest") == Some(ad));
+    let same_action = permits
+        .iter()
+        .filter(|p| field(p, "action_digest") == Some(ad));
     if let Some(dg) = field(rec, "digest")
-        && let Some(p) = same_action.clone().find(|p| field(p, "stop_receipt") == Some(dg))
+        && let Some(p) = same_action
+            .clone()
+            .find(|p| field(p, "stop_receipt") == Some(dg))
     {
         return Some(p);
     }
     let ts = field(rec, "ts").and_then(ts_unix)?;
-    let timed = same_action.filter_map(|p| {
-        Some((p.get("granted").and_then(Value::as_f64)?.floor() as i64, p))
-    });
+    let timed = same_action
+        .filter_map(|p| Some((p.get("granted").and_then(Value::as_f64)?.floor() as i64, p)));
     if matches!(field(rec, "decision"), Some("ALLOW" | "PERMIT_GRANTED")) {
         timed
             .filter(|(g, _)| *g <= ts)
@@ -318,10 +328,7 @@ fn keep(rec: &Value, q: &Query) -> bool {
             .and_then(Value::as_array)
             .map(|a| a.iter().any(|v| v.as_str().is_some_and(&hit)))
             .unwrap_or(false);
-        if !rec
-            .get("rule")
-            .and_then(Value::as_str)
-            .is_some_and(&hit)
+        if !rec.get("rule").and_then(Value::as_str).is_some_and(&hit)
             && !rec
                 .get("commitment")
                 .and_then(Value::as_str)
@@ -340,7 +347,11 @@ fn build_item(rec: &Value, permits: &[Value]) -> Value {
         .and_then(Value::as_str)
         .and_then(ts_unix)
         .and_then(|t| DateTime::from_timestamp(t, 0))
-        .map(|t| t.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string())
+        .map(|t| {
+            t.with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
         .unwrap_or_default();
     let mut item = json!({
         "ts_utc": rec.get("ts").cloned().unwrap_or(Value::Null),
@@ -423,7 +434,10 @@ fn secret_at(s: &str, i: usize) -> Option<usize> {
     }
     if s[i..].starts_with("AKIA") && boundary_before(s, i) {
         let mut j = i + 4;
-        while b.get(j).is_some_and(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+        while b
+            .get(j)
+            .is_some_and(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        {
             j += 1;
         }
         if j - i >= 8 {
@@ -433,9 +447,16 @@ fn secret_at(s: &str, i: usize) -> Option<usize> {
     if !boundary_before(s, i) {
         return None;
     }
-    for name in ["api_key", "api-key", "apikey", "token", "secret", "password"] {
+    for name in [
+        "api_key", "api-key", "apikey", "token", "secret", "password",
+    ] {
         let nb = name.as_bytes();
-        if b.len() - i < nb.len() || !b[i..i + nb.len()].iter().zip(nb).all(|(a, c)| a.eq_ignore_ascii_case(c)) {
+        if b.len() - i < nb.len()
+            || !b[i..i + nb.len()]
+                .iter()
+                .zip(nb)
+                .all(|(a, c)| a.eq_ignore_ascii_case(c))
+        {
             continue;
         }
         let mut j = i + nb.len();
@@ -457,7 +478,12 @@ fn secret_at(s: &str, i: usize) -> Option<usize> {
             return Some(k);
         }
     }
-    if b.len() - i >= 7 && b[i..i + 7].iter().zip(b"bearer ").all(|(a, c)| a.eq_ignore_ascii_case(c)) {
+    if b.len() - i >= 7
+        && b[i..i + 7]
+            .iter()
+            .zip(b"bearer ")
+            .all(|(a, c)| a.eq_ignore_ascii_case(c))
+    {
         let mut k = i + 7;
         while let Some(c) = s[k..].chars().next().filter(|c| !c.is_whitespace()) {
             k += c.len_utf8();
@@ -495,7 +521,10 @@ fn run(home: &Path, q: &Query) -> Result<Value, String> {
         .filter(|(_, _, rec)| keep(rec, q))
         .map(|(ts, seq, rec)| (ts, seq, build_item(&rec, &permits)))
         .collect();
-    let stops = hits.iter().filter(|(_, _, i)| i["decision"] == "STOP").count();
+    let stops = hits
+        .iter()
+        .filter(|(_, _, i)| i["decision"] == "STOP")
+        .count();
     let allowed = hits
         .iter()
         .filter(|(_, _, i)| i["decision"] == "ALLOW" && i["via"] == "permit")
@@ -605,9 +634,17 @@ mod tests {
                 (at(0), rec_with_digest(&iso(at(0)), "STOP", &digests[0], ad)),
                 (
                     at(60),
-                    rec_with_digest(&iso(at(60)), "ALLOW", &digests[1], &format!(r#"{ad},"via":"permit""#)),
+                    rec_with_digest(
+                        &iso(at(60)),
+                        "ALLOW",
+                        &digests[1],
+                        &format!(r#"{ad},"via":"permit""#),
+                    ),
                 ),
-                (at(120), rec_with_digest(&iso(at(120)), "STOP", &digests[2], ad)),
+                (
+                    at(120),
+                    rec_with_digest(&iso(at(120)), "STOP", &digests[2], ad),
+                ),
             ],
         );
         (dir, digests)
@@ -620,14 +657,19 @@ mod tests {
             .iter()
             .find(|i| i["digest"] == digest)
             .unwrap();
-        item.get("permit").map(|p| p["status"].clone()).unwrap_or(Value::Null)
+        item.get("permit")
+            .map(|p| p["status"].clone())
+            .unwrap_or(Value::Null)
     }
 
     fn fixture() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::TempDir::new().unwrap();
         let home = dir.path().to_path_buf();
         let now = Utc::now();
-        let (fresh_at, stale_at) = (now - chrono::Duration::hours(2), now - chrono::Duration::days(3));
+        let (fresh_at, stale_at) = (
+            now - chrono::Duration::hours(2),
+            now - chrono::Duration::days(3),
+        );
         let (fresh, stale) = (iso(fresh_at), iso(stale_at));
         // Granted after the stops active_and_expired_permits_are_visible_via_all writes an hour ago.
         let granted = (now - chrono::Duration::minutes(30)).timestamp();
@@ -646,14 +688,21 @@ mod tests {
         write(
             &home,
             &day_file(fresh_at),
-            &format!("{stop}\nnot json at all\n\n{allowed}\n{}\n", rec(&fresh, "PASS", "")),
+            &format!(
+                "{stop}\nnot json at all\n\n{allowed}\n{}\n",
+                rec(&fresh, "PASS", "")
+            ),
         );
         write(
             &home,
             &day_file(stale_at),
             &format!(
                 "{}\n",
-                rec(&stale, "STOP", r#","action_digest":"cccc3333cccc3333cccc3333","commitment":"OP-003","rule":"no-blind-recursive-delete","detail":"old stop""#)
+                rec(
+                    &stale,
+                    "STOP",
+                    r#","action_digest":"cccc3333cccc3333cccc3333","commitment":"OP-003","rule":"no-blind-recursive-delete","detail":"old stop""#
+                )
             ),
         );
         write(
@@ -727,29 +776,50 @@ mod tests {
         let item = &out["items"][0];
         assert_eq!(item["prev"], "79ecb0a2a995efb2");
         assert_eq!(item["normalized"], "git checkout -- src/app.py");
-        assert_eq!(item["transforms"], json!(["variables-expanded", "heredoc-extracted"]));
+        assert_eq!(
+            item["transforms"],
+            json!(["variables-expanded", "heredoc-extracted"])
+        );
         assert_eq!(item["gate_version"], "0.3.13");
         // The pass-through fields go through the same masking as the rest.
-        assert_eq!(item["detail"], "git checkout discards uncommitted changes [REDACTED]");
+        assert_eq!(
+            item["detail"],
+            "git checkout discards uncommitted changes [REDACTED]"
+        );
     }
 
     #[test]
     fn secret_masking() {
-        assert_eq!(mask_secrets("key sk-abcdefghijklmnop1234 end"), "key [REDACTED] end");
-        assert_eq!(mask_secrets("tok ghp_abcdefghijklmnopqrst"), "tok [REDACTED]");
+        assert_eq!(
+            mask_secrets("key sk-abcdefghijklmnop1234 end"),
+            "key [REDACTED] end"
+        );
+        assert_eq!(
+            mask_secrets("tok ghp_abcdefghijklmnopqrst"),
+            "tok [REDACTED]"
+        );
         assert_eq!(mask_secrets("AKIAIOSFODNN7EXAMPLE"), "[REDACTED]");
         assert_eq!(mask_secrets("sk_live_abc123"), "[REDACTED]");
-        assert_eq!(mask_secrets("Authorization: Bearer abc.xyz"), "Authorization: [REDACTED]");
+        assert_eq!(
+            mask_secrets("Authorization: Bearer abc.xyz"),
+            "Authorization: [REDACTED]"
+        );
         assert_eq!(mask_secrets("api_key=supersecret"), "[REDACTED]");
         assert_eq!(mask_secrets("Token: abc123"), "[REDACTED]");
         assert_eq!(mask_secrets("password: hunter2"), "[REDACTED]");
-        assert_eq!(mask_secrets("a task-x and tokens stay"), "a task-x and tokens stay");
+        assert_eq!(
+            mask_secrets("a task-x and tokens stay"),
+            "a task-x and tokens stay"
+        );
         assert_eq!(mask_secrets("sk-short stays"), "sk-short stays");
     }
 
     #[test]
     fn secret_masking_survives_non_ascii_values() {
-        assert_eq!(mask_secrets("Authorization: Bearer abc… end"), "Authorization: [REDACTED] end");
+        assert_eq!(
+            mask_secrets("Authorization: Bearer abc… end"),
+            "Authorization: [REDACTED] end"
+        );
         assert_eq!(mask_secrets("token: café ok"), "[REDACTED] ok");
         assert_eq!(mask_secrets("password=🔑🔑 x"), "[REDACTED] x");
         assert_eq!(mask_secrets("Bearer é"), "[REDACTED]");
@@ -757,7 +827,8 @@ mod tests {
 
     #[test]
     fn masks_inside_items_and_permits() {
-        let mut v = json!({"action_preview": "echo api_key=zzz", "permit": {"session": "Bearer qq"}});
+        let mut v =
+            json!({"action_preview": "echo api_key=zzz", "permit": {"session": "Bearer qq"}});
         mask_value(&mut v);
         assert_eq!(v["action_preview"], "echo [REDACTED]");
         assert_eq!(v["permit"]["session"], "[REDACTED]");
@@ -836,7 +907,10 @@ mod tests {
             "dddd4444dddd4444dddd4444dddd4444dddd4444dddd4444dddd4444dddd4444"
         );
         assert_eq!(stopped["permit"]["note"], PERMIT_NOTE);
-        assert_eq!(allowed["permit"]["action_digest"], "aaaa1111aaaa1111aaaa1111");
+        assert_eq!(
+            allowed["permit"]["action_digest"],
+            "aaaa1111aaaa1111aaaa1111"
+        );
         assert_eq!(allowed["permit"]["status"], "used");
         assert_eq!(allowed["permit"]["origin_source"], "claude");
     }
@@ -852,9 +926,21 @@ mod tests {
             &day_file(h1_at),
             &format!(
                 "{}\n{}\n{}\n",
-                rec(&h1, "STOP", r#","action_digest":"eeee5555eeee5555eeee5555","commitment":"OP-006","rule":"no-paid-deploy","detail":"x""#),
-                rec(&h1, "STOP", r#","action_digest":"ffff6666ffff6666ffff6666","commitment":"OP-005","rule":"no-unreviewed-publish","detail":"y""#),
-                rec(&h1, "STOP", r#","action_digest":"012345678901234567890123","commitment":"OP-003","rule":"no-blind-recursive-delete","detail":"z""#),
+                rec(
+                    &h1,
+                    "STOP",
+                    r#","action_digest":"eeee5555eeee5555eeee5555","commitment":"OP-006","rule":"no-paid-deploy","detail":"x""#
+                ),
+                rec(
+                    &h1,
+                    "STOP",
+                    r#","action_digest":"ffff6666ffff6666ffff6666","commitment":"OP-005","rule":"no-unreviewed-publish","detail":"y""#
+                ),
+                rec(
+                    &h1,
+                    "STOP",
+                    r#","action_digest":"012345678901234567890123","commitment":"OP-003","rule":"no-blind-recursive-delete","detail":"z""#
+                ),
             ),
         );
         let out = run(&home, &query(json!({}))).unwrap();
@@ -867,7 +953,10 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        assert_eq!(find("eeee5555eeee5555eeee5555")["permit"]["status"], "active");
+        assert_eq!(
+            find("eeee5555eeee5555eeee5555")["permit"]["status"],
+            "active"
+        );
         assert_eq!(
             find("ffff6666ffff6666ffff6666")["permit"]["status"],
             "expired"
@@ -939,8 +1028,16 @@ mod tests {
         let (dir, [first, allow, again]) = stopped_twice(t0);
         let ad = "abab1212abab1212abab1212";
         let secs = |s: i64| t0 + chrono::Duration::seconds(s);
-        write(dir.path(), &format!("permits/{ad}.json.used"), &permit(ad, secs(30), None));
-        write(dir.path(), &format!("permits/{ad}.json"), &permit(ad, secs(150), None));
+        write(
+            dir.path(),
+            &format!("permits/{ad}.json.used"),
+            &permit(ad, secs(30), None),
+        );
+        write(
+            dir.path(),
+            &format!("permits/{ad}.json"),
+            &permit(ad, secs(150), None),
+        );
         let out = run(dir.path(), &query(json!({}))).unwrap();
         assert_eq!(permit_status(&out, &first), "used");
         assert_eq!(permit_status(&out, &allow), "used");
@@ -955,8 +1052,16 @@ mod tests {
         let (dir, [first, _, again]) = stopped_twice(t0);
         let ad = "abab1212abab1212abab1212";
         let secs = |s: i64| t0 + chrono::Duration::seconds(s);
-        write(dir.path(), &format!("permits/{ad}.json.used"), &permit(ad, secs(125), Some(&again)));
-        write(dir.path(), &format!("permits/{ad}.json"), &permit(ad, secs(130), Some(&first)));
+        write(
+            dir.path(),
+            &format!("permits/{ad}.json.used"),
+            &permit(ad, secs(125), Some(&again)),
+        );
+        write(
+            dir.path(),
+            &format!("permits/{ad}.json"),
+            &permit(ad, secs(130), Some(&first)),
+        );
         let out = run(dir.path(), &query(json!({}))).unwrap();
         assert_eq!(permit_status(&out, &first), "active");
         assert_eq!(permit_status(&out, &again), "used");
@@ -966,15 +1071,25 @@ mod tests {
     fn receipt_files_dated_before_the_window_are_not_read() {
         let dir = tempfile::TempDir::new().unwrap();
         let home = dir.path();
-        let cutoff = DateTime::parse_from_rfc3339("2026-10-12T06:00:00Z").unwrap().timestamp();
+        let cutoff = DateTime::parse_from_rfc3339("2026-10-12T06:00:00Z")
+            .unwrap()
+            .timestamp();
         // Every line is stamped inside the window, so only a file's date can keep it out.
         let inside = rec("2026-10-12T07:00:00Z", "STOP", "");
         for day in ["2026-10-10", "2026-10-11", "2026-10-12"] {
-            write(home, &format!("receipts/{day}.jsonl"), &format!("not json\n{inside}\n"));
+            write(
+                home,
+                &format!("receipts/{day}.jsonl"),
+                &format!("not json\n{inside}\n"),
+            );
         }
         write(home, "receipts/undated.jsonl", &format!("{inside}\n"));
         let (recs, skipped) = read_receipts(home, cutoff);
-        assert_eq!(recs.len(), 3, "10-11 (one spare day), 10-12 and the undated file");
+        assert_eq!(
+            recs.len(),
+            3,
+            "10-11 (one spare day), 10-12 and the undated file"
+        );
         assert_eq!(skipped, 2, "the 10-10 file is never read");
     }
 }

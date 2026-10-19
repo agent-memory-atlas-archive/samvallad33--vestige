@@ -18,7 +18,7 @@ pub mod dashboard;
 pub mod intake;
 mod intention_graph_log;
 pub mod protocol;
-#[cfg(all(test, not(feature = "legacy-sqlite")))]
+#[cfg(test)]
 mod protocol_stdio_store;
 pub mod resources;
 pub mod rules_hook;

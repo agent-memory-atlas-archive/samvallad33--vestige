@@ -95,7 +95,6 @@ pub mod ghostlink;
 pub mod composed_graph;
 pub mod contradictions;
 pub mod cross_reference;
-pub(crate) mod lookup_packet;
 
 // v2.0.5: Active Forgetting — Anderson 2025 + Davis Rac1
 pub mod suppress;

@@ -1814,40 +1814,12 @@ impl ImportanceSignals {
     }
 
     /// Compute composite importance for content.
-    ///
-    /// The channels read the words of `content`: novelty against a learned
-    /// word model, arousal from an emotion lexicon. That is a text heuristic,
-    /// and the model it learns makes two identical calls answer differently,
-    /// so it exists only in the legacy engine build (`legacy-sqlite`). Every
-    /// other build returns [`ImportanceScore::not_scored`] and reads nothing:
-    /// see [`TEXT_SCORING_COMPILED_IN`].
     pub fn compute_importance(&self, content: &str, context: &Context) -> ImportanceScore {
-        #[cfg(not(feature = "legacy-sqlite"))]
-        {
-            let _ = (content, context);
-            ImportanceScore::not_scored(&self.weights)
-        }
-        #[cfg(feature = "legacy-sqlite")]
-        {
-            let novelty = self.novelty.compute(content, context);
-            let arousal = self.arousal.compute(content);
-
-            // For reward and attention, we need additional context
-            let reward = context
-                .recent_memory_ids
-                .first()
-                .map(|id| self.reward.compute(id))
-                .unwrap_or(0.5);
-
-            let access_pattern = AccessPattern::default();
-            let attention = self.attention.compute(&access_pattern);
-
-            self.compute_composite(novelty, arousal, reward, attention, content, context)
-        }
+        let _ = (content, context);
+        ImportanceScore::not_scored(&self.weights)
     }
 
-    /// Compute composite importance with explicit values. Legacy engine build
-    /// only, like [`Self::compute_importance`]; elsewhere it is not scored.
+    /// Compute composite importance with explicit values.
     pub fn compute_importance_explicit(
         &self,
         content: &str,
@@ -1855,33 +1827,13 @@ impl ImportanceSignals {
         memory_id: Option<&str>,
         access_pattern: Option<&AccessPattern>,
     ) -> ImportanceScore {
-        #[cfg(not(feature = "legacy-sqlite"))]
-        {
-            let _ = (content, context, memory_id, access_pattern);
-            ImportanceScore::not_scored(&self.weights)
-        }
-        #[cfg(feature = "legacy-sqlite")]
-        {
-            let novelty = self.novelty.compute(content, context);
-            let arousal = self.arousal.compute(content);
-
-            let reward = memory_id.map(|id| self.reward.compute(id)).unwrap_or(0.5);
-
-            let attention = access_pattern
-                .map(|p| self.attention.compute(p))
-                .unwrap_or(0.5);
-
-            self.compute_composite(novelty, arousal, reward, attention, content, context)
-        }
+        let _ = (content, context, memory_id, access_pattern);
+        ImportanceScore::not_scored(&self.weights)
     }
 
-    /// Update novelty model (learning). Legacy engine build only: elsewhere no
-    /// word model is kept, so this reads nothing and changes nothing.
+    /// Update novelty model (learning). No word model is kept on Strata.
     pub fn learn_content(&mut self, content: &str) {
-        #[cfg(not(feature = "legacy-sqlite"))]
         let _ = content;
-        #[cfg(feature = "legacy-sqlite")]
-        self.novelty.update_model(content);
     }
 
     /// Record outcome for reward learning
@@ -1902,69 +1854,6 @@ impl ImportanceSignals {
     /// Set weights
     pub fn set_weights(&mut self, weights: CompositeWeights) {
         self.weights = weights;
-    }
-
-    #[cfg(feature = "legacy-sqlite")]
-    fn compute_composite(
-        &self,
-        novelty: f64,
-        arousal: f64,
-        reward: f64,
-        attention: f64,
-        content: &str,
-        context: &Context,
-    ) -> ImportanceScore {
-        // Weighted composite
-        let composite = novelty * self.weights.novelty
-            + arousal * self.weights.arousal
-            + reward * self.weights.reward
-            + attention * self.weights.attention;
-
-        // Encoding boost: high importance = stronger encoding
-        let encoding_boost = 1.0 + (composite - 0.5) * 0.6; // 0.7 to 1.3
-
-        // Consolidation priority based on score
-        let consolidation_priority = if composite > 0.8 {
-            ConsolidationPriority::Critical
-        } else if composite > 0.6 {
-            ConsolidationPriority::High
-        } else if composite > 0.4 {
-            ConsolidationPriority::Normal
-        } else {
-            ConsolidationPriority::Low
-        };
-
-        // Build explanations
-        let novelty_explanation = self.novelty.explain(content, context);
-        let arousal_explanation = self.arousal.explain(content);
-        let reward_explanation = context
-            .recent_memory_ids
-            .first()
-            .map(|id| self.reward.explain(id))
-            .unwrap_or(RewardExplanation {
-                score: 0.5,
-                helpful_count: 0,
-                total_count: 0,
-                helpfulness_ratio: 0.5,
-                last_outcome: None,
-            });
-        let attention_explanation = self.attention.explain(&AccessPattern::default());
-
-        ImportanceScore {
-            composite: composite.clamp(MIN_IMPORTANCE, MAX_IMPORTANCE),
-            novelty,
-            arousal,
-            reward,
-            attention,
-            encoding_boost,
-            consolidation_priority,
-            weights_used: self.weights.clone(),
-            novelty_explanation: Some(novelty_explanation),
-            arousal_explanation: Some(arousal_explanation),
-            reward_explanation: Some(reward_explanation),
-            attention_explanation: Some(attention_explanation),
-            computed_at: Utc::now(),
-        }
     }
 }
 
@@ -2065,7 +1954,7 @@ pub struct ImportanceScore {
 /// the legacy engine build (`legacy-sqlite`). The default build, which serves
 /// a Strata log, compiles the text scorer out: [`ImportanceSignals`] then
 /// returns [`ImportanceScore::not_scored`] and learns nothing from content.
-pub const TEXT_SCORING_COMPILED_IN: bool = cfg!(feature = "legacy-sqlite");
+pub const TEXT_SCORING_COMPILED_IN: bool = false;
 
 impl ImportanceScore {
     /// The score of a build that does not score text: every channel 0.0, a
@@ -2364,7 +2253,6 @@ mod tests {
     /// The default build has no text scorer: the same words score nothing, an
     /// "emotional" sentence scores the same as a flat one, and learning the
     /// content changes no later answer.
-    #[cfg(not(feature = "legacy-sqlite"))]
     #[test]
     fn the_default_build_scores_no_text_and_learns_none() {
         const { assert!(!TEXT_SCORING_COMPILED_IN) };
@@ -2398,51 +2286,6 @@ mod tests {
         assert_eq!(score.encoding_boost, 1.0);
         assert_eq!(score.consolidation_priority, ConsolidationPriority::Normal);
         assert!(score.explain().is_empty());
-    }
-
-    #[cfg(feature = "legacy-sqlite")]
-    #[test]
-    fn test_composite_importance() {
-        let signals = ImportanceSignals::new();
-        let context = Context::current()
-            .with_project("test-project")
-            .with_learning_session(true);
-
-        // Test with emotional, novel content
-        let score = signals.compute_importance(
-            "BREAKTHROUGH: Solved the critical performance issue that was blocking release!!!",
-            &context,
-        );
-
-        assert!(score.composite > 0.5, "Important content should score high");
-        assert!(
-            score.arousal > 0.5,
-            "Emotional content should have high arousal"
-        );
-
-        // Check encoding boost
-        assert!(
-            score.encoding_boost >= 1.0,
-            "High importance should boost encoding"
-        );
-    }
-
-    #[cfg(feature = "legacy-sqlite")]
-    #[test]
-    fn test_importance_score_explanation() {
-        let signals = ImportanceSignals::new();
-        let context = Context::current();
-
-        let score = signals.compute_importance("Critical error in production system!", &context);
-
-        let explanation = score.explain();
-        assert!(!explanation.is_empty(), "Should provide explanation");
-
-        let summary = score.summary();
-        assert!(
-            summary.contains("Importance"),
-            "Summary should contain score"
-        );
     }
 
     #[test]

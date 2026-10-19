@@ -237,6 +237,15 @@ const MAX_NEIGHBOR_EDGES: usize = 20;
 /// handle-mode response.
 fn handle_flow(storage: &Arc<Storage>, args: &Option<Value>) -> Option<Result<Value, String>> {
     let object = args.as_ref()?.as_object()?;
+    let limit = object
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as usize).max(1));
+    let detail_level = object
+        .get("detail_level")
+        .or_else(|| object.get("detailLevel"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("full");
     if !object.contains_key("handle") {
         // A Strata log has no free-text search, so a `query` there can only be
         // an exact handle. Resolve it as one instead of refusing an id or a tag
@@ -253,7 +262,13 @@ fn handle_flow(storage: &Arc<Storage>, args: &Option<Value>) -> Option<Result<Va
         if resolution.ids.is_empty() && resolution.candidates.is_empty() {
             return None; // not a handle: the search path answers similarity_disabled as before
         }
-        return Some(Ok(handle_resolution_payload(storage, query, resolution)));
+        return Some(Ok(handle_resolution_payload(
+            storage,
+            query,
+            resolution,
+            limit,
+            detail_level,
+        )));
     }
     let handle = object
         .get("handle")
@@ -262,7 +277,13 @@ fn handle_flow(storage: &Arc<Storage>, args: &Option<Value>) -> Option<Result<Va
         .unwrap_or("");
     if !handle.is_empty() {
         let resolution = storage.resolve_handle(handle);
-        return Some(Ok(handle_resolution_payload(storage, handle, resolution)));
+        return Some(Ok(handle_resolution_payload(
+            storage,
+            handle,
+            resolution,
+            limit,
+            detail_level,
+        )));
     }
     // `handle` present but empty/non-string: free text with no handle — the
     // handle_required payload, with candidates mined from the free text.
@@ -278,22 +299,32 @@ fn handle_resolution_payload(
     storage: &Arc<Storage>,
     handle: &str,
     resolution: HandleResolution,
+    limit: Option<usize>,
+    detail_level: &str,
 ) -> Value {
     if !resolution.ids.is_empty() {
-        let nodes: Vec<Value> = resolution
-            .ids
+        let total_nodes = resolution.ids.len();
+        let active_ids: &[String] = match limit {
+            Some(l) if l < resolution.ids.len() => &resolution.ids[..l],
+            _ => &resolution.ids,
+        };
+        let nodes: Vec<Value> = active_ids
             .iter()
             .filter_map(|id| storage.get_node(id).ok().flatten())
-            .map(node_payload)
+            .map(|n| node_payload_with_detail(n, detail_level))
             .collect();
-        let neighbors = one_hop_neighbors(storage, &resolution.ids);
-        return serde_json::json!({
+        let neighbors = one_hop_neighbors(storage, active_ids);
+        let mut out = serde_json::json!({
             "handle": handle,
             "kind": resolution.kind.as_str(),
             "exact": resolution.exact,
             "nodes": nodes,
             "neighbors": neighbors,
         });
+        if nodes.len() < total_nodes {
+            out["totalNodes"] = serde_json::json!(total_nodes);
+        }
+        return out;
     }
     if !resolution.candidates.is_empty() {
         return serde_json::json!({
@@ -379,13 +410,48 @@ fn candidate_json(resolution: &HandleResolution) -> Vec<Value> {
         .collect()
 }
 
+fn truncate_content(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let mut s: String = text.chars().take(max_chars).collect();
+        s.push('…');
+        s
+    }
+}
+
 /// Lean node payload for handle responses. `createdAt` lets a caller order
 /// what one tag returns (the SessionStart rules hook lists newest first).
-fn node_payload(node: KnowledgeNode) -> Value {
+fn node_payload_with_detail(node: KnowledgeNode, detail_level: &str) -> Value {
+    match detail_level {
+        "brief" => serde_json::json!({
+            "id": node.id,
+            "type": node.node_type,
+            "tags": node.tags,
+            "createdAt": node.created_at.to_rfc3339(),
+        }),
+        "summary" => serde_json::json!({
+            "id": node.id,
+            "type": node.node_type,
+            "content": truncate_content(&node.content, 240),
+            "tags": node.tags,
+            "createdAt": node.created_at.to_rfc3339(),
+        }),
+        _ => serde_json::json!({
+            "id": node.id,
+            "type": node.node_type,
+            "content": node.content,
+            "tags": node.tags,
+            "createdAt": node.created_at.to_rfc3339(),
+        }),
+    }
+}
+
+fn neighbor_node_payload(node: KnowledgeNode, max_chars: usize) -> Value {
     serde_json::json!({
         "id": node.id,
         "type": node.node_type,
-        "content": node.content,
+        "content": truncate_content(&node.content, max_chars),
         "tags": node.tags,
         "createdAt": node.created_at.to_rfc3339(),
     })
@@ -393,10 +459,12 @@ fn node_payload(node: KnowledgeNode) -> Value {
 
 /// One hop over `memory_connections` typed edges, strongest first, deduped,
 /// capped. Each neighbor entry carries the edge (link_type + strength +
-/// direction) and the neighbor node payload.
+/// direction) and a bounded neighbor node preview so multi-KB bodies are not
+/// duplicated across up to 20 edges.
 fn one_hop_neighbors(storage: &Arc<Storage>, ids: &[String]) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     let mut seen_edges: Vec<(String, String)> = Vec::new();
+    let mut seen_nodes: std::collections::HashSet<String> = ids.iter().cloned().collect();
     for id in ids {
         let connections = match storage.get_connections_for_memory(id) {
             Ok(conns) => conns,
@@ -416,7 +484,16 @@ fn one_hop_neighbors(storage: &Arc<Storage>, ids: &[String]) -> Vec<Value> {
             } else {
                 edge.source_id.clone()
             };
-            let node = storage.get_node(&other).ok().flatten().map(node_payload);
+            let max_chars = if seen_nodes.insert(other.clone()) {
+                200
+            } else {
+                80
+            };
+            let node = storage
+                .get_node(&other)
+                .ok()
+                .flatten()
+                .map(|n| neighbor_node_payload(n, max_chars));
             out.push(serde_json::json!({
                 "from": edge.source_id,
                 "to": edge.target_id,
@@ -428,239 +505,6 @@ fn one_hop_neighbors(storage: &Arc<Storage>, ids: &[String]) -> Vec<Value> {
         }
     }
     out
-}
-
-#[cfg(all(test, feature = "legacy-sqlite"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_schema_has_mode_and_no_required() {
-        let s = schema();
-        let modes = s["properties"]["mode"]["enum"].as_array().unwrap();
-        assert_eq!(modes.len(), 3);
-        assert_eq!(s["properties"]["mode"]["default"], "lookup");
-        // query must NOT be globally required (contradictions uses topic).
-        assert!(
-            s.get("required").is_none(),
-            "recall must not globally require 'query'"
-        );
-        // lookup params carried over from search schema.
-        assert!(s["properties"]["limit"].is_object());
-        assert!(s["properties"]["detail_level"].is_object());
-    }
-
-    #[tokio::test]
-    async fn test_lookup_is_default_and_resolves() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
-        let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
-        let oc = OutputConfig::default();
-        // No mode → lookup → behaves like search (query required by search).
-        let args = Some(serde_json::json!({ "query": "anything" }));
-        let r = execute(&storage, &cognitive, &oc, args).await;
-        assert!(r.is_ok(), "default lookup should resolve: {r:?}");
-    }
-
-    #[tokio::test]
-    async fn test_contradictions_mode_resolves_without_query() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
-        let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
-        let oc = OutputConfig::default();
-        // contradictions uses topic, not query — must resolve with no query.
-        let args = Some(serde_json::json!({ "mode": "contradictions" }));
-        let r = execute(&storage, &cognitive, &oc, args).await;
-        assert!(r.is_ok(), "contradictions mode should resolve: {r:?}");
-    }
-
-    // ---- handle mode ----
-
-    use vestige_core::{ConnectionRecord, IngestInput};
-
-    fn connect(storage: &Arc<Storage>, from: &str, to: &str, link_type: &str, strength: f64) {
-        let now = chrono::Utc::now();
-        storage
-            .save_connection(&ConnectionRecord {
-                source_id: from.to_string(),
-                target_id: to.to_string(),
-                strength,
-                link_type: link_type.to_string(),
-                created_at: now,
-                last_activated: now,
-                activation_count: 0,
-            })
-            .unwrap();
-    }
-
-    const SHA_A: &str = "0123456789abcdef0123456789abcdef01234567";
-    const SHA_B: &str = "0123456789fffffffedcba9876543210fedcba98";
-
-    async fn handle_store() -> (Arc<Storage>, tempfile::TempDir, String) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let storage = vestige_core::open_storage(Some(dir.path().join("handle.db"))).unwrap();
-        let memory = storage
-            .ingest(IngestInput {
-                content: "Set API_TIMEOUT=2 in the deploy env".into(),
-                tags: vec!["deploy-env".into()],
-                ..Default::default()
-            })
-            .unwrap();
-        let cause = storage
-            .ingest(IngestInput {
-                content: "commit flipping API_TIMEOUT default".into(),
-                ..Default::default()
-            })
-            .unwrap();
-        let commit_a = storage
-            .ingest(IngestInput {
-                content: format!("commit {SHA_A} speed up cold starts\nfiles: src/main.rs"),
-                tags: vec!["git-commit".into()],
-                ..Default::default()
-            })
-            .unwrap();
-        let _commit_b = storage
-            .ingest(IngestInput {
-                content: format!("commit {SHA_B} fix the thing"),
-                tags: vec!["git-commit".into()],
-                ..Default::default()
-            })
-            .unwrap();
-        connect(&storage, &memory.id, &cause.id, "causal", 0.9);
-        connect(&storage, &commit_a.id, &memory.id, "temporal", 0.4);
-        let memory_id = memory.id.clone();
-        (storage, dir, memory_id)
-    }
-
-    #[tokio::test]
-    async fn handle_resolves_uuid_and_returns_one_hop_neighbors() {
-        let (storage, _dir, memory_id) = handle_store().await;
-        let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
-        let oc = OutputConfig::default();
-        let out = execute(
-            &storage,
-            &cognitive,
-            &oc,
-            Some(serde_json::json!({ "handle": memory_id })),
-        )
-        .await
-        .unwrap();
-        assert_eq!(out["kind"], "memory");
-        assert_eq!(out["exact"], true);
-        assert_eq!(out["nodes"][0]["id"], serde_json::json!(memory_id));
-        let neighbors = out["neighbors"].as_array().unwrap();
-        assert_eq!(neighbors.len(), 2, "one hop, both directions: {out}");
-        // Strongest edge first (causal 0.9 before temporal 0.4).
-        assert_eq!(neighbors[0]["link_type"], "causal");
-        assert_eq!(neighbors[0]["direction"], "outgoing");
-        assert!(
-            neighbors[0]["node"].is_object(),
-            "neighbor node payload included"
-        );
-        assert_eq!(neighbors[1]["link_type"], "temporal");
-        assert_eq!(neighbors[1]["direction"], "incoming");
-    }
-
-    #[tokio::test]
-    async fn handle_commit_sha_prefix_and_ambiguity() {
-        let (storage, _dir, _memory_id) = handle_store().await;
-        let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
-        let oc = OutputConfig::default();
-        // Full sha: exact commit resolution.
-        let out = execute(
-            &storage,
-            &cognitive,
-            &oc,
-            Some(serde_json::json!({ "handle": SHA_A })),
-        )
-        .await
-        .unwrap();
-        assert_eq!(out["kind"], "commit");
-        assert_eq!(out["exact"], true);
-        // Shared 7-char prefix across both commits: ambiguous candidates.
-        let out = execute(
-            &storage,
-            &cognitive,
-            &oc,
-            Some(serde_json::json!({ "handle": &SHA_A[..7] })),
-        )
-        .await
-        .unwrap();
-        assert_eq!(out["error"], "ambiguous");
-        assert_eq!(out["candidates"].as_array().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn free_text_without_handle_returns_handle_required_with_candidates() {
-        let (storage, _dir, _memory_id) = handle_store().await;
-        let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
-        let oc = OutputConfig::default();
-        // `handle` key present but empty: free text -> handle_required, with
-        // candidates mined from the text (API_TIMEOUT resolves the memory).
-        let out = execute(
-            &storage,
-            &cognitive,
-            &oc,
-            Some(serde_json::json!({ "handle": "", "query": "what did API_TIMEOUT change" })),
-        )
-        .await
-        .unwrap();
-        assert_eq!(out["error"], "handle_required");
-        assert!(
-            out["detail"]
-                .as_str()
-                .unwrap()
-                .contains("recall is handle-based"),
-            "detail must be the canonical guidance: {out}"
-        );
-        let candidates = out["candidates"].as_array().unwrap();
-        assert!(
-            !candidates.is_empty(),
-            "identifier token must yield candidates: {out}"
-        );
-        assert!(
-            candidates
-                .iter()
-                .all(|c| c["kind"] == "symbol" || c["kind"] == "memory")
-        );
-        // Pure prose with no identifiers: the same error, empty candidates.
-        let out = execute(
-            &storage,
-            &cognitive,
-            &oc,
-            Some(serde_json::json!({ "handle": "", "query": "how did the build break" })),
-        )
-        .await
-        .unwrap();
-        assert_eq!(out["error"], "handle_required");
-        assert_eq!(out["candidates"].as_array().unwrap().len(), 0);
-        // An unresolvable non-empty handle: same payload shape.
-        let out = execute(
-            &storage,
-            &cognitive,
-            &oc,
-            Some(serde_json::json!({ "handle": "no_such_symbol_anywhere" })),
-        )
-        .await
-        .unwrap();
-        assert_eq!(out["error"], "handle_required");
-    }
-
-    #[tokio::test]
-    async fn no_handle_key_keeps_legacy_mode_dispatch() {
-        let (storage, _dir, _memory_id) = handle_store().await;
-        let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
-        let oc = OutputConfig::default();
-        // No `handle` key: the legacy hot path still answers a plain query.
-        let out = execute(
-            &storage,
-            &cognitive,
-            &oc,
-            Some(serde_json::json!({ "query": "API_TIMEOUT" })),
-        )
-        .await;
-        assert!(out.is_ok(), "legacy lookup must keep working: {out:?}");
-    }
 }
 
 /// `query` on a Strata log: there is no free-text search there, so an exact
@@ -807,5 +651,31 @@ mod strata_query {
             "{err}"
         );
         assert!(err.contains("pass an exact handle"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn recall_respects_limit_and_detail_level_on_tag_handles() {
+        let (storage, _dir, _tagged, _other) = store();
+        storage
+            .ingest(IngestInput {
+                content: "second deploy-env memory with extra payload".to_string(),
+                tags: vec!["deploy-env".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let out = recall(
+            &storage,
+            serde_json::json!({
+                "handle": "deploy-env",
+                "limit": 1,
+                "detail_level": "brief"
+            }),
+        )
+        .await
+        .unwrap();
+        let nodes = out["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(out["totalNodes"], 2);
+        assert!(nodes[0].get("content").is_none());
     }
 }

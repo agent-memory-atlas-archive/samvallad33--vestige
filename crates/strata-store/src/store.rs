@@ -2652,8 +2652,7 @@ impl StrataStore {
     /// latest few effects stops early.
     pub fn indexed_effects(
         &self,
-    ) -> Result<impl DoubleEndedIterator<Item = (&EffectProof, Option<i64>)> + '_, StoreError>
-    {
+    ) -> Result<impl DoubleEndedIterator<Item = (&EffectProof, Option<i64>)> + '_, StoreError> {
         self.effect_index.check()?;
         Ok(self
             .effect_index

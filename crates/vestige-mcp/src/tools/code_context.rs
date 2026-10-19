@@ -2,7 +2,7 @@
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
-use vestige_core::codebase::{AnchorStatus, AnchorVerification, CodeAnchor, verify_anchor};
+use vestige_core::codebase::{AnchorStatus, AnchorVerification, verify_anchor};
 use vestige_core::{KnowledgeNode, Storage};
 
 pub(super) fn is_code_memory(node: &KnowledgeNode) -> bool {
@@ -278,32 +278,6 @@ fn verification_order<V>(
     order
 }
 
-/// Roll the *persisted* per-anchor statuses of one memory into a single
-/// last-known status. Staleness wins over freshness, mirroring
-/// [`worst_status`]; `None` means the memory has no anchors at all.
-pub(super) fn worst_persisted_status(anchors: &[CodeAnchor]) -> Option<AnchorStatus> {
-    if anchors.is_empty() {
-        return None;
-    }
-    let statuses: Vec<AnchorStatus> = anchors.iter().filter_map(|a| a.last_status).collect();
-    if statuses.is_empty() {
-        return None;
-    }
-    if statuses.iter().any(|s| s == &AnchorStatus::Missing) {
-        Some(AnchorStatus::Missing)
-    } else if statuses.iter().any(|s| s == &AnchorStatus::Drifted) {
-        Some(AnchorStatus::Drifted)
-    } else if statuses.len() < anchors.len() {
-        // At least one anchor has never been checked: the honest roll-up is
-        // "we last looked and saw X, but not everything has been looked at".
-        Some(AnchorStatus::Unverifiable)
-    } else if statuses.iter().any(|s| s == &AnchorStatus::Moved) {
-        Some(AnchorStatus::Moved)
-    } else {
-        Some(AnchorStatus::Verified)
-    }
-}
-
 /// Annotate already-formatted memory items with their verification verdict.
 /// Returns the ids of the memories that are visibly stale.
 pub(super) fn annotate_items(
@@ -386,6 +360,7 @@ mod verification_order_tests {
     use super::*;
     use std::collections::HashMap;
     use vestige_core::IngestInput;
+    use vestige_core::codebase::CodeAnchor;
 
     fn ids(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| name.to_string()).collect()

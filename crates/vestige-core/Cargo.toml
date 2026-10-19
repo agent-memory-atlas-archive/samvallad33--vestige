@@ -14,54 +14,12 @@ categories = ["science", "database"]
 
 [features]
 default = ["codebase-git"]
-
-# LEGACY SQLITE QUARANTINE (build/t5-legacy-isolation).
-#
-# Every line of SQLite code lives behind this feature: the
-# `storage/sqlite/` module tree, the rusqlite-dependent sibling modules in
-# `storage/` (edges, blast, session_queries, trace_store, portable, ...),
-# `fts.rs` (SQLite FTS5 query sanitization), the `Storage =
-# SqliteMemoryStore` alias, and the `SqliteMemoryStore::new` constructor
-# path. Default ON for now; the flip to default-off happens after the
-# STRATA migration lands. Code outside this boundary must not name
-# rusqlite; open `Storage` handles through `storage::open_storage()`,
-# which fails with a clear error when this feature is off.
-legacy-sqlite = ["dep:rusqlite"]
-
-# Raw v3-engine test harness (PR 0a): builds the legacy engine WITHOUT the
-# v3 read-write guard, for the engine's own restart/durability unit tests
-# and the migration fixture tooling, which legitimately reopen synthetic
-# stores. Off by default; the shipped binary never enables it, so no
-# shipped path can open a v3 SQLite file read-write.
-v3-engine = ["legacy-sqlite"]
-
-# SQLite backend (default, unencrypted)
-bundled-sqlite = ["legacy-sqlite", "rusqlite/bundled"]
-
-# Git history analysis for codebase memory. Pulls git2 + libgit2, which drag
-# OpenSSL and libssh2 into the build. On by default. Off for targets where
-# those C libraries are the difference between a binary and no binary
-# (Android/Termux, #145): the codebase tool then answers "git history is not
-# available in this build" instead of failing to build.
-codebase-git = ["dep:git2"]
-
-# Encrypted SQLite via SQLCipher (mutually exclusive with bundled-sqlite)
-# Use: --no-default-features --features encryption,bundled-sqlite
-# Set VESTIGE_ENCRYPTION_KEY env var to enable encryption
-encryption = ["legacy-sqlite", "rusqlite/bundled-sqlcipher"]
-
-# External-source connectors (#57). The connector *contract*, normalization,
-# and content-hashing are always compiled (pure, no network). This feature adds
-# the network-backed reference connectors (GitHub Issues, …) via `reqwest`, so
-# the default local-first build never links an HTTP client.
+legacy-sqlite = []
+v3-engine = []
+bundled-sqlite = []
+codebase-git = []
+encryption = []
 connectors = ["dep:reqwest"]
-
-# Hosted managed-sync backend (Vestige Cloud). Adds the HTTP `PortableSyncBackend`
-# (`HttpPortableSyncBackend`) that pull-merge-pushes the portable archive to a
-# hosted blob endpoint over HTTPS with a per-user sync key. Like `connectors`,
-# this is the ONLY thing that links an HTTP client — the default local-first
-# build stays network-free. Uses `reqwest`'s blocking client because the
-# `PortableSyncBackend` trait methods are synchronous.
 cloud-sync = ["dep:reqwest", "reqwest/blocking", "dep:chacha20poly1305", "dep:argon2"]
 
 [dependencies]
@@ -81,11 +39,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Error handling
 thiserror = "2"
 
-# Database - SQLite with FTS5 full-text search and JSON
-# Note: "bundled" or "bundled-sqlcipher" added via feature flags above.
-# Optional: present only in `legacy-sqlite` builds (see feature block).
-rusqlite = { version = "0.40", features = ["chrono", "serde_json"], optional = true }
-
 # Platform-specific directories
 directories = "6"
 
@@ -94,13 +47,6 @@ tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time"
 
 # Tracing for structured logging
 tracing = "0.1"
-
-# Git integration for codebase memory (feature `codebase-git`, default on)
-# vendored-openssl: Compile OpenSSL from source for cross-compilation support
-git2 = { version = "0.21", features = ["vendored-openssl"], optional = true }
-
-# File watching for codebase memory
-notify = "8"
 
 trait-variant = "0.1"
 blake3 = "1"

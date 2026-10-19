@@ -2837,7 +2837,9 @@ fn indexed_effects_walk_the_full_scan_with_each_ops_own_clock() {
     let mut store = StrataStore::open(&dir).expect("open");
     let a = store.ingest(input("clock memory a", &[])).expect("a");
     let b = store.ingest(input("clock memory b", &[])).expect("b");
-    store.review_at(&a, 3, Some(1_700_000_000_500)).expect("review");
+    store
+        .review_at(&a, 3, Some(1_700_000_000_500))
+        .expect("review");
     store.review_at(&b, 2, None).expect("review with no clock");
     store
         .save_connection(&ConnectionRecord {
@@ -2865,7 +2867,10 @@ fn indexed_effects_walk_the_full_scan_with_each_ops_own_clock() {
         .map(|(proof, clock)| (proof.clone(), clock))
         .collect();
     let proofs: Vec<_> = indexed.iter().map(|(proof, _)| proof.clone()).collect();
-    assert_eq!(proofs, expected, "the index walks exactly what the log proves");
+    assert_eq!(
+        proofs, expected,
+        "the index walks exactly what the log proves"
+    );
     let clocks: Vec<_> = indexed
         .iter()
         .map(|(proof, clock)| (proof.action, *clock))
@@ -2888,7 +2893,9 @@ fn indexed_effects_walk_the_full_scan_with_each_ops_own_clock() {
         .map(|(proof, _)| proof.action);
     assert_eq!(newest, Some(EffectAction::Intention));
     assert_eq!(
-        reopened.node_record(&a).map(|record| record.content.as_str()),
+        reopened
+            .node_record(&a)
+            .map(|record| record.content.as_str()),
         Some("clock memory a")
     );
     assert!(reopened.node_record("mem-no-such-node").is_none());
