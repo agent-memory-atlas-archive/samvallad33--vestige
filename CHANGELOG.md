@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### @vestige/init 5.0.1: one command for the whole system
+
+- **`npx @vestige/init` installs everything.** It installs the four Vestige
+  binaries from the pinned `@vestige/mcp-<os>-<arch>` package into
+  `~/.local/bin`, starts `vestige-mcp` once to create the Strata store and
+  confirm its tools, connects the detected MCP clients, merges the
+  `vestige hook session-start` rules hook into `~/.claude/settings.json`,
+  installs Operator Lite 0.3.10 through its own installer, and runs the gate's
+  GuardFall self-test. Before this release it only wired clients, and stopped
+  with "vestige-mcp was not found" on a machine without the binary.
+- **Never downgrades.** An installed `vestige-mcp` as new as the bundled one is
+  kept; a binary is placed by rename, so a symlinked pin is replaced as a link
+  and the file it points at is never written through. The gate's installer
+  still refuses to replace a newer or paid gate, and still refuses to run in an
+  agent's shell; the summary says which.
+- **New flags:** `--yes` (all detected clients), `--no-gate`, `--no-hooks`.
+  `--dry-run` now plans every step.
+
 Operator Lite 0.3.11. Version 0.3.8 is skipped: it was published to npm and
 withdrawn, so the number cannot be used again.
 

@@ -5,6 +5,12 @@ const path = require('path');
 const os = require('os');
 const readline = require('readline');
 const { execFileSync, execSync, spawn } = require('child_process');
+// scripts/setup.sh downloads this file on its own, without lib/: it then runs the clients-only
+// wizard it always ran.
+let kernel = null;
+try {
+  kernel = require('../lib/vestige-kernel.js');
+} catch {}
 
 const PACKAGE_VERSION = process.env.VESTIGE_INIT_VERSION || require('../package.json').version;
 const HOME = os.homedir();
@@ -13,6 +19,9 @@ const RAW_ARGS = process.argv.slice(2);
 const FLAGS = new Set(RAW_ARGS);
 const JSON_OUTPUT = FLAGS.has('--json');
 const DRY_RUN = FLAGS.has('--dry-run');
+const CLIENTS_ONLY = FLAGS.has('--clients-only') || !kernel;
+const NO_GATE = FLAGS.has('--no-gate') || CLIENTS_ONLY;
+const NO_HOOKS = FLAGS.has('--no-hooks') || CLIENTS_ONLY;
 
 function valuesFor(flag) {
   const values = [];
@@ -44,7 +53,7 @@ function banner() {
   print('');
   print(tone.cyan('  ╭──────────────────────────────────────────────╮'));
   print(tone.cyan('  │') + `  ${tone.violet('VESTIGE')}  ${tone.dim('// LOCAL CONTROL PLANE')}            ` + tone.cyan('│'));
-  print(tone.cyan('  │') + `  ${tone.dim('detect  →  preserve  →  configure')}            ` + tone.cyan('│'));
+  print(tone.cyan('  │') + `  ${tone.dim('memory  →  clients  →  rules  →  gate')}        ` + tone.cyan('│'));
   print(tone.cyan('  ╰──────────────────────────────────────────────╯'));
   print(tone.dim(`  setup wizard v${PACKAGE_VERSION} · no cloud account · no telemetry`));
   print('');
@@ -470,12 +479,19 @@ function requestedClientNames() {
 
 function usage() {
   return [
-    'Usage: vestige-init [--interactive] [--client <name>] [--all --yes] [--dry-run] [--json]',
+    'Usage: vestige-init [--yes] [--client <name>] [--no-gate] [--no-hooks] [--dry-run] [--json]',
     '',
+    'Installs the whole Vestige system on this machine, in order:',
+    '  the vestige binaries, the Strata memory store, your MCP clients, the Claude Code',
+    '  rules hook, and Operator Lite (the free gate). Run it in your own terminal.',
+    '',
+    '  --yes               connect every detected client without a prompt',
     '  --interactive       choose detected clients in this terminal',
     '  --client <name>     configure one explicit client (claude-code, cursor, vscode, opencode, xcode, jetbrains, windsurf)',
-    '  --all --yes         configure every detected client without a prompt',
-    '  --dry-run           inspect proposed changes without writing',
+    '  --no-gate           skip Operator Lite',
+    '  --no-hooks          skip the Claude Code rules hook',
+    '  --clients-only      only connect clients to an installed vestige-mcp (the setup wizard before 5.0.1)',
+    '  --dry-run           show what would change without writing anything',
     '  --json              print a machine-readable result',
     '  --line-menu         use the numbered text selector instead of keyboard control',
     '  --no-animate        keep the keyboard selector still',
@@ -528,7 +544,7 @@ function signalFieldLines(detected, cursor, selected, phase, notice = '') {
   }
 
   lines.push('');
-  lines.push(`  ${tone.violet('01')}  ${tone.electric('CHOOSE YOUR LOCAL CLIENTS')}  ${tone.dim(`${selectionCount} selected`)}`);
+  lines.push(`  ${tone.violet('02')}  ${tone.electric('CHOOSE YOUR LOCAL CLIENTS')}  ${tone.dim(`${selectionCount} selected`)}`);
   lines.push(`      ${tone.magenta('◉')} ${tone.dim('STRATA')}  ${tone.dim('local evidence source')}`);
   detected.forEach(({ name }, index) => {
     const active = index === cursor;
@@ -541,7 +557,7 @@ function signalFieldLines(detected, cursor, selected, phase, notice = '') {
   });
   lines.push('');
   lines.push(`  ${tone.electric('↑↓ / j k')} move   ${tone.electric('space')} toggle   ${tone.electric('A')} all   ${tone.electric('N')} none`);
-  lines.push(`  ${tone.electric('enter')} review changes   ${tone.electric('esc / Q')} leave unchanged`);
+  lines.push(`  ${tone.electric('enter')} review changes   ${tone.electric('esc / Q')} skip clients`);
   lines.push(tone.dim('  Selection stays local until you approve the review screen.'));
   lines.push(notice ? tone.amber(`  ${notice}`) : tone.dim('  Every selected configuration is backed up before Vestige is added.'));
   return lines;
@@ -566,7 +582,7 @@ function reviewSelectedClients(detected, selected) {
     print(tone.dim('  Vestige will add an MCP server entry for these clients.'));
     print(tone.dim('  Existing file-based configuration is backed up before modification.'));
     print('');
-    print(`  ${tone.electric('enter')} write local configuration   ${tone.electric('esc')} go back   ${tone.electric('Q')} leave unchanged`);
+    print(`  ${tone.electric('enter')} write local configuration   ${tone.electric('esc')} go back   ${tone.electric('Q')} skip clients`);
 
     const wasRaw = Boolean(process.stdin.isRaw);
     const cleanup = () => {
@@ -672,26 +688,24 @@ async function selectClientsWithSignalField(detected) {
 
 async function selectClients(detected) {
   const requests = requestedClientNames();
-  const interactive = FLAGS.has('--interactive') || (process.stdin.isTTY && !JSON_OUTPUT && !FLAGS.has('--all') && requests.length === 0 && !DRY_RUN);
+  const interactive = FLAGS.has('--interactive') || (process.stdin.isTTY && !JSON_OUTPUT && !FLAGS.has('--all') && !FLAGS.has('--yes') && requests.length === 0 && !DRY_RUN);
 
   if (requests.length > 0) return selectedByName(detected, requests);
   if (DRY_RUN) return detected;
-  if (FLAGS.has('--all')) {
-    if (!FLAGS.has('--yes')) throw new Error('--all changes every detected client; add --yes to confirm');
-    return detected;
-  }
+  if (FLAGS.has('--yes')) return detected;
+  if (FLAGS.has('--all')) throw new Error('--all changes every detected client; add --yes to confirm');
   if (!interactive) {
-    throw new Error('non-interactive mode makes no changes by default; use --dry-run, --client <name>, or --all --yes');
+    throw new Error('non-interactive mode makes no changes by default; use --dry-run, --client <name>, or --yes');
   }
 
   if (supportsSignalField()) return selectClientsWithSignalField(detected);
 
-  print(tone.cyan('  01  DETECTED CLIENTS'));
+  print(tone.cyan('  02  DETECTED CLIENTS'));
   detected.forEach(({ name }, index) => {
     print(`      ${tone.violet(String(index + 1).padStart(2, '0'))}  ${name}`);
   });
   print(`      ${tone.violet('A ')}  Configure every detected client`);
-  print(`      ${tone.violet('Q ')}  Exit without changing anything`);
+  print(`      ${tone.violet('Q ')}  Skip client connections`);
   print('');
   print(tone.dim('  Each selected configuration is backed up before Vestige is added.'));
 
@@ -707,12 +721,36 @@ async function selectClients(detected) {
   return selected;
 }
 
-function renderProofPulse({ detected, configured, skipped, backups }) {
-  print(tone.cyan('  03  PROOF PULSE'));
-  print(`      ${tone.green('●')}  DETECTED     ${detected} local client${detected === 1 ? '' : 's'}`);
-  print(`      ${tone.green('●')}  PRESERVED    ${backups} configuration backup${backups === 1 ? '' : 's'} created`);
-  print(`      ${tone.green('●')}  CONFIGURED   ${configured} Vestige MCP connection${configured === 1 ? '' : 's'} written${skipped ? ` · ${skipped} already present` : ''}`);
-  print(`      ${tone.amber('○')}  VERIFY NEXT  restart the selected client and confirm its MCP tools`);
+const GATE_LINES = {
+  installed: (gate) => `Operator Lite ${gate.version} is guarding your agents`,
+  'installed-unwired': (gate) => `Operator Lite ${gate.version} is installed; Claude Code is not wired yet (see above)`,
+  'kept-existing': () => 'your installed gate is newer or paid, so it was kept',
+  'agent-shell': () => 'not installed: this shell belongs to an AI agent. Run npx @vestige/init in your own terminal',
+  failed: (gate) => `not installed (exit ${gate.code}); see the gate's message above`,
+  missing: (gate) => `not installed: ${gate.reason}`,
+  planned: (gate) => `Operator Lite ${gate.version} would be installed`,
+  skipped: () => 'skipped (--no-gate)',
+};
+
+function renderProofPulse({ detected, configured, skipped, backups, store, rules, gate, selfTest }) {
+  const ok = (good) => (good ? tone.green('●') : tone.amber('○'));
+  print(tone.cyan('  07  PROOF PULSE'));
+  if (store) {
+    print(`      ${ok(store.ok)}  STRATA       ${store.ok ? `${store.server} ${store.serverVersion || ''} answered with ${store.tools} tools` : `did not answer: ${store.reason}`}`);
+  }
+  print(`      ${ok(detected > 0)}  CLIENTS      ${configured} connection${configured === 1 ? '' : 's'} written${skipped ? ` · ${skipped} already present` : ''} · ${backups} backup${backups === 1 ? '' : 's'}`);
+  if (rules) {
+    const rulesGood = rules.status === 'written' || rules.status === 'present';
+    print(`      ${ok(rulesGood)}  RULES        ${rulesGood ? 'memories tagged pinned come back at every Claude Code session start' : rules.reason || rules.status}`);
+  }
+  if (gate) {
+    const gateGood = gate.status === 'installed' || gate.status === 'kept-existing';
+    print(`      ${ok(gateGood)}  GATE         ${(GATE_LINES[gate.status] || GATE_LINES.failed)(gate)}`);
+  }
+  if (selfTest) {
+    print(`      ${ok(selfTest.ok)}  SELF-TEST    ${selfTest.cases ? `${selfTest.passed} of ${selfTest.cases} ${selfTest.corpus} bypass cases caught` : selfTest.reason}`);
+  }
+  print(`      ${tone.amber('○')}  VERIFY NEXT  restart your clients and confirm the Vestige tools appear`);
   print('');
   print(tone.violet('      CONFIGURED ≠ VERIFIED'));
   print(tone.dim('      The local configuration is written. A live client response is the next proof.'));
@@ -742,7 +780,7 @@ async function offerObservatory(binaryPath) {
   if (!process.stdin.isTTY) return { offered: false, started: false };
 
   print('');
-  print(tone.cyan('  04  OPTIONAL LOCAL OBSERVATORY'));
+  print(tone.cyan('  08  OPTIONAL LOCAL OBSERVATORY'));
   print(tone.dim('      Open the local dashboard to inspect real records as your agent creates them.'));
   const answer = (await ask(tone.cyan('  Open it now? [y/N]: '))).toLowerCase();
   if (answer !== 'y' && answer !== 'yes') return { offered: true, started: false };
@@ -755,101 +793,193 @@ async function main() {
     return;
   }
   banner();
+  const report = { version: PACKAGE_VERSION, mode: DRY_RUN ? 'dry-run' : 'install' };
+  const plan = (text) => print(`      ${tone.violet('PLAN')}  ${text}`);
 
-  // Step 1: Find the binary
-  print(tone.cyan('  00  LOCATE VESTIGE'));
-  const binaryPath = findBinary();
-
-  if (!binaryPath) {
-    throw new Error('vestige-mcp was not found; install it first from https://github.com/samvallad33/vestige#install');
+  // Step 0: the binaries, copied from the platform package this package pins, unless an equal or
+  // newer vestige-mcp is already installed.
+  print(tone.cyan('  00  VESTIGE BINARIES'));
+  let binaries;
+  if (CLIENTS_ONLY) {
+    const found = findBinary();
+    if (!found) throw new Error('vestige-mcp was not found; install everything with: npx @vestige/init');
+    binaries = { status: 'kept', binaryPath: found, version: null };
+  } else {
+    binaries = kernel.ensureBinaries({ found: findBinary(), dryRun: DRY_RUN });
   }
-
-  print(`      ${tone.green('FOUND')}  ${binaryPath}`);
+  report.binaries = binaries;
+  if (binaries.status === 'missing') {
+    throw new Error(`${binaries.reason}. Install the binaries with: curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/install.sh -o vestige-install.sh && sh vestige-install.sh, then run npx @vestige/init again`);
+  }
+  const binaryPath = binaries.binaryPath;
+  if (binaries.status === 'kept') {
+    print(`      ${tone.green('FOUND')}  vestige-mcp ${binaries.version || ''}  ${binaryPath}`);
+  } else if (binaries.status === 'planned') {
+    plan(`install vestige-mcp ${binaries.version} and its tools into ${binaries.dir}`);
+  } else {
+    print(`      ${tone.green('INSTALLED')}  vestige-mcp ${binaries.version} → ${binaries.dir}${binaries.replaced ? `  (was ${binaries.replaced})` : ''}`);
+    print(tone.dim(`      ${binaries.copied.join(', ')}`));
+    if (binaries.olderElsewhere) print(tone.dim(`      An older vestige-mcp ${binaries.olderElsewhere.version || ''} at ${binaries.olderElsewhere.path} was left as it is; your clients use the new one.`));
+    if (!binaries.onPath) print(tone.dim(`      ${binaries.dir} is not on your PATH. Clients use the full path; add it to run vestige yourself.`));
+  }
   print('');
 
-  // Step 2: Detect IDEs
-  const detected = [];
-
-  for (const [name, ide] of Object.entries(IDE_CONFIGS)) {
-    if (ide.detect()) {
-      detected.push({ name, ide });
+  // Step 1: Strata. Starting vestige-mcp once, as a client would, creates the store on a fresh
+  // machine and proves the server answers.
+  if (CLIENTS_ONLY) {
+    // The clients-only wizard leaves the store to the client's first start.
+  } else if (DRY_RUN) {
+    print(tone.cyan('  01  STRATA MEMORY'));
+    plan(`open the Strata store at ${kernel.dataDir()}`);
+  } else {
+    print(tone.cyan('  01  STRATA MEMORY'));
+    const store = await kernel.startStore(binaryPath, { clientVersion: PACKAGE_VERSION });
+    report.store = store;
+    if (store.ok) {
+      print(`      ${tone.green('READY')}  ${store.server} ${store.serverVersion || ''} · ${store.tools} tools`);
+      if (store.storeExists) print(tone.dim(`      store: ${store.dataDir}`));
+    } else {
+      print(`      ${tone.amber('NEEDS REVIEW')}  vestige-mcp did not answer: ${store.reason}`);
     }
-  }
-
-  if (detected.length === 0) {
-    throw new Error('no supported MCP clients found (Claude Code, Claude Desktop, Cursor, VS Code, OpenCode, Xcode, JetBrains, Windsurf)');
-  }
-
-  const selected = await selectClients(detected);
-  if (selected.length === 0) {
     print('');
-    print(tone.dim('  Vestige left your machine unchanged.'));
-    return;
   }
 
-  if (DRY_RUN) {
-    const plan = { version: PACKAGE_VERSION, mode: 'dry-run', binaryPath, detected: detected.map(({ name }) => name), selected: selected.map(({ name, ide }) => ({ name, configPath: ide.configPath() })) };
-    if (JSON_OUTPUT) console.log(JSON.stringify(plan, null, 2));
-    else {
-      print(tone.cyan('  02  PROPOSED LOCAL CONNECTIONS'));
-      selected.forEach(({ name, ide }) => print(`      ${tone.violet('PLAN')}  ${name} → ${ide.configPath()}`));
-      print('');
-      print(tone.dim('  Dry run only. No configuration changed.'));
+  // Steps 2 and 3: the clients.
+  const detected = [];
+  for (const [name, ide] of Object.entries(IDE_CONFIGS)) {
+    if (ide.detect()) detected.push({ name, ide });
+  }
+  report.detected = detected.map(({ name }) => name);
+
+  let selected = [];
+  if (detected.length === 0) {
+    print(tone.cyan('  02  DETECTED CLIENTS'));
+    print(`      ${tone.amber('NONE')}  no supported MCP client found (Claude Code, Claude Desktop, Cursor, VS Code, OpenCode, Xcode, JetBrains, Windsurf)`);
+    print(tone.dim('      Install one and run npx @vestige/init again to connect it.'));
+    print('');
+  } else {
+    if (FLAGS.has('--yes') || DRY_RUN || requestedClientNames().length > 0) {
+      print(tone.cyan('  02  DETECTED CLIENTS'));
+      detected.forEach(({ name }) => print(`      ${tone.magenta('◉')}  ${name}`));
     }
-    return;
+    selected = await selectClients(detected);
+    if (process.exitCode === 130) {
+      print(tone.dim('  Stopped. Steps already done stay done; run npx @vestige/init again to finish.'));
+      return;
+    }
   }
+  report.selected = selected.map(({ name }) => name);
 
-  // Step 3: Inject configs
-  print('');
-  print(tone.cyan('  02  WRITE LOCAL CONNECTIONS'));
   let configured = 0;
   let skipped = 0;
   const backups = [];
   const reviews = [];
-
-  for (const { name, ide } of selected) {
-    try {
-      const injected = injectConfig(ide, name, binaryPath);
-      if (injected.status === 'written') {
-        print(`      ${tone.green('WRITTEN')}  ${name}`);
-        configured++;
-        if (injected.backupPath) backups.push(injected.backupPath);
-        if (ide.note) {
-          print(`         ${ide.note}`);
-        }
-      } else {
-        skipped++;
+  if (selected.length > 0) {
+    print('');
+    print(tone.cyan(DRY_RUN ? '  03  PROPOSED LOCAL CONNECTIONS' : '  03  WRITE LOCAL CONNECTIONS'));
+    for (const { name, ide } of selected) {
+      if (DRY_RUN) {
+        plan(`${name} → ${ide.configPath()}`);
+        continue;
       }
-    } catch (err) {
-      print(`      ${tone.amber('NEEDS REVIEW')}  ${name} — ${err.message}`);
-      reviews.push({ name, reason: err.message });
+      try {
+        const injected = injectConfig(ide, name, binaryPath);
+        if (injected.status === 'written') {
+          print(`      ${tone.green('WRITTEN')}  ${name}`);
+          configured++;
+          if (injected.backupPath) backups.push(injected.backupPath);
+          if (ide.note) print(`         ${ide.note}`);
+        } else {
+          skipped++;
+        }
+      } catch (err) {
+        print(`      ${tone.amber('NEEDS REVIEW')}  ${name} — ${err.message}`);
+        reviews.push({ name, reason: err.message });
+      }
     }
+    print('');
+  }
+  Object.assign(report, { configured, skipped, backups, reviews });
+
+  // Step 4: the rules hook. Claude Code gets the memories tagged `pinned` back at every session start.
+  if (NO_HOOKS) {
+    report.rules = { status: 'skipped', reason: 'skipped (--no-hooks)' };
+  } else {
+    print(tone.cyan('  04  RULES THAT SURVIVE COMPACTION'));
+    let rules;
+    try {
+      // In a dry run the binaries are not copied yet, so name where `vestige` will be.
+      const vestigeBin = binaries.status === 'planned' ? path.join(binaries.dir, kernel.exe('vestige')) : dashboardBinary(binaryPath);
+      rules = kernel.wireRulesHook(vestigeBin, { dryRun: DRY_RUN, writeJson: writeJsonAtomic });
+    } catch (err) {
+      rules = { status: 'review', reason: err.message };
+    }
+    report.rules = rules;
+    if (rules.status === 'written') {
+      print(`      ${tone.green('WRITTEN')}  Claude Code SessionStart hook → ${rules.settingsPath}`);
+      if (rules.backupPath) print(`  [backup] ${path.basename(rules.backupPath)}`);
+    } else if (rules.status === 'present') {
+      print(`      ${tone.green('PRESENT')}  Claude Code SessionStart hook already registered`);
+    } else if (rules.status === 'planned') {
+      plan(`add "${rules.command}" to SessionStart in ${rules.settingsPath}`);
+    } else {
+      print(`      ${tone.amber(rules.status === 'skipped' ? 'SKIPPED' : 'NEEDS REVIEW')}  ${rules.reason}`);
+    }
+    print(tone.dim('      Save a decision or correction with the tag "pinned" and every new session starts with it.'));
+    print('');
   }
 
-  print('');
+  // Steps 5 and 6: Operator Lite, the free gate, and its own bypass-corpus self-test.
+  let gate = { status: 'skipped' };
+  let selfTest = null;
+  if (!NO_GATE) {
+    print(tone.cyan('  05  OPERATOR LITE GATE'));
+    gate = await kernel.installGate({ dryRun: DRY_RUN, onLine: (line) => print(tone.dim(`      │ ${line}`)) });
+    if (gate.status === 'planned') {
+      plan(`install Operator Lite ${gate.version} and wire every agent host it finds`);
+    } else if (gate.status === 'installed') {
+      print(`      ${tone.green('INSTALLED')}  Operator Lite ${gate.version}`);
+    } else {
+      print(`      ${tone.amber('NOTE')}  ${(GATE_LINES[gate.status] || GATE_LINES.failed)(gate)}`);
+    }
+    print('');
+    if (!DRY_RUN && gate.status !== 'missing') {
+      print(tone.cyan('  06  GATE SELF-TEST'));
+      selfTest = await kernel.gateSelfTest();
+      print(selfTest.cases
+        ? `      ${selfTest.ok ? tone.green('PASSED') : tone.amber('FAILED')}  ${selfTest.passed} of ${selfTest.cases} ${selfTest.corpus} bypass cases caught; nothing was run`
+        : `      ${tone.amber('NEEDS REVIEW')}  ${selfTest.reason}`);
+      print('');
+    }
+  }
+  report.gate = gate.output ? { ...gate, output: undefined } : gate;
+  report.selfTest = selfTest;
 
-  // Step 4: Summary
-  const result = {
-    version: PACKAGE_VERSION,
-    result: 'configuration-written',
-    binaryPath,
-    selected: selected.map(({ name }) => name),
-    configured,
-    skipped,
-    backups,
-    reviews,
-    verification: 'pending: restart the selected client and confirm its MCP tools',
-  };
-  if (JSON_OUTPUT) {
-    console.log(JSON.stringify(result, null, 2));
+  if (DRY_RUN) {
+    if (JSON_OUTPUT) console.log(JSON.stringify(report, null, 2));
+    else print(tone.dim('  Dry run only. Nothing on this machine changed.'));
     return;
   }
 
-  renderProofPulse({ detected: selected.length, configured, skipped, backups: backups.length });
+  report.result = 'installed';
+  report.verification = 'pending: restart your clients and confirm the Vestige tools appear';
+  if (JSON_OUTPUT) {
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+
+  if (CLIENTS_ONLY) {
+    renderProofPulse({ detected: detected.length, configured, skipped, backups: backups.length });
+    print('');
+    print(tone.dim('  Client connections only. For the store, the rules hook and Operator Lite as well: npx @vestige/init'));
+  } else {
+    renderProofPulse({ detected: detected.length, configured, skipped, backups: backups.length, store: report.store, rules: report.rules, gate, selfTest });
+  }
   print('');
-  print('  1. Restart the selected client.');
-  print('  2. Ask: "What MCP tools do you have access to?"');
-  print('  3. Save a record with an exact tag, then recall that same tag in a new session.');
+  print('  1. Restart your clients.');
+  print('  2. Ask your agent: "What Vestige tools do you have?"');
+  print('  3. Save a memory with an exact tag, then recall that same tag in a new session.');
+  print('  4. Follow one real stop around the loop:  npx @vestige/init precedent');
   print('');
   print(tone.violet('  Intelligence can run anywhere. Your records stay here.'));
 

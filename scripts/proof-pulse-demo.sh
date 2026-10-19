@@ -23,6 +23,6 @@ HOME="$DEMO_ROOT" \
 PATH="$DEMO_ROOT/bin:/usr/bin:/bin" \
 VESTIGE_MCP_PATH="$DEMO_ROOT/bin/vestige-mcp" \
 "$NODE_BIN" "$ROOT/packages/vestige-init/bin/init.js" \
-  --interactive --no-dashboard
+  --interactive --clients-only --no-dashboard
 
 printf '\n  Demo fixture only: the temporary local client config will now be removed.\n'

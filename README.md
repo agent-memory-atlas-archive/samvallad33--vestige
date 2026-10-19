@@ -40,6 +40,25 @@ Operator Lite is free and stays free. Vestige Operator is the owner's version of
 
 ## Quick start
 
+One command installs the whole system. Run it in your own terminal:
+
+```bash
+npx @vestige/init
+```
+
+In order, it:
+
+1. installs the `vestige-mcp`, `vestige`, `vestige-restore` and `vestige-upgrade` binaries for your machine from npm, unless the same or a newer version is already installed;
+2. starts `vestige-mcp` once, which creates your Strata store, and checks that it answers with its 18 tools;
+3. connects the MCP clients it finds (Claude Code, Claude Desktop, Cursor, VS Code, OpenCode, Xcode, JetBrains, Windsurf), backing up each file before changing it;
+4. adds the Claude Code rules hook, so the decisions and corrections you tag `pinned` come back at every session start and after every compaction;
+5. installs Operator Lite, the free gate, in enforce mode, and wires every agent host it finds;
+6. runs the gate's own bypass test, then lists what it configured and what to verify after a restart.
+
+It never downgrades: a newer binary, or a newer or paid gate, stays where it is. `--dry-run` shows every change and writes nothing, `--yes` connects every detected client without a prompt, and `--no-gate` and `--no-hooks` skip those steps. Operator Lite needs Python 3.9 or newer, and it refuses to install from inside an AI agent's shell. Tested end to end on macOS and Linux; the Windows x64 binaries ship in the same package but that path has not been tested end to end yet.
+
+### Operator Lite on its own
+
 Operator Lite is the free gate in [`operator-lite/`](operator-lite/). It is one file, stdlib only, and it sits on a PreToolUse hook (Claude Code, OpenClaw, or any host with a documented command-hook port).
 
 macOS and Linux:
