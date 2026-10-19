@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
-# Install the latest signed Vestige release without npm.
+# Install the latest Vestige release binaries without npm.
+# For the whole system (clients, the rules hook and Operator Lite), run: npx @vestige/init
 # Usage: curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/scripts/install.sh | sh
 set -eu
 
@@ -35,7 +36,7 @@ workdir="$(mktemp -d "${TMPDIR:-/tmp}/vestige-install.XXXXXX")"
 cleanup() { rm -rf "$workdir"; }
 trap cleanup EXIT HUP INT TERM
 
-printf '%s\n' "Downloading the latest signed Vestige release for ${target}..."
+printf '%s\n' "Downloading the latest Vestige release for ${target}..."
 curl --fail --location --silent --show-error "$base" --output "$workdir/$archive"
 curl --fail --location --silent --show-error "${base}.sha256" --output "$workdir/${archive}.sha256"
 
@@ -62,3 +63,4 @@ done
 printf '%s\n' "Installed Vestige in $INSTALL_DIR"
 printf '%s\n' "Connect Claude Code: claude mcp add vestige $INSTALL_DIR/vestige-mcp -s user"
 printf '%s\n' "Connect Codex:       codex mcp add vestige -- $INSTALL_DIR/vestige-mcp"
+printf '%s\n' "Or set up everything at once (clients, rules hook, Operator Lite): npx @vestige/init"
