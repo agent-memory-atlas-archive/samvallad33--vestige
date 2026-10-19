@@ -177,7 +177,9 @@ ILOG2="$H2/install.log"
 if ! do_install "$H2" "$ILOG2"; then
     echo "FATAL: install.sh failed inside the shadow home:"; cat "$ILOG2"; exit 1
 fi
-echo "phase 2: mode=shadow (installer default), receipts in $H2"
+[ "$(cat "$H2/.operator/mode")" = "enforce" ] || { echo "FATAL: install.sh did not start in enforce"; exit 1; }
+echo shadow > "$H2/.operator/mode"     # the owner's choice: record, do not block
+echo "phase 2: mode=shadow (set by the owner; install.sh writes enforce), receipts in $H2"
 echo ""
 
 # --- case 4: shadow rm -rf canary via shim -> passes through, receipt written ----- #

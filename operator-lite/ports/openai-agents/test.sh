@@ -92,7 +92,7 @@ cat "$LOGS/install.log"
 GATE_VER=$(sed -n 's/^VERSION = *"\([^"]*\)".*/\1/p' "$GATE_DST" 2>/dev/null | head -n 1)
 [ "$GATE_VER" != "" ] && ok "gate carries a VERSION ($GATE_VER)" || bad "gate VERSION unreadable"
 [ -f "$MOD_DIR/operator_guard.py" ] && ok "guardrail module installed to $MOD_DIR" || bad "module not installed"
-[ "$(cat "$TEST_HOME/.operator/mode" 2>/dev/null)" = "shadow" ] && ok "mode file = shadow" || bad "mode file not shadow"
+[ "$(cat "$TEST_HOME/.operator/mode" 2>/dev/null)" = "enforce" ] && ok "mode file = enforce (the installer default)" || bad "mode file not enforce: a fresh install must block"
 
 # ---- 2. stdlib-only surface of the INSTALLED module --------------------------- #
 section "module surface, stdlib-only"
@@ -116,7 +116,8 @@ assert d["gate"] and isinstance(d["gate_present"], bool)
 PYEOF
 
 # ---- 3. shadow mode (default): receipts written, nothing blocked -------------- #
-section "shadow mode (default)"
+section "shadow mode (the owner's choice)"
+echo shadow > "$TEST_HOME/.operator/mode"
 drive run_shell "ls -la" s-ls
 [ "$(drv_outcome s-ls)" = "allow" ] && ok "benign ls -> allow" || bad "benign ls: $(drv_outcome s-ls)"
 

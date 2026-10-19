@@ -26,22 +26,26 @@ Mechanism (verified against the SDK docs, 2026-09-29):
 
 ## What it stops
 
-The gate's 11 enforce-mode STOP rules, unchanged (27 rules total live in the
-gate; the rest are shadow candidates):
+The gate's 15 enforce-mode STOP rules, the mode a fresh install starts in (30 rules
+in all; the other 15 only record):
 
 | Rule | Name | Stops |
 |---|---|---|
 | OP-000 | protect-the-gate | Editing the gate, its rules, permits, mode or hook registrations |
 | OP-001 | protect-workspaces | Deleting or moving a registered workspace root (or a parent of one) |
 | OP-002 | protect-memory | Wiping, deleting or rewriting the Vestige store |
-| OP-003 | no-blind-recursive-delete | Recursive delete outside scratch/build directories |
-| OP-004 | no-history-destruction | Force-pushing over a shared branch, deleting `.git` |
+| OP-003 | no-blind-recursive-delete | Recursive delete outside the project and outside scratch/build directories |
+| OP-004 | no-history-destruction | Force-pushing over a shared branch, deleting `.git` or a whole repository |
 | OP-005 | no-unreviewed-publish | Publishing a release/package, deleting a public repo |
-| OP-006 | no-paid-deploy | Deploying the billing/control plane, acting on live billing |
-| OP-007 | no-destructive-sql | `DROP`/`TRUNCATE`/unscoped `DELETE` against a database |
+| OP-006 | no-paid-deploy | Production deploys, infrastructure teardown, live database changes and live billing actions |
+| OP-007 | no-destructive-sql | `DROP`/`TRUNCATE`/unscoped `DELETE`, or a framework database reset |
 | OP-008 | no-shell-init-write | Writing shell rc/init files (code execution by install) |
 | OP-009 | no-reverse-shell | `/dev/tcp`, `nc -e`, DNS-tunnel tools |
 | OP-010 | no-cloud-metadata | Querying cloud metadata credential endpoints |
+| OP-011 | no-unrestorable-loss | Discarding uncommitted git work, shredding or emptying files outside the project, `crontab -r` |
+| OP-014 | no-machine-wreck | Raw-disk writes, formatting or erasing a volume, fork bombs, recursive `chmod`/`chown` on `/` or home |
+| OP-018 | no-blind-fetch-run | A download piped or handed straight to a shell or interpreter |
+| OP-CANARY | canary | The verification string that proves the gate is wired |
 
 The gate parses the command, not the vibe: it tracks `cd`, variable
 assignment, heredocs, command substitution, base64 blobs, ANSI-C quoting and
@@ -56,8 +60,9 @@ sh ports/openai-agents/install.sh
 ```
 
 Installs the gate to `~/.operator/gate/` (never overwrites a newer copy),
-the module to `~/.operator/ports/openai-agents/`, and sets **shadow mode**
-(log-only) unless you already chose a mode.
+the module to `~/.operator/ports/openai-agents/`, and sets **enforce mode**
+(blocking) unless you already chose a mode; the `shadow` an install before 0.3.9
+wrote becomes `enforce`, once.
 
 ## Minimal usage
 
@@ -93,14 +98,15 @@ Other entry points, for tools you do not create yourself:
   `state.approve(item)` or `state.reject(item, rejection_message=...)`, then
   resume with `Runner.run(agent, state)`.
 
-## Shadow → enforce
+## Enforce and shadow
 
-Shadow mode classifies, receipts, and lets everything through — read the log
-first:
+Enforce mode blocks what a STOP rule matches and receipts every call. Shadow
+mode classifies and receipts but lets everything through:
 
 ```sh
-cat ~/.operator/receipts/$(date -u +%F).jsonl
-echo enforce > ~/.operator/mode     # flip
+cat ~/.operator/receipts/$(date -u +%F).jsonl   # what the gate decided today
+echo shadow > ~/.operator/mode                  # record without blocking
+echo enforce > ~/.operator/mode                 # block again
 ```
 
 `$OPERATOR_GATE_MODE` overrides the file; `$OPERATOR_GATE` overrides the gate

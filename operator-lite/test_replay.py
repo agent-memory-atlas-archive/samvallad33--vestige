@@ -130,7 +130,9 @@ check("json carries the drafted laws and the incident", [l["class"] for l in r.g
       and len(r.get("incidents", [])) == 1 and r["incidents"][0]["rule"] == "OP-004" and r["incidents"][0]["project"] == "app", r.get("laws"))
 
 p = run(["replay", "--all", "--json"])
-check("--all reads the old record too (deploy appears)", json.loads(p.stdout).get("by_own", {}).get("deploy") == 1, p.stdout[:200])
+ra = json.loads(p.stdout or "{}")
+check("--all reads the old record too (terraform apply, stopped under OP-006)",
+      ra.get("by_stop", {}).get("OP-006") == 1 and "deploy" not in ra.get("by_own", {}), p.stdout[:200])
 p = run(["replay", "--here", "--json"], cwd=OTHER)
 check("--here keeps only calls made under the current directory", json.loads(p.stdout).get("calls") == 1, p.stdout[:200])
 
@@ -161,7 +163,7 @@ check("bad --days is a usage error", p.returncode == 2 and "usage:" in p.stdout)
 # 3. install runs the replay by itself and remembers the count
 p = run(["install"])
 check("install exits 0", p.returncode == 0, p.stderr[-300:])
-check("install ends with the replay report", "operator-gate replay: the last 30 days" in p.stdout and "mode: shadow" in p.stdout
+check("install ends with the replay report", "operator-gate replay: the last 30 days" in p.stdout and "mode: enforce" in p.stdout
       and p.stdout.rstrip().endswith("operator-gate.py status"), p.stdout[-400:])
 sp = os.path.join(home, ".operator", "state", "replay.json")
 check("replay summary remembered for the status hint", os.path.exists(sp) and json.load(open(sp)).get("own_calls") == 5)
@@ -192,16 +194,17 @@ except Exception as exc:
     wired = repr(exc)
 check("lone file: the Claude Code hook points at the installed copy", wired == g.claude_hook_command(installed)
       and installed in wired and wired.endswith("hook --source claude"), wired)
-check("lone file: install starts in shadow and shows the replay without being asked",
-      open(os.path.join(home2, ".operator", "mode")).read().strip() == "shadow"
+check("lone file: install starts in enforce and shows the replay without being asked",
+      open(os.path.join(home2, ".operator", "mode")).read().strip() == "enforce"
       and "tool calls your agents made" in p.stdout and "Your first laws, drafted from this history:" in p.stdout, p.stdout[-400:])
 payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git push --force origin main"}, "cwd": REPO, "session_id": "t"})
 # Claude Code runs a hook command through a shell, so the test does too.
 p = subprocess.run(wired, shell=True, input=payload, capture_output=True, text=True, env=env2)
-check("lone file: the wired hook records in shadow and does not block", p.returncode == 0 and not p.stderr, p.stderr[:200])
-open(os.path.join(home2, ".operator", "mode"), "w").write("enforce\n")
+check("lone file: right after install the wired hook stops the force-push", p.returncode == 2 and "OP-004" in p.stderr, p.stderr[:200])
+open(os.path.join(home2, ".operator", "mode"), "w").write("shadow\n")
 p = subprocess.run(wired, shell=True, input=payload, capture_output=True, text=True, env=env2)
-check("lone file: after the flip to enforce the wired hook stops the force-push", p.returncode == 2 and "OP-004" in p.stderr, p.stderr[:200])
+check("lone file: in shadow mode, the owner's choice, the wired hook records and does not block",
+      p.returncode == 0 and not p.stderr, p.stderr[:200])
 p = subprocess.run([sys.executable, installed, "verify"], capture_output=True, text=True, env=env2)
 check("lone file: both verdicts are in the receipt chain", "receipts=2 chain=OK" in p.stdout, p.stdout[:200])
 p = subprocess.run([sys.executable, installed, "corpus", "guardfall"], capture_output=True, text=True, env=env2)
@@ -243,6 +246,8 @@ def call3(cmd):
     return subprocess.run([sys.executable, gate3, "hook", "--source", "claude"], input=pl, capture_output=True, text=True, env=env3)
 
 
+mode3 = os.path.join(home3, ".operator", "mode")
+check("a fresh install writes enforce", open(mode3).read().strip() == "enforce")
 for c in ("git status", "git push --force origin main", "psql -c 'DROP TABLE users' app", "git reset --hard HEAD~1", "ls"):
     call3(c)
 recs3 = []
@@ -250,29 +255,38 @@ rdir3 = os.path.join(home3, ".operator", "receipts")
 for fn in sorted(x for x in os.listdir(rdir3) if x.endswith(".jsonl")):
     with open(os.path.join(rdir3, fn), encoding="utf-8") as f:
         recs3 += [json.loads(line) for line in f]
-check("a call no rule matched is recorded as PASS and a rule hit as SHADOW_STOP",
-      [r["decision"] for r in recs3] == ["PASS", "SHADOW_STOP", "SHADOW_STOP", "SHADOW_STOP", "PASS"], [r["decision"] for r in recs3])
+check("a fresh install stops what a STOP rule matches; no rule is PASS, a shadow rule is SHADOW_STOP",
+      [r["decision"] for r in recs3] == ["PASS", "STOP", "STOP", "SHADOW_STOP", "PASS"], [r["decision"] for r in recs3])
 p = subprocess.run(["operator-gate", "status"], capture_output=True, text=True, env=env3, cwd=home3)
 st = p.stdout
-check("status counts the week: 5 checked, 2 would have been stopped and ran, 1 flagged", "5  tool calls checked" in st
-      and "2  would have been stopped, and ran: the gate was in shadow mode" in st and "1  flagged: recorded, not stopped" in st, st[:700])
-check("status lists what ran, with the project, the rule and the command", "Ran, because the gate was in shadow mode:" in st
+check("status counts the week: 5 checked, 2 stopped, 1 flagged", "5  tool calls checked" in st and "2  stopped" in st
+      and "1  flagged: recorded, not stopped" in st and "would have been stopped" not in st, st[:700])
+check("status lists what was stopped, with the project, the rule and the command", "Stopped:" in st
       and "shop-api" in st and "OP-004" in st and "git push --force origin main" in st and "OP-007" in st and "DROP TABLE users" in st, st)
-check("status says how to start blocking, with a command that works", "operator-gate mode enforce" in st and "Last call checked just now." in st, st[-400:])
+check("in enforce mode status gives no shadow hint", "Shadow mode records" not in st and "Last call checked just now." in st, st[-400:])
 check("piped status carries no pitch and no colour", "upgrade" not in st and "\033[" not in st, st[-300:])
 p = subprocess.run(["operator-gate", "status", "--rules"], capture_output=True, text=True, env=env3, cwd=home3)
 check("status --rules is the rule table, in words a stranger can read", "OP-004" in p.stdout and "no-history-destruction" in p.stdout
       and not any(w in p.stdout for w in ("launch gates", "claim-gate", "Pro bridge", "postmark")), p.stdout[:300])
-p = subprocess.run(["operator-gate", "mode", "enforce"], capture_output=True, text=True, env=env3, cwd=home3)
-check("mode refuses outside an interactive terminal", p.returncode == 3 and open(os.path.join(home3, ".operator", "mode")).read().strip() == "shadow", p.stdout)
+p = subprocess.run(["operator-gate", "mode", "shadow"], capture_output=True, text=True, env=env3, cwd=home3)
+check("mode refuses outside an interactive terminal", p.returncode == 3 and open(mode3).read().strip() == "enforce", p.stdout)
 p = subprocess.run(["operator-gate", "mode"], capture_output=True, text=True, env=env3, cwd=home3)
-check("mode with no argument reports the mode", p.returncode == 0 and "mode is shadow" in p.stdout, p.stdout)
-open(os.path.join(home3, ".operator", "mode"), "w").write("enforce\n")
+check("mode with no argument reports the mode", p.returncode == 0 and "mode is enforce" in p.stdout, p.stdout)
+# shadow is the owner's choice: what it records, and how status says to block again
+open(mode3, "w").write("shadow\n")
+for c in ("git push --force origin main", "psql -c 'DROP TABLE users' app"):
+    call3(c)
+p = subprocess.run(["operator-gate", "status"], capture_output=True, text=True, env=env3, cwd=home3)
+st = p.stdout
+check("in shadow mode status lists what ran and how to block again",
+      "2  would have been stopped, and ran: the gate was in shadow mode" in st and "Ran, because the gate was in shadow mode:" in st
+      and "operator-gate mode enforce" in st, st[-700:])
+open(mode3, "w").write("enforce\n")
 r3 = call3("git push --force origin main")
 check("the stop message names a command the owner can paste", r3.returncode == 2 and "operator-gate approve " in r3.stderr, r3.stderr[-300:])
 p = subprocess.run(["operator-gate", "status"], capture_output=True, text=True, env=env3, cwd=home3)
-check("in enforce mode status shows the stop under Stopped", "mode: enforce (blocking)" in p.stdout and "1  stopped" in p.stdout
-      and "Stopped:" in p.stdout and "operator-gate mode enforce" not in p.stdout, p.stdout[:900])
+check("back in enforce mode status shows the stop under Stopped", "mode: enforce (blocking)" in p.stdout and "3  stopped" in p.stdout
+      and "Stopped:" in p.stdout and "Shadow mode records" not in p.stdout, p.stdout[:900])
 p = subprocess.run([sys.executable, gate3, "uninstall"], capture_output=True, text=True, env=env3, cwd=home3)
 check("uninstall removes the hook and the launcher it placed", not os.path.exists(launcher) and "launcher removed" in p.stdout, p.stdout)
 p = subprocess.run([sys.executable, gate3, "status"], capture_output=True, text=True, env=dict(env3, PATH=env.get("PATH", "")), cwd=home3)

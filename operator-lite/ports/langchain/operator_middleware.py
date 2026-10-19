@@ -43,7 +43,7 @@ The gate contract on its stdin:
     {"tool_name": ..., "tool_input": {"command": ...}, "cwd": ...,
      "session_id": ...?}
 spawned as: python3 <gate> hook --source langchain
-Shadow vs enforce is a file: ~/.operator/mode (shadow default).
+Enforce vs shadow is a file: ~/.operator/mode (enforce when missing; install.sh writes enforce).
 
 This module is stdlib-only and importable WITHOUT langchain installed; the
 langchain-facing pieces (`OperatorLiteMiddleware`, `operator_middleware()`)

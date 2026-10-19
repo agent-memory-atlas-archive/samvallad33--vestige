@@ -9,16 +9,17 @@ payload reshaper plus install/test scripts. It contains no rule logic.
 
 ```
 git clone https://github.com/samvallad33/vestige && cd vestige/operator-lite   # skip if already cloned
-sh ports/gemini-cli/install.sh               # gate + adapter + ~/.gemini/settings.json hook, mode=shadow
+sh ports/gemini-cli/install.sh               # gate + adapter + ~/.gemini/settings.json hook, mode=enforce
 sh ports/gemini-cli/test.sh                  # optional: proves the chain end-to-end
 ```
 
 `install.sh` is idempotent:
 
 - installs the gate to `~/.operator/gate/operator-gate.py` (downloads from
-  GitHub; never overwrites an existing same-or-newer copy)
+  GitHub, or uses this checkout's copy when it is newer; never overwrites an
+  existing same-or-newer copy)
 - installs the adapter to `~/.operator/gate/gemini-wrapper.py`
-- sets `~/.operator/mode` to `shadow` if no mode file exists yet
+- sets `~/.operator/mode` to `enforce` if no mode file exists yet, and switches the `shadow` an install before 0.3.9 wrote to `enforce`, once
 - merges the `BeforeTool` hook into `~/.gemini/settings.json` (a timestamped
   backup is written first; existing settings and existing hooks are preserved;
   an invalid existing file is left untouched and manual steps are printed)
@@ -26,43 +27,49 @@ sh ports/gemini-cli/test.sh                  # optional: proves the chain end-to
 Requires `python3` on PATH. Hooks are on by default in gemini-cli
 (`hooksConfig.enabled` defaults to `true`).
 
-## Shadow → enforce
+## Enforce and shadow
 
-Start in shadow: every decision is analyzed and receipted, nothing is blocked.
-When the log looks right, flip:
+A fresh install blocks: every command a STOP rule matches is denied, and every
+decision is receipted. To record without blocking, and back:
 
 ```
+echo shadow > ~/.operator/mode
 echo enforce > ~/.operator/mode
 ```
 
 ## What it protects against
 
-Eleven STOP rules (blocking in enforce mode):
+Fifteen STOP rules (blocking in enforce mode):
 
 | Rule | Catches |
 |---|---|
 | OP-000 | edits to the gate itself, hook registrations, agent settings files |
 | OP-001 | delete/move of a workspace root (or a parent of one) |
 | OP-002 | wiping the Vestige store (sqlite3 writes, `vestige gc/purge`) |
-| OP-003 | blind recursive deletes, sweeps from `/`, fork bombs |
-| OP-004 | force-push to shared branches, remote-main deletion, `.git` removal |
-| OP-005 | unreviewed publishes (npm/cargo/twine/docker/gh release) |
-| OP-006 | paid deploys and live-billing actions |
-| OP-007 | destructive SQL (DROP/TRUNCATE/unscoped DELETE) |
+| OP-003 | recursive deletes outside the project and outside scratch/build folders, sweeps from `/` |
+| OP-004 | force-push to shared branches, remote-main deletion, deleting `.git` or a whole repository |
+| OP-005 | unreviewed publishes (npm/pnpm/yarn/cargo/twine/docker push/gh release), deleting a public repo |
+| OP-006 | production deploys, infrastructure apply and teardown, live billing |
+| OP-007 | destructive SQL (DROP/TRUNCATE/unscoped DELETE), framework database resets |
 | OP-008 | shell-init writes (`>> ~/.zshrc` = code execution by install) |
 | OP-009 | reverse shells (`/dev/tcp`, `nc -e`, DNS-tunnel tools) |
 | OP-010 | cloud metadata endpoints (169.254.169.254, metadata.google.internal) |
 
-Plus shadow-only OP-S01..S17 (work-loss git, outgoing comms, public mutation,
+| OP-011 | discarding uncommitted git work, shredding or emptying files outside the project, `crontab -r` |
+| OP-014 | raw-disk writes, formatting or erasing a volume, fork bombs, recursive `chmod`/`chown` on `/` or home |
+| OP-018 | a download piped or handed straight to a shell or interpreter (`curl X \| sh`, `bash <(curl X)`) |
+| OP-CANARY | the verification canary string |
+
+Plus shadow-only OP-S01..S08 and OP-S11..S17 (work-loss git, outgoing comms, public mutation,
 credential-shaped writes, pipe-to-interpreter, persistence, env hijacks,
 exfil shapes, invisible characters, MCP argument exfil, agent-config writes,
 paste/tunnel egress, new git remotes, sandbox-escape primitives), recorded in
 receipts and promotable per rule via `commitments.json`.
 
-**GuardFall-proof:** the gate replays a 43-case corpus of GuardFall bypass
+**GuardFall-proof:** the gate replays a 46-case corpus of GuardFall bypass
 techniques (quote reassembly, `$IFS`, command substitution, ANSI-C escapes,
 base64 bodies, brace/glob enumeration, subshell time-bombs, session variables,
-cd tracking, heredocs, fork bombs, `mv x /dev/null`, …) and must pass 43/43:
+cd tracking, heredocs, fork bombs, `mv x /dev/null`, …) and must pass 46/46:
 
 ```
 python3 ~/.operator/gate/operator-gate.py corpus guardfall

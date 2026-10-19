@@ -4,7 +4,7 @@
 # Owner-side script: installs the gate to ~/.operator/gate/ (downloaded from
 # the Vestige repo if no bundled copy is present), wires the Goose lifecycle
 # hook plugin into ~/.agents/plugins/operator-lite/ (Open Plugins spec,
-# auto-discovered by goose >= v1.41.0), sets shadow mode if unset, and prints
+# auto-discovered by goose >= v1.41.0), sets enforce mode if unset (an older install's shadow becomes enforce, once), and prints
 # next steps.
 #
 # POSIX sh. No arguments required.
@@ -61,12 +61,22 @@ fi
 
 # ------------------------------------------------------------ mode file ------
 mkdir -p "$OP_HOME"
-if [ ! -f "$OP_HOME/mode" ]; then
-  echo shadow > "$OP_HOME/mode"
-  echo "mode:  shadow (log-only) written to $OP_HOME/mode"
-else
-  echo "mode:  existing $(cat "$OP_HOME/mode") left untouched ($OP_HOME/mode)"
+NEW_MODE=""
+[ -f "$OP_HOME/mode" ] || { echo enforce > "$OP_HOME/mode"; NEW_MODE=1; }
+# Installs before 0.3.9 wrote shadow, which blocks nothing. The gate settles the mode once (a shadow the
+# owner chose with its mode command stays) and records that it did, so a later `echo shadow` is kept.
+SETTLED=""
+if grep -q '^EDITION = "lite"' "$GATE" 2>/dev/null; then
+    SETTLED=$(python3 -I "$GATE" mode --settle 2>/dev/null) || SETTLED=""
 fi
+case "$SETTLED" in
+  *"("*) echo "mode:  $SETTLED. To record without blocking: echo shadow > $OP_HOME/mode" ;;
+  *) if [ -n "$NEW_MODE" ]; then
+       echo "mode:  enforce (blocking) written to $OP_HOME/mode"
+     else
+       echo "mode:  existing $(cat "$OP_HOME/mode") left untouched ($OP_HOME/mode)"
+     fi ;;
+esac
 
 # -------------------------------------------------------- hook plugin --------
 # goose auto-discovers ~/.agents/plugins/<name>/hooks/hooks.json (user scope)
@@ -86,11 +96,10 @@ Next steps:
        sh test.sh
      or end-to-end inside goose, ask it to run:
        echo OPERATOR_CANARY_STOP_7f3a
-     Shadow mode logs the STOP to ~/.operator/receipts/ without blocking;
-     after flipping to enforce, goose shows the gate's OPERATOR: STOPPED text
-     and the tool call never runs.
-  3. When the receipts look right, flip to enforce:
-       echo enforce > $OP_HOME/mode
+     goose shows the gate's OPERATOR: STOPPED text and the tool call never
+     runs; the receipt lands in ~/.operator/receipts/.
+  3. To record without blocking instead:
+       echo shadow > $OP_HOME/mode
   4. Optional (strict fail-closed): if the hook itself cannot run you may
      prefer to block everything rather than allow. Edit
      $PLUGIN_DIR/hooks/hooks.json and add

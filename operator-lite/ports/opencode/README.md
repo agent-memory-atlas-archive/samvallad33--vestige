@@ -19,28 +19,34 @@ what the model sees as the tool error, so it can change course.
 
 ## What it stops
 
-In enforce mode the gate blocks (exit 2) on eleven closed, deterministic rules:
+In enforce mode, the mode a fresh install starts in, the gate blocks (exit 2) on fourteen
+closed, deterministic rules:
 
 | Rule | Stops |
 |---|---|
 | OP-000 | editing the gate itself, its rules, permits, mode or hook registrations |
 | OP-001 | deleting or moving a registered workspace root (or any parent of one) |
 | OP-002 | wiping or rewriting the Vestige store |
-| OP-003 | blind recursive deletes outside scratch/build directories |
-| OP-004 | force-pushing over a shared branch; deleting `.git` |
+| OP-003 | recursive deletes outside the project and outside scratch/build directories |
+| OP-004 | force-pushing over a shared branch; deleting `.git` or a whole repository |
 | OP-005 | publishing releases/packages; deleting public repos |
-| OP-006 | paid/production deploys and live billing actions |
-| OP-007 | destructive SQL (DROP/TRUNCATE, unscoped DELETE) |
+| OP-006 | production deploys, infrastructure teardown, live database changes and live billing actions |
+| OP-007 | destructive SQL (DROP/TRUNCATE, unscoped DELETE) or a framework database reset |
 | OP-008 | writing shell rc/init files (code execution by install) |
 | OP-009 | reverse shells and DNS tunnels (`/dev/tcp`, `nc -e`, dnscat2...) |
 | OP-010 | cloud metadata credential endpoints (169.254.169.254 et al.) |
 
+| OP-011 | discarding uncommitted git work, shredding or emptying files outside the project, `crontab -r` |
+| OP-014 | raw-disk writes, formatting or erasing a volume, fork bombs, recursive `chmod`/`chown` on `/` or home |
+| OP-018 | a download piped or handed straight to a shell or interpreter (`curl X \| sh`, `bash <(curl X)`) |
+
 A canary rule (`OP-CANARY`) always stops when present, purely to prove the gate
-is wired. Seventeen further shadow-only candidates (OP-S01..S17: git work loss,
+is wired. Fifteen further shadow-only rules (OP-S01..S08 and OP-S11..S17: git work loss,
 outbound comms, secret-shaped writes, pipe-to-interpreter, persistence writes,
 env hijacking, exfil shapes, invisible characters, MCP argument exfiltration,
 agent-config writes, sandbox escapes...) are recorded to the receipt log but
-never block; promote the ones you want after reviewing the log. The gate also
+never block; promote the ones you want after reviewing the log, in
+`~/.operator/commitments.json`: `{"mode_overrides": {"OP-S06": "enforce"}}`. The gate also
 sees through common bypass attempts: `cd` tracking, variable expansion, heredoc
 bodies, `$'..'`/base64 encoding, quote-split commands like `r''m`, brace/glob
 expansion, subshells and command substitution. Approving a blocked action once
@@ -65,20 +71,23 @@ is owner-only and interactive: `operator-gate approve <digest>`.
 ```sh
 cd operator-lite/ports/opencode
 sh install.sh            # add --project for project-only scope
-sh test.sh               # 10-check harness, expect "10 passed, 0 failed"
+sh test.sh               # 11-check harness, expect "11 passed, 0 failed"
 ```
 
 `install.sh` puts the gate at `~/.operator/gate/operator-gate.py` (bundled copy
 preferred, otherwise downloaded from the main repo; never overwrites an
 existing gate), copies `index.js` to `~/.config/opencode/plugin/operator-lite.js`,
-sets shadow mode, and prints next steps. Requires `python3` on PATH.
+writes `enforce` to `~/.operator/mode` when there is no mode file yet (the `shadow`
+an install before 0.3.9 wrote becomes `enforce`, once), and prints
+next steps. Requires `python3` on PATH.
 
-The gate starts in **shadow** mode: every decision is classified and written to
-`~/.operator/receipts/` as a hash-chained digest log, but nothing is blocked.
-Review the log, then flip one file:
+The gate starts in **enforce** mode: every command a STOP rule matches is
+blocked before it runs, and every decision is written to `~/.operator/receipts/`
+as a hash-chained digest log. An existing `~/.operator/mode` file is kept, except the `shadow` every install before 0.3.9 wrote, which becomes `enforce` once; a shadow you choose with `operator-gate mode shadow` stays. One file sets the mode:
 
 ```sh
-echo enforce > ~/.operator/mode     # shadow -> enforce
+echo shadow  > ~/.operator/mode     # record without blocking
+echo enforce > ~/.operator/mode     # block again
 echo off     > ~/.operator/mode     # or disable entirely
 ```
 
@@ -107,12 +116,13 @@ overrides the gate path; `$OPERATOR_PYTHON` overrides the interpreter.
 
 ## Test status
 
-`test.sh` (10/10): gate contract with OpenCode-shaped payloads (plain
-`rm -rf` -> STOP, `r''m` obfuscation -> STOP, benign `ls` -> ALLOW), the 43-case
-GuardFall bypass corpus (43/43), adapter hook contract driven directly with node
+`test.sh` (11/11): gate contract with OpenCode-shaped payloads (plain
+`rm -rf` -> STOP, `r''m` obfuscation -> STOP, benign `ls` -> ALLOW), the 46-case
+GuardFall bypass corpus (46/46), a fresh `install.sh` that starts in enforce,
+adapter hook contract driven directly with node
 (block / canary / benign / gate-unreachable), and — with the `opencode` CLI
 installed — plugin discovery via `opencode debug config` plus a clean
 `opencode debug startup` smoke run. **UNTESTED**: a live blocking decision
 inside a real OpenCode session (needs a configured model). Verify manually with
-the canary: ask OpenCode to run `echo OPERATOR_CANARY_STOP_7f3a` — in shadow
-mode it logs an OP-CANARY STOP receipt without interrupting the session.
+the canary: ask OpenCode to run `echo OPERATOR_CANARY_STOP_7f3a` — the gate
+stops it and writes an OP-CANARY receipt (in shadow mode it only writes the receipt).

@@ -12,8 +12,8 @@
  *   2. the gate bundled in this package (gate/operator-gate.py)
  *   3. ~/.operator/gate/operator-gate.py (a previously installed copy)
  *
- * Shadow mode by default: the gate classifies and receipts but always exits 0.
- * Flip to blocking: echo enforce > ~/.operator/mode
+ * Enforce mode unless ~/.operator/mode says otherwise: the gate stops what a STOP rule matches
+ * (exit 2) and receipts every call. To record without blocking: echo shadow > ~/.operator/mode
  */
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -95,7 +95,7 @@ const plugin = {
   id: "vestige-operator-lite",
   name: "Vestige Operator Lite",
   description:
-    "Deterministic pre-tool gate: 27 rules, cd/vars/heredoc-aware shell analysis, GuardFall-proof, hash-chained receipts. Gate bundled — shadow mode by default.",
+    "Deterministic pre-tool gate: 15 STOP and 15 SHADOW rules, cd/vars/heredoc-aware shell analysis, GuardFall-proof, hash-chained receipts. Gate bundled — enforce mode by default.",
   kind: "security",
 
   register(api) {
@@ -134,7 +134,7 @@ const plugin = {
           blockReason: res.reason || "OPERATOR LITE: STOPPED",
         };
       }
-      return undefined; // allowed (shadow receipts written by the gate itself)
+      return undefined; // allowed (the gate wrote the receipt, a shadow stop included)
     });
   },
 };

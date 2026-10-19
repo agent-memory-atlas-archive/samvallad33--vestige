@@ -60,7 +60,7 @@ cat "$LOGS/install.log"
 
 [ -f "$TEST_HOME/.operator/gate/operator-gate.py" ] && ok "gate installed" || bad "gate missing"
 [ -x "$TEST_HOME/.operator/gate/operator-gate.py" ] && ok "gate is executable" || bad "gate not executable"
-[ "$(cat "$TEST_HOME/.operator/mode" 2>/dev/null)" = "shadow" ] && ok "mode file = shadow" || bad "mode file not shadow"
+[ "$(cat "$TEST_HOME/.operator/mode" 2>/dev/null)" = "enforce" ] && ok "mode file = enforce (the installer default)" || bad "mode file not enforce: a fresh install must block"
 [ -x "$PLUGIN_DIR/scripts/operator-hook.py" ] && ok "hook shim installed + executable" || bad "hook shim missing"
 
 python3 - "$PLUGIN_DIR/hooks/hooks.json" <<'PYEOF' && ok "hooks.json valid + wired (\${PLUGIN_ROOT}, PreToolUse, timeout)" || bad "hooks.json wrong"
@@ -74,7 +74,8 @@ assert h["timeout"] == 10, h
 PYEOF
 
 # ---- 2. shadow mode: receipts written, nothing blocked ----------------------- #
-section "shadow mode (default)"
+section "shadow mode (the owner's choice)"
+echo shadow > "$TEST_HOME/.operator/mode"
 rc=$(gate_hook '{"event":"PreToolUse","session_id":"s1","tool_name":"shell","tool_input":{"command":"ls -la"},"working_dir":"'"$TEST_PROJ"'"}' >/dev/null 2>&1; echo $?)
 [ "$rc" = "0" ] && ok "benign ls -> exit 0 (allowed)" || bad "benign ls exited $rc, want 0"
 

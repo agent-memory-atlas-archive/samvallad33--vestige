@@ -9,7 +9,8 @@
 #      never overwrites a newer gate)
 #   2. copies this port's adapter to ~/.operator/ports/crewai/operator_hooks.py
 #      (any existing copy is backed up first)
-#   3. sets mode to shadow if no mode file exists yet
+#   3. sets mode to enforce if no mode file exists yet; a shadow an install
+#      before 0.3.9 wrote becomes enforce, once
 #   4. prints next steps
 #
 # CrewAI has no hooks.json to merge: hooks are execution hooks registered from
@@ -75,7 +76,10 @@ if [ -s "$TMP_GATE" ] && grep -q '^VERSION = ' "$TMP_GATE"; then
 else
     rm -f "$TMP_GATE"
 fi
-if [ "$SRC" = "" ] && [ -f "$REPO_GATE" ] && grep -q '^VERSION = ' "$REPO_GATE"; then
+# the checkout's own gate wins when it is newer than main's (a branch being tested, a release not yet merged)
+if [ -f "$REPO_GATE" ] && grep -q '^VERSION = ' "$REPO_GATE" && \
+    { [ "$SRC" = "" ] || ! version_ge "$(gate_version "$SRC")" "$(gate_version "$REPO_GATE")"; }; then
+    [ "$SRC" = "$TMP_GATE" ] && rm -f "$TMP_GATE"
     SRC="$REPO_GATE"
 fi
 
@@ -119,14 +123,24 @@ python3 -c 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.
     "$MODULE_DST" 2>/dev/null || die "$MODULE_DST does not parse; installation is broken"
 say "operator_hooks: adapter installed -> $MODULE_DST"
 
-# --- mode: shadow unless the owner already chose ----------------------------- #
+# --- mode: enforce unless the owner already chose ----------------------------- #
 MODE_DST="$OP_HOME/mode"
-if [ ! -f "$MODE_DST" ]; then
-    printf 'shadow\n' > "$MODE_DST"
-    say "operator-gate: mode=shadow (log-only). Flip with: echo enforce > $MODE_DST"
-else
-    say "operator-gate: mode=$(cat "$MODE_DST") (existing mode kept)"
+NEW_MODE=""
+[ -f "$MODE_DST" ] || { printf 'enforce\n' > "$MODE_DST"; NEW_MODE=1; }
+# Installs before 0.3.9 wrote shadow, which blocks nothing. The gate settles the mode once (a shadow the
+# owner chose with its mode command stays) and records that it did, so a later `echo shadow` is kept.
+SETTLED=""
+if grep -q '^EDITION = "lite"' "$GATE_DST" 2>/dev/null; then
+    SETTLED=$(python3 -I "$GATE_DST" mode --settle 2>/dev/null) || SETTLED=""
 fi
+case "$SETTLED" in
+    *"("*) say "operator-gate: $SETTLED. To record without blocking: echo shadow > $MODE_DST" ;;
+    *) if [ -n "$NEW_MODE" ]; then
+           say "operator-gate: mode=enforce (blocking). To record without blocking: echo shadow > $MODE_DST"
+       else
+           say "operator-gate: mode=$(cat "$MODE_DST") (existing mode kept)"
+       fi ;;
+esac
 
 # --- smoke: the adapter resolves the gate and reports its wiring -------------- #
 python3 - "$MODULE_DST" "$GATE_DST" <<'PYEOF' || die "adapter smoke check failed"
@@ -150,10 +164,10 @@ say "       sys.path.insert(0, os.path.expanduser(\"$PORTS_CREWAI_DIR\"))"
 say "       import operator_hooks   # registers the global PRE_TOOL_CALL gate hook"
 say "  2. Prove it: sh $PORT_DIR/test.sh"
 say "  3. Review receipts: python3 $GATE_DST status ; python3 $GATE_DST verify"
-say "  4. Inside a crew (shadow mode logs the STOP without blocking), ask it to run:"
+say "  4. Inside a crew (the gate stops it), ask it to run:"
 say "       echo OPERATOR_CANARY_STOP_7f3a"
 say "     then check $OP_HOME/receipts/ for the OP-CANARY receipt."
-say "  5. When the shadow log looks right, flip to blocking:"
-say "        echo enforce > $MODE_DST"
+say "  5. To record without blocking instead:"
+say "        echo shadow > $MODE_DST"
 say "  6. Unwire: remove the import (or set OPERATOR_CREWAI_AUTOINSTALL=0);"
 say "     delete $MODULE_DST to uninstall the adapter."

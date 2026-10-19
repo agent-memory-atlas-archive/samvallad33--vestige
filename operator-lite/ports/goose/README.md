@@ -2,11 +2,12 @@
 
 The Operator gate, wired into [Goose](https://github.com/block/goose) (Block's
 open-source AI agent) through Goose's **lifecycle hooks** — the same
-host-agnostic gate that ships for Claude Code, Codex, OpenClaw, OpenHands,
+host-agnostic gate that ships for Claude Code, OpenClaw, OpenHands,
 OpenCode and Cline. Part of
 [Vestige](https://github.com/samvallad33/vestige); see the
 [main Operator Lite README](../../README.md) for the full rule table
-(OP-000..OP-010 enforce, OP-S01..S17 shadow).
+(15 STOP rules: OP-000..OP-011, OP-014, OP-018, OP-CANARY; 15 shadow rules:
+OP-S01..S08, OP-S11..S17).
 
 ## The verified mechanism (and why)
 
@@ -63,10 +64,14 @@ What was **not** viable, checked honestly:
 
 Everything the gate stops on any host: edits to the gate/hook/permit files
 itself (OP-000), workspace-root deletion (OP-001), Vestige store wipes
-(OP-002), blind recursive deletes and sweeps from `/` (OP-003), git history
-destruction (OP-004), unreviewed publishes (OP-005), paid deploys (OP-006),
-destructive SQL (OP-007), shell-init writes (OP-008), reverse shells (OP-009),
-cloud-metadata exfil (OP-010), plus the shadow-only classes (work-loss git,
+(OP-002), recursive deletes outside the project and sweeps from `/` (OP-003),
+git history destruction (OP-004), unreviewed publishes (OP-005), production
+deploys and infrastructure teardown (OP-006), destructive SQL and database
+resets (OP-007), shell-init writes (OP-008), reverse shells (OP-009),
+cloud-metadata exfil (OP-010), discarded uncommitted work, shredded or emptied
+files and `crontab -r` (OP-011), raw-disk writes, fork bombs and recursive
+permission changes on `/` or home (OP-014), a download piped or handed
+straight to a shell (OP-018), plus the shadow-only classes (work-loss git,
 pipe-to-interpreter, persistence, env hijack, exfil shapes, ...). The
 analyzer sees through quote reassembly (`r''m`), `$IFS`, `$(echo rm)`,
 ANSI-C quoting, base64 bodies, heredocs, session variables and subshell
@@ -81,7 +86,8 @@ sh operator-lite/ports/goose/install.sh
 The script installs the gate to `~/.operator/gate/` (downloaded from the
 Vestige repo if no local copy exists; never overwrites an existing gate),
 copies the hook plugin into `~/.agents/plugins/operator-lite/`, sets
-**shadow mode** if no mode file exists, and prints next steps. Requires
+**enforce mode** if no mode file exists (the `shadow` an install before 0.3.9
+wrote becomes `enforce`, once), and prints next steps. Requires
 goose v1.41.0+ and `python3` on PATH.
 
 Verify the wiring:
@@ -90,17 +96,17 @@ Verify the wiring:
 sh operator-lite/ports/goose/test.sh    # 29 hermetic checks, installs into a throwaway HOME
 ```
 
-Then inside goose (shadow mode: the STOP is logged, nothing is blocked):
+Then inside goose (the gate stops it; in shadow mode it only logs the STOP):
 
 > Run `echo OPERATOR_CANARY_STOP_7f3a`
 
 and check `~/.operator/receipts/<today>.jsonl` for the `OP-CANARY` receipt.
 
-## Shadow -> enforce
+## Enforce and shadow
 
 ```sh
-echo enforce > ~/.operator/mode     # blocks for real; receipts keep flowing
-echo shadow  > ~/.operator/mode     # back to log-only
+echo shadow  > ~/.operator/mode     # log-only: nothing is blocked
+echo enforce > ~/.operator/mode     # blocks again (the install default); receipts keep flowing
 ```
 
 In enforce mode a blocked call shows the model the gate's full verdict —
@@ -144,5 +150,5 @@ digest the owner can grant from their own terminal.
 |---|---|
 | `hooks.json` | Open Plugins hook config (template, `${PLUGIN_ROOT}`-relative) |
 | `operator-hook.py` | stdin payload translator + gate runner (stdlib only) |
-| `install.sh` | gate install + plugin wiring, shadow default |
+| `install.sh` | gate install + plugin wiring, enforce default |
 | `test.sh` | hermetic end-to-end tests (real install.sh, real hook command) |

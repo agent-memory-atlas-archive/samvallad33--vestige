@@ -20,9 +20,9 @@ async def run_shell(command: str) -> str: ...
 
 Every verdict is **deterministic**: a single stdlib-only gate file classifies
 the command before it runs — exit 0 allow, exit 2 block with a reason the
-model sees — and appends a hash-chained receipt. Shadow mode (the default
-after install) logs every would-block without blocking; flip with
-`echo enforce > ~/.operator/mode`.
+model sees — and appends a hash-chained receipt. Enforce mode is the default
+(a missing `~/.operator/mode` reads as enforce, and every installer writes it);
+`echo shadow > ~/.operator/mode` logs every would-block without blocking.
 
 **The gate is not in this wheel.** It is one auditable file, installed to
 `~/.operator/gate/operator-gate.py`:

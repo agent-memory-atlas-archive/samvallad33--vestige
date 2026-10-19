@@ -1,11 +1,12 @@
 # Operator Lite — Cursor port (official)
 
 The Operator gate, wired into [Cursor](https://cursor.com)'s **agent hooks** —
-the same host-agnostic gate that ships for Claude Code, Codex, Gemini CLI,
+the same host-agnostic gate that ships for Claude Code, Gemini CLI,
 Goose, OpenClaw, OpenHands, OpenCode and Cline. Part of
 [Vestige](https://github.com/samvallad33/vestige); see the
 [main Operator Lite README](../../README.md) for the full rule table
-(OP-000..OP-010 enforce, OP-S01..S17 shadow).
+(15 STOP rules: OP-000..OP-011, OP-014, OP-018, OP-CANARY; 15 shadow rules:
+OP-S01..S08, OP-S11..S17).
 
 ## The verified mechanism (and why)
 
@@ -96,20 +97,24 @@ either spawn model.
 
 Everything the gate stops on any host: edits to the gate/hook/permit files
 itself (OP-000), workspace-root deletion (OP-001), Vestige store wipes
-(OP-002), blind recursive deletes and sweeps from `/` (OP-003), git history
-destruction (OP-004), unreviewed publishes (OP-005), paid deploys (OP-006),
-destructive SQL (OP-007), shell-init writes (OP-008), reverse shells (OP-009),
-cloud-metadata exfil (OP-010) — plus the shadow-only classes (work-loss git,
+(OP-002), recursive deletes outside the project and sweeps from `/` (OP-003),
+git history destruction (OP-004), unreviewed publishes (OP-005), production
+deploys and infrastructure teardown (OP-006), destructive SQL and database
+resets (OP-007), shell-init writes (OP-008), reverse shells (OP-009),
+cloud-metadata exfil (OP-010), discarded uncommitted work, shredded or emptied
+files and `crontab -r` (OP-011), raw-disk writes, fork bombs and recursive
+permission changes on `/` or home (OP-014), a download piped or handed
+straight to a shell (OP-018) — plus the shadow-only classes (work-loss git,
 outgoing comms, public mutation, credential-shaped writes,
 pipe-to-interpreter, persistence, env hijacks, exfil shapes, invisible
 characters, MCP argument exfil, agent-config writes, paste/tunnel egress, new
 git remotes, sandbox-escape primitives), recorded in receipts and promotable
 per rule via `commitments.json`.
 
-**GuardFall-proof:** the gate replays a 43-case corpus of bypass techniques
+**GuardFall-proof:** the gate replays a 46-case corpus of bypass techniques
 (quote reassembly, `$IFS`, command substitution, ANSI-C escapes, base64
 bodies, brace/glob enumeration, subshell time-bombs, cd tracking, heredocs,
-fork bombs, `mv x /dev/null`, …) and must pass 43/43:
+fork bombs, `mv x /dev/null`, …) and must pass 46/46:
 
 ```
 python3 ~/.operator/gate/operator-gate.py corpus guardfall
@@ -123,16 +128,17 @@ signatures.
 
 ```
 git clone https://github.com/samvallad33/vestige && cd vestige/operator-lite   # skip if already cloned
-sh ports/cursor/install.sh               # gate + adapter + ~/.cursor/hooks.json hooks, mode=shadow
+sh ports/cursor/install.sh               # gate + adapter + ~/.cursor/hooks.json hooks, mode=enforce
 sh ports/cursor/test.sh                  # optional: proves the chain end-to-end
 ```
 
 `install.sh` is idempotent:
 
 - installs the gate to `~/.operator/gate/operator-gate.py` (downloads from
-  GitHub; never overwrites an existing same-or-newer copy)
+  GitHub, or uses this checkout's copy when it is newer; never overwrites an
+  existing same-or-newer copy)
 - installs the adapter to `~/.operator/gate/cursor-hook.py`
-- sets `~/.operator/mode` to `shadow` if no mode file exists yet
+- sets `~/.operator/mode` to `enforce` if no mode file exists yet, and switches the `shadow` an install before 0.3.9 wrote to `enforce`, once
 - merges the three hooks into `~/.cursor/hooks.json` (user scope, every
   project; a timestamped backup is written first; existing hooks and settings
   are preserved; an invalid existing file is left untouched and manual steps
@@ -143,12 +149,13 @@ them automatically; if the hooks do not load, restart Cursor. The bundled
 `hooks.json` in this directory is the reference template
 (`REPLACE_WITH_HOME` is substituted by the installer).
 
-## Shadow → enforce
+## Enforce and shadow
 
-Start in shadow: every decision is analyzed and receipted, nothing is blocked.
-When the log looks right, flip:
+A fresh install blocks: every command a STOP rule matches is denied, and every
+decision is receipted. To record without blocking, and back:
 
 ```
+echo shadow > ~/.operator/mode
 echo enforce > ~/.operator/mode
 ```
 
@@ -237,7 +244,7 @@ payloads in the exact stdin shapes documented above:
 |---|---|
 | `hooks.json` | Reference template (installer writes the absolute path into `~/.cursor/hooks.json`) |
 | `cursor-hook.py` | Payload translator + verdict translation + gate runner (stdlib only) |
-| `install.sh` | gate install + hooks.json merge (backup, idempotent), shadow default |
+| `install.sh` | gate install + hooks.json merge (backup, idempotent), enforce default |
 | `test.sh` | hermetic end-to-end tests (real install.sh, real adapter, exact payload shapes) |
 
 ## Back to the main repo

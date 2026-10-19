@@ -242,13 +242,17 @@ except Exception as exc:
 print("wired hook: %s" % wired)
 check("the registered hook names this interpreter and the installed gate", wired.startswith('"') and "python3 " not in wired
       and "/.operator/gate/operator-gate.py" in wired and "'--source','claude'" in wired and " -I -c " in wired, wired)
+with open(os.path.join(fake, ".operator", "mode")) as f:
+    check("a fresh Windows install writes enforce", f.read().strip() == "enforce")
 payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git push --force origin main"}, "cwd": work, "session_id": "t"})
 p = subprocess.run(wired, shell=True, input=payload, capture_output=True, text=True, env=env2)
-check("the registered hook runs through the Windows shell and records in shadow", p.returncode == 0 and not p.stderr.strip(), p.stderr[:200])
+check("right after install the registered hook runs through the Windows shell and stops the force-push",
+      p.returncode == 2 and "OP-004" in p.stderr, p.stderr[:200])
 with open(os.path.join(fake, ".operator", "mode"), "w") as f:
-    f.write("enforce\n")
+    f.write("shadow\n")
 p = subprocess.run(wired, shell=True, input=payload, capture_output=True, text=True, env=env2)
-check("after the flip to enforce the registered hook stops the force-push", p.returncode == 2 and "OP-004" in p.stderr, p.stderr[:200])
+check("in shadow mode, the owner's choice, the registered hook records and does not block",
+      p.returncode == 0 and not p.stderr.strip(), p.stderr[:200])
 shutil.rmtree(fake, ignore_errors=True)
 
 p = subprocess.run([sys.executable, GATE, "verify"], capture_output=True, text=True, env=env)

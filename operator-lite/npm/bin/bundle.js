@@ -16,6 +16,8 @@ fs.cpSync(path.join(src, "ports"), path.join(dst, "ports"), {
   recursive: true,
   filter: (p) => !/(^|[\\/])(__pycache__|node_modules)$/.test(p),
 });
+// the corpora beside the gate, so `npx operator-lite test` replays them on the user's own machine
+fs.cpSync(path.join(src, "corpora"), path.join(dst, "corpora"), { recursive: true });
 
 const gate = fs.readFileSync(path.join(dst, "operator-gate.py"), "utf8");
 const version = (gate.match(/^VERSION = "([^"]+)"/m) || [])[1];

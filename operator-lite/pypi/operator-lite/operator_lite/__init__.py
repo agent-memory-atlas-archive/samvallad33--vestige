@@ -18,7 +18,7 @@ Gate contract (unchanged from the ports):
     stdin:       {"tool_name": ..., "tool_input": {"command": ...},
                   "cwd": ..., "session_id": ...?}
     exit 0 = allow, exit 2 = block (reason on stderr)
-    shadow vs enforce is a file: ~/.operator/mode (shadow default)
+    enforce vs shadow is a file: ~/.operator/mode (enforce when missing)
 
 Everything decision-bearing lives in the gate. This package is payload shaping
 and plumbing only -- no rule logic, no analysis. Stdlib-only at import time;

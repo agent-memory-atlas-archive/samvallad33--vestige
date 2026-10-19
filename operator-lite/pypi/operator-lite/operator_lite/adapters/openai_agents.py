@@ -138,7 +138,7 @@ def describe() -> dict:
         "gate": gate,
         "gate_present": os.path.exists(gate),
         "mode": mode or "(no mode file -- the gate treats this as enforce; "
-                        "ensure_gate/install writes 'shadow')",
+                        "install.sh writes 'enforce', ensure_gate writes none)",
         "agents_sdk": agents_sdk_available(),
     }
 

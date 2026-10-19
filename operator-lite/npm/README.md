@@ -6,9 +6,27 @@ A deterministic pre-tool gate for coding agents. One command, the same on macOS,
 
 It installs the gate to `~/.operator/gate`, wires Claude Code, then wires every other agent it
 finds on the machine (Cursor, Gemini CLI, Windsurf, Cline, Goose, opencode, Amazon Q). It starts in
-shadow mode: every verdict is recorded and nothing is blocked until you run
+enforce mode: from your agent's next tool call, every command a STOP rule matches is stopped before
+it runs, and every verdict gets a hash-chained receipt. An existing `~/.operator/mode` file is kept, except the `shadow` every install before 0.3.9 wrote, which becomes `enforce` once; a shadow you choose with `operator-gate mode shadow` stays.
+To record without blocking:
 
-    npx operator-lite mode enforce
+    npx operator-lite mode shadow
+
+To check it on your own machine before you trust it:
+
+    npx operator-lite test       # prints: corpus=guardfall cases=46 passed=46 failed=0
+    npx operator-lite status     # the mode, whether the hook is registered, what it stopped
+    npx operator-lite verify     # the receipt chain, in order
+
+`test` replays the 46-case GuardFall bypass corpus this package carries, with the gate it
+carries; it classifies every command and executes none.
+
+The STOP rules cover edits to the gate itself, wiping the Vestige memory store, deleting a
+workspace, home or `/`, recursive deletes outside the project,
+force-pushes and `.git` removal, unreviewed publishes, production deploys and infrastructure
+teardown, destructive SQL and database resets, shell-init writes, reverse shells, cloud metadata
+endpoints, discarded uncommitted git work, shredded or emptied files, raw-disk and recursive
+permission wrecks, fork bombs, and a download piped or handed straight to a shell.
 
 Run it in your own terminal. The installer refuses to run in a shell that Claude Code's agent
 started (it reads `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT`), or in any shell that sets

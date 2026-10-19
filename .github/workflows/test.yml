@@ -60,6 +60,17 @@ jobs:
       - if: runner.os != 'Windows'
         run: python3 operator-lite/test_self_protect.py
       - if: runner.os != 'Windows'
+        name: a fresh install stops every clearly destructive command
+        run: python3 operator-lite/test_destructive.py
+      - name: an upgrade from 0.3.7 blocks
+        run: python operator-lite/test_upgrade.py
+      - if: runner.os != 'Windows'
+        name: the npm package carries this gate at its own version
+        run: node operator-lite/npm/test.js
+      - if: runner.os != 'Windows'
+        name: the pip package's gate contract, against this gate
+        run: OPERATOR_GATE="$PWD/operator-lite/operator-gate.py" python3 operator-lite/pypi/operator-lite/test_smoke.py
+      - if: runner.os != 'Windows'
         name: every host port's own test suite, offline
         run: |
           for t in operator-lite/ports/*/test.sh; do

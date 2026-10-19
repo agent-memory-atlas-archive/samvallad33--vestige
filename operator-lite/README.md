@@ -23,9 +23,10 @@ On Windows, in PowerShell, with Python 3.9 or newer installed:
     curl.exe -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/operator-lite/operator-gate.py -o "$env:TEMP\operator-gate.py"; python "$env:TEMP\operator-gate.py" install
 
 From a clone, `python3 operator-gate.py install` does the same. It copies the gate to
-`~/.operator/gate`, registers the Claude Code hook, starts in shadow mode (records
-every verdict, blocks nothing) and then replays your last 30 days of Claude Code
-history through the rules. Nothing in that history is executed.
+`~/.operator/gate`, registers the Claude Code hook, starts in enforce mode (every
+command a STOP rule matches is stopped, from your agent's next tool call) and then
+replays your last 30 days of Claude Code history through the rules. Nothing in that
+history is executed. An existing `~/.operator/mode` file is kept, except the `shadow` every install before 0.3.9 wrote, which becomes `enforce` once; a shadow you choose with `operator-gate mode shadow` stays.
 
 `install` never replaces a gate that outranks it: when `~/.operator/gate/operator-gate.py`
 is the paid Operator gate or a newer version, it prints both versions and the path, changes
@@ -33,6 +34,27 @@ nothing and exits 4. `install --force` replaces it anyway, after a warning, and 
 replaced gate in `~/.operator/install-backups/`. `install` and `uninstall` refuse to run in
 a shell Claude Code's agent started (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`) or one that sets
 `OPERATOR_AGENT_SESSION`; other agents' shells are not recognized.
+
+## Check every claim yourself
+
+Each claim below comes with the command that checks it on your own machine. Run them
+before you trust the gate, and again after any upgrade.
+
+| Claim | Check it | It prints |
+|---|---|---|
+| It blocks from your agent's first tool call | `operator-gate status` | `Operator Lite 0.3.9   mode: enforce (blocking)   Claude Code hook: registered` |
+| What it stops is a closed list you can read | `operator-gate status --rules` | all 30 rules: 15 STOP, 15 SHADOW |
+| It sees through 46 adapted GuardFall bypass cases | `npx operator-lite test` | `corpus=guardfall cases=46 passed=46 failed=0` |
+| A fresh install stops 91 destructive commands and lets 22 normal ones run | `python3 operator-lite/test_destructive.py`, from a clone | `failures: 0 of 113` |
+| An upgrade from 0.3.7 blocks too | `python3 operator-lite/test_upgrade.py`, from a clone | `all upgrade checks passed` |
+| Every decision is on record, in order | `operator-gate verify` | `receipts=<count> chain=OK integrity=reference_digest_not_signature` |
+
+`operator-gate` is the command `install` puts on your PATH; without it, run
+`python3 ~/.operator/gate/operator-gate.py` instead. Nothing in these checks runs a
+destructive command: the gate classifies each one and executes none. CI runs the same
+checks on every change ([test.yml](../.github/workflows/test.yml)): the destructive
+commands and the corpus on Linux and macOS, and the upgrade and the receipt chain on Linux,
+macOS and Windows. What the gate cannot see is stated under [Honest boundary](#honest-boundary).
 
 ## Other hosts, or by hand
 
@@ -42,7 +64,7 @@ The `cp` below checks nothing: if `~/.operator/gate/operator-gate.py` already ex
     mkdir -p ~/.operator/gate
     cp operator-gate.py ~/.operator/gate/
     chmod 755 ~/.operator/gate/operator-gate.py
-    echo shadow > ~/.operator/mode          # always shadow first
+    echo enforce > ~/.operator/mode         # block from the first call; "shadow" only records
 
 **Claude Code** (`~/.claude/settings.json`), which `install` writes for you:
 ```json
@@ -64,7 +86,8 @@ hook needs its own verified wiring before it can be called supported.
 binary: gate exit 0 = allow, exit 2 = block with the reason.)
 
 ALLOW = exit 0, silent. STOP = exit 2, reason on stderr (the agent sees it and
-must change course). Flip to blocking with `operator-gate mode enforce`.
+must change course). `operator-gate mode shadow` records without blocking;
+`operator-gate mode enforce` blocks again.
 
 ## See it on your own history first
 
@@ -93,41 +116,44 @@ From a made-up history:
 ```
 operator-gate replay: the last 30 days on this machine. Nothing was executed.
 
-       23  tool calls your agents made (2 Claude Code sessions, 2 projects)
-        3  a built-in rule would have stopped
+       22  tool calls your agents made (2 Claude Code sessions, 2 projects)
+        4  a built-in rule would have stopped
         1  flagged in shadow: recorded, not stopped
-       14  no built-in rule decides: only you can
+       13  no built-in rule decides: only you can
 
 Would have been stopped (all of them):
-  Mar 21  shop-api           OP-004 force push to a shared branch
+  Oct 16  shop-api           OP-004 force push to a shared branch
                              git push --force origin main
-  Mar 19  shop-api           OP-007 destructive SQL
+  Oct 15  shop-api           OP-007 destructive SQL
                              psql $DATABASE_URL -c 'DROP TABLE sessions'
-  Mar 14  infra              OP-003 recursive delete of ~/Documents/old-terraform-state
+  Oct 10  infra              OP-003 recursive delete of ~/Documents/old-terraform-state
                              rm -rf ~/Documents/old-terraform-state
+  Oct 10  infra              OP-006 terraform apply
+                             terraform apply -auto-approve
 By rule:
       1  OP-003 no-blind-recursive-delete   recursive delete of ~/Documents/old-terraform-state
       1  OP-004 no-history-destruction      force push to a shared branch
+      1  OP-006 no-paid-deploy              terraform apply
       1  OP-007 no-destructive-sql          destructive SQL
 
 Flagged in shadow, recorded and not stopped:
-      1  OP-S01 work-loss                   git reset --hard HEAD~1
+      1  OP-S01 work-loss                   git branch -D spike-cache
 
 No built-in rule decides these. They ran:
       4  pushed to a remote                 git push origin main
       3  installed packages by name         npm install left-pad
       2  ran a database client or migration psql -c 'select count(*) from users' shop
-      2  deployed or changed infrastructure terraform apply -auto-approve
       1  wrote CI or deploy config          Write .github/workflows/ci.yml
+      1  deployed or changed infrastructure kubectl apply -f k8s/
       1  wrote an env file                  Write .env
       1  skipped git hooks                  git commit --no-verify -m wip
 
 Your first laws, drafted from this history:
   "No push without my permit."                           4 times
   "No new package without my review."                    3 times
-  "Deploys and infrastructure changes are mine."         2 times
   "No database client or migration without my permit."   2 times
   "Never skip git hooks."                                1 time
+  "Deploys and infrastructure changes are mine."         1 time
   "CI and deploy config are mine to change."             1 time
   "Env files are mine to change."                        1 time
 ```
@@ -144,20 +170,30 @@ Windows can run. On Windows it is tested by `test_windows.py` on a CI runner.
 
 ## What it stops
 
+30 rules. In enforce mode the 15 STOP rules block; the 15 SHADOW rules only write a receipt.
+
 | Rule | Mode | Catches |
 |---|---|---|
-| OP-000 | STOP | edits to the gate itself, hook registrations, settings files |
-| OP-001 | STOP | delete/move of a workspace root (or parent) |
+| OP-000 | STOP | edits to the gate itself, its mode, permits and rules, hook registrations, settings files |
+| OP-001 | STOP | delete/move of a workspace root or a parent of one, including `/` and your home folder |
 | OP-002 | STOP | wiping the Vestige store (its log or database files, sqlite3 writes, `vestige gc`) |
-| OP-003 | STOP | blind recursive deletes, sweeps from `/`, fork bombs |
-| OP-004 | STOP | force-push to shared branches, remote-main deletion, `.git` removal |
-| OP-005 | STOP | unreviewed publishes (npm/cargo/twine/docker/gh release) |
-| OP-006 | STOP | paid deploys and live-billing actions |
-| OP-007 | STOP | destructive SQL (DROP/TRUNCATE/unscoped DELETE) |
+| OP-003 | STOP | recursive deletes outside the project and outside scratch/build folders (`rm -r`, `find -delete`, `trash`, inline `shutil.rmtree`/`fs.rmSync`), sweeps from `/` |
+| OP-004 | STOP | force-push to shared branches, remote-main deletion, deleting `.git` or a whole repository |
+| OP-005 | STOP | unreviewed publishes (npm/pnpm/yarn/cargo/twine/docker push/gh release), deleting a public repo |
+| OP-006 | STOP | production deploys (`vercel --prod`, `fly deploy`, `railway up`, `netlify deploy --prod`, `wrangler deploy`), infrastructure changes and teardown (`terraform`/`tofu` apply or destroy, `pulumi up`, `cdk deploy`, `kubectl delete`, `helm uninstall`, `aws s3 rb`, cloud `delete` commands), live billing |
+| OP-007 | STOP | destructive SQL (DROP/TRUNCATE/unscoped DELETE, `FLUSHALL`), framework database resets (`prisma migrate reset`, `rails db:drop`, `manage.py flush`, `artisan migrate:fresh`) |
 | OP-008 | STOP | shell-init writes (`>> ~/.zshrc` = code execution by install) |
-| OP-009 | STOP | reverse shells (`/dev/tcp`, `nc -e`, DNS-tunnel tools) |
+| OP-009 | STOP | reverse shells (`/dev/tcp`, `nc -e`, DNS-tunnel tools, inline code that hands a socket a shell) |
 | OP-010 | STOP | cloud metadata endpoints (169.254.169.254, metadata.google.internal) |
-| OP-S01..S08 and S11..S17 | SHADOW | work-loss git, comms, public mutation, secret writes, pipe-to-interpreter, persistence, env-hijack (LD_PRELOAD/PATH=), exfil shapes, invisible chars, MCP argument exfil, agent-config writes, paste/tunnel egress, new git remotes, sandbox-escape primitives |
+| OP-011 | STOP | loss nothing can undo: `git reset --hard`, `git clean -f`, `git checkout -- <path>` and `git stash drop` when they would discard real work, `shred`/`srm`/`rm -P`, emptying a non-empty file outside the project, `crontab -r` |
+| OP-014 | STOP | machine wreck: `dd` onto a device, `mkfs`/`fdisk`-class tools, `diskutil erase*`, recursive `chmod`/`chown`/`chgrp` on `/`, a system folder or home, fork bombs |
+| OP-018 | STOP | a download run unread: `curl X \| sh`, `wget -qO- X \| python3`, `bash <(curl X)`, `sh -c "$(curl X)"`, `eval "$(wget -qO- X)"` |
+| OP-CANARY | STOP | the verification canary string, which proves a host is wired |
+| OP-S01..S08 and S11..S17 | SHADOW | git commands that can lose work but did not here, comms, public mutation, secret writes, other pipe-to-interpreter, persistence, env-hijack (LD_PRELOAD/PATH=), exfil shapes, invisible chars, MCP argument exfil, agent-config writes, paste/tunnel egress, new git remotes, sandbox-escape primitives |
+
+A pipe, `<(` or `$(` inside quotes is text, not a command: `git commit -m "curl X | sh"` and
+`echo 'curl X | sh' >> README.md` pass. So does a download piped into a tool that reads it as
+data (`| jq`, `| python3 -m json.tool`, `| python3 -c '...'`).
 
 ## What the analyzer sees through
 
@@ -186,8 +222,9 @@ form that works on your machine.
 `verify` walks the receipt hash chain. `corpus guardfall` replays 46 adapted
 GuardFall bypass cases (must pass 46/46). `upgrade` describes the paid Operator
 gate and where to get it. `python3 test_parser.py` and `python3 test_replay.py`
-run the tests; CI runs them on Linux and macOS. `corpus` needs a clone: the corpus
-file ships in the repository, not with the single gate file. Every verdict appends to
+run the tests; CI runs them on Linux and macOS. `corpus` reads the corpus file beside
+the gate: it ships in the repository and in the npm package (`npx operator-lite test`),
+not with the single gate file the one-line install copies. Every verdict appends to
 `~/.operator/receipts/<date>.jsonl`.
 
 ## Honest boundary
