@@ -42,7 +42,7 @@ before you trust the gate, and again after any upgrade.
 
 | Claim | Check it | It prints |
 |---|---|---|
-| It blocks from your agent's first tool call | `operator-gate status` | `Operator Lite 0.3.10   mode: enforce (blocking)   Claude Code hook: registered` |
+| It blocks from your agent's first tool call | `operator-gate status` | `Operator Lite 0.3.11   mode: enforce (blocking)   Claude Code hook: registered` |
 | What it stops is a closed list you can read | `operator-gate status --rules` | all 30 rules: 15 STOP, 15 SHADOW |
 | It sees through 46 adapted GuardFall bypass cases | `npx operator-lite test` | `corpus=guardfall cases=46 passed=46 failed=0` |
 | A fresh install stops 210 destructive commands and lets 62 normal ones run | `python3 operator-lite/test_destructive.py`, from a clone | `failures: 0 of 272` |
@@ -182,7 +182,7 @@ Windows can run. On Windows it is tested by `test_windows.py` on a CI runner.
 | OP-005 | STOP | unreviewed publishes (npm/pnpm/yarn/cargo/twine/docker push/gh release), deleting a public repo |
 | OP-006 | STOP | production deploys (`vercel --prod`, `fly deploy`, `railway up`, `netlify deploy --prod`, `wrangler deploy`), infrastructure/bucket/project teardown (`terraform`/`tofu` apply or destroy, `pulumi up`, `cdk deploy`, `kubectl delete`, `helm uninstall`, `aws s3 rb`, `gsutil rm -r`/`rb`, `rclone purge`, `vercel rm`, `firebase projects:delete`, `supabase projects delete`, cloud `delete` commands), live billing |
 | OP-007 | STOP | destructive SQL (DROP/TRUNCATE, unscoped or tautological DELETE/UPDATE, `FLUSHALL`/`FLUSHDB`, `mongosh` `.drop()`/`dropDatabase()`), framework/schema resets (`prisma migrate reset`, `rails db:drop`, `manage.py flush`, `artisan migrate:fresh`, `flyway clean`, `alembic downgrade base`, `typeorm schema:drop`, `liquibase dropAll`), Docker volume wipes (`docker volume rm`/`prune`, `docker compose down -v`, `docker system prune --volumes`) |
-| OP-008 | STOP | shell-init writes (`>> ~/.zshrc` = code execution by install) |
+| OP-008 | STOP | shell-init and persistent hook writes (`>> ~/.zshrc`, `.git/hooks`, `.husky`, `.cargo/config.toml`), detached `tmux`/`screen`, and scheduler installs (`crontab`, `at`, `batch`, `anacron`, `schtasks /create`, `launchctl load`/`bootstrap`/`submit`/`enable`, `systemctl enable`/`start`) |
 | OP-009 | STOP | reverse shells (`/dev/tcp`, `nc -e`, DNS-tunnel tools, inline code that hands a socket a shell) |
 | OP-010 | STOP | cloud metadata endpoints (169.254.169.254, metadata.google.internal) |
 | OP-011 | STOP | loss nothing can undo: `git reset --hard`, `git clean -f`, `git checkout -- <path>`, `git checkout -f` and `git stash drop` when they would discard real work, deleting a project directory with uncommitted git changes, `shred`/`srm`/`rm -P`, deleting, overwriting or emptying a non-empty file outside the project, `crontab -r` |
@@ -203,6 +203,18 @@ live filesystem, subshell time-bombs (`(sleep 300; rm -rf) &`), session variable
 (`T=~/x; rm -rf $T`), cd tracking, heredocs, data-vs-code pipe discrimination,
 fork bombs, `mv x /dev/null`, a command written after a redirection
 (`>log rm -rf x`). Every STOP tells you which transforms it applied.
+
+## 0.3.11 next-gen anti-bypass
+
+Seven groups. A payload staged on an earlier turn, aliased through a symlink, handed to `mcp__*`, or left running in `tmux` is judged with the same STOP rules as the shell that would have run it.
+
+1. **Cross-turn Write/Edit manifest and hook staging.** `Write`, `Edit`, `MultiEdit`, and `apply_patch` of `package.json`, `Makefile`, `.git/hooks/*`, `.husky/*`, `.envrc`, `.psqlrc`, `.cargo/config.toml`, `conftest.py`, `setup.py`, and `build.rs` are analyzed as staged execution hooks before a later shell turn can run them.
+2. **Stateful config persistence and tamper defense.** `git config` of `core.fsmonitor`, `core.hooksPath`, `core.sshCommand`, and `alias.*=!`, and `npm` / `pnpm` / `yarn config set` of `script-shell` and `onload-script`, persist a later execution hook and are stopped. Inline assignment of `OPERATOR_HOME`, `OPERATOR_GATE_MODE`, and `VESTIGE_DATA_DIR` is tamper defense.
+3. **Toolchain and compiler execution flags.** Stops `go test -exec`, `cargo --config` `rustc-wrapper` / `runner`, `node` / `bun` / `deno --import data:`, `curl -K` / `--config`, `sqlite3 -init`, `mysql --init-command`, and `openssl engine`.
+4. **Ancestor realpath and in-command symlink escape.** Symlinked ancestor directories are resolved when the leaf does not exist yet, and an in-command `ln -s` alias is resolved before the path is judged.
+5. **Cross-channel `mcp__*` parity.** `mcp__*` shell runners, destructive SQL, filesystem delete and write, and GitHub and cloud teardown use the same STOP rules as the shell.
+6. **Detached multiplexers and schedulers (OP-008).** `tmux new-session -d` and `send-keys`, `screen -dmS`, `crontab`, `at`, `batch`, `anacron`, `schtasks /create`, `launchctl load` / `bootstrap` / `submit` / `enable`, and `systemctl enable` / `start` are Enforce.
+7. **Causal transform provenance.** Receipts record `write-manifest-analyzed`, `symlink-escaped`, `execution-hook-analyzed`, and `mcp-cross-channel-analyzed`.
 
 ## Commands
 

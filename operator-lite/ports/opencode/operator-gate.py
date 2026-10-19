@@ -32,13 +32,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 
 try:
     import fcntl
 except ImportError:                                  # Windows: receipts lock through msvcrt instead
     fcntl = None
 
-VERSION = "0.3.10"
+VERSION = "0.3.11"
 EDITION = "lite"                 # the paid gate is "operator"; install never replaces a gate that outranks this one
 INTEGRITY = "reference_digest_not_signature"
 IS_WINDOWS = os.name == "nt"
@@ -99,9 +100,24 @@ def norm(path, cwd):
 
 
 def real(path):
-    """Symlinks resolved; on Windows this also turns an 8.3 short name into the long one."""
+    """Symlinks resolved (including symlinked ancestor directories when the leaf does not exist yet);
+    on Windows this also turns an 8.3 short name into the long one."""
     try:
-        return canon(os.path.realpath(path))
+        r = canon(os.path.realpath(path))
+        if r != path or os.path.exists(path):
+            return r
+        cur = path.rstrip("/")
+        tail = []
+        while cur and cur != "/":
+            parent, leaf = posixpath.split(cur)
+            if not leaf or parent == cur:
+                break
+            tail.append(leaf)
+            cur = parent
+            if os.path.exists(cur):
+                rp = canon(os.path.realpath(cur)).rstrip("/")
+                return rp + "/" + "/".join(reversed(tail))
+        return r
     except Exception:
         return path
 
@@ -1051,10 +1067,16 @@ def db_input_sql(fed, rest, seg, ecwd):
     for i, t in enumerate(rest):
         if REDIRECT_TOKEN_RE.match(t):
             break                                       # what follows `>` is an output file, not input
-        if t in ("-f", "--file") and i + 1 < len(rest):
+        if t in ("-f", "--file", "-init", "--init") and i + 1 < len(rest):
             names.append(rest[i + 1])
         elif t.startswith("--file="):
             names.append(t[7:])
+        elif t.startswith("--init="):
+            names.append(t[7:])
+        elif t == "--init-command" and i + 1 < len(rest):
+            texts.append(rest[i + 1])
+        elif t.startswith("--init-command="):
+            texts.append(t.split("=", 1)[1])
         elif not t.startswith("-") and t.lower().endswith(SQL_FILE_EXT):
             names.append(t)
     names += re.findall(r"(?:\.read|\\ir?)\s+([^\s'\";]+)", seg)
@@ -1080,12 +1102,28 @@ SCRIPT_ARG_INTERPRETERS = ("bash", "sh", "zsh", "dash", "ksh", "fish",
 
 def resolve_script_arg(rest, ecwd):
     """First plausible script-path token from interpreter args (post-expansion)."""
-    for t in rest:
+    i = 0
+    while i < len(rest):
+        t = rest[i]
         if t in ("-c", "-e", "--eval", "-m") or (t.startswith("-") and not t.startswith("--") and t.endswith(("c", "e"))):
             return None
+        if t in ("--import", "--loader", "--require", "-r") and i + 1 < len(rest):
+            mod_t = rest[i + 1]
+            if not mod_t.startswith("data:") and ("/" in mod_t or mod_t.endswith((".js", ".mjs", ".cjs", ".ts"))):
+                return resolve(mod_t, ecwd) if ecwd else tilde(mod_t)
+            i += 2
+            continue
+        elif re.match(r"^--(?:import|loader|require)=(.+)$", t):
+            mod_t = t.split("=", 1)[1]
+            if not mod_t.startswith("data:") and ("/" in mod_t or mod_t.endswith((".js", ".mjs", ".cjs", ".ts"))):
+                return resolve(mod_t, ecwd) if ecwd else tilde(mod_t)
+            i += 1
+            continue
         if t.startswith("-"):
+            i += 1
             continue
         if t in (".", ".."):
+            i += 1
             continue
         if "/" in t or t.endswith((".sh", ".bash", ".py", ".pl", ".rb", ".js",
                                    ".mjs", ".cjs", ".ts", ".php", ".lua", ".zsh",
@@ -1410,10 +1448,77 @@ def replace_command_substs(cmd, substs, vars_):
     return SUBST_RE.sub("__SUBST__", out)
 
 
+GATE_TAMPER_VARS = {"OPERATOR_HOME", "OPERATOR_GATE_MODE", "VESTIGE_DATA_DIR"}
+# Prefixing these is a sandbox harness (`OPERATOR_HOME=$H python3 operator-gate.py`), not tamper.
+_SANDBOX_PROGS = ("python", "python3", "node", "sh", "bash", "zsh", "vestige", "vestige-mcp",
+                  "cargo", "npm", "npx", "echo", "mkdir", "cd", "for", "ls", "cat", "cp", "mv")
+_GATE_DISABLE_MODES = ("off", "shadow", "disabled", "0", "false")
+_DESTRUCTIVE_PROGS = ("rm", "rmdir", "mv", "shred", "dd", "truncate")
+
+
+def _remember_custom_strata(val, ecwd, vars_):
+    """Point later deletes at a command-local Strata dir without treating the assignment itself as tamper."""
+    if not val:
+        return
+    r_vdir = resolve(val, ecwd)
+    if r_vdir and not r_vdir.startswith(UNKNOWN_CWD) and "$" not in r_vdir and "__SUBST__" not in r_vdir:
+        vars_["__CUSTOM_STRATA_DIR__"] = r_vdir
+
+
+def _remaining_command(toks):
+    """Tokens after leading env/export wrappers and NAME=value prefixes."""
+    i = 0
+    while i < len(toks):
+        if re.match(r"^([A-Za-z_][A-Za-z0-9_%-]*)=(.*)$", toks[i], re.S):
+            i += 1
+            continue
+        if os.path.basename(toks[i]) in ("env", "export"):
+            i += 1
+            continue
+        break
+    return toks[i:]
+
+
+def _sandbox_invocation(rem_toks):
+    """A test/interpreter/toolchain harness, or no command at all (a bare assignment)."""
+    if not rem_toks:
+        return True
+    prog = os.path.basename(rem_toks[0])
+    if prog in _SANDBOX_PROGS or prog.startswith("vestige-"):
+        return True
+    return any("gate" in a or "operator" in a or "test_" in a for a in rem_toks)
+
+
+def _gate_mode_tamper(val):
+    """OPERATOR_GATE_MODE is tamper only when set to a disabling value."""
+    return (val or "").strip().lower() in _GATE_DISABLE_MODES
+
+
+def _git_force_push(eff):
+    if os.path.basename(str(eff.get("prog") or "")) != "git" or eff.get("sub") != "push":
+        return False
+    ga = eff.get("gargs") or []
+    return any(a in ("--force", "-f", "--force-with-lease") or str(a).startswith("--force")
+               or (str(a).startswith("+") and len(str(a)) > 1) for a in ga)
+
+
+def _env_tamper_effect(name, val, ecwd, seg=""):
+    return {"prog": "export", "seg": seg, "kind": "env_tamper", "var": name, "val": val, "target": val,
+            "targets": [], "recursive": False, "filtered": False, "unresolved": False,
+            "flags": [], "args": [], "cwd": ecwd or UNKNOWN_CWD, "writes": [], "text": seg or val}
+
+
 def carried_by_vars(toks, ecwd, depth, vars_):
-    """Analyze commands carried in execution environment variables (`GIT_SSH_COMMAND=... git fetch`)
-    and Shellshock function exports (`env x='() { :;}; cmd' bash -c :`, CVE-2014-6271)."""
+    """Analyze commands carried in execution environment variables (`GIT_SSH_COMMAND=... git fetch`),
+    Shellshock function exports (`env x='() { :;}; cmd' bash -c :`, CVE-2014-6271), and gate/store
+    environment variable tampering (`OPERATOR_HOME=...`, `OPERATOR_GATE_MODE=off`, `VESTIGE_DATA_DIR=...`).
+
+    `VESTIGE_DATA_DIR` only records `__CUSTOM_STRATA_DIR__` so a later delete of that store is OP-002.
+    `OPERATOR_GATE_MODE` is tamper only for a disabling value, and not when the remaining command is a
+    test or sandbox runner. `OPERATOR_HOME` is tamper only for a non-runner command in the same segment.
+    """
     out = []
+    rem_toks = _remaining_command(toks)
     for t in toks:
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_%-]*)=(.*)$", t, re.S)
         if not m:
@@ -1421,6 +1526,12 @@ def carried_by_vars(toks, ecwd, depth, vars_):
                 continue
             break
         name, val = m.group(1), m.group(2).strip()
+        if name == "VESTIGE_DATA_DIR" and val:
+            _remember_custom_strata(val, ecwd, vars_)
+        elif name == "OPERATOR_GATE_MODE" and _gate_mode_tamper(val) and not _sandbox_invocation(rem_toks):
+            out.append(_env_tamper_effect(name, val, ecwd))
+        elif name == "OPERATOR_HOME" and val and not _sandbox_invocation(rem_toks):
+            out.append(_env_tamper_effect(name, val, ecwd))
         sm = re.match(r"^\(\s*\)\s*\{([^}]*)\}\s*;?\s*(.*)$", val, re.S)
         if sm:
             if sm.group(1).strip() and sm.group(1).strip() != ":":
@@ -1471,15 +1582,16 @@ def carried_by_git(rest, sub, gargs):
         elif kl in GIT_EXEC_KEYS or kl.startswith("pager.") or (kl.startswith("alias.") and v.startswith("!")):
             cmds.append(v.lstrip("!"))
     if sub == "config":
-        words = [a for a in gargs if not a.startswith("-")]
-        if len(words) >= 2:
-            kl, v = words[0].lower(), words[1].strip()
-            if v.lower() not in ("", "false", "0", "off", "none", "true", "cat", "less"):
-                if kl in GIT_HOOK_CONFIG_KEYS or (kl.startswith("filter.") and kl.endswith((".clean", ".smudge", ".process"))):
-                    hooks.append((kl, v))
-                    cmds.append(v.lstrip("!"))
-                elif kl in GIT_EXEC_KEYS or kl.startswith("pager.") or (kl.startswith("alias.") and v.startswith("!")):
-                    cmds.append(v.lstrip("!"))
+        if not any(f in ("--get", "--get-all", "--get-regexp", "--list", "-l", "--unset", "--unset-all") for f in gargs if f.startswith("-")):
+            words = [a for a in gargs if not a.startswith("-")]
+            if len(words) >= 2:
+                kl, v = words[0].lower(), words[1].strip()
+                if v.lower() not in ("", "false", "0", "off", "none", "true", "cat", "less"):
+                    if (kl in GIT_HOOK_CONFIG_KEYS or kl in GIT_EXEC_KEYS or kl.startswith("pager.") or
+                            (kl.startswith("alias.") and v.startswith("!")) or
+                            (kl.startswith("filter.") and kl.endswith((".clean", ".smudge", ".process")))):
+                        hooks.append((kl, v))
+                        cmds.append(v.lstrip("!"))
     for j, a in enumerate(gargs):
         nxt = gargs[j + 1] if j + 1 < len(gargs) else None
         if sub in ("difftool", "mergetool") and a in ("-x", "--extcmd") and nxt:
@@ -1581,6 +1693,91 @@ def carried_by_archive_or_transfer(prog, rest):
                 pm = re.match(r"^:?py(?:thon)?3?\s+(.+)$", ex_s.strip())
                 if pm:
                     cmds.append("python3 -c " + shlex.quote(pm.group(1)))
+    elif prog == "go":
+        for i, t in enumerate(rest):
+            if t == "-exec" and i + 1 < len(rest):
+                cmds.append(rest[i + 1])
+            elif t.startswith("-exec="):
+                cmds.append(t.split("=", 1)[1])
+    elif prog == "cargo":
+        for i, t in enumerate(rest):
+            cfg_v = None
+            if t == "--config" and i + 1 < len(rest):
+                cfg_v = rest[i + 1]
+            elif t.startswith("--config="):
+                cfg_v = t.split("=", 1)[1]
+            if cfg_v:
+                m = re.search(r'(?:rustc-wrapper|runner)\s*=\s*(?:\[([^\]]+)\]|["\']([^"\']+)["\']|(\S+))', cfg_v)
+                if m:
+                    if m.group(1):
+                        parts = [w.strip().strip("'\"") for w in m.group(1).split(",") if w.strip()]
+                        cmds.append(" ".join(parts))
+                    else:
+                        cmds.append((m.group(2) or m.group(3)).strip("'\""))
+    elif prog in ("node", "bun", "deno"):
+        for i, t in enumerate(rest):
+            mod_v = None
+            if t in ("--import", "--loader", "--require", "-r") and i + 1 < len(rest):
+                mod_v = rest[i + 1]
+            elif re.match(r"^--(?:import|loader|require)=(.+)$", t):
+                mod_v = t.split("=", 1)[1]
+            if mod_v and re.match(r"(?i)^data:(?:text|application)/javascript", mod_v):
+                if "," in mod_v:
+                    hdr, body_d = mod_v.split(",", 1)
+                    try:
+                        import base64 as _b64
+                        js_code = _b64.b64decode(body_d).decode("utf-8", "replace") if ";base64" in hdr.lower() else urllib.parse.unquote(body_d)
+                        if js_code.strip():
+                            cmds.append("node -e " + shlex.quote(js_code))
+                    except Exception:
+                        pass
+    elif prog == "tmux":
+        # `tmux new-session -d 'cmd'`, `tmux split-window 'cmd'`, `tmux send-keys -t 0 'cmd' Enter`
+        sub_i = next((idx for idx, tok in enumerate(rest) if not tok.startswith("-")), None)
+        if sub_i is not None:
+            tsub = rest[sub_i]
+            tail = rest[sub_i + 1:]
+            if tsub in ("new-session", "new", "split-window", "splitw", "respawn-pane", "respawnp", " respawn-window", " pipe-pane", "pipep"):
+                j = 0
+                while j < len(tail):
+                    if tail[j] in ("-s", "-n", "-t", "-c", "-F", "-e", "-x", "-y") and j + 1 < len(tail):
+                        j += 2
+                    elif tail[j].startswith("-"):
+                        j += 1
+                    else:
+                        break
+                if j < len(tail):
+                    cmds.append(tail[j] if len(tail[j:]) == 1 else " ".join(shlex.quote(x) for x in tail[j:]))
+            elif tsub in ("send-keys", "send"):
+                j = 0
+                keys = []
+                while j < len(tail):
+                    if tail[j] in ("-t", "-N") and j + 1 < len(tail):
+                        j += 2
+                    elif tail[j].startswith("-"):
+                        j += 1
+                    else:
+                        if tail[j] not in ("Enter", "C-m", "KPEnter"):
+                            keys.append(tail[j])
+                        j += 1
+                if keys:
+                    cmds.append(" ".join(keys))
+    elif prog == "screen":
+        # `screen -dmS name cmd args...` or `screen -d -m cmd args...`
+        if any(f.startswith("-") and ("d" in f[1:] or "m" in f[1:]) for f in rest if f.startswith("-")):
+            j = 0
+            while j < len(rest):
+                t = rest[j]
+                if t in ("-S", "-t", "-c", "-L", "-Logfile", "-p", "-h", "-e") and j + 1 < len(rest):
+                    j += 2
+                elif t.startswith("-") and "S" in t[1:] and t.endswith("S") and j + 1 < len(rest):
+                    j += 2
+                elif t.startswith("-"):
+                    j += 1
+                else:
+                    break
+            if j < len(rest):
+                cmds.append(rest[j] if len(rest[j:]) == 1 else " ".join(shlex.quote(x) for x in rest[j:]))
     return cmds
 
 
@@ -1617,6 +1814,7 @@ INLINE_SHELL_CALL_RE = re.compile(
     r"(?:\b(?:os\.(?:system|popen|execl|execlp|execv|execvp|spawnl|spawnlp)|"
     r"subprocess\.(?:run|call|check_call|check_output|Popen|getoutput|getstatusoutput)|"
     r"pty\.spawn|commands\.getoutput|child_process\.(?:execSync|exec|spawnSync|spawn|execFileSync|execFile)|"
+    r"execSync|spawnSync|execFileSync|execFile|"
     r"Bun\.(?:spawnSync|spawn)|Deno\.Command|"
     r"Kernel\.(?:system|exec)|IO\.popen|os\.execute|io\.popen|"
     r"shell_exec|passthru|proc_open|popen|system|exec)|"
@@ -1727,6 +1925,7 @@ def analyze(cmd, cwd, depth=0, vars_=None):
         vars_ = dict(vars_)
     raw_vars = {}
     alias_bins = {}
+    symlink_map = {}
     state = {"cwd": cwd}
     if INVISIBLE_RE.search(cmd):
         effects.append({"prog": "\u200b", "seg": cmd[:120], "targets": [], "recursive": False,
@@ -1866,6 +2065,10 @@ def analyze(cmd, cwd, depth=0, vars_=None):
                         vars_.pop(name, None)
                 else:
                     vars_[name] = tilde(val)
+                    if name == "VESTIGE_DATA_DIR" and val.strip():
+                        _remember_custom_strata(val.strip(), state["cwd"], vars_)
+                    elif name == "OPERATOR_GATE_MODE" and _gate_mode_tamper(val):
+                        effects.append(_env_tamper_effect(name, val.strip(), state["cwd"], seg))
             continue
         pre_toks = strip_leading_redirects(toks)
         effects += carried_by_vars(pre_toks, state["cwd"], depth, vars_)
@@ -1942,7 +2145,8 @@ def analyze(cmd, cwd, depth=0, vars_=None):
         ecwd = state["cwd"]
         eff = {"prog": prog, "seg": seg, "targets": [], "recursive": False, "kind": None, "filtered": False,
                "unresolved": via_xargs, "flags": flags, "args": args, "rest": rest, "cwd": ecwd or UNKNOWN_CWD,
-               "writes": write_targets(prog, rest, flags, args, expand_vars(seg, vars_), ecwd), "text": seg}
+               "writes": write_targets(prog, rest, flags, args, expand_vars(seg, vars_), ecwd), "text": seg,
+               "custom_strata_dir": vars_.get("__CUSTOM_STRATA_DIR__")}
         for sub_cmd in carried_by_archive_or_transfer(prog, rest):
             effects += analyze(sub_cmd, ecwd, depth + 1, vars_)
 
@@ -2120,6 +2324,28 @@ def analyze(cmd, cwd, depth=0, vars_=None):
             if src_b in KNOWN_EXEC_BINS:
                 alias_bins[resolve(args[-1], ecwd)] = src_b
                 alias_bins[os.path.basename(args[-1])] = src_b
+            if prog == "ln" or has_flag(flags, "s") or "--symbolic-link" in flags:
+                src_p = resolve(args[0], ecwd)
+                dst_p = resolve(args[-1], ecwd)
+                if not src_p.startswith(UNKNOWN_CWD) and not dst_p.startswith(UNKNOWN_CWD):
+                    symlink_map[dst_p.rstrip("/")] = src_p.rstrip("/")
+                    eff["symlink_src"] = src_p
+                    eff["symlink_dst"] = dst_p
+        elif prog in ("curl", "wget"):
+            for jj, t in enumerate(rest):
+                cfg_f = None
+                if prog == "curl" and t in ("-K", "--config") and jj + 1 < len(rest):
+                    cfg_f = rest[jj + 1]
+                elif t.startswith("--config="):
+                    cfg_f = t.split("=", 1)[1]
+                elif prog == "curl" and t.startswith("-K") and len(t) > 2 and not t.startswith("--"):
+                    cfg_f = t[2:]
+                if cfg_f and ecwd:
+                    cfg_body = sql_file_text(resolve(cfg_f, ecwd))
+                    if cfg_body:
+                        eff["text"] += "\n" + cfg_body
+                        for cm in re.finditer(r'(?:^|\s)(?:-o|--output(?:-document)?|\boutput\s*=?)\s*["\']?([^\s"\']+)', cfg_body, re.M):
+                            eff["writes"].append(resolve(cm.group(1), ecwd))
         elif prog == "sort":
             if piped and fed and fed[0] in ("echo", "printf") and any("compress-program" in t for t in rest):
                 fed_txt = decode_ansi_c(" ".join(w for w in fed[1] if not w.startswith("-")))
@@ -2156,6 +2382,40 @@ def analyze(cmd, cwd, depth=0, vars_=None):
             eff["kind"] = "cli"
             if prog in ("npm", "pnpm", "yarn"):
                 effects += npm_script_effects(prog, rest, ecwd, depth, vars_)
+                if "config" in args and "set" in args:
+                    set_i = args.index("set")
+                    if set_i + 1 < len(args):
+                        ck = args[set_i + 1]
+                        cv = args[set_i + 2] if set_i + 2 < len(args) else ""
+                        if "=" in ck and not cv:
+                            ck, cv = ck.split("=", 1)
+                        if ck.lower() in ("script-shell", "scriptshell", "onload-script", "cafile") and cv:
+                            eff["git_hooks"] = [(prog + "." + ck, cv)]
+                            effects += analyze(cv, ecwd, depth + 1, vars_)
+            if prog == "cargo":
+                for t in rest:
+                    if ("rustc-wrapper" in t or "runner" in t) and ("--config" in rest or t.startswith("--config=")):
+                        eff["git_hooks"] = [("cargo.config", t)]
+        elif prog == "openssl" and ("-engine" in rest or "engine" in rest):
+            eff["git_hooks"] = [("openssl.engine", " ".join(rest))]
+        # Substitute any in-command symlinks created earlier in the same command line (`ln -s ~/Documents ./d && rm -rf ./d`)
+        if symlink_map and not eff.get("symlink_src"):
+            for key in ("targets", "writes"):
+                mapped = []
+                for x in eff[key]:
+                    xr = x.rstrip("/")
+                    sub_x = x
+                    for link_p, target_p in symlink_map.items():
+                        if xr == link_p:
+                            sub_x = target_p
+                            eff["via_symlink"] = True
+                            break
+                        if xr.startswith(link_p + "/"):
+                            sub_x = target_p + xr[len(link_p):]
+                            eff["via_symlink"] = True
+                            break
+                    mapped.append(sub_x)
+                eff[key] = mapped
         # anything that resolved into an unknown cwd cannot be judged statically
         for key in ("targets", "writes"):
             kept = [x for x in eff[key] if not x.startswith(UNKNOWN_CWD) and "$" not in x and "__SUBST__" not in x]
@@ -2352,7 +2612,7 @@ def is_scratch(path):
     return False
 
 
-def target_hits(kind, t, recursive, roots, gate_files):
+def target_hits(kind, t, recursive, roots, gate_files, extra_strata=()):
     """Checks for one delete/move target."""
     hits = []
     for r in roots:
@@ -2364,7 +2624,7 @@ def target_hits(kind, t, recursive, roots, gate_files):
                          "If this is a reorganisation, leave a symlink at the old path and ask the owner; "
                          "if it is cleanup, delete children explicitly, never the workspace root."))
             break
-    hits += write_hits(t, gate_files, kind)
+    hits += write_hits(t, gate_files, kind, extra_strata=extra_strata)
     if (os.path.basename(t) == ".git" or "/.git/" in t) and kind in ("delete", "move") \
             and not is_scratch(t):
         hits.append(("OP-004", "%s of %s" % (kind, t), "Do not remove or rewrite .git internals; ask the owner."))
@@ -2381,10 +2641,10 @@ def rel_inside(target, root):
     return None
 
 
-def memory_store_hit(w, verb):
+def memory_store_hit(w, verb, extra_strata=()):
     """Why touching `w` is OP-002, or None. A Strata store loses its history when its log, keys, marker or
     backups go, or when the data dir (or a folder holding it, short of HOME) is deleted or moved."""
-    for d in STRATA_DIRS:
+    for d in list(STRATA_DIRS) + [x for x in extra_strata if x]:
         if verb in ("delete", "move") and is_same_or_ancestor(w, d) and not is_same_or_ancestor(w, HOME):
             return "%s of the Vestige store %s" % (verb, d)
         rel = rel_inside(w, d)
@@ -2395,22 +2655,30 @@ def memory_store_hit(w, verb):
     return None
 
 
-def write_hits(w, gate_files, verb="write to"):
+def write_hits(w, gate_files, verb="write to", extra_strata=()):
     hits = []
     if touches_gate_home(w) or any(is_inside(w, f) for f in gate_files):
         hits.append(("OP-000", "%s gate/hook path %s" % (verb, w),
                      "Ask the owner to make this change, or to grant a one-time permit."))
-    store = memory_store_hit(w, verb)
+    store = memory_store_hit(w, verb, extra_strata=extra_strata)
     if store:
         hits.append(("OP-002", store, "Use `vestige backup` first; erasure is not something an agent decides."))
     base = w.rstrip("/").rsplit("/", 1)[-1]
     parent = w.rstrip("/").rsplit("/", 1)[-2] if w.rstrip("/").count("/") >= 1 else ""
-    is_init = base in SHELL_INIT_FILES or (base == "config.fish" and parent.endswith("fish")) \
-        or (w.endswith("/.ssh/rc"))
+    is_init = (base in SHELL_INIT_FILES or (base == "config.fish" and parent.endswith("fish"))
+               or w.endswith("/.ssh/rc")
+               or base in (".envrc", ".psqlrc", ".gdbinit", ".lldbinit", ".Rprofile")
+               or ("/.git/hooks/" in w and not w.endswith(".sample"))
+               or ("/.husky/" in w and not w.endswith(("_", ".gitignore")))
+               or w.endswith("/.cargo/config.toml") or w.endswith("/.cargo/config")
+               or any(w.startswith(d + "/") for d in ("/Library/LaunchAgents", "/Library/LaunchDaemons",
+                                                      HOME + "/Library/LaunchAgents", "/etc/cron",
+                                                      "/var/spool/cron", "/etc/systemd/system",
+                                                      HOME + "/.config/systemd/user")))
     if is_init:
-        hits.append(("OP-008", "%s shell init file %s" % (verb, w),
-                     "Init files execute on every future shell; propose the line to the owner instead "
-                     "of writing it."))
+        hits.append(("OP-008", "%s shell init or persistent hook file %s" % (verb, w),
+                     "Init and hook files execute automatically on future commands or shells; "
+                     "propose the change to the owner instead of writing it."))
     if base.lower() in AGENT_CONFIG_NAMES or parent.endswith("/.cursor/rules") or "/.cursor/rules/" in w:
         hits.append(("OP-S14", "%s agent config %s" % (verb, w),
                      "Agent instruction files are pre-stage prompt injection (Nx/CurXecute); "
@@ -2575,9 +2843,10 @@ def classify_effect(e, cfg, cwd):
     gate_files = self_protected_files() + [norm(p, cwd) for p in cfg["protected_files"]]
     ecwd = e.get("cwd") if e.get("cwd") and not e["cwd"].startswith(UNKNOWN_CWD) else None
     followed_inline = kind == "inline" and bool(e.get("script_body"))
+    extra_strata = (e.get("custom_strata_dir"),) if e.get("custom_strata_dir") else ()
 
     for w in e.get("writes", []):
-        hits += write_hits(w, gate_files)
+        hits += write_hits(w, gate_files, extra_strata=extra_strata)
         if is_precious_outside_file(w) and not is_scratch(w) and not (ecwd and is_inside(w, ecwd)) \
                 and not any(h[0] in ("OP-000", "OP-001", "OP-002", "OP-008", "OP-011") for h in hits):
             hits.append(("OP-011", "overwrites %s, which is outside the project" % w,
@@ -2609,8 +2878,28 @@ def classify_effect(e, cfg, cwd):
                      "Run rg without --pre, or ask the owner."))
     if e.get("git_hooks"):
         hk, hv = e["git_hooks"][0]
-        hits.append(("OP-008", "git execution hook (%s=%s)" % (hk, hv),
-                     "fsmonitor/hooksPath/filters execute on git commands (GitSpawn); ask the owner."))
+        hits.append(("OP-008", "execution hook (%s=%s)" % (hk, hv),
+                     "Hooks and compiler wrappers execute automatically on commands; ask the owner."))
+    if e.get("kind") == "env_tamper":
+        tvar, tval = e.get("var", ""), e.get("val", "")
+        if tvar in ("OPERATOR_HOME", "OPERATOR_GATE_MODE"):
+            hits.append(("OP-000", "%s=%s overrides the gate's own home or mode" % (tvar, tval),
+                         "Never override OPERATOR_HOME or OPERATOR_GATE_MODE from an agent."))
+        elif tvar == "VESTIGE_DATA_DIR":
+            hits.append(("OP-002", "VESTIGE_DATA_DIR=%s redirects or touches the Vestige store" % tval,
+                         "Do not override VESTIGE_DATA_DIR from an agent; use the configured store."))
+    if e.get("symlink_src") and e.get("symlink_dst"):
+        ssrc, sdst = e["symlink_src"], e["symlink_dst"]
+        if touches_gate_home(ssrc) or any(is_inside(ssrc, f) for f in gate_files):
+            hits.append(("OP-000", "symlink aliases gate path %s -> %s" % (sdst, ssrc),
+                         "Do not create symlinks pointing into the gate directory."))
+        elif any(is_same_or_ancestor(ssrc, d) or bool(rel_inside(ssrc, d) and STRATA_CRITICAL_RE.match(rel_inside(ssrc, d).rstrip("/")))
+                 for d in STRATA_DIRS) and not same_path(ssrc, HOME):
+            hits.append(("OP-002", "symlink aliases Vestige store path %s -> %s" % (sdst, ssrc),
+                         "Do not create symlinks pointing into the Vestige store."))
+        elif any(is_inside(ssrc, d) for d in CREDENTIAL_DIRS):
+            hits.append(("OP-011", "symlink aliases credential path %s -> %s" % (sdst, ssrc),
+                         "Do not create symlinks pointing into credential directories."))
 
     prog0, text0 = e.get("prog", ""), e.get("text", "")
     if not followed_inline and CONTAINER_ESCAPE_RE.search(text0):
@@ -2661,12 +2950,19 @@ def classify_effect(e, cfg, cwd):
                      "fsmonitor/hooksPath/filters execute outside every sandbox (GitSpawn); ask the owner."))
 
 
-    # persistence: crontab/at/launchctl/systemd/tmux-detached
+    # persistence: crontab/at/launchctl/systemd/schtasks/tmux-detached
     if prog0 in PERSISTENCE_PROGS:
-        mutating = any(a in ("install", "load", "submit", "enable", "new-session", "write", "-") for a in e.get("args", []))
-        if prog0 in ("crontab", "at", "batch") or mutating or \
-                any(t.startswith("/Library/LaunchAgents") or t.startswith(pj(HOME, "Library", "LaunchAgents"))
-                    for t in e.get("writes", [])):
+        sched_mutate = (
+            (prog0 == "crontab" and not any(f in ("-l", "-r") for f in flags0)) or
+            prog0 in ("at", "batch", "anacron") or
+            (prog0 == "schtasks" and any(a.lower() in ("/create", "-create") for a in flags0 + args0)) or
+            (prog0 == "launchctl" and any(a in ("load", "bootstrap", "submit", "enable") for a in args0)) or
+            (prog0 == "systemctl" and any(a in ("enable", "start", "link", "reenable") for a in args0))
+        )
+        if sched_mutate:
+            hits.append(("OP-008", "%s schedules or installs persistent background execution" % prog0,
+                         "Scheduled or daemonized execution escapes the session audit window; ask the owner."))
+        elif any(a in ("install", "new-session", "write", "-", "kickstart", "run") for a in args0):
             hits.append(("OP-S07", "%s schedules or installs code for later execution" % prog0,
                          "Scheduled execution escapes every audit window; propose it and let the owner run it."))
 
@@ -2725,8 +3021,8 @@ def classify_effect(e, cfg, cwd):
     if kind in ("delete", "move"):
         for t in e["targets"]:
             if e.get("filtered"):      # `find X -name ... -delete` never removes X itself
-                hits += write_hits(t, gate_files, kind)
-                if any(is_inside(t, d) for d in MEMORY_DIRS):
+                hits += write_hits(t, gate_files, kind, extra_strata=extra_strata)
+                if any(is_inside(t, d) for d in MEMORY_DIRS + list(extra_strata)):
                     hits.append(("OP-002", "filtered delete inside the memory store %s" % t,
                                  "Use `vestige backup` first; erasure is not something an agent decides."))
                 elif not is_scratch(t) and (t == "/" or same_path(t, HOME) or t.count("/") <= 2 or ecwd is None
@@ -2737,7 +3033,7 @@ def classify_effect(e, cfg, cwd):
                     hits.append(("OP-S01", "filtered mass delete inside workspace %s" % t,
                                  "Narrow the filter or delete named files; git protects committed work only."))
             else:
-                hits += target_hits(kind, t, e["recursive"], roots, gate_files)
+                hits += target_hits(kind, t, e["recursive"], roots, gate_files, extra_strata=extra_strata)
         if kind == "delete" and e["recursive"] and any(t in ("/",) for t in e["targets"]):
             hits.append(("OP-003", "recursive sweep rooted at /",
                          "Scope the find to a named project directory; never sweep from /."))
@@ -3262,6 +3558,59 @@ def lite_owner_sub(prog, args):
     return None
 
 
+def write_body_text(tool, ti):
+    """Extract the added/written text from a file-writing tool call."""
+    if tool == "multiedit" and isinstance(ti.get("edits"), list):
+        return "\n".join(str(e.get("new_string") or e.get("content") or "") for e in ti["edits"] if isinstance(e, dict))
+    if tool == "apply_patch":
+        patch = str(ti.get("patch") or ti.get("input") or ti.get("command") or "")
+        return "\n".join(ln[1:] for ln in patch.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
+    return str(ti.get("content") or ti.get("new_string") or ti.get("file_text") or ti.get("new_str") or "")
+
+
+def write_manifest_hits(path, body, cfg, cwd):
+    """Cross-turn split-horizon defense: inspect commands staged into package.json scripts, Makefiles,
+    git/husky hooks, .envrc/.psqlrc, and conftest.py/setup.py/build.rs via Write/Edit/apply_patch."""
+    if not body or not body.strip():
+        return []
+    hits = []
+    base = path.rstrip("/").rsplit("/", 1)[-1].lower()
+    pdir = os.path.dirname(path) or cwd
+    staged_cmds = []
+    if base == "package.json":
+        try:
+            pkg = json.loads(body)
+            if isinstance(pkg, dict) and isinstance(pkg.get("scripts"), dict):
+                staged_cmds += [str(v) for v in pkg["scripts"].values() if isinstance(v, str)]
+        except Exception:
+            for sm in re.finditer(r'"scripts"\s*:\s*\{([^}]*)\}', body, re.S):
+                staged_cmds += [m.group(1) for m in re.finditer(r':\s*"((?:[^"\\]|\\.)*)"', sm.group(1))]
+            if not staged_cmds:
+                for sm in re.finditer(r'"(?:preinstall|install|postinstall|prepare|prepublish|pretest|test|posttest|start|build)"\s*:\s*"((?:[^"\\]|\\.)*)"', body):
+                    staged_cmds.append(sm.group(1).replace('\\"', '"'))
+    elif base in ("makefile", "gnumakefile"):
+        for ln in body.splitlines():
+            if ln.startswith("\t") and ln.strip() and not ln.strip().startswith("#"):
+                staged_cmds.append(ln.strip().lstrip("@-+").strip())
+    elif base in (".envrc", ".psqlrc", ".gdbinit", ".lldbinit") or "/.git/hooks/" in path or "/.husky/" in path:
+        staged_cmds.append(body)
+    elif base in ("conftest.py", "setup.py", "build.rs"):
+        lang = "python3" if base.endswith(".py") else "node"
+        for sc in inline_shell_commands(body, lang):
+            staged_cmds.append(sc)
+        roots = [norm(r, cwd) for r in cfg["protected_roots"]] + [cwd]
+        gate_files = self_protected_files() + [norm(p, cwd) for p in cfg["protected_files"]]
+        found, _, _ = inline_file_calls(body, pdir, roots, gate_files)
+        for rid, d, h in found:
+            hits.append((rid, "%s -- staged in %s" % (d, os.path.basename(path)), h))
+    for sc in staged_cmds[:24]:
+        for eff in analyze(sc, pdir):
+            for rid, d, h in classify_effect(eff, cfg, pdir):
+                if not rid.startswith("OP-S"):
+                    hits.append((rid, "%s -- staged in %s" % (d, os.path.basename(path)), h))
+    return hits
+
+
 def hook_settings_hit(path, text):
     """Claude Code reads hooks from every .claude/settings*.json, and a project's settings outrank the
     user's, so a project file that turns hooks off or rewires them switches the gate off. OP-000 when the
@@ -3318,6 +3667,10 @@ def classify(payload, cfg):
         for eff in (analyze_powershell(cmd, cwd) if tool in POWERSHELL_TOOLS else analyze(cmd, cwd)):
             effects_out.append(eff)
             hits += classify_effect(eff, cfg, cwd)
+            if eff.get("via_symlink") and "symlink-escaped" not in meta["transforms"]:
+                meta["transforms"].append("symlink-escaped")
+            if eff.get("git_hooks") and "execution-hook-analyzed" not in meta["transforms"]:
+                meta["transforms"].append("execution-hook-analyzed")
             sub = lite_owner_sub(eff.get("prog", ""), eff.get("args", []))
             if sub is not None:
                 hits.append(("OP-000", "agent invoked `operator-lite %s`" % (sub or "install"),
@@ -3338,15 +3691,19 @@ def classify(payload, cfg):
             hits.append(("OP-S04", "credential-shaped string written to disk", ""))
     elif tool in WRITE_TOOLS:
         gate_files = self_protected_files() + [norm(p, cwd) for p in cfg["protected_files"]]
+        body = write_body_text(tool, ti)
         for p in write_paths(tool, ti, cwd):
             previews.append("%s %s" % (tool_raw, p))
             hits += write_hits(p, gate_files)   # full coverage: OP-000, OP-002, OP-008, OP-S14
+            mhits = write_manifest_hits(p, body, cfg, cwd)
+            if mhits:
+                hits += mhits
+                if "write-manifest-analyzed" not in meta["transforms"]:
+                    meta["transforms"].append("write-manifest-analyzed")
             effects_out.append({"prog": tool, "seg": "%s %s" % (tool_raw, p), "targets": [],
                                 "recursive": False, "kind": None, "filtered": False,
                                 "unresolved": False, "flags": [], "args": [],
                                 "cwd": cwd, "writes": [p], "text": "%s %s" % (tool_raw, p)})
-        body = str(ti.get("content") or ti.get("new_string") or "")
-        for p in write_paths(tool, ti, cwd):
             hit = hook_settings_hit(p, body)
             if hit:
                 hits.append(hit)
@@ -3354,6 +3711,71 @@ def classify(payload, cfg):
             hits.append(("OP-S04", "credential-shaped string in write", ""))
     elif tool.startswith("mcp__"):
         previews.append(tool_raw)
+        mcp_hits = []
+        # 1. MCP shell execution delegation (`mcp__shell__run_command`, `mcp__terminal__execute`, etc.)
+        if re.search(r"__(?:run_command|execute_command|run_shell|bash|shell|exec|terminal_command|exec_command)(?:_|$)", tool):
+            mcmd = str(ti.get("command") or ti.get("cmd") or ti.get("script") or "")
+            if mcmd:
+                for eff in analyze(mcmd, cwd):
+                    effects_out.append(eff)
+                    mcp_hits += classify_effect(eff, cfg, cwd)
+        # 2. MCP destructive SQL (`mcp__postgres__query`, `mcp__supabase__execute_sql`, `mcp__sqlite__query`, etc.)
+        for sk in ("sql", "query", "statement", "statements"):
+            sv = ti.get(sk)
+            if isinstance(sv, str) and sv.strip():
+                lo_s = re.sub(r"pragma\s+wal_checkpoint\s*(\(\s*\w+\s*\))?", "", sv.lower())
+                unscoped_u = any(not re.search(r"\bwhere\b", m.group(1))
+                                 for m in re.finditer(r"\bupdate\s+[\w.\"`]+\s+set\b([^;]*)", lo_s))
+                taut_w = bool(re.search(
+                    r"\b(?:delete\s+from|update)\s+[\w.\"`]+\b[^;]*?\bwhere\s+(?:true\b|1\s*=\s*1\b|'(\w*)'\s*=\s*'\1'|\"(\w*)\"\s*=\s*\"\2\")",
+                    lo_s))
+                if (re.search(r"\bdrop\s+(table|database|schema|index)\b|(?<![\w(])truncate\s+(table\s+)?[\w\"`]|"
+                              r"\bflush(all|db)\b|\bdropdatabase\b|\bdb\.[\w.]+\.drop\s*\(", lo_s) or
+                        re.search(r"\bdelete\s+from\s+[\w.\"`]+\s*(;|\"|'|$)", lo_s) or unscoped_u or taut_w):
+                    mcp_hits.append(("OP-007", "%s executes destructive SQL" % tool_raw,
+                                     "Run it as a SELECT first, scope with WHERE, and ask the owner for a permit."))
+        # 3. MCP filesystem delete/write/move parity (`mcp__filesystem__delete_file`, `mcp__fs__write_file`, etc.)
+        is_mcp_del = bool(re.search(r"__(?:delete|remove|unlink|rmdir|rm|purge|erase|trash)(?:_|$)", tool) and
+                          not re.search(r"__(?:delete_memory|delete_entity|delete_observations|delete_relations)$", tool))
+        is_mcp_write = bool(re.search(r"__(?:write|edit|create_file|update_file|save|overwrite|put_file|patch|move|rename|copy)(?:_|$)", tool))
+        if is_mcp_del or is_mcp_write:
+            roots = [norm(r, cwd) for r in cfg["protected_roots"]] + [cwd]
+            gate_files = self_protected_files() + [norm(p, cwd) for p in cfg["protected_files"]]
+            mpaths = []
+            for pk in ("path", "file_path", "filepath", "source", "src", "destination", "dest", "target", "directory", "dir"):
+                pv = ti.get(pk)
+                if isinstance(pv, str) and pv.strip():
+                    mpaths.append(norm(pv, cwd))
+                elif isinstance(pv, list):
+                    mpaths += [norm(str(x), cwd) for x in pv if isinstance(x, str)]
+            for mp in mpaths:
+                if is_mcp_del:
+                    eff_m = {"prog": tool_raw, "seg": "%s %s" % (tool_raw, mp), "targets": [mp],
+                             "recursive": True, "kind": "delete", "filtered": False, "unresolved": False,
+                             "flags": [], "args": [mp], "cwd": cwd, "writes": [], "text": "%s %s" % (tool_raw, mp)}
+                    effects_out.append(eff_m)
+                    mcp_hits += classify_effect(eff_m, cfg, cwd)
+                else:
+                    mcp_hits += write_hits(mp, gate_files, "%s writes to" % tool_raw)
+                    mbody = str(ti.get("content") or ti.get("new_string") or ti.get("text") or "")
+                    h_hit = hook_settings_hit(mp, mbody)
+                    if h_hit:
+                        mcp_hits.append(h_hit)
+                    if is_precious_outside_file(mp) and not is_scratch(mp) and not is_inside(mp, cwd):
+                        mcp_hits.append(("OP-011", "%s overwrites %s outside the project" % (tool_raw, mp),
+                                         "Copy it to a dated backup first, or ask the owner."))
+        # 4. MCP cloud/repo teardown parity (`mcp__github__delete_repository`, `mcp__supabase__delete_project`, etc.)
+        if re.search(r"__(?:delete_repo|delete_repository|archive_repo|delete_release|delete_branch)(?:_|$)", tool):
+            mcp_hits.append(("OP-005", "%s deletes or mutates a repository/release/branch" % tool_raw,
+                             "Repository and release deletions are owner-only."))
+        if re.search(r"__(?:delete_project|destroy_project|delete_database|drop_database|delete_bucket|delete_cluster|"
+                     r"delete_service|delete_volume|delete_environment|delete_namespace)(?:_|$)", tool):
+            mcp_hits.append(("OP-006", "%s tears down cloud infrastructure" % tool_raw,
+                             "Run a plan or dry-run first, then ask the owner for a one-time permit."))
+        if mcp_hits:
+            hits += mcp_hits
+            if "mcp-cross-channel-analyzed" not in meta["transforms"]:
+                meta["transforms"].append("mcp-cross-channel-analyzed")
         if re.search(r"__(send_imessage|send_message|forward|reply)$", tool):
             hits.append(("OP-S02", tool_raw, ""))
         blob_l = blob
