@@ -44,6 +44,23 @@ withdrawn, so the number cannot be used again.
   when the working tree has uncommitted changes under OP-011.
 - **Machine halt, reboot, and kill-all-processes (OP-014).** Stops `shutdown`
   (without `-c`), `reboot`, `halt`, `poweroff`, and `kill` targeting `-1`.
+- **Shell, wrapper, flag-injection, and inline-interpreter bypass closures across
+  2000s/2010s/2020s (OP-001/OP-003/OP-005/OP-006/OP-008/OP-010/OP-011/OP-018).**
+  Unwraps arbitrary-depth `$(...)` and arithmetic `$(( $(...) ))` / `let` /
+  `unset` / `test -v` array subscripts, parameter fallbacks (`${VAR:-...}`,
+  `${VAR:=...}`), prompt/indirect expansion (`${a@P}`, `${!b}`), Shellshock
+  function exports, brace command expansion (`{rm,-rf,...}`), `${PATH:0:1}` slash
+  construction, uninitialized-variable token splitting (`r${u}m`), `${IFS}`
+  gluing, binary copy/symlink aliasing, `env -S`, `sudo -u`, `xargs -I{}` pipe
+  substitution, `find -exec`/`-ok`/`"-"exec`, `git -c` execution hooks
+  (`core.fsmonitor`, `core.sshCommand`, `alias.*=!`), `git --upload-pack` /
+  `--upload-pa*`, `ssh://-oProxyCommand=`, `ext::` remote helpers, `tar`
+  `--checkpoint-action=exec=` / `--to-command`, `rsync -e` / empty-dir
+  `--delete`, `zip -TT`, `man --html=` / `-P`, `sort --compress-program=` / `-o`,
+  `vi`/`vim -c ':!...'`, `ed` shell escapes, `sed` `e` and `w` commands, `awk`
+  pipe-to-`getline`, `rg --pre`, `sqlite3 .shell`/`.output`, `psql \!`/`COPY TO
+  PROGRAM`, `dig +short TXT | sh`, `curl -F @file` secret uploads, `gh api -X
+  DELETE /repos/...`, and GraphQL infrastructure delete mutations.
 
 Upgrading Operator Lite: every install before 0.3.9 wrote `shadow` into
 `~/.operator/mode`, and shadow blocks nothing. The first 0.3.9 install

@@ -441,11 +441,46 @@ def tokenize(seg):
 
 
 WRAPPERS = {"sudo", "doas", "env", "command", "builtin", "nohup", "time", "nice", "exec", "stdbuf",
-            "caffeinate", "timeout", "xargs", "unbuffer", "setsid"}
+            "caffeinate", "timeout", "xargs", "unbuffer", "setsid", "busybox", "toybox",
+            "ionice", "chrt", "taskset", "arch", "setarch", "pkexec", "eatmydata", "xcrun"}
+WRAPPER_ARG_FLAGS = {
+    "sudo": {"-u", "-g", "-C", "-D", "-R", "-T", "-U", "-h", "-p",
+             "--user", "--group", "--chdir", "--chroot", "--other-user", "--prompt", "--role", "--type"},
+    "doas": {"-u", "-C"},
+    "env": {"-u", "--unset", "-C", "--chdir"},
+    "xargs": {"-I", "-i", "-L", "-l", "-n", "-P", "-s", "-d", "-a", "-E", "-e",
+              "--delimiter", "--max-args", "--max-procs", "--max-lines", "--replace", "--arg-file", "--eof"},
+    "timeout": {"-k", "--kill-after", "-s", "--signal"},
+    "nice": {"-n", "--adjustment"},
+    "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+    "ionice": {"-c", "-n", "-p", "-P", "-u"},
+    "chrt": {"-p"},
+    "taskset": {"-c", "-p"},
+    "arch": {"-arch"},
+    "xcrun": {"-sdk", "--sdk", "-toolchain", "--toolchain"},
+}
+
+
+def xargs_repl_token(toks):
+    """Custom replacement token from `xargs -I <tok>` or `--replace=<tok>`, default `{}`."""
+    for i, t in enumerate(toks):
+        if os.path.basename(t) == "xargs":
+            j = i + 1
+            while j < len(toks) and toks[j].startswith("-"):
+                f = toks[j]
+                if f in ("-I", "-i", "--replace") and j + 1 < len(toks):
+                    return toks[j + 1]
+                if f.startswith("-I") and len(f) > 2:
+                    return f[2:]
+                if f.startswith("--replace=") and len(f) > 10:
+                    return f.split("=", 1)[1]
+                j += 2 if f in WRAPPER_ARG_FLAGS["xargs"] and "=" not in f else 1
+    return "{}"
 
 
 def strip_wrappers(toks):
     """Drop leading VAR=x, wrappers and their flags. Returns (tokens, via_xargs)."""
+    toks = list(toks)
     via_xargs = False
     i = 0
     while i < len(toks):
@@ -457,9 +492,26 @@ def strip_wrappers(toks):
             if base == "xargs":
                 via_xargs = True
             i += 1
+            arg_flags = WRAPPER_ARG_FLAGS.get(base, ())
             while i < len(toks) and toks[i].startswith("-"):
+                f = toks[i]
+                if f == "--":
+                    i += 1
+                    break
+                if base == "env" and (f in ("-S", "--split-string") and i + 1 < len(toks)
+                                      or f.startswith("-S") and len(f) > 2
+                                      or f.startswith("--split-string=")):
+                    if f in ("-S", "--split-string"):
+                        raw_s = toks[i + 1]
+                        toks = toks[:i] + tokenize(raw_s) + toks[i + 2:]
+                    else:
+                        raw_s = f[2:] if f.startswith("-S") else f.split("=", 1)[1]
+                        toks = toks[:i] + tokenize(raw_s) + toks[i + 1:]
+                    continue
                 i += 1
-                if base in ("timeout", "nice", "sudo") and i < len(toks) and re.match(r"^[0-9]+$", toks[i]):
+                if f in arg_flags and i < len(toks):
+                    i += 1
+                elif base in ("timeout", "nice", "sudo") and i < len(toks) and re.match(r"^[0-9]+$", toks[i]):
                     i += 1
             if base == "timeout" and i < len(toks) and re.match(r"^[0-9.]+[smhd]?$", toks[i]):
                 i += 1
@@ -579,19 +631,31 @@ def extract_heredocs(cmd):
     return "\n".join(out), bodies
 
 
-def mask_quotes(text):
-    """Same length as text, with every character inside single or double quotes replaced by a
-    space, so structural scans (parentheses, pipes) skip quoted data."""
+def mask_quotes(text, mask_double=True):
+    """Same length as text, with every character inside single quotes, shell `#` comments, and
+    (when mask_double is True) double quotes replaced by a space, so structural scans skip quoted
+    data and comments."""
     out, q, i, n = [], None, 0, len(text)
     while i < n:
         c = text[i]
         if q:
             if c == "\\" and q == '"' and i + 1 < n:
-                out.append(" "); out.append(" "); i += 2
+                out.append(" " if mask_double else c)
+                out.append(" " if mask_double else text[i + 1])
+                i += 2
                 continue
-            out.append(c if c == q else " ")
             if c == q:
-                q = None
+                out.append(c); q = None
+            elif c == "\n":
+                out.append("\n")
+            elif q == "'" or mask_double:
+                out.append(" ")
+            else:
+                out.append(c)
+        elif c == "#" and (i == 0 or text[i - 1] in " \t\n;&|("):
+            while i < n and text[i] != "\n":
+                out.append(" "); i += 1
+            continue
         elif c in "'\"":
             q = c; out.append(c)
         elif c == "\\" and i + 1 < n:
@@ -604,13 +668,71 @@ def mask_quotes(text):
 
 
 def expand_vars(text, vars_):
-    def rep(m):
+    # Strip empty positional/special parameters glued inside tokens (`r$@m`, `r$*m`, `r$9m`, `r${@}m`)
+    if "@" not in vars_ and "*" not in vars_:
+        text = re.sub(r"(?<=[A-Za-z0-9_./~-])\$(?:\{[@*1-9]\}|[@*1-9])|\$(?:\{[@*1-9]\}|[@*1-9])(?=[A-Za-z0-9_./~-])", "", text)
+
+    def rep_brace(m):
+        name, op, arg = m.group(1), m.group(2) or "", m.group(3) or ""
+        if name == "IFS":
+            return " "
+        v = vars_.get(name)
+        if op in (":-", "-"):
+            if v is not None and (v != "" or op == "-"):
+                return v
+            return expand_vars(arg, vars_)
+        if op in (":=", "="):
+            if v is not None and (v != "" or op == "="):
+                return v
+            val = expand_vars(arg, vars_)
+            vars_[name] = tilde(val)
+            return val
+        if op in (":+", "+"):
+            if v is not None and (v != "" or op == "+"):
+                return expand_vars(arg, vars_)
+            return ""
+        if op == ",,":
+            return v.lower() if v is not None else m.group(0)
+        if op == "^^":
+            return v.upper() if v is not None else m.group(0)
+        if op == ",":
+            return (v[:1].lower() + v[1:]) if v is not None else m.group(0)
+        if op == "^":
+            return (v[:1].upper() + v[1:]) if v is not None else m.group(0)
+        if op in ("/", "//") and v is not None:
+            parts = arg.split("/", 1)
+            pat = parts[0]
+            repl = parts[1] if len(parts) > 1 else ""
+            return v.replace(pat, repl) if op == "//" else v.replace(pat, repl, 1)
+        if op == ":" and v is not None:
+            parts = arg.split(":", 1)
+            try:
+                off = int(parts[0].strip())
+                ln = int(parts[1].strip()) if len(parts) > 1 else None
+                return v[off:off + ln] if ln is not None else v[off:]
+            except ValueError:
+                return v
+        return v if v is not None else m.group(0)
+
+    for _ in range(3):
+        prev = text
+        text = re.sub(
+            r"\$\{!([A-Za-z_][A-Za-z0-9_]*)\}",
+            lambda m: vars_.get(vars_.get(m.group(1), ""), m.group(0)), text)
+        text = re.sub(
+            r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:-|:=|:\+|[-=+]|,,|\^\^|,|\^|//|/|:)([^{}]*))?\}",
+            rep_brace, text)
+        if text == prev:
+            break
+
+    def rep_simple(m):
         name = m.group(1) or m.group(2)
         if name == "IFS":                      # word separator: `rm$IFS-rf` must reassemble
             return " "
         v = vars_.get(name)
         return v if v is not None else m.group(0)
-    return re.sub(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))", rep, text)
+    text = text.replace("${0}", vars_.get("0", "sh"))
+    return re.sub(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|(0)(?![0-9]))", rep_simple, text)
 
 
 def tilde(v):
@@ -722,12 +844,21 @@ def write_targets(prog, rest, flags, args, seg, cwd):
     out = list(redirect_targets(seg))
     if prog in WRITE_ALL_ARGS:
         out += args
-    elif prog in ("sed", "perl", "awk", "gawk", "ruby", "ed", "ex"):
+    elif prog in ("sed", "gsed", "perl", "awk", "gawk", "mawk", "nawk", "ruby", "ed", "ex"):
         inplace = any(f == "--in-place" or f.startswith("--in-place=") or
-                      (not f.startswith("--") and "i" in f[1:] and prog in ("sed", "perl", "ruby")) or f == "-i"
-                      for f in flags) or (prog in ("awk", "gawk") and "inplace" in " ".join(rest)) or prog in ("ed", "ex")
+                      (not f.startswith("--") and "i" in f[1:] and prog in ("sed", "gsed", "perl", "ruby")) or f == "-i"
+                      for f in flags) or (prog in ("awk", "gawk", "mawk", "nawk") and "inplace" in " ".join(rest)) or prog in ("ed", "ex")
         if inplace:
             out += args
+        if prog in ("sed", "gsed"):
+            for r in rest:
+                for m in re.finditer(r"(?:^|[;\n\s]|[0-9$,!]+)s(?:/(?:\\.|[^/])*/(?:\\.|[^/])*/[gpimI]*w\s+([^\s;'\"]+))"
+                                     r"|(?:^|[;\n\s]|[0-9$,!]+)w\s+([^\s;'\"]+)", r):
+                    out.append(m.group(1) or m.group(2))
+        if prog in ("awk", "gawk", "mawk", "nawk"):
+            for r in rest:
+                for m in re.finditer(r'>>?\s*"([^"]+)"', r):
+                    out.append(m.group(1))
     elif prog in WRITE_DEST_LAST:
         tv = None
         for k, t in enumerate(rest):
@@ -740,9 +871,25 @@ def write_targets(prog, rest, flags, args, seg, cwd):
             out.append(dest)
     elif prog == "dd":
         out += [t[3:] for t in rest if t.startswith("of=")]
+    elif prog == "find":
+        for k, t in enumerate(rest[:-1]):
+            if t in ("-fprint", "-fprint0", "-fprintf", "-fls"):
+                out.append(rest[k + 1])
     elif prog in ("curl", "wget"):
         for k, t in enumerate(rest):
             if t in ("-o", "-O", "--output", "--output-document") and k + 1 < len(rest):
+                out.append(rest[k + 1])
+    elif prog == "sort":
+        for k, t in enumerate(rest):
+            if t in ("-o", "--output") and k + 1 < len(rest):
+                out.append(rest[k + 1])
+            elif t.startswith("--output="):
+                out.append(t.split("=", 1)[1])
+            elif t.startswith("-o") and len(t) > 2 and not t.startswith("--"):
+                out.append(t[2:])
+    elif prog == "history":
+        for k, t in enumerate(rest):
+            if t in ("-a", "-w") and k + 1 < len(rest):
                 out.append(rest[k + 1])
     return [resolve(w, cwd) for w in out if w]
 
@@ -757,15 +904,18 @@ PIPE_SINK_RE = re.compile(
     r"\|\s*(?:(?:sudo|env|command|nohup|timeout)\s+)*"
     r"(bash|sh|zsh|dash|ksh|fish|python3?|node|perl|ruby|osascript)\b")
 B64_BLOB_RE = re.compile(r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{8,}={0,2})(?![A-Za-z0-9+/=])")
+HEX_BLOB_RE = re.compile(r"(?<![0-9a-fA-F])((?:[0-9a-fA-F]{2}){6,})(?![0-9a-fA-F])")
 
 
 def decode_b64_text(cmd):
-    """Best-effort decode of base64-looking blobs, so `echo <b64> | base64 -d | sh` is analyzed."""
+    """Best-effort decode of base64/hex/reversed/escaped pipelines so encoded commands are analyzed."""
     out = []
-    has_b64_cmd = "base64" in cmd
+    has_b64_cmd = bool(re.search(r"\b(?:base64|b64decode|atob)\b", cmd))
     for m in B64_BLOB_RE.finditer(cmd):
         blob = m.group(1)
         if len(blob) < 24 and not has_b64_cmd:
+            continue
+        if len(blob) < 12 and "=" not in blob:
             continue
         try:
             import base64
@@ -774,9 +924,31 @@ def decode_b64_text(cmd):
             continue
         if "\ufffd" in dec:
             continue
-        if any(c.isalpha() for c in dec) and any(k in dec for k in ("rm ", "sh ", "bash", "curl", "wget",
-                                                                   "eval", "python", "chmod", "dd ", "mkfs")):
+        ascii_cmd = all(32 <= ord(c) < 127 or c in "\n\r\t" for c in dec) and any(c in dec for c in (" ", "/", ">", ";", "|"))
+        if any(c.isalpha() for c in dec) and (
+                (has_b64_cmd and ascii_cmd) or
+                any(k in dec for k in ("rm ", "mv ", "sh ", "bash", "curl", "wget", "eval", "python",
+                                       "chmod", "dd ", "mkfs", "git ", "find ", "sed ", "truncate"))):
             out.append(dec)
+    if re.search(r"\bxxd\s+-[a-zA-Z]*r|\bfromhex\b|\bunhexlify\b", cmd):
+        for m in HEX_BLOB_RE.finditer(cmd):
+            try:
+                dec = bytes.fromhex(m.group(1)).decode("utf-8", "replace")
+                if "\ufffd" not in dec and all(32 <= ord(c) < 127 or c in "\n\r\t" for c in dec) and any(c.isalpha() for c in dec):
+                    out.append(dec)
+            except Exception:
+                pass
+    masked = mask_quotes(cmd)
+    if re.search(r"\|\s*rev\b", masked):
+        for m in re.finditer(r"(?:echo|printf)\s+(['\"])(.*?)\1\s*\|\s*rev\b", cmd):
+            out.append(m.group(2)[::-1])
+    if PIPE_SINK_RE.search(masked):
+        for m in re.finditer(r"(?:printf|echo\s+-e)\s+(['\"])((?:[^'\"\\]|\\.)*)\1\s*\|", cmd):
+            if "\\x" in m.group(2) or re.search(r"\\[0-7]{2,3}", m.group(2)):
+                out.append(decode_ansi_c(m.group(2)))
+        for m in re.finditer(r"(?:echo|printf)\s+(['\"]?)([^\n|'\"]+)\1\s*\|\s*tr\s+-d\s+(['\"]?)([^\s|'\"]+)\3\s*\|", cmd):
+            body_s, drop_s = m.group(2), m.group(4)
+            out.append("".join(c for c in body_s if c not in drop_s))
     return out
 
 
@@ -909,6 +1081,8 @@ SCRIPT_ARG_INTERPRETERS = ("bash", "sh", "zsh", "dash", "ksh", "fish",
 def resolve_script_arg(rest, ecwd):
     """First plausible script-path token from interpreter args (post-expansion)."""
     for t in rest:
+        if t in ("-c", "-e", "--eval", "-m") or (t.startswith("-") and not t.startswith("--") and t.endswith(("c", "e"))):
+            return None
         if t.startswith("-"):
             continue
         if t in (".", ".."):
@@ -960,7 +1134,12 @@ def script_body_effects(path, ecwd, depth, vars_, mode="auto", prog=None, seg=""
         return []
     base = os.path.basename(path)
     first = body.split("\n", 1)[0]
-    non_shell = mode != "shell" and (path.endswith(NON_SHELL_SCRIPT_EXT) or NON_SHELL_SHEBANG_RE.match(first))
+    prog_base = os.path.basename(prog or "").rstrip("0123456789.")
+    non_shell = mode != "shell" and (
+        path.endswith(NON_SHELL_SCRIPT_EXT)
+        or bool(NON_SHELL_SHEBANG_RE.match(first))
+        or prog_base in ("python", "perl", "ruby", "node", "deno", "bun", "php", "lua")
+    )
     if non_shell:
         return [{"prog": prog or "script", "seg": seg or base, "targets": [], "recursive": False, "kind": "inline",
                  "filtered": False, "unresolved": False, "flags": [], "args": [], "cwd": ecwd or UNKNOWN_CWD,
@@ -1122,7 +1301,7 @@ AWK_SYSTEM_RE = re.compile(r"\bsystem\s*\(\s*(['\"])(.*?)\1\s*\)")
 CODE_ARG_FLAGS = {"python": r"-[A-Za-z]*[cm]", "python3": r"-[A-Za-z]*[cm]",
                   "node": r"-[A-Za-z]*[epc]\b|--(?:eval|print|check)\b", "perl": r"-[A-Za-z]*[eE]",
                   "ruby": r"-[A-Za-z]*[ec]", "osascript": r"-[A-Za-z]*e"}
-FETCH_PROG = r"(?:sudo\s+(?:-\S+\s+)*)?(?:curl|wget|aria2c|fetch|https?|iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b"
+FETCH_PROG = r"(?:sudo\s+(?:-\S+\s+)*)?(?:curl|wget|aria2c|fetch|https?|iwr|irm|Invoke-WebRequest|Invoke-RestMethod|dig|nslookup|host|drill)\b"
 RUN_HEAD = r"(?:^|[\s;&|(])(?:sudo\s+(?:-\S+\s+)*)?(?:[\w./~-]*/)?"
 # `bash <(curl X)`, `source <(curl X)`: read on the quote-masked command, where a quoted `<(` is text
 PROC_SUBST_RUN_RE = re.compile(RUN_HEAD + r"(bash|sh|zsh|dash|ksh|fish|python[23]?|node|perl|ruby|source|\.)"
@@ -1133,6 +1312,407 @@ CODE_SUBST_HEAD_RE = re.compile(RUN_HEAD + r"(?:(bash|sh|zsh|dash|ksh|fish)\s+(?
                                 r"|(python[23]?|perl|ruby|node|osascript)\s+(?:-\S+\s+)*?-[A-Za-z]*[ce]|(eval))\s+\"?")
 FETCH_SUBST_RE = re.compile(r"(?:\$\(|`)\s*" + FETCH_PROG)
 
+EXEC_VARS = {"PAGER", "GIT_PAGER", "MANPAGER", "EDITOR", "VISUAL", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR",
+             "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_PROXY_COMMAND",
+             "LESSOPEN", "LESSCLOSE", "PROMPT_COMMAND", "KUBECTL_EXTERNAL_DIFF", "RUSTC_WRAPPER"}
+GIT_EXEC_KEYS = ("core.pager", "core.editor", "core.sshcommand", "core.fsmonitor", "sequence.editor",
+                 "diff.external", "credential.helper", "gpg.program", "uploadpack.packobjectshook")
+GIT_HOOK_CONFIG_KEYS = ("core.fsmonitor", "core.hookspath", "uploadpack.packobjectshook")
+SAFE_COMPRESSORS = {"gzip", "pigz", "bzip2", "pbzip2", "xz", "pxz", "zstd", "pzstd", "lz4", "lzop", "compress", "lzip"}
+ARITH_SUBSCRIPT_CMDS = {"let", "declare", "typeset", "local", "readonly", "unset", "test", "[", "[["}
+
+
+def find_command_substs(text, masked=None):
+    """Yield (start, end, inner, top_level) for every $(...) and `...` in text across arbitrary nesting depth."""
+    if masked is None:
+        masked = mask_quotes(text, mask_double=False)
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text[i:i + 2] == "$(" and masked[i] != " ":
+            if text[i:i + 3] == "$((":
+                i += 3
+                continue
+            depth, j, q = 1, i + 2, None
+            while j < n and depth > 0:
+                c = text[j]
+                if q:
+                    if c == "\\" and q == '"' and j + 1 < n:
+                        j += 2; continue
+                    if c == q:
+                        q = None
+                elif c in "'\"":
+                    q = c
+                elif c == "\\" and j + 1 < n:
+                    j += 2; continue
+                elif c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                j += 1
+            if depth == 0:
+                inner = text[i + 2:j - 1]
+                out.append((i, j, inner, True))
+                for sub_s, sub_e, sub_in, _ in find_command_substs(inner):
+                    out.append((i + 2 + sub_s, i + 2 + sub_e, sub_in, False))
+                i = j
+                continue
+        elif text[i] == "`" and masked[i] != " ":
+            j = i + 1
+            while j < n and text[j] != "`":
+                if text[j] == "\\" and j + 1 < n:
+                    j += 2; continue
+                j += 1
+            if j < n:
+                out.append((i, j + 1, text[i + 1:j], True))
+                i = j + 1
+                continue
+        i += 1
+    return out
+
+
+def eval_trivial_subst(inner, vars_):
+    """Evaluate trivial `echo ...` or `printf ...` command substitutions to their literal output, else None."""
+    s = (inner or "").strip()
+    if not s or any(c in s for c in ";|&><\n`") or "$(" in s:
+        return None
+    toks = tokenize(expand_vars(s, vars_))
+    if not toks:
+        return None
+    prog = os.path.basename(toks[0])
+    rest = toks[1:]
+    if prog == "echo":
+        esc = False
+        while rest and rest[0] in ("-n", "-e", "-E", "-ne", "-en"):
+            if "e" in rest[0]:
+                esc = True
+            rest = rest[1:]
+        val = " ".join(rest)
+        if esc:
+            val = decode_ansi_c(val)
+        return val if re.match(r"^[A-Za-z0-9_./~ -]+$", val) else None
+    if prog == "printf" and rest:
+        if len(rest) == 1:
+            val = decode_ansi_c(rest[0])
+            return val if re.match(r"^[A-Za-z0-9_./~ -]+$", val) else None
+        if len(rest) == 2 and rest[0] in ("%s", "%b"):
+            val = decode_ansi_c(rest[1]) if rest[0] == "%b" else rest[1]
+            return val if re.match(r"^[A-Za-z0-9_./~ -]+$", val) else None
+    return None
+
+
+def replace_command_substs(cmd, substs, vars_):
+    """Replace top-level $(...) and `...` spans with trivial literal output when static, else __SUBST__."""
+    tops = sorted([ item for item in substs if item[3] ], key=lambda x: x[0], reverse=True)
+    out = cmd
+    for s, e, inner, _ in tops:
+        lit = eval_trivial_subst(inner, vars_)
+        out = out[:s] + (lit if lit is not None else "__SUBST__") + out[e:]
+    return SUBST_RE.sub("__SUBST__", out)
+
+
+def carried_by_vars(toks, ecwd, depth, vars_):
+    """Analyze commands carried in execution environment variables (`GIT_SSH_COMMAND=... git fetch`)
+    and Shellshock function exports (`env x='() { :;}; cmd' bash -c :`, CVE-2014-6271)."""
+    out = []
+    for t in toks:
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_%-]*)=(.*)$", t, re.S)
+        if not m:
+            if os.path.basename(t) in ("env", "export"):
+                continue
+            break
+        name, val = m.group(1), m.group(2).strip()
+        sm = re.match(r"^\(\s*\)\s*\{([^}]*)\}\s*;?\s*(.*)$", val, re.S)
+        if sm:
+            if sm.group(1).strip() and sm.group(1).strip() != ":":
+                out += analyze(sm.group(1).strip(), ecwd, depth + 1, vars_)
+            if sm.group(2).strip():
+                out += analyze(sm.group(2).strip(), ecwd, depth + 1, vars_)
+            continue
+        if name in EXEC_VARS and val and val not in ("cat", "less", "more", "true", "false", ":"):
+            out += analyze(val, ecwd, depth + 1, vars_)
+    return out
+
+
+def carried_by_git(rest, sub, gargs):
+    """Return (commands_to_analyze, [(hook_key, hook_val)]) from a git invocation."""
+    cmds, hooks = [], []
+    i = 0
+    while i < len(rest):
+        t = rest[i]
+        kv = None
+        if t == "-c" and i + 1 < len(rest) and "=" in rest[i + 1]:
+            kv = rest[i + 1]; i += 2
+        elif t.startswith("-c") and len(t) > 2 and "=" in t[2:]:
+            kv = t[2:]; i += 1
+        elif re.match(r"^--(?:upload-pa\w*|receive-pa\w*|exec)=(.+)$", t):
+            cmds.append(t.split("=", 1)[1]); i += 1; continue
+        elif re.match(r"^--(?:upload-pa\w*|receive-pa\w*|exec)$", t) and i + 1 < len(rest):
+            cmds.append(rest[i + 1]); i += 2; continue
+        elif t.startswith("ext::") and len(t) > 5:
+            raw_ext = re.sub(r"%[SsGV]\S*", "", t[5:]).strip()
+            ext_toks = [w.replace("\x00", " ").strip() for w in raw_ext.replace("% ", "\x00").split() if w.strip()]
+            if ext_toks:
+                cmds.append(" ".join(shlex.quote(w) for w in ext_toks))
+            i += 1; continue
+        elif re.match(r"(?i)^ssh://[^/\s]*?-o(?:ProxyCommand|LocalCommand)=(.+)$", t):
+            pm = re.match(r"(?i)^ssh://[^/\s]*?-o(?:ProxyCommand|LocalCommand)=(.+)$", t)
+            cmds.append(pm.group(1).rstrip("/")); i += 1; continue
+        else:
+            i += 1
+            continue
+        key, val = kv.split("=", 1)
+        kl = key.strip().lower()
+        v = val.strip()
+        if v.lower() in ("", "false", "0", "off", "none", "true", "cat", "less"):
+            continue
+        if kl in GIT_HOOK_CONFIG_KEYS or (kl.startswith("filter.") and kl.endswith((".clean", ".smudge", ".process"))):
+            hooks.append((kl, v))
+            cmds.append(v.lstrip("!"))
+        elif kl in GIT_EXEC_KEYS or kl.startswith("pager.") or (kl.startswith("alias.") and v.startswith("!")):
+            cmds.append(v.lstrip("!"))
+    if sub == "config":
+        words = [a for a in gargs if not a.startswith("-")]
+        if len(words) >= 2:
+            kl, v = words[0].lower(), words[1].strip()
+            if v.lower() not in ("", "false", "0", "off", "none", "true", "cat", "less"):
+                if kl in GIT_HOOK_CONFIG_KEYS or (kl.startswith("filter.") and kl.endswith((".clean", ".smudge", ".process"))):
+                    hooks.append((kl, v))
+                    cmds.append(v.lstrip("!"))
+                elif kl in GIT_EXEC_KEYS or kl.startswith("pager.") or (kl.startswith("alias.") and v.startswith("!")):
+                    cmds.append(v.lstrip("!"))
+    for j, a in enumerate(gargs):
+        nxt = gargs[j + 1] if j + 1 < len(gargs) else None
+        if sub in ("difftool", "mergetool") and a in ("-x", "--extcmd") and nxt:
+            cmds.append(nxt)
+        elif sub in ("difftool", "mergetool") and a.startswith("--extcmd="):
+            cmds.append(a.split("=", 1)[1])
+        elif sub == "rebase" and a in ("-x", "--exec") and nxt:
+            cmds.append(nxt)
+        elif sub == "rebase" and a.startswith("--exec="):
+            cmds.append(a.split("=", 1)[1])
+        elif sub == "filter-branch" and re.match(r"^--[a-z\-]+-filter$", a) and nxt:
+            cmds.append(nxt)
+    if sub == "bisect" and gargs[:1] == ["run"] and len(gargs) > 1:
+        cmds.append(" ".join(shlex.quote(a) for a in gargs[1:]))
+    if sub == "submodule" and "foreach" in gargs:
+        tail = [a for a in gargs[gargs.index("foreach") + 1:] if a != "--recursive"]
+        if tail:
+            cmds.append(tail[0] if len(tail) == 1 else " ".join(shlex.quote(a) for a in tail))
+    return cmds, hooks
+
+
+def carried_by_archive_or_transfer(prog, rest):
+    """Extract shell commands carried by tar/rsync/zip/scp/sftp/ssh/man/sort/vim execution flags."""
+    cmds = []
+    if prog in ("tar", "gtar", "bsdtar"):
+        for i, t in enumerate(rest):
+            m = re.match(r"^--checkpoint-action=exec=(.+)$", t)
+            if m:
+                cmds.append(m.group(1))
+            elif t.startswith("--to-command="):
+                cmds.append(t.split("=", 1)[1])
+            elif t == "--to-command" and i + 1 < len(rest):
+                cmds.append(rest[i + 1])
+            elif t.startswith("--use-compress-program="):
+                c = t.split("=", 1)[1]
+                if c not in SAFE_COMPRESSORS:
+                    cmds.append(c)
+            elif t in ("-I", "--use-compress-program", "-F", "--info-script") and i + 1 < len(rest):
+                c = rest[i + 1]
+                if c not in SAFE_COMPRESSORS:
+                    cmds.append(c)
+            elif t.startswith("--info-script="):
+                cmds.append(t.split("=", 1)[1])
+    elif prog == "rsync":
+        for i, t in enumerate(rest):
+            if t in ("-e", "--rsh") and i + 1 < len(rest):
+                cmds.append(rest[i + 1])
+            elif t.startswith("--rsh="):
+                cmds.append(t.split("=", 1)[1])
+            elif t.startswith("-e") and len(t) > 2 and not t.startswith("--"):
+                cmds.append(t[2:])
+    elif prog == "zip":
+        for i, t in enumerate(rest):
+            if t in ("-TT", "--unzip-command") and i + 1 < len(rest):
+                cmds.append(rest[i + 1])
+            elif t.startswith("--unzip-command="):
+                cmds.append(t.split("=", 1)[1])
+    elif prog in ("scp", "sftp", "ssh"):
+        for i, t in enumerate(rest):
+            if prog in ("scp", "sftp") and t == "-S" and i + 1 < len(rest):
+                cmds.append(rest[i + 1])
+            elif t == "-o" and i + 1 < len(rest):
+                m = re.match(r"(?i)^(?:ProxyCommand|LocalCommand)=(.+)$", rest[i + 1])
+                if m:
+                    cmds.append(m.group(1))
+            elif t.startswith("-o") and len(t) > 2:
+                m = re.match(r"(?i)^(?:ProxyCommand|LocalCommand)=(.+)$", t[2:])
+                if m:
+                    cmds.append(m.group(1))
+    elif prog == "man":
+        for i, t in enumerate(rest):
+            if t in ("-P", "--pager", "-H", "--html") and i + 1 < len(rest):
+                if rest[i + 1] not in ("cat", "less", "more"):
+                    cmds.append(rest[i + 1])
+            elif re.match(r"^--(?:pager|html)=(.+)$", t):
+                c = t.split("=", 1)[1]
+                if c not in ("cat", "less", "more"):
+                    cmds.append(c)
+    elif prog == "sort":
+        for i, t in enumerate(rest):
+            if t == "--compress-program" and i + 1 < len(rest):
+                if rest[i + 1] not in SAFE_COMPRESSORS:
+                    cmds.append(rest[i + 1])
+            elif t.startswith("--compress-program="):
+                c = t.split("=", 1)[1]
+                if c not in SAFE_COMPRESSORS:
+                    cmds.append(c)
+    elif prog in ("vi", "vim", "nvim", "rvim", "ex", "view"):
+        for i, t in enumerate(rest):
+            ex_s = None
+            if t == "-c" and i + 1 < len(rest):
+                ex_s = rest[i + 1]
+            elif t.startswith("+") and len(t) > 1:
+                ex_s = t[1:]
+            if ex_s:
+                em = re.match(r"^:?!(?:silent\s+)?(.+)$", ex_s.strip())
+                if em:
+                    cmds.append(em.group(1))
+                pm = re.match(r"^:?py(?:thon)?3?\s+(.+)$", ex_s.strip())
+                if pm:
+                    cmds.append("python3 -c " + shlex.quote(pm.group(1)))
+    return cmds
+
+
+def db_shell_and_writes(prog, text, ecwd):
+    """Extract shell-escape commands and file-write targets from sqlite3/duckdb/psql/mysql scripts."""
+    cmds, writes = [], []
+    if prog in ("sqlite3", "duckdb"):
+        for m in re.finditer(r"(?:^|[\n;\"'])\s*\.(?:shell|system)\s+([^\n\"']+)", text):
+            cmds.append(m.group(1).strip())
+        for m in re.finditer(r"(?:^|[\n;\"'])\s*\.(?:output|once|import)\s+\|\s*([^\n\"']+)", text):
+            cmds.append(m.group(1).strip())
+        for m in re.finditer(r"(?:^|[\n;\"'])\s*\.(?:output|once|backup|save|clone)\s+(?!\|)([^\s;\"']+)", text):
+            writes.append(resolve(m.group(1), ecwd))
+    elif prog == "psql":
+        for m in re.finditer(r"\\!\s+([^\n\"']+)", text):
+            cmds.append(m.group(1).strip())
+        for m in re.finditer(r"\\o\s+\|\s*([^\n\"']+)", text):
+            cmds.append(m.group(1).strip())
+        for m in re.finditer(r"(?i)\bCOPY\b[^;\n]*?\b(?:TO|FROM)\s+PROGRAM\s+'([^']+)'", text):
+            cmds.append(m.group(1).strip())
+        for m in re.finditer(r"(?i)\\copy\b[^\n]*?\b(?:to|from)\s+program\s+'([^']+)'", text):
+            cmds.append(m.group(1).strip())
+        for m in re.finditer(r"\\o\s+(?!\|)([^\s;\"']+)", text):
+            writes.append(resolve(m.group(1), ecwd))
+    elif prog in ("mysql", "mariadb"):
+        for m in re.finditer(r"(?:\\!|(?:^|[\n;])\s*system)\s+([^\n;\"']+)", text):
+            cmds.append(m.group(1).strip())
+        for m in re.finditer(r"(?i)\bINTO\s+(?:OUTFILE|DUMPFILE)\s+['\"]([^'\"]+)['\"]", text):
+            writes.append(resolve(m.group(1), ecwd))
+    return cmds, writes
+
+
+INLINE_SHELL_CALL_RE = re.compile(
+    r"(?:\b(?:os\.(?:system|popen|execl|execlp|execv|execvp|spawnl|spawnlp)|"
+    r"subprocess\.(?:run|call|check_call|check_output|Popen|getoutput|getstatusoutput)|"
+    r"pty\.spawn|commands\.getoutput|child_process\.(?:execSync|exec|spawnSync|spawn|execFileSync|execFile)|"
+    r"Bun\.(?:spawnSync|spawn)|Deno\.Command|"
+    r"Kernel\.(?:system|exec)|IO\.popen|os\.execute|io\.popen|"
+    r"shell_exec|passthru|proc_open|popen|system|exec)|"
+    r"\.\s*(?:execSync|exec|spawnSync|spawn|system|popen))\s*\("
+)
+
+
+def inline_shell_commands(text, prog):
+    """Extract shell commands spawned inside an inline `-c`/`-e` interpreter snippet."""
+    code = _code_of(text)
+    if not code or not code.strip():
+        return []
+    out = []
+    pbase = os.path.basename(prog or "").rstrip("0123456789.")
+    if pbase == "python":
+        try:
+            import ast, warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                tree = ast.parse(code)
+            for n in ast.walk(tree):
+                if not isinstance(n, ast.Call) or not n.args:
+                    continue
+                fn = ""
+                if isinstance(n.func, ast.Name):
+                    fn = n.func.id
+                elif isinstance(n.func, ast.Attribute):
+                    if isinstance(n.func.value, ast.Name):
+                        fn = n.func.value.id + "." + n.func.attr
+                    elif isinstance(n.func.value, ast.Call) and isinstance(n.func.value.func, ast.Name) \
+                            and n.func.value.func.id == "__import__" and n.func.value.args \
+                            and isinstance(n.func.value.args[0], ast.Constant):
+                        fn = str(n.func.value.args[0].value) + "." + n.func.attr
+                if fn in ("os.system", "os.popen", "subprocess.run", "subprocess.call", "subprocess.check_call",
+                          "subprocess.check_output", "subprocess.Popen", "subprocess.getoutput",
+                          "subprocess.getstatusoutput", "pty.spawn", "system", "popen", "run", "call",
+                          "check_call", "check_output", "Popen"):
+                    a0 = n.args[0]
+                    if isinstance(a0, ast.Constant) and isinstance(a0.value, str):
+                        out.append(a0.value)
+                    elif isinstance(a0, (ast.List, ast.Tuple)):
+                        words = []
+                        for elt in a0.elts:
+                            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                                words.append(elt.value)
+                            elif isinstance(elt, ast.Call) and isinstance(elt.func, ast.Attribute) \
+                                    and elt.func.attr == "expanduser" and elt.args \
+                                    and isinstance(elt.args[0], ast.Constant) and isinstance(elt.args[0].value, str):
+                                words.append(tilde(elt.args[0].value))
+                        if words:
+                            out.append(" ".join(shlex.quote(w) for w in words))
+        except Exception:
+            pass
+    masked = _mask_code_strings(code)
+    for m in INLINE_SHELL_CALL_RE.finditer(masked):
+        open_idx = code.find("(", m.start())
+        if open_idx < 0:
+            continue
+        args = _balanced_args(code, open_idx)
+        if not args:
+            continue
+        a0 = args[0].strip()
+        sm = re.match(r"^(['\"`])(.*)\1$", a0, re.S)
+        if sm:
+            cmd_s = sm.group(2)
+            if len(args) >= 2 and args[1].strip().startswith("["):
+                arr_items = re.findall(r"(['\"])(.*?)\1", args[1])
+                if arr_items:
+                    cmd_s = " ".join([cmd_s] + [shlex.quote(x[1]) for x in arr_items])
+            if cmd_s not in out:
+                out.append(cmd_s)
+        elif a0.startswith("["):
+            arr_items = re.findall(r"(['\"])(.*?)\1", a0)
+            if arr_items:
+                cmd_s = " ".join(shlex.quote(x[1]) for x in arr_items)
+                if cmd_s not in out:
+                    out.append(cmd_s)
+    if pbase == "osascript":
+        for m in re.finditer(r'do\s+shell\s+script\s+"((?:[^"\\]|\\.)*)"', code, re.I):
+            out.append(re.sub(r'\\(.)', r'\1', m.group(1)))
+    elif pbase in ("ruby", "perl", "php"):
+        for m in re.finditer(r"(?<![\w$@])`([^`\n]{2,400})`", code):
+            out.append(m.group(1))
+        for m in re.finditer(r"\b(?:qx|%x)\s*([({\[/])(.*?)[)}\]/]", code):
+            out.append(m.group(2))
+        for m in re.finditer(r"(?m)^[ \t]*(?:system|exec)[ \t]+(['\"])(.*?)\1", code):
+            out.append(m.group(2))
+        for m in re.finditer(r"\bopen\s*\(\s*[^,)]+\s*,\s*(['\"])\s*(?:\|\s*([^'\"]+?)|([^'\"]+?)\s*\|)\s*\1\s*\)", code):
+            out.append((m.group(2) or m.group(3)).strip())
+    return out
+
+
+KNOWN_EXEC_BINS = {"rm", "rmdir", "shred", "unlink", "dd", "mkfs", "sh", "bash", "zsh", "dash", "ksh", "fish",
+                   "python", "python3", "perl", "ruby", "node", "curl", "wget", "git", "find", "sed", "awk",
+                   "sqlite3", "psql", "mysql", "mv", "cp", "chmod", "chown"}
+
 
 def analyze(cmd, cwd, depth=0, vars_=None):
     """Walk a shell command tracking cd and simple VAR=value, yielding effects (never executes anything)."""
@@ -1140,11 +1720,13 @@ def analyze(cmd, cwd, depth=0, vars_=None):
     if depth > MAX_DEPTH or not cmd or not cmd.strip():
         return effects
     if vars_ is None:
-        vars_ = {"HOME": HOME, "USERPROFILE": HOME}
+        vars_ = {"HOME": HOME, "USERPROFILE": HOME, "PATH": "/usr/bin:/bin", "SHELL": "/bin/sh", "0": "sh"}
         if os.environ.get("TMPDIR"):
             vars_["TMPDIR"] = canon(os.environ["TMPDIR"].rstrip("/"))
     else:
         vars_ = dict(vars_)
+    raw_vars = {}
+    alias_bins = {}
     state = {"cwd": cwd}
     if INVISIBLE_RE.search(cmd):
         effects.append({"prog": "\u200b", "seg": cmd[:120], "targets": [], "recursive": False,
@@ -1161,12 +1743,19 @@ def analyze(cmd, cwd, depth=0, vars_=None):
             continue                                        # `name=(...)`, `name+=(...)`: an array literal
         if inner:
             effects += analyze(inner, state["cwd"], depth + 1, vars_)
-    for inner in SUBST_RE.findall(cmd):
-        effects += analyze(inner[2:-1] if inner.startswith("$(") else inner[1:-1], state["cwd"], depth + 1, vars_)
+    substs = find_command_substs(cmd, mask_quotes(cmd, mask_double=False))
+    for _, _, inner, _ in substs:
+        effects += analyze(inner, state["cwd"], depth + 1, vars_)
+    # Process substitution `<(echo ...)` / `<(printf ...)` handed to a shell (`bash <(echo "rm -rf ~/Documents")`)
+    masked = mask_quotes(cmd)
+    for pm in re.finditer(RUN_HEAD + r"(bash|sh|zsh|dash|ksh|fish|source|\.)\s+(?:-\S+\s+)*<\(([^()]+)\)", masked):
+        p_inner = cmd[pm.start(2):pm.end(2)].strip()
+        lit = eval_trivial_subst(p_inner, vars_)
+        if lit:
+            effects += analyze(lit, state["cwd"], depth + 1, vars_)
     # pipe-to-interpreter: only when the interpreter reads its PROGRAM from the pipe
     # (`curl X | sh`). `curl X | python3 -c 'code'` pipes data, not code -- benign. A pipe inside
     # quotes is text (a commit message, a README line), so the scan reads the quote-masked command.
-    masked = mask_quotes(cmd)
     for m in PIPE_SINK_RE.finditer(masked):
         tail = cmd[m.end():cmd.find("\n", m.end()) if "\n" in cmd[m.end():] else len(cmd)]
         tail = re.split(r"[|;&]", tail)[0]
@@ -1199,13 +1788,14 @@ def analyze(cmd, cwd, depth=0, vars_=None):
         for it in raw_items:
             items += expand_braces(it)
         for val in items[:16]:
-            if "$" not in val and "__SUBST__" not in val and lbody:
+            if val and "$" not in val and "__SUBST__" not in val and lbody:
                 effects += analyze(lbody, state["cwd"], depth + 1, dict(vars_, **{lvar: tilde(val)}))
     if FORK_BOMB_RE.search(masked):                        # quoted, it is text; `sh -c '...'` is walked as its own command
         effects.append({"prog": ":()", "seg": cmd[:200], "targets": [], "recursive": False, "kind": "fork-bomb",
                         "filtered": False, "unresolved": False, "flags": [], "args": [], "cwd": UNKNOWN_CWD,
                         "writes": [], "text": cmd[:200]})
-    cmd = SUBST_RE.sub("__SUBST__", cmd)
+    raw_segs = split_segments(cmd)
+    cmd = replace_command_substs(cmd, substs, vars_)
     for seg in split_segments(cmd):                     # `: > f`, `> f`, `truncate -s 0 f`, `cp /dev/null f`
         m = TRUNCATE_RE.match(seg)
         if m:
@@ -1214,14 +1804,41 @@ def analyze(cmd, cwd, depth=0, vars_=None):
                             "filtered": False, "unresolved": False, "flags": [], "args": [], "cwd": state["cwd"] or UNKNOWN_CWD,
                             "writes": [], "text": seg})
     hd, cursor, feeder = 0, 0, None
-    for seg in split_segments(cmd):
+    for seg_idx, seg in enumerate(split_segments(cmd)):
+        raw_seg = raw_segs[seg_idx] if seg_idx < len(raw_segs) else seg
+        # Prompt expansion `${VAR@P}` (CVE-2026-29783): evaluates $VAR as a prompt with $(...) active
+        for pm in re.finditer(r"\$\{([A-Za-z_][A-Za-z0-9_]*)@P\}", raw_seg):
+            raw_v = raw_vars.get(pm.group(1)) or vars_.get(pm.group(1))
+            if raw_v:
+                effects += analyze(raw_v, state["cwd"], depth + 1, vars_)
         nh = len(HEREDOC_RE.findall(seg))
         my_bodies, hd = bodies[hd:hd + nh], hd + nh
+        # Extract here-string (`<<< "cmd"` or `<<<cmd`) before tokenizing
+        hs_bodies = []
+        hs_m = re.search(r"<<<\s*(['\"]?)(.+?)\1(?:\s*$|\s+[;&|])", raw_seg)
+        if hs_m:
+            hs_bodies.append(expand_vars(hs_m.group(2), vars_))
+            seg = seg[:hs_m.start()].strip()
         toks = tokenize(expand_vars(seg, vars_))
+        # Re-check `${VAR@P}` after `expand_vars` in case `${VAR:=cmd}` assigned VAR in the same segment (CVE-2026-29783)
+        for pm in re.finditer(r"\$\{([A-Za-z_][A-Za-z0-9_]*)@P\}", raw_seg):
+            if pm.group(1) not in raw_vars and vars_.get(pm.group(1)):
+                effects += analyze(vars_[pm.group(1)], state["cwd"], depth + 1, vars_)
         for _ in range(3):                                  # `if f() { rm ...`: keywords and function heads
             while toks and toks[0] in KEYWORDS:
                 toks = toks[1:]
             toks = strip_function_head(toks)
+        # Brace command expansion (`{rm,-rf,~/Documents}` or `{/bin/rm,-rf,~/Documents}`)
+        if toks and re.match(r"^\{[^{}\s]+,[^{}\s]+\}$", toks[0]):
+            parts_b = [tilde(p) for p in toks[0][1:-1].split(",") if p]
+            if parts_b:
+                toks = parts_b + toks[1:]
+        # Arithmetic subscript evaluation in single/double quotes: `let 'a[$(cmd)]'`, `unset 'a[$(cmd)]'`, `test -v 'a[$(cmd)]'`
+        if toks and (os.path.basename(toks[0]) in ARITH_SUBSCRIPT_CMDS or
+                     os.path.basename(toks[0]) == "printf" and any(re.search(r"%[diuxXo]", t) for t in toks[1:])):
+            for am in re.finditer(r"\[[^\]]*?(\$\([^()]+\)|`[^`]+`)[^\]]*?\]", raw_seg):
+                sub_s = am.group(1)
+                effects += analyze(sub_s[2:-1] if sub_s.startswith("$(") else sub_s[1:-1], state["cwd"], depth + 1, vars_)
         if toks and toks[0] == "for" and len(toks) >= 4 and toks[2] == "in":
             if "$" not in toks[3] and "__SUBST__" not in toks[3]:
                 vars_[toks[1]] = tilde(toks[3])
@@ -1235,25 +1852,61 @@ def analyze(cmd, cwd, depth=0, vars_=None):
         while k < len(toks) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\+?=", toks[k]):
             k += 1
         if k > j and k == len(toks):                       # pure assignment segment
-            for t in toks[j:k]:
+            raw_toks_assign = tokenize(raw_seg)
+            for idx_t, t in enumerate(toks[j:k]):
                 name, val = t.split("=", 1)
+                if j + idx_t < len(raw_toks_assign) and "=" in raw_toks_assign[j + idx_t]:
+                    raw_vars[name.rstrip("+")] = raw_toks_assign[j + idx_t].split("=", 1)[1]
                 if name.endswith("+"):                      # `name+=value` appends: the value is no longer known
                     vars_.pop(name[:-1], None)
                 elif "__SUBST__" in val or "$" in val:
-                    vars_.pop(name, None)
+                    if name == "HOME":
+                        vars_["HOME"] = "$UNRESOLVED_HOME"
+                    else:
+                        vars_.pop(name, None)
                 else:
                     vars_[name] = tilde(val)
             continue
-        toks, via_xargs = strip_wrappers(strip_leading_redirects(toks))
+        pre_toks = strip_leading_redirects(toks)
+        effects += carried_by_vars(pre_toks, state["cwd"], depth, vars_)
+        xrepl = xargs_repl_token(pre_toks)
+        toks, via_xargs = strip_wrappers(pre_toks)
         toks = strip_leading_redirects(toks)
         if not toks:
             continue
-        prog = os.path.basename(toks[0])
+        if re.match(r"^\{[^{}\s]+,[^{}\s]+\}$", toks[0]):
+            parts_b = [tilde(p) for p in toks[0][1:-1].split(",") if p]
+            if parts_b:
+                toks = parts_b + toks[1:]
+        prog_tok = toks[0]
+        if "$" in prog_tok and "__SUBST__" not in prog_tok:
+            stripped_p = re.sub(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*", "", prog_tok)
+            if os.path.basename(stripped_p) in KNOWN_EXEC_BINS:
+                prog_tok = stripped_p
+        if GLOB_CHARS_RE.search(prog_tok):
+            prog_tok = re.sub(r"\[([^\[\]\\])\]", r"\1", prog_tok)
+            if GLOB_CHARS_RE.search(prog_tok) and prog_tok.startswith("/"):
+                try:
+                    import glob as _glob
+                    for gh in sorted(_glob.glob(prog_tok))[:16]:
+                        if os.path.basename(gh) in KNOWN_EXEC_BINS:
+                            prog_tok = gh
+                            break
+                except Exception:
+                    pass
+        prog = os.path.basename(prog_tok)
+        if resolve(prog_tok, state["cwd"]) in alias_bins:
+            prog = alias_bins[resolve(prog_tok, state["cwd"])]
+        elif prog in alias_bins:
+            prog = alias_bins[prog]
         rest = toks[1:]
         at = cmd.find(seg, cursor)                          # is this segment fed by a pipe from the one before?
         piped = at > 0 and re.search(r"(?<!\|)\|&?\s*$", cmd[:at]) is not None
         cursor = at + len(seg) if at >= 0 else cursor
-        fed, feeder = (feeder if piped else None), (prog, rest)
+        fed, feeder = (feeder if piped else None), (prog, rest, my_bodies)
+        if piped and fed and len(fed) >= 3 and fed[0] in ("cat", "tee") and fed[2]:
+            my_bodies = list(fed[2]) + list(my_bodies)
+        my_bodies = list(my_bodies) + hs_bodies
         handed = cmd_exe_line(toks)
         if handed is not None:                              # `cmd /c "rmdir /s /q X"` from a shell
             effects += cmd_exe_effects(handed, state["cwd"])
@@ -1281,15 +1934,34 @@ def analyze(cmd, cwd, depth=0, vars_=None):
             if fed[0] == "printf" and fed_words and "%" in fed_words[0]:
                 fed_words = fed_words[1:]
             if fed_words and all("$" not in w and "__SUBST__" not in w for w in fed_words):
-                if "{}" in args:
-                    args = [fw if a == "{}" else a.replace("{}", fw) for a in args for fw in fed_words]
+                if any(xrepl in a for a in args):
+                    args = [fw if a == xrepl else a.replace(xrepl, fw) for a in args for fw in fed_words]
                 else:
                     args = list(args) + fed_words
                 via_xargs = False
         ecwd = state["cwd"]
         eff = {"prog": prog, "seg": seg, "targets": [], "recursive": False, "kind": None, "filtered": False,
-               "unresolved": via_xargs, "flags": flags, "args": args, "cwd": ecwd or UNKNOWN_CWD,
+               "unresolved": via_xargs, "flags": flags, "args": args, "rest": rest, "cwd": ecwd or UNKNOWN_CWD,
                "writes": write_targets(prog, rest, flags, args, expand_vars(seg, vars_), ecwd), "text": seg}
+        for sub_cmd in carried_by_archive_or_transfer(prog, rest):
+            effects += analyze(sub_cmd, ecwd, depth + 1, vars_)
+
+        if prog in ("su", "sg"):
+            for jj, t in enumerate(rest):
+                if t in ("-c", "--command") and jj + 1 < len(rest):
+                    effects += analyze(rest[jj + 1], ecwd, depth + 1, vars_)
+                    break
+                if t.startswith("--command="):
+                    effects += analyze(t.split("=", 1)[1], ecwd, depth + 1, vars_)
+                    break
+            continue
+        if prog == "parallel" and ":::" in rest:
+            idx_p = rest.index(":::")
+            p_cmd = [w for w in rest[:idx_p] if not w.startswith("-")]
+            p_args = [w for w in rest[idx_p + 1:] if w != ":::"]
+            if p_cmd and p_args:
+                effects += analyze(" ".join(p_cmd + p_args), ecwd, depth + 1, vars_)
+            continue
 
         if prog in ("bash", "sh", "zsh", "dash", "ksh", "fish"):
             if eff["writes"]:
@@ -1304,6 +1976,10 @@ def analyze(cmd, cwd, depth=0, vars_=None):
                 effects += analyze(inner_cmd, ecwd, depth + 1, vars_)
             for body in my_bodies:                          # `bash <<EOF` executes its body
                 effects += analyze(body, ecwd, depth + 1, vars_)
+            if piped and fed and fed[0] in ("echo", "printf"):
+                fed_sh = decode_ansi_c(" ".join(w for w in fed[1] if not (w.startswith("-") and len(w) <= 3)))
+                if fed_sh.strip():
+                    effects += analyze(fed_sh, ecwd, depth + 1, vars_)
             # opaque-script resolution: `bash totally_harmless.sh` executes the FILE body as shell
             sp = resolve_script_arg(rest, ecwd)
             if sp:
@@ -1349,13 +2025,32 @@ def analyze(cmd, cwd, depth=0, vars_=None):
                 if a.startswith("-") or a in ("(", ")", "!"):
                     break
                 roots.append(a)
-            joined = " ".join(rest)
-            if "-delete" in rest or re.search(r"-exec(dir)?\s+(rm|shred|unlink)\b", joined):
+            filtered_find = any(a in ("-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-mtime",
+                                      "-mmin", "-newer", "-size", "-user", "-perm", "-type", "-empty")
+                                for a in rest)
+            is_del_find = "-delete" in rest
+            idx_f = 0
+            while idx_f < len(rest):
+                if rest[idx_f] in ("-exec", "-execdir", "-ok", "-okdir"):
+                    end_f = idx_f + 1
+                    while end_f < len(rest) and rest[end_f] not in (";", "\\;", "+"):
+                        end_f += 1
+                    ex_toks, _ = strip_wrappers(rest[idx_f + 1:end_f])
+                    if ex_toks:
+                        ex_prog = os.path.basename(ex_toks[0])
+                        if ex_prog in ("rm", "rmdir", "shred", "unlink", "trash", "srm"):
+                            is_del_find = True
+                        else:
+                            for r_root in (roots or ["."]):
+                                sub_toks = [r_root if w == "{}" else w.replace("{}", r_root) for w in ex_toks]
+                                effects += analyze(" ".join(shlex.quote(w) for w in sub_toks), ecwd, depth + 1, vars_)
+                    idx_f = end_f + 1
+                else:
+                    idx_f += 1
+            if is_del_find:
                 eff["kind"] = "delete"
                 eff["recursive"] = True
-                eff["filtered"] = any(a in ("-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-mtime",
-                                            "-mmin", "-newer", "-size", "-user", "-perm", "-type", "-empty")
-                                      for a in rest)
+                eff["filtered"] = filtered_find
                 eff["targets"] = resolve_targets(roots or ["."], ecwd)
         elif prog == "rsync" and any("--remove-source-files" in f or f == "--delete" for f in flags):
             eff["kind"] = "delete"
@@ -1372,11 +2067,15 @@ def analyze(cmd, cwd, depth=0, vars_=None):
             eff["sub"] = g[0] if g else ""
             eff["gargs"] = g[1:]
             eff["gdir"] = gdir
+            git_cmds, git_hooks = carried_by_git(rest, eff["sub"], eff["gargs"])
+            eff["git_hooks"] = git_hooks
+            for gcmd in git_cmds:
+                effects += analyze(gcmd, gdir or ecwd, depth + 1, vars_)
         elif prog in INTERPRETERS:
             eff["kind"] = "inline"
             if my_bodies:
                 eff["text"] = seg + "\n" + "\n".join(my_bodies)
-            sp = resolve_script_arg(rest, ecwd)
+            sp = None if ("-" in rest and my_bodies) else resolve_script_arg(rest, ecwd)
             if sp and is_gate_source(sp):
                 # `python3 .../operator-gate.py <subcommand>` is the gate itself. Judge it as the
                 # operator-gate program (approve, install, onboard stay owner-only); never walk its source.
@@ -1386,11 +2085,22 @@ def analyze(cmd, cwd, depth=0, vars_=None):
                 eff["text"] = seg
             elif sp:
                 effects += script_body_effects(sp, ecwd, depth, vars_, mode="auto", prog=prog, seg=seg)
-        elif prog in ("grep", "egrep", "fgrep", "rg", "ag", "ack"):
+            else:
+                for sub_cmd in inline_shell_commands(eff["text"], prog):
+                    effects += analyze(sub_cmd, ecwd, depth + 1, vars_)
+        elif prog in ("grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack"):
             # `... | grep -v x` filters text already on the pipe; `grep -rn x src` and `rg x` read files.
             operands = args[1:]
-            recursive = has_flag(flags, "r") or has_flag(flags, "R") or "--recursive" in flags or prog in ("rg", "ag", "ack")
+            recursive = has_flag(flags, "r") or has_flag(flags, "R") or "--recursive" in flags or prog in ("rg", "ripgrep", "ag", "ack")
             eff["kind"] = "filter" if not operands and not recursive else "read"
+            if prog in ("rg", "ripgrep"):
+                for jj, t in enumerate(rest):
+                    if t == "--pre" and jj + 1 < len(rest):
+                        eff["pre_cmd"] = rest[jj + 1]
+                        effects += analyze(rest[jj + 1], ecwd, depth + 1, vars_)
+                    elif t.startswith("--pre="):
+                        eff["pre_cmd"] = t.split("=", 1)[1]
+                        effects += analyze(eff["pre_cmd"], ecwd, depth + 1, vars_)
         elif prog in DB_CLIENT_PROGS:
             eff["kind"] = "db"
             if my_bodies:
@@ -1401,11 +2111,43 @@ def analyze(cmd, cwd, depth=0, vars_=None):
                 fed_sql = ""
             if fed_sql:
                 eff["text"] += "\n" + fed_sql
+            db_cmds, db_writes = db_shell_and_writes(prog, eff["text"], ecwd)
+            eff["writes"] += db_writes
+            for dcmd in db_cmds:
+                effects += analyze(dcmd, ecwd, depth + 1, vars_)
+        elif prog in ("cp", "ln") and len(args) >= 2:
+            src_b = os.path.basename(args[-2])
+            if src_b in KNOWN_EXEC_BINS:
+                alias_bins[resolve(args[-1], ecwd)] = src_b
+                alias_bins[os.path.basename(args[-1])] = src_b
+        elif prog == "sort":
+            if piped and fed and fed[0] in ("echo", "printf") and any("compress-program" in t for t in rest):
+                fed_txt = decode_ansi_c(" ".join(w for w in fed[1] if not w.startswith("-")))
+                for fline in fed_txt.splitlines():
+                    if fline.strip():
+                        effects += analyze(fline.strip(), ecwd, depth + 1, vars_)
+        elif prog in ("ed", "ex"):
+            ed_lines = list(my_bodies)
+            if piped and fed and fed[0] in ("echo", "printf"):
+                ed_lines.append(decode_ansi_c(" ".join(w for w in fed[1] if not w.startswith("-"))))
+            for el in "\n".join(ed_lines).splitlines():
+                if el.strip().startswith("!"):
+                    effects += analyze(el.strip()[1:], ecwd, depth + 1, vars_)
+        elif prog in ("sed", "gsed"):
+            for a in rest:
+                for em in re.finditer(r"(?:^|[;\n]|[0-9$,!]+)e\s+([^\n;]+)", a):
+                    effects += analyze(em.group(1), ecwd, depth + 1, vars_)
+                for sm in re.finditer(r"s/(?:\\.|[^/])*/((?:\\.|[^/])*)/[gpimI]*e\b", a):
+                    s_cmd = sm.group(1).replace("\\/", "/").strip()
+                    if s_cmd:
+                        effects += analyze(s_cmd, ecwd, depth + 1, vars_)
         elif prog in ("awk", "gawk", "mawk", "nawk"):
             eff["kind"] = "inline"
             for a in rest:
                 for sm in AWK_SYSTEM_RE.finditer(a):
                     effects += analyze(sm.group(2), ecwd, depth + 1, vars_)
+                for pm in re.finditer(r'"((?:[^"\\]|\\.)+)"\s*\|\s*getline\b|\|\s*"((?:[^"\\]|\\.)+)"', a):
+                    effects += analyze(pm.group(1) or pm.group(2), ecwd, depth + 1, vars_)
         elif prog in ("make", "gmake"):
             eff["kind"] = "cli"
             effects += make_target_effects(rest, ecwd, depth, vars_)
@@ -1676,7 +2418,7 @@ def write_hits(w, gate_files, verb="write to"):
     return hits
 
 
-NET_FETCH_RE = re.compile(r"\b(?:curl|wget|fetch|aria2c|http|https|iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b|https?://")
+NET_FETCH_RE = re.compile(r"\b(?:curl|wget|fetch|aria2c|http|https|iwr|irm|Invoke-WebRequest|Invoke-RestMethod|dig|nslookup|host|drill)\b|https?://")
 REVSHELL_CODE_RE = re.compile(r"\bsocket\b|\bnet\.(?:Socket|connect|createConnection)\b|IO::Socket|TCPSocket")
 DB_RESET_PROGS = {"npx", "pnpm", "pnpx", "yarn", "bunx", "bun", "prisma", "rails", "rake", "bin/rails", "python",
                   "python3", "php", "sequelize", "knex", "drizzle-kit", "dropdb", "mongosh", "mongo", "bundle",
@@ -1796,6 +2538,35 @@ def git_work_loss(sub, ga, where):
     return None
 
 
+CREDENTIAL_DIRS = (
+    pj(HOME, ".ssh"),
+    pj(HOME, ".gnupg"),
+    pj(HOME, ".aws"),
+    pj(HOME, ".kube"),
+    pj(HOME, ".config", "gcloud"),
+    pj(HOME, "Library", "Keychains"),
+)
+PRECIOUS_EXTS = {
+    ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".key", ".pages", ".numbers",
+    ".pdf", ".rtf", ".odt", ".ods", ".odp", ".jpg", ".jpeg", ".png", ".heic", ".gif",
+    ".tiff", ".raw", ".mov", ".mp4", ".m4a", ".mp3", ".wav", ".psd", ".sketch", ".fig",
+}
+
+
+def is_precious_outside_file(path):
+    """True when an existing non-empty file outside the project is under a credential folder
+    or is a personal document or media file by extension."""
+    if not (os.path.isfile(path) and os.path.getsize(path) > 0):
+        return False
+    if any(is_inside(path, d) for d in CREDENTIAL_DIRS):
+        return True
+    if is_inside(path, pj(HOME, "Library", "Application Support", "Claude")) \
+            or re.search(r"/(?:fixtures?|__fixtures__|test_fixtures)(?:/|$)", path):
+        return False
+    _, ext = os.path.splitext(path)
+    return ext.lower() in PRECIOUS_EXTS
+
+
 def classify_effect(e, cfg, cwd):
     """Yield (rule_id, reason_detail, rewrite_hint) for one effect."""
     hits = []
@@ -1803,10 +2574,11 @@ def classify_effect(e, cfg, cwd):
     roots = default_protected_roots() + [norm(p, cwd) for p in cfg["protected_roots"]]
     gate_files = self_protected_files() + [norm(p, cwd) for p in cfg["protected_files"]]
     ecwd = e.get("cwd") if e.get("cwd") and not e["cwd"].startswith(UNKNOWN_CWD) else None
+    followed_inline = kind == "inline" and bool(e.get("script_body"))
 
     for w in e.get("writes", []):
         hits += write_hits(w, gate_files)
-        if os.path.isfile(w) and os.path.getsize(w) > 0 and not is_scratch(w) and not (ecwd and is_inside(w, ecwd)) \
+        if is_precious_outside_file(w) and not is_scratch(w) and not (ecwd and is_inside(w, ecwd)) \
                 and not any(h[0] in ("OP-000", "OP-001", "OP-002", "OP-008", "OP-011") for h in hits):
             hits.append(("OP-011", "overwrites %s, which is outside the project" % w,
                          "Copy it to a dated backup first, or ask the owner."))
@@ -1824,7 +2596,7 @@ def classify_effect(e, cfg, cwd):
                          "Download to a file, read it, then run it deliberately; the owner reviews the script."))
     if kind == "truncate":
         for t in e["targets"]:
-            if os.path.isfile(t) and os.path.getsize(t) > 0 and not is_scratch(t) and not (ecwd and is_inside(t, ecwd)):
+            if is_precious_outside_file(t) and not is_scratch(t) and not (ecwd and is_inside(t, ecwd)):
                 hits.append(("OP-011", "empties %s, which is outside the project" % t,
                              "Copy it to a dated backup first, or ask the owner."))
 
@@ -1832,20 +2604,30 @@ def classify_effect(e, cfg, cwd):
         hits.append(("OP-S12", "zero-width/Bidi control characters in the command",
                      "Legitimate commands never contain invisible characters; retype it plainly."))
 
+    if e.get("pre_cmd"):
+        hits.append(("OP-018", "rg --pre runs %s on matched files" % e["pre_cmd"],
+                     "Run rg without --pre, or ask the owner."))
+    if e.get("git_hooks"):
+        hk, hv = e["git_hooks"][0]
+        hits.append(("OP-008", "git execution hook (%s=%s)" % (hk, hv),
+                     "fsmonitor/hooksPath/filters execute on git commands (GitSpawn); ask the owner."))
+
     prog0, text0 = e.get("prog", ""), e.get("text", "")
-    if CONTAINER_ESCAPE_RE.search(text0):
+    if not followed_inline and CONTAINER_ESCAPE_RE.search(text0):
         hits.append(("OP-S17", "container/VM escape primitive in command",
                      "Docker socket mounts, privileged containers and namespace tools are sandbox-break stages; ask the owner."))
-    if "/dev/tcp/" in text0 or "/dev/udp/" in text0 or \
-            prog0 in ("nc", "ncat", "netcat") and any(f in ("-e", "-c") for f in e.get("flags", [])) or \
-            DNS_TUNNEL_RE.search(text0):
+    if not followed_inline and (
+            "/dev/tcp/" in text0 or "/dev/udp/" in text0 or
+            prog0 in ("nc", "ncat", "netcat") and any(f in ("-e", "-c") for f in e.get("flags", [])) or
+            DNS_TUNNEL_RE.search(text0)):
         hits.append(("OP-009", "raw outbound shell/DNS channel",
                      "No agent task needs a reverse shell or DNS tunnel; ask the owner if connectivity is genuinely required."))
-    if REVSHELL_CODE_RE.search(text0) and re.search(r"\.connect\s*\(|net\.(?:Socket|connect|createConnection)", text0) \
+    if not followed_inline and REVSHELL_CODE_RE.search(text0) and \
+            re.search(r"\.connect\s*\(|net\.(?:Socket|connect|createConnection)", text0) \
             and re.search(r"dup2|pty\.spawn|/bin/(?:ba|z)?sh\b|cmd\.exe|child_process|subprocess", text0):
         hits.append(("OP-009", "code opens a socket and hands it a shell",
                      "No agent task needs a reverse shell; ask the owner if connectivity is genuinely required."))
-    if CLOUD_METADATA_RE.search(text0):
+    if not followed_inline and CLOUD_METADATA_RE.search(text0):
         hits.append(("OP-010", "queries a cloud metadata credential endpoint",
                      "Metadata endpoints mint instance credentials; fetch nothing from 169.254.169.254-class addresses."))
     # one command, whatever kind of effect the walker gave it: teardown, resets, machine wreck, crontab -r
@@ -1853,7 +2635,7 @@ def classify_effect(e, cfg, cwd):
     if "--dry-run" not in flags0 and teardown_or_deploy(prog0, args0, flags0):
         hits.append(("OP-006", "%s %s" % (prog0, " ".join(args0[:2])),
                      "Run the plan or a dry run first, then ask the owner for a one-time permit."))
-    if os.path.basename(prog0) in DB_RESET_PROGS and DB_RESET_RE.search(text0):
+    if not followed_inline and os.path.basename(prog0) in DB_RESET_PROGS and DB_RESET_RE.search(text0):
         hits.append(("OP-007", "database reset (%s)" % DB_RESET_RE.search(text0).group(0).strip(),
                      "Reset a throwaway database, or take a backup and ask the owner for a permit."))
     wreck = machine_wreck(prog0, args0, flags0, ecwd)
@@ -1899,16 +2681,46 @@ def classify_effect(e, cfg, cwd):
 
     # exfil shapes: curl/wget posting/uploading file contents, esp. credential-shaped paths
     if prog0 in ("curl", "wget"):
-        for a in e.get("args", []):
-            if a.startswith("@"):
-                path = a[1:]
-                if path and EXFIL_SECRET_PATH_RE.search(path) or path and os.path.isfile(os.path.expanduser(path)) \
-                        and EXFIL_SECRET_PATH_RE.search(path):
-                    hits.append(("OP-S11", "uploads %s to the network" % a,
-                                 "Never send file contents to remote endpoints; redact and ask the owner."))
+        rest0 = e.get("rest") or (e.get("flags", []) + e.get("args", []))
+        upload_paths = []
+        for ii, a in enumerate(rest0):
+            if a in ("-T", "--upload-file", "--post-file") and ii + 1 < len(rest0):
+                upload_paths.append(rest0[ii + 1])
+            elif a.startswith(("--upload-file=", "--post-file=")):
+                upload_paths.append(a.split("=", 1)[1])
+            elif a.startswith("-T") and len(a) > 2 and not a.startswith("--"):
+                upload_paths.append(a[2:])
+            elif a in ("-F", "--form", "--form-string", "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode") and ii + 1 < len(rest0):
+                v_up = rest0[ii + 1]
+                if "@" in v_up:
+                    upload_paths.append(v_up.split("@", 1)[1].split(";", 1)[0])
+            elif a.startswith(("-F", "--form=", "-d@", "--data=", "--data-binary=", "--data-raw=", "--data-urlencode=")) and "@" in a:
+                upload_paths.append(a.split("@", 1)[1].split(";", 1)[0])
+            elif a.startswith("@") and len(a) > 1:
+                upload_paths.append(a[1:])
+        for path in upload_paths:
+            if not path:
+                continue
+            rpath = resolve(path, ecwd)
+            if any(is_inside(rpath, d) for d in CREDENTIAL_DIRS) or \
+                    re.search(r"(?:^|/)(?:\.ssh/|\.aws/|\.gnupg/|id_(?:rsa|ed25519|ecdsa|dsa)|\.netrc$|\.npmrc$|\.pypirc$)", rpath, re.I) or \
+                    rpath == pj(HOME, ".env"):
+                hits.append(("OP-010", "uploads credential file %s to the network" % path,
+                             "Never send credential or key files to remote endpoints."))
+            if EXFIL_SECRET_PATH_RE.search(path) or EXFIL_SECRET_PATH_RE.search(rpath):
+                hits.append(("OP-S11", "uploads %s to the network" % path,
+                             "Never send file contents to remote endpoints; redact and ask the owner."))
                 break
-            if re.search(r"\.(env|pem|key)$|id_rsa", a, re.I) and a.startswith(("-T", "--upload")):
-                hits.append(("OP-S11", "uploads %s" % a, "Redact first; ask the owner."))
+        if re.search(r"(?:-X|--request)\s*=?\s*DELETE\b", text0, re.I):
+            if re.search(r"https?://(?:api\.(?:vercel|supabase|railway|fly|render|cloudflare|netlify|heroku|digitalocean|stripe)\.com|backboard\.railway\.com)", text0, re.I):
+                hits.append(("OP-006", "%s DELETE against production cloud API" % prog0,
+                             "Run the plan or a dry run first, then ask the owner for a one-time permit."))
+            elif re.search(r"https?://api\.github\.com/repos/[^/\s'\"]+/[^/\s'\"]+(?:/releases)?(?:['\"\s]|$)", text0, re.I):
+                hits.append(("OP-005", "%s DELETE against GitHub repository API" % prog0,
+                             "Repository and release deletions are owner-only."))
+        if re.search(r"\b(?:volumeDelete|projectDelete|serviceDelete|environmentDelete|databaseDelete|clusterDelete)\s*\(", text0):
+            hits.append(("OP-006", "%s GraphQL infrastructure deletion mutation" % prog0,
+                         "Infrastructure teardown mutations require a one-time permit from the owner."))
 
     if kind in ("delete", "move"):
         for t in e["targets"]:
@@ -1954,7 +2766,7 @@ def classify_effect(e, cfg, cwd):
                              "Use rm on a copy you no longer need, or ask the owner."))
         if kind == "delete" and not e["recursive"] and not e.get("filtered"):
             for t in e["targets"]:
-                if (os.path.isfile(t) and os.path.getsize(t) > 0 or "/.ssh/" in t or "/.gnupg/" in t) \
+                if is_precious_outside_file(t) \
                         and not is_scratch(t) and not (ecwd and is_inside(t, ecwd)) \
                         and not any(h[0] in ("OP-000", "OP-001", "OP-002", "OP-003", "OP-004", "OP-011") for h in hits):
                     hits.append(("OP-011", "deletes %s, which is outside the project" % t,
@@ -2020,7 +2832,8 @@ def classify_effect(e, cfg, cwd):
         if prog == "gh":
             if args[:1] == ["release"] and args[1:2] in (["create"], ["delete"], ["edit"], ["upload"]) and not draft or \
                args[:1] == ["repo"] and args[1:2] in (["delete"], ["archive"], ["rename"], ["edit"]) or \
-               args[:1] == ["api"] and re.search(r"-X\s*(DELETE|PATCH)|--method\s*(DELETE)", text) and "/releases" in text:
+               args[:1] == ["api"] and re.search(r"(?:-X|--method)\s*=?\s*(?:DELETE|PATCH)\b", text, re.I) and \
+               ("/releases" in text or re.search(r"(?:^|[\s'\"])/?repos/[^/\s'\"]+/[^/\s'\"]+(?:['\"\s]|$)", text)):
                 hits.append(("OP-005", "gh %s" % " ".join(args[:2]),
                              "Prepare the artifact and notes as a draft and hand them to the owner."))
             elif args[:1] in (["pr"], ["issue"], ["discussion"], ["gist"]) and \
@@ -2081,12 +2894,12 @@ def classify_effect(e, cfg, cwd):
             found, unresolved, mentions_gate = inline_file_calls(text, ecwd, roots, gate_files)
             if found:
                 hits += [(rid, d if d.startswith("inline code") else "inline code: " + d, h) for rid, d, h in found]
-            elif unresolved and mentions_gate:
+            elif unresolved and mentions_gate and not e.get("script_body"):
                 # a write or delete whose target the gate cannot resolve, in code that names a gate path:
                 # fail closed, as before 0.3.5
                 hits.append(("OP-000", "inline code has a %s whose target the gate cannot resolve, and names a gate path" % unresolved,
                              "Name the target as a plain literal so the gate can judge it, or ask the owner."))
-            elif unresolved == "delete":
+            elif unresolved == "delete" and not e.get("script_body"):
                 # an unresolved write in code that names no gate path is ordinary scripting, not a finding
                 hits.append(("OP-S05", "inline code has a delete whose target the gate cannot resolve", ""))
     if hits and e.get("script_body"):
@@ -2100,11 +2913,13 @@ INLINE_WRITE_CALL_RE = re.compile(
 INLINE_DELETE_CALL_RE = re.compile(
     r"\brmtree\s*\(|shutil\.move\s*\(|os\.(?:remove|unlink|rmdir|removedirs|rename|replace)\s*\(|\brmSync\s*\(|"
     r"\brimraf\s*\(|\bunlinkSync\s*\(|fs\.(?:rm|unlink|rename)\w*\s*\(|File\.delete\s*\(|FileUtils\.(?:rm|mv)\w*\s*\(|"
-    r"\bremove_tree\s*\(|\bunlink\s*\(")
+    r"\bremove_tree\s*\(|\.(?:unlink|rmdir)\s*\(|\bunlink\s*\(")
 INLINE_RECURSIVE_RE = re.compile(r"rmtree|rmSync|rimraf|remove_tree|rm_r|rm_rf|rmdirSync|^fs\.rm\b|fs\.promises\.rm|FileUtils\.rm")
 INLINE_MODE_RE = re.compile(r"^(?:mode\s*=\s*)?['\"][wax][+bt]*['\"]$")
-INLINE_LITERAL_RE = re.compile(r"^(?:os\.path\.expanduser\(|Path\(|pathlib\.Path\()?\s*(['\"])(.*?)\1\s*\)?$")
-INLINE_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*((?:os\.path\.expanduser\(|Path\(|pathlib\.Path\()?\s*(['\"]).*?\3\s*\)?)\s*$", re.M)
+INLINE_LITERAL_RE = re.compile(
+    r"^(?:os\.path\.expanduser\(|Path\(|pathlib\.Path\()?\s*(['\"])(.*?)\1\s*\)?(?:\.(?:expanduser|resolve|absolute)\(\s*\))*$")
+INLINE_ASSIGN_RE = re.compile(
+    r"^\s*([A-Za-z_]\w*)\s*=\s*((?:os\.path\.expanduser\(|Path\(|pathlib\.Path\()?\s*(['\"]).*?\3\s*\)?(?:\.(?:expanduser|resolve|absolute)\(\s*\))*)\s*$", re.M)
 
 
 def _balanced_args(text, open_idx):
@@ -2152,7 +2967,7 @@ HOME_JOIN_RES = (
 
 
 def _literal_path(expr, literals):
-    expr = (expr or "").strip()
+    expr = re.sub(r"(?:\.(?:expanduser|resolve|absolute)\(\s*\))+$", "", (expr or "").strip()).strip()
     for r in HOME_EXPR_RES:
         m = r.match(expr)
         if m:
@@ -2193,7 +3008,10 @@ def _temp_expr(expr, temp):
 
 
 def _code_of(text):
-    """The program text: the -c/-e argument of an interpreter call, or the text itself (a script body)."""
+    """The program text: the -c/-e argument or heredoc body of an interpreter call, or the text itself (a script body)."""
+    first, sep, rest_lines = text.partition("\n")
+    if sep and "__HEREDOC_" in first:
+        return rest_lines
     try:
         toks = shlex.split(text, posix=True)
     except ValueError:
@@ -2203,6 +3021,52 @@ def _code_of(text):
             if t in ("-c", "-e", "--eval") or (t.startswith("-") and not t.startswith("--") and t.endswith(("c", "e"))):
                 return toks[i + 1]
     return text
+
+
+def _mask_code_strings(code):
+    """Same length as code, with the interior of string literals (including triple-quoted strings)
+    and # / // / /* */ comments replaced by spaces, so string constants (test cases, docs, examples)
+    are never read as file-writing or file-deleting calls."""
+    out, i, n = [], 0, len(code)
+    while i < n:
+        c = code[i]
+        if c == "#" or code[i:i + 2] == "//":
+            while i < n and code[i] != "\n":
+                out.append(" "); i += 1
+            continue
+        if code[i:i + 2] == "/*":
+            out.append(" "); out.append(" "); i += 2
+            while i < n and code[i:i + 2] != "*/":
+                out.append("\n" if code[i] == "\n" else " "); i += 1
+            if i < n:
+                out.append(" "); out.append(" "); i += 2
+            continue
+        if code[i:i + 3] in ('"""', "'''"):
+            q3 = code[i:i + 3]
+            out.append(q3); i += 3
+            while i < n and code[i:i + 3] != q3:
+                if code[i] == "\\" and i + 1 < n:
+                    out.append(" "); out.append("\n" if code[i + 1] == "\n" else " "); i += 2
+                    continue
+                out.append("\n" if code[i] == "\n" else " "); i += 1
+            if i < n:
+                out.append(q3); i += 3
+            continue
+        if c in ('"', "'", "`"):
+            q = c
+            out.append(q); i += 1
+            while i < n and code[i] != q:
+                if code[i] == "\\" and i + 1 < n:
+                    out.append(" "); out.append("\n" if code[i + 1] == "\n" else " "); i += 2
+                    continue
+                if code[i] == "\n" and q != "`":
+                    break
+                out.append("\n" if code[i] == "\n" else " "); i += 1
+            if i < n and code[i] == q:
+                out.append(q); i += 1
+            continue
+        out.append(c); i += 1
+    return "".join(out)
 
 
 def _statements(text):
@@ -2248,7 +3112,7 @@ def _temp_names(text):
         m = ANY_ASSIGN_RE.match(s)
         if m:
             rhs.setdefault(m.group(1), []).append(m.group(2))
-    code, rebound = "\n".join(stmts), set()
+    code, rebound = _mask_code_strings("\n".join(stmts)), set()
     for r in REBIND_RES:
         rebound |= set(r.findall(code))
     for r in REBIND_LIST_RES:
@@ -2268,24 +3132,30 @@ def _temp_names(text):
 def inline_file_calls(text, ecwd, roots, gate_files):
     """Judge each file-writing or file-deleting call in inline code by its own path operand.
     Returns (hits, unresolved_kind_or_None, mentions_gate_path)."""
-    temp = _temp_names(text)
+    code = _code_of(text)
+    masked = _mask_code_strings(code)
+    temp = _temp_names(code)
     literals = {}
-    for m in INLINE_ASSIGN_RE.finditer(text):
+    for m in INLINE_ASSIGN_RE.finditer(code):
+        if masked[m.start(1)] == " ":
+            continue
         lit = _literal_path(m.group(2), {})
         if lit is not None and m.group(1) not in literals:
             literals[m.group(1)] = lit
     found, unresolved = [], None
     for kind, call_re in (("write", INLINE_WRITE_CALL_RE), ("delete", INLINE_DELETE_CALL_RE)):
-        for m in call_re.finditer(text):
-            open_idx = text.index("(", m.start())
-            args = _balanced_args(text, open_idx)
-            name = text[m.start():open_idx].strip()
+        for m in call_re.finditer(masked):
+            open_idx = code.index("(", m.start())
+            args = _balanced_args(code, open_idx)
+            name = code[m.start():open_idx].strip()
             if args is None:
                 unresolved = "delete" if kind == "delete" else (unresolved or kind)
                 continue
             operands = []
-            if name.startswith(".write_"):
-                recv = re.search(r"([A-Za-z_]\w*|(?:pathlib\.)?Path\(\s*(['\"]).*?\2\s*\))\s*$", text[:m.start()])
+            if name.startswith((".write_", ".unlink", ".rmdir")):
+                recv = re.search(
+                    r"([A-Za-z_]\w*|(?:pathlib\.)?Path\(\s*(['\"]).*?\2\s*\)(?:\.(?:expanduser|resolve|absolute)\(\s*\))*)\s*$",
+                    code[:m.start()])
                 operands = [recv.group(1)] if recv else []
             elif name == "open":
                 if not any(INLINE_MODE_RE.match(a) for a in args[1:]):
@@ -2311,6 +3181,10 @@ def inline_file_calls(text, ecwd, roots, gate_files):
                 target = resolve(lit, ecwd)
                 if kind == "write":
                     found += write_hits(target, gate_files, "inline code writes to")
+                    if is_precious_outside_file(target) and not is_scratch(target) and not (ecwd and is_inside(target, ecwd)) \
+                            and not any(h[0] in ("OP-000", "OP-001", "OP-002", "OP-008", "OP-011") for h in found):
+                        found.append(("OP-011", "inline code overwrites %s, which is outside the project" % target,
+                                      "Copy it to a dated backup first, or ask the owner."))
                 else:
                     own = target_hits("delete", target, True, roots, gate_files)
                     found += own
@@ -2319,8 +3193,17 @@ def inline_file_calls(text, ecwd, roots, gate_files):
                             or not is_inside(target, ecwd) or is_same_or_ancestor(target, ecwd)):
                         found.append(("OP-003", "inline code: recursive delete of %s" % target,
                                       "Move it to a dated folder under /tmp, or ask the owner."))
+                    elif not own and not is_scratch(target):
+                        if is_precious_outside_file(target) and not (ecwd and is_inside(target, ecwd)):
+                            found.append(("OP-011", "inline code deletes %s, which is outside the project" % target,
+                                          "Copy it to a dated backup first, or ask the owner."))
+                        elif ecwd and is_inside(target, ecwd):
+                            dirty = dirty_git_path(target, ecwd)
+                            if dirty:
+                                found.append(("OP-011", "inline code deletes %s with uncommitted changes to %s" % (target, dirty),
+                                              "Commit or stash the work first (`git stash`), or ask the owner."))
     mentions_gate = any(touches_gate_home(resolve(q, ecwd)) or any(is_inside(resolve(q, ecwd), f) for f in gate_files)
-                        for q in re.findall(r"(?:~|\$HOME|\$\{HOME\}|/)[^\s'\"),;\]]*", text))
+                        for q in re.findall(r"(?:~|\$HOME|\$\{HOME\}|/)[^\s'\"),;\]]*", code))
     return found, unresolved, mentions_gate
 
 
