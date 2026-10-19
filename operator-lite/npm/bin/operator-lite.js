@@ -27,6 +27,12 @@ const HOSTS = [
   { name: "goose", label: "Goose", dir: path.join(CONFIG, "goose") },
   { name: "opencode", label: "opencode", dir: path.join(CONFIG, "opencode") },
   { name: "amazon-q", label: "Amazon Q", dir: path.join(HOME, ".aws", "amazonq") },
+  { name: "roo-code", label: "Roo Code", dir: path.join(HOME, ".roo") },
+  { name: "kilo-code", label: "Kilo Code", dir: path.join(HOME, ".kilocode") },
+  { name: "continue", label: "Continue", dir: path.join(HOME, ".continue") },
+  { name: "kiro", label: "Kiro", dir: path.join(HOME, ".kiro") },
+  { name: "zed", label: "Zed", dir: path.join(CONFIG, "zed") },
+  { name: "amp", label: "Amp", dir: path.join(CONFIG, "amp") },
 ];
 
 function findPython() {

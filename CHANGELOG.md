@@ -7,8 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Operator Lite 0.3.10. Version 0.3.8 is skipped: it was published to npm and
+Operator Lite 0.3.11. Version 0.3.8 is skipped: it was published to npm and
 withdrawn, so the number cannot be used again.
+
+### Added (0.3.11)
+
+- **Cross-turn split-horizon build-hook and manifest staging (Group 1).**
+  `Write`, `Edit`, `MultiEdit`, and `apply_patch` of `package.json`,
+  `Makefile`, `.git/hooks/*`, `.husky/*`, `.envrc`, `.psqlrc`,
+  `.cargo/config.toml`, `conftest.py`, `setup.py`, and `build.rs` are analyzed
+  as staged execution hooks before a later shell turn can run them.
+- **Stateful config-mutation persistence (Group 2).** `git config` of
+  `core.fsmonitor`, `core.hooksPath`, `core.sshCommand`, and `alias.*=!`, and
+  `npm` / `pnpm` / `yarn config set` of `script-shell` and `onload-script`,
+  persist a later execution hook and are stopped. Inline assignment of
+  `OPERATOR_HOME`, `OPERATOR_GATE_MODE`, and `VESTIGE_DATA_DIR` is tamper
+  defense: a non-runner command that redirects the gate home, disables the
+  mode, or retargets the Vestige store is stopped.
+- **Toolchain, compiler, and test-runner execution flags (Group 3).** Stops
+  `go test -exec`, `cargo --config` `rustc-wrapper` / `runner`,
+  `node` / `bun` / `deno --import data:text/javascript` ESM URL and base64
+  payloads, `curl -K` / `--config`, `sqlite3 -init`, `mysql --init-command`,
+  and `openssl engine`.
+- **Symlink aliasing and ancestor realpath escape closure (Group 4).**
+  Symlinked ancestor directories are resolved when the leaf does not exist
+  yet, and an in-command `ln -s` alias is resolved before the path is judged.
+- **Cross-channel MCP tool parity (Group 5).** `mcp__*` shell runners,
+  destructive SQL, filesystem delete and write, and GitHub and cloud teardown
+  are judged with the same STOP rules as the shell.
+- **Detached multiplexer and scheduler persistence (Group 6).**
+  `tmux new-session -d` and `send-keys`, `screen -dmS`, `crontab`, `at`,
+  `batch`, `anacron`, `schtasks /create`, `launchctl load` / `bootstrap` /
+  `submit` / `enable`, and `systemctl enable` / `start` are promoted to
+  OP-008 Enforce.
+- **Causal transform provenance (Group 7).** Receipts record
+  `write-manifest-analyzed`, `symlink-escaped`, `execution-hook-analyzed`,
+  and `mcp-cross-channel-analyzed`.
+
+Operator Lite 0.3.10.
 
 ### Added (0.3.10)
 
