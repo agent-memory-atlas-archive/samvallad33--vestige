@@ -36,6 +36,12 @@ corpus, everywhere.
 | OpenAI Agents SDK | tool input guardrails (`reject_content`) | [openai-agents/](openai-agents/) | gate-tested, suite 30/30; the real SDK wrap runs when `openai-agents` is importable |
 | LangChain / LangGraph (Python) | `@wrap_tool_call` / `AgentMiddleware` middleware for LangChain v1 `create_agent` (block = returned `ToolMessage`, handler never runs); hand-rolled LangGraph `ToolNode` via `decide()` + `ToolException` in the tool | [langchain/](langchain/) | gate-tested, suite 43/43 incl. corpus 46/46 via adapter; the real middleware and a `create_agent` loop (scripted model) run when `langchain` is importable |
 | Aider | no hook API — terminal wrapper | [aider/](aider/) | gate-tested, 6 wrapper cases |
+| Roo Code | `preToolUse` in `~/.roo/hooks.json` (Cursor-shaped; guarded gate command, exit 2 blocks). Cline-shaped `~/.roo/pre_tool_use` is the other registration point and is intentionally not also installed | [roo-code/](roo-code/) | experimental — installer idempotent; host payload not live-verified |
+| Kilo Code | `preToolUse` in `~/.kilocode/hooks.json` | [kilo-code/](kilo-code/) | experimental — installer idempotent; host payload not live-verified |
+| Continue | `preToolUse` in `~/.continue/hooks.json` | [continue/](continue/) | experimental — installer idempotent; host payload not live-verified |
+| Kiro | `preToolUse` in `~/.kiro/settings/hooks.json` | [kiro/](kiro/) | experimental — installer idempotent; host payload not live-verified |
+| Zed | `preToolUse` in `$XDG_CONFIG_HOME/zed/hooks.json` (default `~/.config/zed/hooks.json`) | [zed/](zed/) | experimental — installer idempotent; host payload not live-verified |
+| Amp | `preToolUse` in `$XDG_CONFIG_HOME/amp/hooks.json` (default `~/.config/amp/hooks.json`) | [amp/](amp/) | experimental — installer idempotent; host payload not live-verified |
 
 Status values: `shipped` (tested end-to-end) · `gate-tested` (gate contract
 verified locally; host wiring follows documented, unmodified upstream
