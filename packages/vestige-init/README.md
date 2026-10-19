@@ -9,7 +9,7 @@ npx @vestige/init
 Run it in your own terminal. In order, it:
 
 1. **Installs the binaries.** `vestige-mcp`, `vestige`, `vestige-restore` and `vestige-upgrade` come from npm for your machine (`@vestige/mcp-<os>-<arch>`) and go into `~/.local/bin`. A version that is already installed and as new is kept.
-2. **Opens your Strata memory.** It starts the memory server once, the way a client would, which creates the store, and checks that it answers with its 18 tools. Strata is an append-only, hash-chained log: every write passes a gate and leaves a receipt, and a memory is found by its exact id or tag, never by vector similarity.
+2. **Opens your Strata memory.** It starts `vestige-mcp` once, the way a client would, which creates the store, and checks that it answers with its 18 tools. Strata is an append-only, hash-chained log: every write passes a gate and leaves a receipt, and a memory is found by its exact id or tag, never by vector similarity.
 3. **Connects your clients.** Claude Code, Claude Desktop, Cursor, VS Code, OpenCode, Xcode, JetBrains and Windsurf, whichever it finds. Each file is backed up before it changes.
 4. **Adds the rules hook.** In Claude Code, `vestige hook session-start` hands every new session, and every session after a compaction, the decisions and corrections you tagged `pinned`, each with its memory id. It only reads, and it prints nothing when there is nothing to say.
 5. **Installs Operator Lite,** the free gate, in enforce mode, and wires every agent host it finds. From your agent's next tool call, every command a STOP rule matches is stopped before it runs, with a hash-chained receipt for every decision.

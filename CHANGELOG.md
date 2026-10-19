@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`npx @vestige/init` installs everything.** It installs the four Vestige
   binaries from the pinned `@vestige/mcp-<os>-<arch>` package into
-  `~/.local/bin`, starts the memory server once to create the Strata store and
+  `~/.local/bin`, starts `vestige-mcp` once to create the Strata store and
   confirm its tools, connects the detected MCP clients, merges the
   `vestige hook session-start` rules hook into `~/.claude/settings.json`,
   installs Operator Lite 0.3.10 through its own installer, and runs the gate's

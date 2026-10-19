@@ -36,7 +36,7 @@ npx @vestige/init
 In order, it:
 
 1. installs the `vestige-mcp`, `vestige`, `vestige-restore` and `vestige-upgrade` binaries for your machine from npm, unless the same or a newer version is already installed;
-2. starts the memory server once, which creates your Strata store, and checks that it answers with its 18 tools;
+2. starts `vestige-mcp` once, which creates your Strata store, and checks that it answers with its 18 tools;
 3. connects the MCP clients it finds (Claude Code, Claude Desktop, Cursor, VS Code, OpenCode, Xcode, JetBrains, Windsurf), backing up each file before changing it;
 4. adds the Claude Code rules hook, so the decisions and corrections you tag `pinned` come back at every session start and after every compaction;
 5. installs Operator Lite, the free gate, in enforce mode, and wires every agent host it finds;
