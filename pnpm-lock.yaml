@@ -74,7 +74,27 @@ importers:
 
   packages/mcp-win32-x64: {}
 
-  packages/vestige-init: {}
+  packages/vestige-init:
+    dependencies:
+      operator-lite:
+        specifier: 0.3.10
+        version: 0.3.10
+    optionalDependencies:
+      '@vestige/mcp-darwin-arm64':
+        specifier: 5.0.0
+        version: 5.0.0
+      '@vestige/mcp-darwin-x64':
+        specifier: 5.0.0
+        version: 5.0.0
+      '@vestige/mcp-linux-arm64':
+        specifier: 5.0.0
+        version: 5.0.0
+      '@vestige/mcp-linux-x64':
+        specifier: 5.0.0
+        version: 5.0.0
+      '@vestige/mcp-win32-x64':
+        specifier: 5.0.0
+        version: 5.0.0
 
   packages/vestige-mcp-npm: {}
 
@@ -393,6 +413,31 @@ packages:
 
   '@types/webxr@0.5.24':
     resolution: {integrity: sha512-h8fgEd/DpoS9CBrjEQXR+dIDraopAEfu4wYVNY2tEPwk60stPWhvZMf4Foo5FakuQ7HFZoa8WceaWFervK2Ovg==}
+
+  '@vestige/mcp-darwin-arm64@5.0.0':
+    resolution: {integrity: sha512-x7vGf4fJQOoNID9wSviRiJEuoi3Y96EjJ6d7CreV49wnxfXBYatosxHoA4ng8CnT9nDsbt7zP05uexL7k4q+Vw==}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@vestige/mcp-darwin-x64@5.0.0':
+    resolution: {integrity: sha512-jsxhhMCW36Uz8Z9ijWnS9YXPnbUrUD4cQh0bUvWVywRg4QVMuZ3TfOJ6Bx+I06g+6T78VUevLAp6/RycHm578g==}
+    cpu: [x64]
+    os: [darwin]
+
+  '@vestige/mcp-linux-arm64@5.0.0':
+    resolution: {integrity: sha512-fxPia2Os4zlw2Q6TRNdjKDoV7KdTXThBlUXy5ousm2L1ZROLtnrC+7v0Di7altBDxOG+Hx8Pgyb8rHgMP2uxSQ==}
+    cpu: [arm64]
+    os: [linux]
+
+  '@vestige/mcp-linux-x64@5.0.0':
+    resolution: {integrity: sha512-oCl/3lC8xoRKFr+qikumFIso9oPJiof0wAYS5mDE7nGb60KPG2vyD77f4bl9UPtHxJuL4TlvH51pWsgDJ/VuhA==}
+    cpu: [x64]
+    os: [linux]
+
+  '@vestige/mcp-win32-x64@5.0.0':
+    resolution: {integrity: sha512-NZqIofgF8dkAXNg4e4wrOa4ucPDVEiXwsrku8LQfYs2CR032wNQyoTFqJY7E78SnhXzNQU8wECZ6tCMdwy6O7Q==}
+    cpu: [x64]
+    os: [win32]
 
   '@vitest/coverage-v8@5.0.0':
     resolution: {integrity: sha512-toMg6PZGCIa/lQNCDoASrfb1ly4hsUKXFtFYC9kD4t78o5Y6LyNJU7AENt8eHPr3quYdxaxK7hj2mnbFfUk9NA==}
@@ -716,6 +761,11 @@ packages:
   obug@2.1.4:
     resolution: {integrity: sha512-4a+OsYv9UktOJKE+l1A4OufDgdRF9PifWj+tJnHURo/P+WOxpG4GzUFL9qCalmWauao6ogiG+QvnCovwPoyAWA==}
     engines: {node: '>=12.20.0'}
+
+  operator-lite@0.3.10:
+    resolution: {integrity: sha512-kI2RJG01AxWOBVEhfzV/QKqbvVoM9IHw0XD56DrWap1/nd5JdFONjBH8vv4pz0/Vp9c3wbGvD756IOpeReBDgQ==}
+    engines: {node: '>=16'}
+    hasBin: true
 
   picocolors@1.1.1:
     resolution: {integrity: sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==}
@@ -1162,6 +1212,21 @@ snapshots:
 
   '@types/webxr@0.5.24': {}
 
+  '@vestige/mcp-darwin-arm64@5.0.0':
+    optional: true
+
+  '@vestige/mcp-darwin-x64@5.0.0':
+    optional: true
+
+  '@vestige/mcp-linux-arm64@5.0.0':
+    optional: true
+
+  '@vestige/mcp-linux-x64@5.0.0':
+    optional: true
+
+  '@vestige/mcp-win32-x64@5.0.0':
+    optional: true
+
   '@vitest/coverage-v8@5.0.0(vitest@5.0.0)':
     dependencies:
       '@bcoe/v8-coverage': 1.0.2
@@ -1391,6 +1456,8 @@ snapshots:
   nanoid@3.3.18: {}
 
   obug@2.1.4: {}
+
+  operator-lite@0.3.10: {}
 
   picocolors@1.1.1: {}
 

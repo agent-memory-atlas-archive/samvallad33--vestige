@@ -160,6 +160,74 @@ for name, ok in [
     if not ok:
         fails.append(name)
 
+
+def hook_tool(tool_name, tool_input, cwd=None):
+    payload = json.dumps({"tool_name": tool_name, "tool_input": tool_input, "cwd": cwd or work, "session_id": "t"})
+    p = subprocess.run([sys.executable, GATE, "hook", "--source", "claude"], input=payload,
+                       capture_output=True, text=True, env=env)
+    return p.returncode, (p.stderr.strip().splitlines() or [""])[0]
+
+
+def stop_tool(name, tool_name, tool_input, rule):
+    rc, first = hook_tool(tool_name, tool_input)
+    ok = rc == 2 and ("(%s " % rule) in first
+    print("%s  stop   %s" % ("ok " if ok else "BAD", name) + ("" if ok else "   -> exit %d %s" % (rc, first)))
+    if not ok:
+        fails.append(name)
+
+
+def allow_tool(name, tool_name, tool_input):
+    rc, first = hook_tool(tool_name, tool_input)
+    ok = rc == 0
+    print("%s  allow  %s" % ("ok " if ok else "BAD", name) + ("" if ok else "   -> exit %d %s" % (rc, first)))
+    if not ok:
+        fails.append(name)
+
+
+# 0.3.11 Group 1: Cross-Turn Split-Horizon Build-Hook & Auto-Run File Staging (`WRITE_TOOLS`)
+stop_tool("Write package.json with destructive test script", "Write",
+          {"file_path": os.path.join(work, "package.json"),
+           "content": '{"name":"x","scripts":{"test":"rm -rf ~/Documents"}}'}, "OP-003")
+allow_tool("Write package.json with benign test script", "Write",
+           {"file_path": os.path.join(work, "package.json"),
+            "content": '{"name":"x","scripts":{"test":"node test.js"}}'})
+stop_tool("Write Makefile with destructive recipe", "Write",
+          {"file_path": os.path.join(work, "Makefile"),
+           "content": "test:\n\trm -rf ~/Documents\n"}, "OP-003")
+stop_tool("Write .git/hooks/pre-commit", "Write",
+          {"file_path": os.path.join(work, ".git/hooks/pre-commit"),
+           "content": "#!/bin/sh\necho hi\n"}, "OP-008")
+stop_tool("Write .envrc", "Write",
+          {"file_path": os.path.join(work, ".envrc"),
+           "content": "export FOO=bar\n"}, "OP-008")
+stop_tool("Write conftest.py with destructive os.system", "Write",
+          {"file_path": os.path.join(work, "conftest.py"),
+           "content": "import os\nos.system('rm -rf ~/Documents')\n"}, "OP-003")
+
+# 0.3.11 Group 4: Ancestor realpath resolution when leaf does not exist yet
+sym_dir = os.path.join(work, "sym_gate")
+os.symlink(op_home, sym_dir)
+stop_tool("Write through symlinked ancestor to non-existent leaf inside gate home", "Write",
+          {"file_path": os.path.join(sym_dir, "new_leaf.json"), "content": "{}"}, "OP-000")
+
+# 0.3.11 Group 5: Cross-Channel MCP Tool Parity (`mcp__*`)
+stop_tool("MCP shell execution delegation", "mcp__shell__run_command",
+          {"command": "rm -rf ~/Documents"}, "OP-003")
+stop_tool("MCP destructive SQL DROP TABLE", "mcp__postgres__query",
+          {"sql": "DROP TABLE users;"}, "OP-007")
+stop_tool("MCP destructive SQL unscoped DELETE", "mcp__supabase__execute_sql",
+          {"query": "DELETE FROM accounts;"}, "OP-007")
+allow_tool("MCP benign SQL SELECT", "mcp__postgres__query",
+           {"sql": "SELECT count(*) FROM users WHERE active = true;"})
+stop_tool("MCP filesystem delete of ~/Documents", "mcp__filesystem__delete_directory",
+          {"path": os.path.expanduser("~/Documents")}, "OP-003")
+stop_tool("MCP filesystem write to ~/.zshrc", "mcp__filesystem__write_file",
+          {"path": os.path.expanduser("~/.zshrc"), "content": "alias ls=rm"}, "OP-008")
+stop_tool("MCP GitHub repository deletion", "mcp__github__delete_repository",
+          {"owner": "sam", "repo": "vestige"}, "OP-005")
+stop_tool("MCP cloud project deletion", "mcp__supabase__delete_project",
+          {"project_id": "abcd"}, "OP-006")
+
 shutil.rmtree(op_home, ignore_errors=True)
 shutil.rmtree(work, ignore_errors=True)
 print("\nfailures: %d" % len(fails))

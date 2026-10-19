@@ -1,7 +1,7 @@
 {
   "name": "@vestige/init",
-  "version": "5.0.0",
-  "description": "Set up Vestige, the Causal Proof Engine and operating system for AI agents, in your MCP client",
+  "version": "5.0.1",
+  "description": "One command for the whole Vestige system: the binaries, the Strata memory store, your MCP clients, the Claude Code rules hook and the free Operator Lite gate",
   "bin": {
     "vestige-init": "bin/init.js"
   },
@@ -29,6 +29,16 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "operator-lite": "0.3.10"
+  },
+  "optionalDependencies": {
+    "@vestige/mcp-darwin-arm64": "5.0.0",
+    "@vestige/mcp-darwin-x64": "5.0.0",
+    "@vestige/mcp-linux-arm64": "5.0.0",
+    "@vestige/mcp-linux-x64": "5.0.0",
+    "@vestige/mcp-win32-x64": "5.0.0"
   },
   "files": [
     "bin",

@@ -262,8 +262,7 @@ function renderTitle(cv, L, ctx, f, tick = 0) {
     lines.push(['a case appears the first time Operator stops one of your agents', 34, { fg: SOFT }]);
     if (ctx.log && ctx.log.records.length) lines.push([`${fmt(ctx.log.records.length)} receipts on the chain so far, every one checked`, 36, { fg: SOFT }]);
     lines.push(['', 0, {}]);
-    lines.push(['set up Vestige:  npx @vestige/init', 38, { fg: THEMES.title.accent, bold: true }]);
-    lines.push(['add the gate:  npx operator-lite', 39, { fg: THEMES.title.accent, bold: true }]);
+    lines.push(['set up Vestige and Operator:  npx @vestige/init', 38, { fg: THEMES.title.accent, bold: true }]);
   }
   if (ctx.since) lines.push([ctx.since, 41, { fg: FAINT }]);
   lines.forEach(([raw, start, style], i) => {

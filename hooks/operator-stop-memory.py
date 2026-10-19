@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""operator-stop-memory: every Operator stop becomes a Vestige memory. An opt-in Claude Code hook.
+
+The Operator gate (Lite or paid) writes a hash-chained receipt for every verdict to
+~/.operator/receipts/<UTC date>.jsonl. This hook reads the STOP receipts it has not recorded yet and
+saves each one into Vestige through the MCP server's smart_ingest, so any agent on the same store can
+recall it later by exact handle:
+
+  stop memory   node_type event; tags <rule>, op-receipt-<first 16 hex of the receipt digest>,
+                operator, operator-stop; its text quotes that digest; derived_from its rule memory
+  rule memory   node_type pattern; tags <rule>, op-rule-<rule>, operator, operator-rule; written the
+                first time that rule stops a call
+
+These are the handles `recall` and the PRECEDENT journey (`npx @vestige/init`) look up. A stop already
+in memory under its op-receipt tag, from this hook or any other writer, is not written again.
+
+Write path: the hook starts `vestige-mcp` (VESTIGE_MCP_BIN, else the one on PATH). It attaches to the
+server that already owns the store, or opens the store when none does, and the hook speaks MCP over its
+stdin: initialize, notifications/initialized, then tools/call. A write from here passes the same gate and
+gets the same receipt as an agent's own smart_ingest.
+
+The hook never blocks a tool call. It works within a time budget, logs any failure to
+~/.operator/state/stop-memory.log, tries that stop again on a later call, and always exits 0. On
+PostToolUse and UserPromptSubmit it tells the agent, as additional context, which stops of its own
+session it just recorded and the handle that recalls each one.
+
+Wire it after the gate's own PreToolUse hook: hooks/settings.stop-memory.fragment.json.
+Env: OPERATOR_HOME (default ~/.operator), VESTIGE_MCP_BIN, OPERATOR_STOP_MEMORY_BUDGET (seconds, default 20).
+Stdlib only, Python 3.9 and later.
+"""
+import json
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+try:
+    import fcntl
+except ImportError:                                   # Windows: one writer is not enforced there
+    fcntl = None
+
+VERSION = "0.1.0"
+HOME = os.path.expanduser("~")
+OP_HOME = os.environ.get("OPERATOR_HOME") or os.path.join(HOME, ".operator")
+RECEIPTS = os.path.join(OP_HOME, "receipts")
+STATE_DIR = os.path.join(OP_HOME, "state")
+STATE = os.path.join(STATE_DIR, "stop-memory.json")
+LOG = os.path.join(STATE_DIR, "stop-memory.log")
+LOCK = os.path.join(STATE_DIR, "stop-memory.lock")
+MAX_PER_RUN = 8                                       # stops written per hook call; the rest wait for the next
+MAX_PENDING = 500
+MAX_DONE = 5000
+FIRST_RUN_FILES = 30                                  # day files read the first time, newest first
+DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+RULE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+NODE_RE = re.compile(r"^(mem-[0-9a-f]{16}|[0-9a-f-]{36})$")
+
+
+def log(msg):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 262144:
+            os.replace(LOG, LOG + ".1")
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg))
+    except Exception:
+        pass
+
+
+def load_state():
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            st = json.load(f)
+        if isinstance(st, dict):
+            st.setdefault("offsets", {})
+            st.setdefault("pending", [])
+            st.setdefault("done", {})
+            st.setdefault("rules", {})
+            return st
+    except Exception:
+        pass
+    return {"offsets": {}, "pending": [], "done": {}, "rules": {}}
+
+
+def save_state(st):
+    st["pending"] = st["pending"][-MAX_PENDING:]
+    if len(st["done"]) > MAX_DONE:
+        st["done"] = dict(list(st["done"].items())[-MAX_DONE:])
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    os.replace(tmp, STATE)
+
+
+def stop_row(rec):
+    """The fields of a STOP receipt this hook keeps, or None when the line is not a usable stop."""
+    if not isinstance(rec, dict) or rec.get("decision") != "STOP":
+        return None
+    digest, rule = str(rec.get("digest") or ""), str(rec.get("commitment") or "")
+    if not DIGEST_RE.match(digest) or not RULE_RE.match(rule):
+        return None
+    clip = lambda v, n: " ".join(str(v or "").split())[:n]
+    return {"digest": digest, "prev": clip(rec.get("prev"), 64), "rule": rule, "rule_name": clip(rec.get("rule"), 80),
+            "ts": clip(rec.get("ts"), 32), "source": clip(rec.get("source"), 32), "session": clip(rec.get("session"), 64),
+            "cwd": clip(rec.get("cwd"), 300), "tool": clip(rec.get("tool"), 64), "preview": clip(rec.get("action_preview"), 300),
+            "detail": clip(rec.get("detail"), 300), "action": clip(rec.get("action_digest"), 24),
+            "gate_version": clip(rec.get("gate_version"), 16)}
+
+
+def scan(st):
+    """New STOP rows from the receipt files since the last call; the read position is kept per file."""
+    try:
+        names = sorted(n for n in os.listdir(RECEIPTS) if re.match(r"^\d{4}-\d{2}-\d{2}\.jsonl$", n))
+    except Exception:
+        return []
+    if not st["offsets"]:
+        for n in names[:-FIRST_RUN_FILES]:            # the first run reads the newest files only
+            try:
+                st["offsets"][n] = os.path.getsize(os.path.join(RECEIPTS, n))
+            except Exception:
+                pass
+    rows = []
+    for n in names:
+        path = os.path.join(RECEIPTS, n)
+        try:
+            size = os.path.getsize(path)
+            start = st["offsets"].get(n, 0)
+            if start > size:                          # the file was replaced: read it again
+                start = 0
+            if start == size:
+                continue
+            with open(path, "rb") as f:
+                f.seek(start)
+                data = f.read(size - start)
+            end = data.rfind(b"\n") + 1               # a line still being written waits for the next call
+            for line in data[:end].decode("utf-8", "replace").splitlines():
+                try:
+                    row = stop_row(json.loads(line))
+                except ValueError:
+                    continue
+                if row:
+                    rows.append(row)
+            st["offsets"][n] = start + end
+        except Exception as exc:
+            log("scan %s: %r" % (n, exc))
+    keep = set(names)
+    st["offsets"] = {k: v for k, v in st["offsets"].items() if k in keep}
+    return rows
+
+
+class Mcp(object):
+    """A short MCP client over a spawned vestige-mcp's stdio."""
+
+    def __init__(self, binary, deadline):
+        self.deadline = deadline
+        self.next_id = 1
+        self.lines = queue.Queue()
+        self.proc = subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL)
+        threading.Thread(target=self._pump, daemon=True).start()
+        self.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                    "clientInfo": {"name": "operator-stop-memory", "version": VERSION}})
+        self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _pump(self):
+        for raw in self.proc.stdout:
+            self.lines.put(raw)
+        self.lines.put(None)
+
+    def send(self, obj):
+        self.proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+        self.proc.stdin.flush()
+
+    def request(self, method, params):
+        rid, self.next_id = self.next_id, self.next_id + 1
+        self.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        while True:
+            left = self.deadline - time.time()
+            if left <= 0:
+                raise RuntimeError("%s did not answer within the budget" % method)
+            try:
+                raw = self.lines.get(timeout=left)
+            except queue.Empty:
+                raise RuntimeError("%s did not answer within the budget" % method)
+            if raw is None:
+                raise RuntimeError("vestige-mcp closed before answering %s" % method)
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(msg, dict) and "method" not in msg and msg.get("id") == rid:
+                if msg.get("error"):
+                    raise RuntimeError("%s: %s" % (method, json.dumps(msg["error"])[:300]))
+                return msg.get("result") or {}
+
+    def tool(self, name, arguments):
+        """The structured result of one tool call (structuredContent, else the JSON text of content[0])."""
+        result = self.request("tools/call", {"name": name, "arguments": arguments})
+        text = ""
+        content = result.get("content")
+        if isinstance(content, list) and content and isinstance(content[0], dict):
+            text = str(content[0].get("text") or "")
+        if result.get("isError"):
+            raise RuntimeError("%s failed: %s" % (name, (text or json.dumps(result))[:300]))
+        if isinstance(result.get("structuredContent"), dict):
+            return result["structuredContent"]
+        try:
+            value = json.loads(text)
+        except ValueError:
+            raise RuntimeError("%s answered with no JSON" % name)
+        return value if isinstance(value, dict) else {}
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=3)
+        except Exception:
+            self.proc.kill()
+
+
+def tagged(mcp, tag):
+    """The id of the memory under this exact tag, or None when no memory carries it."""
+    found = mcp.tool("recall", {"handle": tag, "detail_level": "brief"})
+    if found.get("error") == "handle_required":
+        return None
+    for node in found.get("nodes") or []:
+        if isinstance(node, dict) and tag in (node.get("tags") or []) and NODE_RE.match(str(node.get("id") or "")):
+            return node["id"]
+    return None
+
+
+def ingest(mcp, item):
+    out = mcp.tool("smart_ingest", {"items": [item]})
+    res = (out.get("results") or [{}])[0]
+    node = str(res.get("nodeId") or "")
+    if not NODE_RE.match(node):
+        raise RuntimeError("smart_ingest saved nothing: %s" % json.dumps(res)[:300])
+    return node
+
+
+def source_of(row):
+    return "operator-gate receipt %s, operator-stop-memory %s" % (row["digest"], VERSION)
+
+
+def rule_item(row):
+    rule = row["rule"]
+    return {"node_type": "pattern", "tags": [rule, "op-rule-" + rule, "operator", "operator-rule"],
+            "source": source_of(row),
+            "content": ("OPERATOR RULE %s%s. Recorded the first time this rule stopped a call: %s UTC, host %s, "
+                        "session %s. The gate's reason that time: %s. Every stop under this rule is a memory tagged "
+                        "operator-stop and %s that is derived_from this memory, so a causal walk from any of those "
+                        "stops reaches the rule." % (rule, " " + row["rule_name"] if row["rule_name"] else "", row["ts"],
+                                                    row["source"] or "unknown", row["session"][:8] or "unknown",
+                                                    row["detail"] or "not given", rule))}
+
+
+def stop_item(row, rule_node):
+    d16 = row["digest"][:16]
+    return {"node_type": "event", "tags": [row["rule"], "op-receipt-" + d16, "operator", "operator-stop"],
+            "source": source_of(row), "links": [{"kind": "derived_from", "to": rule_node}],
+            "content": ("OPERATOR STOP, recorded from the gate's own receipt. When: %s UTC. Host: %s, session %s. "
+                        "Working directory: %s. Tool: %s. Rule: %s%s. Command, as the gate's redacted preview: %s. "
+                        "Why: %s. Receipt digest %s, chain prev %s, gate version %s, action id %s. Nothing was run. "
+                        "Derived from the rule memory %s. The way forward is the compliant path the stop named, or a "
+                        "one-time permit for that action id, which only the owner grants from their own terminal."
+                        % (row["ts"], row["source"] or "unknown", row["session"][:8] or "unknown", row["cwd"] or "unknown",
+                           row["tool"] or "unknown", row["rule"], " " + row["rule_name"] if row["rule_name"] else "",
+                           row["preview"] or "none", row["detail"] or "not given", d16, row["prev"][:16] or "start",
+                           row["gate_version"] or "unknown", row["action"] or "none", rule_node))}
+
+
+def record(st):
+    """Write the pending stops, newest first, within the budget. Returns [(row, node_id)] written now."""
+    try:
+        budget = float(os.environ.get("OPERATOR_STOP_MEMORY_BUDGET") or 20)
+    except ValueError:
+        budget = 20.0
+    todo = [r for r in reversed(st["pending"]) if r["digest"][:16] not in st["done"]][:MAX_PER_RUN]
+    if not todo:
+        return []
+    binary = os.environ.get("VESTIGE_MCP_BIN") or shutil.which("vestige-mcp")
+    if not binary:
+        log("vestige-mcp is not on PATH and VESTIGE_MCP_BIN is unset; %d stops wait" % len(todo))
+        return []
+    written, mcp = [], None
+    try:
+        mcp = Mcp(binary, time.time() + budget)
+        for row in todo:
+            d16 = row["digest"][:16]
+            node = tagged(mcp, "op-receipt-" + d16)
+            if node:                                  # already in memory, from this hook or another writer
+                st["done"][d16] = node
+                continue
+            rule_node = st["rules"].get(row["rule"]) or tagged(mcp, "op-rule-" + row["rule"])
+            if not rule_node:
+                rule_node = ingest(mcp, rule_item(row))
+            st["rules"][row["rule"]] = rule_node
+            node = ingest(mcp, stop_item(row, rule_node))
+            st["done"][d16] = node
+            written.append((row, node))
+    except Exception as exc:
+        log("record: %r" % (exc,))
+    finally:
+        if mcp:
+            mcp.close()
+    st["pending"] = [r for r in st["pending"] if r["digest"][:16] not in st["done"]]
+    return written
+
+
+def main():
+    try:
+        raw = sys.stdin.buffer.read().decode("utf-8", "replace")
+        payload = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    event = str(payload.get("hook_event_name") or "")
+    session = str(payload.get("session_id") or "")
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        lock = open(LOCK, "a+")
+    except Exception:
+        return 0
+    try:
+        if fcntl:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return 0                              # another call is recording; it picks these up
+        st = load_state()
+        known = set(st["done"]) | set(r["digest"][:16] for r in st["pending"])
+        for row in scan(st):
+            if row["digest"][:16] not in known:
+                st["pending"].append(row)
+                known.add(row["digest"][:16])
+        written = record(st)
+        save_state(st)
+    except Exception as exc:
+        log("main: %r" % (exc,))
+        return 0
+    finally:
+        lock.close()
+    mine = [(r, n) for r, n in written if session and r["session"] == session]
+    if mine and event in ("PostToolUse", "UserPromptSubmit"):
+        lines = ["Vestige recorded %d Operator stop%s from this session as memory:"
+                 % (len(mine), "" if len(mine) == 1 else "s")]
+        for r, n in mine:
+            lines.append("- %s under %s (receipt %s): recall(handle=\"op-receipt-%s\")"
+                         % (n, r["rule"], r["digest"][:16], r["digest"][:16]))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": "\n".join(lines)}}))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        sys.exit(0)

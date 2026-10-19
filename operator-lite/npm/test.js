@@ -50,10 +50,43 @@ if (py) {
 }
 
 const cli = fs.readFileSync(path.join(pkg, "bin", "operator-lite.js"), "utf8");
-const hosts = [...cli.matchAll(/\{ name: "([a-z-]+)", label:/g)].map((m) => m[1]);
-check(hosts.length > 0, "the one-command install names " + hosts.length + " hosts");
-for (const host of hosts) {
-  check(fs.existsSync(path.join(pkg, "gate", "ports", host, "install.sh")), host + ": installer bundled");
+const hosts = [...cli.matchAll(/\{ name: "([a-z-]+)", label: "([^"]+)"/g)].map((m) => [m[1], m[2]]);
+const expected = [
+  ["cursor", "Cursor"],
+  ["gemini-cli", "Gemini CLI"],
+  ["windsurf", "Windsurf"],
+  ["cline", "Cline"],
+  ["goose", "Goose"],
+  ["opencode", "opencode"],
+  ["amazon-q", "Amazon Q"],
+  ["roo-code", "Roo Code"],
+  ["kilo-code", "Kilo Code"],
+  ["continue", "Continue"],
+  ["kiro", "Kiro"],
+  ["zed", "Zed"],
+  ["amp", "Amp"],
+];
+check(JSON.stringify(hosts) === JSON.stringify(expected),
+  "HOSTS is " + hosts.map((h) => h[0] + " (" + h[1] + ")").join(", "));
+const contracts = {
+  "roo-code": ".roo/hooks.json",
+  "kilo-code": ".kilocode/hooks.json",
+  "continue": ".continue/hooks.json",
+  kiro: ".kiro/settings/hooks.json",
+  zed: "zed/hooks.json",
+  amp: "amp/hooks.json",
+};
+for (const [name] of hosts) {
+  const bundled = path.join(pkg, "gate", "ports", name, "install.sh");
+  check(fs.existsSync(bundled), name + ": installer bundled");
+  check(fs.existsSync(path.join(pkg, "gate", "ports", name, "README.md")), name + ": README bundled");
+  if (contracts[name]) {
+    const text = fs.readFileSync(bundled, "utf8");
+    check(text.includes('PORT_NAME="' + name + '"'), name + ": install.sh names itself");
+    check(text.includes(contracts[name]), name + ": install.sh targets " + contracts[name]);
+    check(text.includes("hook --source ${PORT_NAME}"), name + ": install.sh guards the gate command");
+    check(text.includes("[ -f "), name + ": install.sh file-guards a missing gate");
+  }
 }
 
 console.log("\nnpm package: " + (failures.length ? failures.length + " failed" : "all checks pass"));

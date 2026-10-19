@@ -29,7 +29,7 @@ GATE_URL = ("https://raw.githubusercontent.com/samvallad33/vestige/main/"
 GATE_RELATIVE = os.path.join("gate", "operator-gate.py")
 
 # Package version (the wheel's own line; the gate file has its VERSION).
-VERSION = "0.3.2"
+VERSION = "0.3.11"
 
 # Verdicts returned by decide()/gate_verdict() (same vocabulary as the ports).
 PASS = "pass"          # not shell-ish -> no gating, call the handler
