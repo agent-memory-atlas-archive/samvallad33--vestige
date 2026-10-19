@@ -14,7 +14,6 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-#[cfg_attr(not(feature = "legacy-sqlite"), allow(unused_imports))]
 use std::sync::Arc;
 
 use crate::Storage;
@@ -517,10 +516,9 @@ pub fn write_projection(
     result
 }
 
-#[cfg(all(test, feature = "legacy-sqlite"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::IngestInput;
 
     fn item(id: &str, node_type: &str, content: &str) -> ProjectedItem {
         ProjectedItem {
@@ -531,34 +529,6 @@ mod tests {
             updated_at: Utc::now(),
             retention: 0.9,
         }
-    }
-
-    #[test]
-    fn selection_excludes_future_and_suppressed_memory() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::open_storage(Some(dir.path().join("test.db"))).unwrap();
-        let future = storage
-            .ingest(IngestInput {
-                content: "future decision".into(),
-                node_type: "decision".into(),
-                valid_from: Some(Utc::now() + chrono::Duration::days(2)),
-                ..Default::default()
-            })
-            .unwrap();
-        let hidden = storage
-            .ingest(IngestInput {
-                content: "suppressed decision".into(),
-                node_type: "decision".into(),
-                ..Default::default()
-            })
-            .unwrap();
-        storage.suppress_memory(&hidden.id).unwrap();
-        let selected = select_durable(&storage, &ProjectionOptions::default()).unwrap();
-        assert!(
-            !selected
-                .iter()
-                .any(|item| item.id == future.id || item.id == hidden.id)
-        );
     }
 
     #[test]
@@ -658,74 +628,6 @@ mod tests {
             "{text}"
         );
         assert!(line_diff("same\n", "same\n").iter().all(|l| l.kind == ' '));
-    }
-
-    #[test]
-    fn select_durable_keeps_decisions_patterns_and_rule_tagged_facts_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::open_storage(Some(dir.path().join("test.db"))).unwrap();
-        let ingest = |content: &str, node_type: &str, tags: &[&str], valid_until| {
-            storage
-                .ingest(IngestInput {
-                    content: content.to_string(),
-                    node_type: node_type.to_string(),
-                    tags: tags.iter().map(|t| t.to_string()).collect(),
-                    valid_until,
-                    ..Default::default()
-                })
-                .unwrap()
-                .id
-        };
-        let decision = ingest(
-            "Ship releases from an integration branch",
-            "decision",
-            &[],
-            None,
-        );
-        let pattern = ingest("Touch files after scripted edits", "pattern", &[], None);
-        let rule = ingest("Prefer tabs in Svelte files", "fact", &["preference"], None);
-        let plain = ingest("The office moved in spring", "fact", &[], None);
-        let expired = ingest(
-            "Old decision that was superseded",
-            "decision",
-            &[],
-            Some(Utc::now() - chrono::Duration::days(1)),
-        );
-
-        let items = select_durable(&storage, &ProjectionOptions::default()).unwrap();
-        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
-        assert!(ids.contains(&decision.as_str()), "{ids:?}");
-        assert!(ids.contains(&pattern.as_str()), "{ids:?}");
-        assert!(ids.contains(&rule.as_str()), "{ids:?}");
-        assert!(
-            !ids.contains(&plain.as_str()),
-            "an untagged fact is not durable: {ids:?}"
-        );
-        assert!(
-            !ids.contains(&expired.as_str()),
-            "an invalidated memory is out: {ids:?}"
-        );
-        assert_eq!(items[0].node_type, "decision", "decisions render first");
-
-        let strict = select_durable(
-            &storage,
-            &ProjectionOptions {
-                min_retention: 1.1,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert!(strict.is_empty(), "the retention floor applies");
-
-        let other_scope = select_durable(
-            &storage,
-            &ProjectionOptions {
-                scope: "some-other-project".to_string(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert!(other_scope.is_empty(), "scope isolation holds");
     }
 }
 

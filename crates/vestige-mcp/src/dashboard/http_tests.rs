@@ -455,7 +455,10 @@ async fn withheld_features_answer_with_a_structured_reason() {
     // the memory's own recorded write.
     let audit = own(&app, "GET", &format!("/api/memories/{id}/audit"), None).await;
     assert_eq!(audit.status, StatusCode::OK, "{}", audit.body);
-    let events = audit.json()["events"].as_array().cloned().unwrap_or_default();
+    let events = audit.json()["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
         events.iter().any(|event| event["action"] == "created"),
         "{}",
@@ -510,7 +513,12 @@ fn mutation_kinds(receipts: &Value) -> Vec<String> {
         .as_array()
         .unwrap()
         .iter()
-        .map(|receipt| receipt["mutations"][0]["kind"].as_str().unwrap().to_string())
+        .map(|receipt| {
+            receipt["mutations"][0]["kind"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
         .collect()
 }
 
@@ -610,8 +618,15 @@ async fn traces_list_each_memorys_recorded_history_as_a_run() {
         })
         .collect();
     assert_eq!(kinds, ["created", "edge_recorded", "promoted"], "{trace}");
-    assert_eq!(events[1]["diff"]["edge"]["target"], second.as_str(), "{trace}");
-    assert_eq!(events[1]["diff"]["edge"]["linkType"], "derived_from", "{trace}");
+    assert_eq!(
+        events[1]["diff"]["edge"]["target"],
+        second.as_str(),
+        "{trace}"
+    );
+    assert_eq!(
+        events[1]["diff"]["edge"]["linkType"], "derived_from",
+        "{trace}"
+    );
 
     // The run's receipts are exactly the ones its events cite, newest first.
     let reply = own(
@@ -623,8 +638,15 @@ async fn traces_list_each_memorys_recorded_history_as_a_run() {
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     let run_receipts: Vec<Value> = reply.json()["receipts"].as_array().unwrap().clone();
-    let cited: Vec<&Value> = events.iter().rev().map(|event| &event["diff"]["receiptId"]).collect();
-    let listed: Vec<&Value> = run_receipts.iter().map(|receipt| &receipt["receipt_id"]).collect();
+    let cited: Vec<&Value> = events
+        .iter()
+        .rev()
+        .map(|event| &event["diff"]["receiptId"])
+        .collect();
+    let listed: Vec<&Value> = run_receipts
+        .iter()
+        .map(|receipt| &receipt["receipt_id"])
+        .collect();
     assert_eq!(listed, cited);
 
     // The edge is part of the target's run too, named by its writer.
@@ -641,7 +663,12 @@ async fn traces_list_each_memorys_recorded_history_as_a_run() {
     // A suppressed memory, or an id no memory has, is no run.
     for missing in [hidden.as_str(), "mem-ffffffffffffffff"] {
         let reply = own(&app, "GET", &format!("/api/traces/{missing}"), None).await;
-        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{missing}: {}", reply.body);
+        assert_eq!(
+            reply.status,
+            StatusCode::NOT_FOUND,
+            "{missing}: {}",
+            reply.body
+        );
         let reply = own(&app, "GET", &format!("/api/receipts?run={missing}"), None).await;
         assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
         assert_eq!(reply.json()["total"], 0, "{missing}");

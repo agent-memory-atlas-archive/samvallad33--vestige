@@ -92,10 +92,6 @@ pub mod consolidation;
 pub mod data_dir;
 /// Durable profile contracts for local embedding vector spaces.
 pub mod fsrs;
-/// SQLite FTS5 query sanitization — quarantined with the SQLite backend
-/// behind `legacy-sqlite` (build/t5-legacy-isolation).
-#[cfg(feature = "legacy-sqlite")]
-pub mod fts;
 /// Evidence-aware future intentions with deterministic local evaluation.
 pub mod intention_graph;
 pub mod memory;
@@ -105,9 +101,6 @@ pub mod storage;
 /// Agent Black Box, Memory Receipts & Memory PRs — the cognitive flight
 /// recorder, immune system, and reviewable-diff model for agent memory.
 pub mod trace;
-
-/// Hybrid and temporal search over ranked result lists.
-pub mod search;
 
 /// Advanced memory features - bleeding edge 2026 cognitive capabilities
 pub mod advanced;
@@ -200,28 +193,13 @@ pub use trace::{
 // Storage layer
 // Storage: backend-agnostic surface (always available).
 pub use storage::LegacySqliteDisabled;
-#[cfg(not(feature = "legacy-sqlite"))]
 pub use storage::install_open_storage_hook;
 
-/// Install the protocol-test Strata opener when this crate was built without
-/// `legacy-sqlite`. Workspace feature unification can turn that feature on
-/// for `vestige-core` while `vestige-mcp`'s own feature stays off; the
-/// `legacy-sqlite` expansion drops the hook so the caller still compiles and
-/// `open_storage` stays the SQLite constructor.
-#[cfg(not(feature = "legacy-sqlite"))]
 #[macro_export]
 macro_rules! install_strata_open_hook {
     ($hook:expr) => {
         $crate::install_open_storage_hook($hook)
     };
-}
-
-#[cfg(feature = "legacy-sqlite")]
-#[macro_export]
-macro_rules! install_strata_open_hook {
-    ($hook:expr) => {{
-        let _ = $hook;
-    }};
 }
 pub use storage::{
     ACCESS_LOG_RETENTION_DAYS, ClassificationResult, DEFAULT_MEMORY_SCOPE, Domain, HealthStatus,
@@ -314,266 +292,41 @@ pub use storage::{
     replay_policy_digest,
 };
 
-#[cfg(feature = "legacy-sqlite")]
-pub use storage::{
-    EmbeddingProfileIntegrityManifest, EmbeddingProfileMigrationNodeCheckpoint,
-    EmbeddingProfileMigrationRecord, EmbeddingProfileVector, FrozenReplayItem, ReplayBuildError,
-    ReplayInvalidationReason, ReplayMaterializationCheck, ReplayPrivacyInvalidation,
-    SqliteMemoryStore, ablate_frozen_context,
-};
-
-// Embedding profile contracts are feature-independent so profile discovery,
-// storage metadata, and explicit install workflows remain available in a
-// lightweight build without an inference runtime.
-
 // Consolidation (sleep-inspired memory processing)
-pub use consolidation::SleepConsolidation;
 pub use consolidation::{
-    CreativeConnection, CreativeConnectionType, DreamEngine, DreamInsight, DreamPhase,
-    FourPhaseDreamResult, PhaseResult, TriageCategory, TriagedMemory,
-};
-pub use consolidation::{
-    DreamCompileConfig, DreamCompilePhase, DreamCompilePr, DreamCompileReport, run_dream_compile,
+    DreamCompileConfig, DreamCompilePhase, DreamCompilePr, DreamCompileReport,
 };
 
 // Advanced features (bleeding edge 2026)
 pub use advanced::{
-    AccessContext,
-    AccessTrigger,
-    ActionType,
-    ActivityStats,
-    ActivityTracker,
-    ApplicableKnowledge,
-    AppliedModification,
-    // Prediction Error Gating (solves bad vs good similar memory problem)
-    CandidateMemory,
-    ChainStep,
-    ChangeSummary,
-    CompressedMemory,
-    CompressionConfig,
-    CompressionStats,
-    ConnectionGraph,
-    ConnectionReason,
-    ConnectionStats,
-    ConnectionType,
-    ConsolidationReport,
-    // Sleep consolidation (automatic background consolidation)
-    ConsolidationScheduler,
-    CreateReason,
-    // Cross-project learning
-    CrossProjectLearner,
-    DetectedIntent,
-    DiscoveredConnection,
-    DiscoveredConnectionType,
-    DreamConfig,
-    // DreamMemory - input type for dreaming
-    DreamMemory,
-    DreamResult,
-    EvaluationIntent,
-    GateDecision,
-    GateStats,
-    ImportanceDecayConfig,
-    ImportanceScore,
-    // Importance tracking
-    ImportanceTracker,
-    // Intent detection
-    IntentDetector,
-    // Reconsolidation (memories become modifiable on retrieval)
-    LabileCandidate,
-    LabileState,
-    MaintenanceType,
-    // Merge / Supersede controls (Phase 3)
-    MatchClass,
-    MatchSignals,
-    // Memory chains
-    MemoryChainBuilder,
-    // Memory compression
-    MemoryCompressor,
-    MemoryConnection,
-    // Memory dreams
-    MemoryDreamer,
-    MemoryPath,
-    MemoryReplay,
-    MemorySnapshot,
-    MergeCandidate,
-    MergeOperation,
-    MergePlan,
-    MergePolicy,
-    MergeStrategy,
-    Modification,
-    Pattern,
-    PatternType,
-    PlanKind,
-    PredictedMemory,
-    PredictionContext,
-    PredictionErrorConfig,
-    PredictionErrorGate,
-    ProjectContext,
-    ReasoningChain,
-    ReconsolidatedMemory,
-    ReconsolidationManager,
-    ReconsolidationMeta,
-    ReconsolidationStats,
-    RelationshipType,
-    RetrievalRecord,
-    SimilarityResult as PredictionSimilarityResult,
-    // Speculative retrieval
-    SpeculativeRetriever,
-    SupersedeReason,
-    SynthesizedInsight,
-    UniversalPattern,
-    UpdateType,
-    UsageEvent,
-    UsagePattern,
-    UserAction,
-};
-
-// Codebase memory (Vestige's killer differentiator)
-pub use codebase::{
-    // Types
-    ArchitecturalDecision,
-    BugFix,
-    CodePattern,
-    CodebaseError,
-    // Main interface
-    CodebaseMemory,
-    CodebaseNode,
-    CodebaseStats,
-    // Watcher
-    CodebaseWatcher,
-    CodingPreference,
-    // Git analysis
-    CommitInfo,
-    // Context
-    ContextCapture,
-    FileContext,
-    FileEvent,
-    FileRelationship,
-    Framework,
-    GitAnalyzer,
-    GitContext,
-    HistoryAnalysis,
-    LearningResult,
-    // Patterns
-    PatternDetector,
-    PatternMatch,
-    PatternSuggestion,
-    ProjectType,
-    RelatedFile,
-    // Relationships
-    RelationshipGraph,
-    RelationshipTracker,
-    WatcherConfig,
-    WorkContext,
-    WorkingContext,
+    AccessContext, AccessTrigger, ActionType, ActivityStats, ActivityTracker, ApplicableKnowledge,
+    AppliedModification, ChangeSummary, ConnectionGraph, ConnectionReason, ConnectionStats,
+    ConsolidationReport, ConsolidationScheduler, CrossProjectLearner, DetectedIntent,
+    DiscoveredConnection, DiscoveredConnectionType, DreamConfig, DreamMemory, DreamResult,
+    ImportanceDecayConfig, ImportanceScore, ImportanceTracker, IntentDetector, LabileCandidate,
+    LabileState, MaintenanceType, MatchClass, MatchSignals, MemoryConnection, MemoryDreamer,
+    MemoryReplay, MemorySnapshot, MergeCandidate, MergeOperation, MergePlan, MergePolicy,
+    Modification, Pattern, PatternType, PlanKind, ProjectContext, ReconsolidatedMemory,
+    ReconsolidationManager, ReconsolidationMeta, ReconsolidationStats, RelationshipType,
+    RetrievalRecord, SynthesizedInsight, UniversalPattern, UsageEvent, UserAction,
 };
 
 // Neuroscience-inspired memory mechanisms
 pub use neuroscience::{
-    AccessPattern,
-    AccessibilityCalculator,
-    // Spreading Activation (Associative Memory Network)
-    ActivatedMemory,
-    ActivationConfig,
-    ActivationNetwork,
-    ActivationNode,
-    ArousalExplanation,
-    ArousalSignal,
-    AssociatedMemory,
-    AssociationEdge,
-    AssociationLinkType,
-    AttentionExplanation,
-    AttentionSignal,
-    BarcodeGenerator,
-    BatchUpdateResult,
-    CaptureResult,
-    CaptureWindow,
-    CapturedMemory,
-    CompetitionCandidate,
-    CompetitionConfig,
-    CompetitionEvent,
-    CompetitionManager,
-    CompetitionResult,
-    CompositeWeights,
-    ConsolidationPriority,
-    ContentPointer,
-    ContentStore,
-    ContentType as HippocampalContentType,
-    Context as ImportanceContext,
-    // Context-Dependent Memory (Encoding Specificity Principle)
-    ContextMatcher,
-    ContextReinstatement,
-    ContextWeights,
-    DecayFunction,
-    // Emotional Memory (Brown & Kulik 1977, Bower 1981, LaBar & Cabeza 2006)
-    EmotionCategory,
-    EmotionalContext,
-    EmotionalEvaluation,
-    EmotionalMarker,
-    EmotionalMemory,
-    EmotionalMemoryStats,
-    EncodingContext,
-    FullMemory,
-    // Hippocampal Indexing (Teyler & Rudy, 2007)
-    HippocampalIndex,
-    HippocampalIndexConfig,
-    HippocampalIndexError,
-    INDEX_EMBEDDING_DIM,
-    ImportanceCluster,
-    ImportanceConsolidationConfig,
-    ImportanceEncodingConfig,
-    ImportanceEvent,
-    ImportanceEventType,
-    ImportanceFlags,
-    ImportanceRetrievalConfig,
-    // Multi-channel Importance Signaling (Neuromodulator-inspired)
-    ImportanceSignals,
-    IndexLink,
-    IndexMatch,
-    IndexQuery,
-    LifecycleSummary,
-    LinkType,
-    MarkerType,
-    MemoryBarcode,
-    MemoryIndex,
-    MemoryLifecycle,
-    // Memory States (accessibility continuum)
-    MemoryState,
-    MemoryStateInfo,
-    MigrationNode,
-    MigrationResult,
-    NoveltyExplanation,
-    NoveltySignal,
-    Outcome,
-    OutcomeType,
-    RecencyBucket,
-    RewardExplanation,
-    RewardSignal,
-    ScoredMemory,
-    SentimentAnalyzer,
-    SentimentResult,
-    Session as AttentionSession,
-    SessionContext,
-    StateDecayConfig,
-    StatePercentages,
-    StateTimeAccumulator,
-    StateTransition,
-    StateTransitionReason,
-    StateUpdateService,
-    StorageLocation,
-    // Synaptic Tagging and Capture (retroactive importance)
-    SynapticTag,
-    SynapticTaggingConfig,
-    SynapticTaggingSystem,
-    TaggingStats,
-    TemporalContext,
-    TemporalMarker,
-    TimeOfDay,
-    TopicalContext,
+    AccessPattern, AccessibilityCalculator, ActivatedMemory, ActivationConfig, ActivationNetwork,
+    ActivationNode, ArousalExplanation, ArousalSignal, AssociatedMemory, AssociationEdge,
+    AttentionExplanation, AttentionSignal, BatchUpdateResult, CaptureResult, CaptureWindow,
+    CapturedMemory, CompetitionCandidate, CompetitionConfig, CompetitionEvent, CompetitionManager,
+    CompetitionResult, CompositeWeights, ConsolidationPriority, Context as ImportanceContext,
+    DecayFunction, EmotionalMarker, ImportanceCluster, ImportanceConsolidationConfig,
+    ImportanceEncodingConfig, ImportanceEvent, ImportanceEventType, ImportanceRetrievalConfig,
+    ImportanceSignals, LifecycleSummary, LinkType, MarkerType, MemoryLifecycle, MemoryState,
+    MemoryStateInfo, NoveltyExplanation, NoveltySignal, Outcome, OutcomeType, RewardExplanation,
+    RewardSignal, SentimentAnalyzer, SentimentResult, Session as AttentionSession,
+    StateDecayConfig, StatePercentages, StateTimeAccumulator, StateTransition,
+    StateTransitionReason, StateUpdateService, SynapticTag, SynapticTaggingConfig,
+    SynapticTaggingSystem, TaggingStats,
 };
-
-// Search fusion (RRF + linear combination over ranked result lists)
-pub use search::{HybridSearchConfig, HybridSearcher, linear_combination, reciprocal_rank_fusion};
 
 // ============================================================================
 // VERSION INFO
@@ -595,89 +348,21 @@ pub mod prelude {
         ConsolidationResult, FSRSScheduler, FSRSState, IngestInput, KnowledgeNode, MemoryStats,
         NodeType, Rating, RecallInput, SearchMode,
     };
-
-    // Legacy SQLite surface (behind `legacy-sqlite`, build/t5-legacy-isolation).
-    #[cfg(feature = "legacy-sqlite")]
     pub use crate::{Result, Storage, StorageError};
-
-    pub use crate::HybridSearcher;
 
     // Advanced features
     pub use crate::{
-        ActivityTracker,
-        ConnectionGraph,
-        ConsolidationReport,
-        // Sleep consolidation
-        ConsolidationScheduler,
-        CrossProjectLearner,
-        EvaluationIntent,
-        GateDecision,
-        ImportanceTracker,
-        IntentDetector,
-        LabileCandidate,
-        LabileState,
-        MemoryChainBuilder,
-        MemoryCompressor,
-        MemoryDreamer,
-        MemoryReplay,
-        Modification,
-        PredictedMemory,
-        // Prediction Error Gating
-        PredictionErrorGate,
-        ReconsolidatedMemory,
-        // Reconsolidation
-        ReconsolidationManager,
-        SpeculativeRetriever,
-    };
-
-    // Codebase memory
-    pub use crate::{
-        ArchitecturalDecision, BugFix, CodePattern, CodebaseMemory, CodebaseNode, WorkingContext,
+        ActivityTracker, ConnectionGraph, ConsolidationReport, ConsolidationScheduler,
+        CrossProjectLearner, ImportanceTracker, IntentDetector, LabileCandidate, LabileState,
+        MemoryDreamer, MemoryReplay, Modification, ReconsolidatedMemory, ReconsolidationManager,
     };
 
     // Neuroscience-inspired mechanisms
     pub use crate::{
-        AccessPattern,
-        AccessibilityCalculator,
-        ArousalSignal,
-        AttentionSession,
-        AttentionSignal,
-        BarcodeGenerator,
-        CapturedMemory,
-        CompetitionManager,
-        CompositeWeights,
-        ConsolidationPriority,
-        ContentPointer,
-        ContentStore,
-        // Context-dependent memory
-        ContextMatcher,
-        ContextReinstatement,
-        EmotionalContext,
-        EncodingContext,
-        // Hippocampal indexing (Teyler & Rudy)
-        HippocampalIndex,
-        ImportanceCluster,
-        ImportanceContext,
-        ImportanceEvent,
-        // Multi-channel importance signaling
-        ImportanceSignals,
-        IndexMatch,
-        IndexQuery,
-        MemoryBarcode,
-        MemoryIndex,
-        MemoryLifecycle,
-        // Memory states
-        MemoryState,
-        NoveltySignal,
-        Outcome,
-        OutcomeType,
-        RewardSignal,
-        ScoredMemory,
-        SessionContext,
-        StateUpdateService,
-        SynapticTag,
-        SynapticTaggingSystem,
-        TemporalContext,
-        TopicalContext,
+        AccessPattern, AccessibilityCalculator, ArousalSignal, AttentionSession, AttentionSignal,
+        CapturedMemory, CompetitionManager, CompositeWeights, ConsolidationPriority,
+        ImportanceCluster, ImportanceContext, ImportanceEvent, ImportanceSignals, MemoryLifecycle,
+        MemoryState, NoveltySignal, Outcome, OutcomeType, RewardSignal, StateUpdateService,
+        SynapticTag, SynapticTaggingSystem,
     };
 }

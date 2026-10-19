@@ -146,69 +146,12 @@ pub fn ensure_not_v3(path: &Path) -> Result<()> {
 }
 
 /// True when the read-write v3 refusal is compiled in.
-///
-/// Workspace tests unify `v3-engine`, which compiles the constructor guard
-/// out. The MCP pre-check must use the same switch or a racing start treats
-/// the in-progress file (schema version 0) as a migration refusal.
 pub fn v3_rw_guard_armed() -> bool {
-    cfg!(all(feature = "legacy-sqlite", not(feature = "v3-engine")))
+    false
 }
 
-#[cfg_attr(not(feature = "legacy-sqlite"), allow(unused_variables))]
-fn read_schema_version(path: &Path, header: &[u8; 100]) -> u32 {
-    #[cfg(feature = "legacy-sqlite")]
-    if let Some(v) = query_schema_version_table(path) {
-        return v;
-    }
-    // Header fallback without rusqlite: bytes 60..64 hold the database
-    // `user_version` (big-endian). Vestige tracks its migration version in
-    // the `schema_version` table, so this is best-effort provenance only —
-    // refusal does not depend on it.
-    let _ = header;
-    0
-}
-
-/// Highest `schema_version.version` row, read strictly through the
-/// mandated read-only immutable URI. The connection physically cannot
-/// write, journal, or create `-wal`/`-shm` siblings.
-#[cfg(feature = "legacy-sqlite")]
-fn query_schema_version_table(path: &Path) -> Option<u32> {
-    let uri = format!("file:{}?mode=ro&immutable=1", uri_encode_path(path));
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-        | rusqlite::OpenFlags::SQLITE_OPEN_URI
-        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = rusqlite::Connection::open_with_flags(uri, flags).ok()?;
-    conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| {
-        row.get::<_, u32>(0)
-    })
-    .ok()
-}
-
-/// Percent-encode a path for use inside a `file:` URI. SQLite treats `?`
-/// and `#` as URI structure and `%` as an escape; everything outside the
-/// unreserved set is encoded so spaces and shell-hostile names survive.
-#[cfg(feature = "legacy-sqlite")]
-fn uri_encode_path(path: &Path) -> String {
-    // Raw OS bytes on Unix: a path need not be valid UTF-8, and a lossy
-    // conversion would name a different file.
-    #[cfg(unix)]
-    let bytes: std::borrow::Cow<'_, [u8]> = {
-        use std::os::unix::ffi::OsStrExt;
-        std::borrow::Cow::Borrowed(path.as_os_str().as_bytes())
-    };
-    #[cfg(not(unix))]
-    let bytes: std::borrow::Cow<'_, [u8]> =
-        std::borrow::Cow::Owned(path.to_string_lossy().into_owned().into_bytes());
-    let mut out = String::with_capacity(bytes.len());
-    for byte in bytes.iter() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b'~' => {
-                out.push(*byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
+fn read_schema_version(_path: &Path, header: &[u8; 100]) -> u32 {
+    u32::from_be_bytes([header[60], header[61], header[62], header[63]])
 }
 
 #[cfg(test)]
@@ -272,13 +215,5 @@ mod tests {
             }
             other => panic!("wrong error: {other:?}"),
         }
-    }
-
-    #[cfg(all(unix, feature = "legacy-sqlite"))]
-    #[test]
-    fn a_non_utf8_path_is_encoded_from_its_raw_bytes() {
-        use std::os::unix::ffi::OsStrExt;
-        let path = Path::new(std::ffi::OsStr::from_bytes(b"/data/d-\xff\xfe/vestige.db"));
-        assert_eq!(uri_encode_path(path), "/data/d-%FF%FE/vestige.db");
     }
 }

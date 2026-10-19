@@ -569,7 +569,7 @@ struct RawComment {
     user: Option<RawUser>,
 }
 
-#[cfg(all(test, feature = "legacy-sqlite"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -706,10 +706,9 @@ mod tests {
 // error messages naming the exact failing call, and the comment retry-then-skip
 // path. A tiny hand-rolled HTTP server on 127.0.0.1 keeps this dependency-free.
 
-#[cfg(all(test, feature = "connectors", feature = "legacy-sqlite"))]
+#[cfg(all(test, feature = "connectors"))]
 mod http_tests {
     use super::*;
-    use crate::storage::SqliteMemoryStore;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1034,118 +1033,6 @@ mod http_tests {
             msg.contains(&format!("GET {base}/repos/o/r/issues")),
             "transport errors must name the exact call (reqwest 0.13 Display may \
              omit the url; our wrapper must not): {msg}"
-        );
-    }
-
-    // ===================== Real read-only integration ==================
-    /// REAL network test against api.github.com (READ-ONLY, public repo).
-    /// Gated: run with `VESTIGE_SOURCE_SYNC_INTEGRATION=1 cargo test -p
-    /// vestige-core --features connectors`. Never writes to GitHub; syncs one
-    /// page of samvallad33/vestige issues into a throwaway temp db and proves
-    /// the end-to-end path: paginate → normalize → cite-backed memories →
-    /// idempotent re-run (no duplicates).
-    #[tokio::test]
-    async fn integration_real_github_sync_readonly_end_to_end() {
-        if std::env::var("VESTIGE_SOURCE_SYNC_INTEGRATION")
-            .ok()
-            .as_deref()
-            != Some("1")
-        {
-            eprintln!("skipping: set VESTIGE_SOURCE_SYNC_INTEGRATION=1 to run");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let store = SqliteMemoryStore::new(Some(dir.path().join("integration.db"))).unwrap();
-
-        let token = std::env::var("GITHUB_TOKEN").ok().filter(|s| !s.is_empty());
-        let config = GithubConfig::new("samvallad33", "vestige").with_token(token);
-        let conn = GithubConnector::new(config).unwrap();
-
-        let report = crate::connectors::run_sync(&store, &conn, false, 1)
-            .await
-            .unwrap();
-        assert!(
-            report.created >= 1,
-            "a real page of samvallad33/vestige issues must index: {report:?}"
-        );
-        assert!(
-            report.warnings.is_empty(),
-            "no warnings expected on a healthy repo: {:?}",
-            report.warnings
-        );
-        assert!(
-            report.new_cursor.is_some(),
-            "the cursor checkpoint must be persisted"
-        );
-
-        // Every ingested memory is a good citizen: keyed envelope, citation
-        // URL, event node type, structured tags.
-        let rows: Vec<(String, String, String, String, String, String)> = {
-            let reader = store.reader.lock().unwrap();
-            let mut stmt = reader
-                .prepare(
-                    "SELECT node_type, source_system, source_id, source_url, tags, content_hash \
-                     FROM knowledge_nodes WHERE source_system = 'github'",
-                )
-                .unwrap();
-            stmt.query_map([], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            })
-            .unwrap()
-            .filter_map(Result::ok)
-            .collect()
-        };
-        assert_eq!(
-            rows.len(),
-            report.created,
-            "no duplicates: one node per record"
-        );
-        for (node_type, system, id, url, tags, hash) in &rows {
-            assert_eq!(node_type, "event");
-            assert_eq!(system, "github");
-            assert!(!id.is_empty());
-            assert!(url.starts_with("https://github.com/samvallad33/vestige/issues/"));
-            assert!(tags.contains("\"github\""), "tagged github: {tags}");
-            assert!(!hash.is_empty(), "content_hash present");
-        }
-
-        // Re-run resumes from the saved cursor (max_pages=1 is a PARTIAL sync
-        // of this repo): the overlap window re-scans the boundary issues as
-        // Unchanged and may legitimately index further never-seen issues. The
-        // hard invariant is ONE node per source id — no duplicates ever.
-        let report2 = crate::connectors::run_sync(&store, &conn, false, 1)
-            .await
-            .unwrap();
-        assert!(
-            report2.warnings.is_empty(),
-            "no warnings expected: {:?}",
-            report2.warnings
-        );
-        let (total, distinct): (i64, i64) = {
-            let reader = store.reader.lock().unwrap();
-            let mut stmt = reader
-                .prepare(
-                    "SELECT COUNT(*), COUNT(DISTINCT source_id) FROM knowledge_nodes \
-                     WHERE source_system = 'github' AND source_project = 'samvallad33/vestige'",
-                )
-                .unwrap();
-            stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
-        };
-        assert_eq!(
-            total as usize,
-            rows.len() + report2.created,
-            "every created report maps to exactly one new row (report2: {report2:?})"
-        );
-        assert_eq!(
-            total, distinct,
-            "no duplicate source ids across re-runs (report2: {report2:?})"
         );
     }
 }

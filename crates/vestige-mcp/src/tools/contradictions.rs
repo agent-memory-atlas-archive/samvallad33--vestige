@@ -1,16 +1,14 @@
 //! First-class contradiction surface.
 //!
-//! `deep_reference` already computes trust-weighted contradiction pairs while
-//! answering a specific question. This tool exposes the same local logic as an
-//! inspectable memory-health operation.
+//! On Strata, contradictions are recorded only via explicit `corrects` edges;
+//! free-text pairwise contradiction scanning returns `similarity_disabled`.
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::tools::cross_reference::{appears_contradictory, compute_trust, topic_overlap};
-use vestige_core::{DEFAULT_MEMORY_SCOPE, KnowledgeNode, Storage};
+use vestige_core::{DEFAULT_MEMORY_SCOPE, Storage};
 
 pub fn schema() -> Value {
     serde_json::json!({
@@ -54,10 +52,13 @@ pub fn schema() -> Value {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ContradictionArgs {
+    #[allow(dead_code)]
     topic: Option<String>,
     since: Option<String>,
     #[serde(alias = "min_trust")]
+    #[allow(dead_code)]
     min_trust: Option<f64>,
+    #[allow(dead_code)]
     limit: Option<i32>,
     scope: Option<String>,
     #[serde(alias = "include_cross_scope")]
@@ -134,262 +135,13 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
         );
     }
 
-    let limit = args.limit.unwrap_or(50).clamp(2, 200);
-    let min_trust = args.min_trust.unwrap_or(0.3).clamp(0.0, 1.0);
-    let (scope, include_cross_scope) = parse_scope(&args)?;
-    let since = match args.since.as_deref() {
-        Some(raw) => Some(
-            DateTime::parse_from_rfc3339(raw)
-                .map_err(|e| format!("Invalid since timestamp: {}", e))?
-                .with_timezone(&Utc),
-        ),
-        None => None,
-    };
-
-    // Filtering must happen before the requested LIMIT. For topic search the
-    // current hybrid index is global, so over-fetch a bounded pool and apply
-    // the canonical node scope predicate before truncation. Recent mode uses
-    // the scoped SQL reader directly, preventing other namespaces from
-    // consuming the window at all.
-    let fetch_limit = limit.saturating_mul(4).min(800);
-    let mut memories = if let Some(topic) = args.topic.as_deref().filter(|s| !s.trim().is_empty()) {
-        let results = storage
-            .hybrid_search(topic, fetch_limit, 0.3, 0.7)
-            .map_err(|e| e.to_string())?;
-        results
-            .into_iter()
-            .filter_map(|result| {
-                if include_cross_scope {
-                    Some(Ok(result.node))
-                } else {
-                    match storage.node_is_in_scope(&result.node.id, &scope) {
-                        Ok(true) => Some(Ok(result.node)),
-                        Ok(false) => None,
-                        Err(error) => Some(Err(error.to_string())),
-                    }
-                }
-            })
-            .collect::<Result<Vec<_>, String>>()?
-    } else if include_cross_scope {
-        storage
-            .get_all_nodes(fetch_limit, 0)
-            .map_err(|e| e.to_string())?
-    } else {
-        storage
-            .get_all_nodes_in_scope(&scope, fetch_limit, 0)
-            .map_err(|e| e.to_string())?
-    };
-
-    if let Some(since) = since {
-        memories.retain(|memory| memory.updated_at >= since);
+    let _ = parse_scope(&args)?;
+    if let Some(raw) = args.since.as_deref() {
+        let _ = DateTime::parse_from_rfc3339(raw)
+            .map_err(|e| format!("Invalid since timestamp: {}", e))?
+            .with_timezone(&Utc);
     }
-    memories.truncate(limit as usize);
-
-    let contradictions = find_contradictions(&memories, min_trust);
-
-    Ok(serde_json::json!({
-        "topic": args.topic,
-        "scope": scope,
-        "includeCrossScope": include_cross_scope,
-        "memoriesAnalyzed": memories.len(),
-        "minTrust": min_trust,
-        "contradictionsFound": contradictions.len(),
-        "contradictions": contradictions,
-    }))
-}
-
-fn find_contradictions(memories: &[KnowledgeNode], min_trust: f64) -> Vec<Value> {
-    let mut contradictions = Vec::new();
-
-    for i in 0..memories.len() {
-        for j in (i + 1)..memories.len() {
-            let a = &memories[i];
-            let b = &memories[j];
-            let overlap = topic_overlap(&a.content, &b.content);
-            if overlap < 0.4 || !appears_contradictory(&a.content, &b.content) {
-                continue;
-            }
-
-            let a_trust = trust_for(a);
-            let b_trust = trust_for(b);
-            if a_trust.min(b_trust) < min_trust {
-                continue;
-            }
-
-            let (stronger, stronger_trust, weaker, weaker_trust) = if a_trust >= b_trust {
-                (a, a_trust, b, b_trust)
-            } else {
-                (b, b_trust, a, a_trust)
-            };
-
-            contradictions.push(serde_json::json!({
-                "stronger": memory_card(stronger, stronger_trust),
-                "weaker": memory_card(weaker, weaker_trust),
-                "topicOverlap": overlap,
-            }));
-        }
-    }
-
-    contradictions.sort_by(|a, b| {
-        let a_overlap = a["topicOverlap"].as_f64().unwrap_or(0.0);
-        let b_overlap = b["topicOverlap"].as_f64().unwrap_or(0.0);
-        b_overlap
-            .partial_cmp(&a_overlap)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    contradictions
-}
-
-fn trust_for(memory: &KnowledgeNode) -> f64 {
-    compute_trust(
-        memory.retention_strength,
-        memory.stability,
-        memory.reps,
-        memory.lapses,
+    Err(
+        "similarity_disabled: contradictions are not a recorded edge; embeddings, cosine, BM25, FTS, Jaccard, and keyword or name matching are not Strata operations".into(),
     )
-}
-
-fn memory_card(memory: &KnowledgeNode, trust: f64) -> Value {
-    serde_json::json!({
-        "id": memory.id.clone(),
-        "preview": memory.content.chars().take(200).collect::<String>(),
-        "trust": (trust * 100.0).round() / 100.0,
-        "updatedAt": memory.updated_at.to_rfc3339(),
-        "tags": memory.tags.clone(),
-    })
-}
-
-#[cfg(all(test, feature = "legacy-sqlite"))]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-    use vestige_core::IngestInput;
-
-    async fn test_storage() -> (Arc<Storage>, TempDir) {
-        let dir = TempDir::new().unwrap();
-        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
-        (storage, dir)
-    }
-
-    #[tokio::test]
-    async fn test_contradictions_reports_conflicting_memories() {
-        let (storage, _dir) = test_storage().await;
-        storage
-            .ingest(IngestInput {
-                content:
-                    "For the release workflow we always run cargo test before publishing Vestige"
-                        .to_string(),
-                node_type: "fact".to_string(),
-                ..Default::default()
-            })
-            .unwrap();
-        storage
-            .ingest(IngestInput {
-                content:
-                    "Correction: for the release workflow we never run cargo test before publishing Vestige"
-                        .to_string(),
-                node_type: "fact".to_string(),
-                ..Default::default()
-            })
-            .unwrap();
-
-        let result = execute(
-            &storage,
-            Some(serde_json::json!({
-                "topic": "release workflow cargo test Vestige",
-                "min_trust": 0.0
-            })),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result["contradictionsFound"], 1);
-        assert!(result["contradictions"][0]["stronger"]["id"].is_string());
-    }
-
-    #[tokio::test]
-    async fn contradictions_default_to_user_scope_before_limit() {
-        let (storage, _dir) = test_storage().await;
-        let user_a = storage
-            .ingest_in_scope(
-                IngestInput {
-                    content: "Scope canary always enables cargo test before release".to_string(),
-                    ..Default::default()
-                },
-                "user",
-            )
-            .unwrap()
-            .id;
-        let user_b = storage
-            .ingest_in_scope(
-                IngestInput {
-                    content: "Scope canary never enables cargo test before release".to_string(),
-                    ..Default::default()
-                },
-                "user",
-            )
-            .unwrap()
-            .id;
-        let private = storage
-            .ingest_in_scope(
-                IngestInput {
-                    content: "Scope canary private project never enables cargo test before release"
-                        .to_string(),
-                    ..Default::default()
-                },
-                "private-project",
-            )
-            .unwrap()
-            .id;
-
-        let scoped = execute(
-            &storage,
-            Some(serde_json::json!({
-                "topic": "scope canary cargo test release",
-                "min_trust": 0.0,
-                "limit": 10
-            })),
-        )
-        .await
-        .unwrap();
-        let encoded = serde_json::to_string(&scoped).unwrap();
-        assert!(encoded.contains(&user_a));
-        assert!(encoded.contains(&user_b));
-        assert!(!encoded.contains(&private));
-        assert_eq!(scoped["scope"], "user");
-        assert_eq!(scoped["includeCrossScope"], false);
-
-        let cross_scope = execute(
-            &storage,
-            Some(serde_json::json!({
-                "topic": "scope canary cargo test release",
-                "min_trust": 0.0,
-                "limit": 10,
-                "includeCrossScope": true
-            })),
-        )
-        .await
-        .unwrap();
-        assert!(
-            serde_json::to_string(&cross_scope)
-                .unwrap()
-                .contains(&private)
-        );
-    }
-
-    #[tokio::test]
-    async fn contradictions_reject_inherited_unsupported_fields() {
-        let (storage, _dir) = test_storage().await;
-        let error = execute(
-            &storage,
-            Some(serde_json::json!({
-                "topic": "release",
-                "token_budget": 500
-            })),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.contains("Unsupported recall contradictions-mode field"));
-        assert!(error.contains("token_budget"));
-    }
 }

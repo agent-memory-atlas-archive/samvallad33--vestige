@@ -249,14 +249,6 @@ pub struct PurgeReport {
     pub insights_deleted: i64,
     /// Number of temporal-summary children detached from this parent.
     pub children_orphaned: i64,
-    /// This established purge path audits legacy local cleanup only.  It does
-    /// not claim the post-V25 lineage coverage required for verified local
-    /// machine unlearning.
-    pub unlearning_scope: crate::storage::UnlearningScope,
-    /// Legacy purge is intentionally never labeled `VerifiedWithinScope`.
-    pub unlearning_verdict: crate::storage::UnlearningVerdict,
-    /// Fixed boundary shown by MCP callers rather than a free-form guarantee.
-    pub unlearning_claim_boundary: &'static str,
     /// `eff-` receipt when a named `purge` retire was admitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt_id: Option<String>,

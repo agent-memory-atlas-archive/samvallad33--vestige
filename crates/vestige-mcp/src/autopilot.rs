@@ -234,49 +234,20 @@ async fn handle_event(
     dedup_state: &mut DedupSweepState,
 ) {
     match event {
-        VestigeEvent::MemoryCreated {
-            id,
-            content_preview,
-            tags,
-            ..
-        } => {
-            // Synaptic capture must stay inside smart_ingest's V22 SQLite
-            // transaction. Calling the legacy in-memory trigger_prp here could
-            // mark a local tag captured without the event, guarded promotion,
-            // or receipt that makes that decision auditable.
-            //
-            // Predictive-memory learning is read-model-local and remains a
-            // legitimate autopilot side effect.
-            let cog = cognitive.lock().await;
-            let _ = cog
-                .predictive_memory
-                .record_memory_access(&id, &content_preview, &tags);
+        VestigeEvent::MemoryCreated { id, .. } => {
             debug!(
                 memory_id = %id,
-                "Autopilot: MemoryCreated routed to predictive_memory; durable synaptic capture is owned by smart_ingest"
+                "Autopilot: MemoryCreated observed; durable synaptic capture is owned by smart_ingest"
             );
         }
 
         VestigeEvent::SearchPerformed {
             query, result_ids, ..
         } => {
-            // Feed the search into the predictive-retrieval model so the
-            // speculative prefetch path warms up for the NEXT query. The
-            // event doesn't carry per-result content, so we record with an
-            // empty preview — the model only needs the id + tag signal.
-            let cog = cognitive.lock().await;
-            let empty_tags_str: [&str; 0] = [];
-            let empty_tags_string: [String; 0] = [];
-            let _ = cog.predictive_memory.record_query(&query, &empty_tags_str);
-            for mid in result_ids.iter().take(10) {
-                let _ = cog
-                    .predictive_memory
-                    .record_memory_access(mid, "", &empty_tags_string);
-            }
             debug!(
                 query = %query,
                 n_results = result_ids.len(),
-                "Autopilot: SearchPerformed routed to predictive_memory"
+                "Autopilot: SearchPerformed observed"
             );
         }
 
@@ -481,53 +452,5 @@ async fn run_prospective_poller(cognitive: Arc<Mutex<CognitiveEngine>>) {
                 warn!(error = %e, "Autopilot: prospective check_triggers failed");
             }
         }
-    }
-}
-
-#[cfg(all(test, feature = "legacy-sqlite"))]
-mod tests {
-    use super::*;
-    use chrono::Utc;
-
-    #[tokio::test]
-    async fn memory_created_preserves_predictive_learning_without_legacy_capture() {
-        let directory = tempfile::tempdir().expect("temporary database directory");
-        let storage = Arc::new(
-            vestige_core::open_storage(Some(directory.path().join("autopilot.db")))
-                .expect("test storage"),
-        );
-        let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
-        let (event_tx, _) = broadcast::channel(1);
-        let mut dedup_state = DedupSweepState::new();
-
-        // The old handler called trigger_prp with strength 0.5. That captured
-        // this local tag without a V22 event or receipt. A MemoryCreated event
-        // must now leave capture ownership with smart_ingest/storage.
-        {
-            let mut engine = cognitive.lock().await;
-            engine.synaptic_tagging.tag_memory("durable-tag-owner");
-            assert!(!engine.synaptic_tagging.is_captured("durable-tag-owner"));
-        }
-
-        handle_event(
-            VestigeEvent::MemoryCreated {
-                id: "new-memory".into(),
-                content_preview: "predictive learning remains enabled".into(),
-                node_type: "fact".into(),
-                tags: vec!["project:vestige".into()],
-                timestamp: Utc::now(),
-            },
-            &cognitive,
-            &storage,
-            &event_tx,
-            &mut dedup_state,
-        )
-        .await;
-
-        let engine = cognitive.lock().await;
-        assert!(
-            !engine.synaptic_tagging.is_captured("durable-tag-owner"),
-            "autopilot must not run the unaudited in-memory capture engine"
-        );
     }
 }

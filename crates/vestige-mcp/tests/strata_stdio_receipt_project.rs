@@ -420,15 +420,26 @@ fn memory_status_changelog_reads_a_strata_memory_over_real_stdio() {
     let mut server = StdioServer::spawn(data.path());
     server.handshake();
 
-    let id = ingest(&mut server, "Changelog fixture memory", "fact", &["changelog-fixture"]);
+    let id = ingest(
+        &mut server,
+        "Changelog fixture memory",
+        "fact",
+        &["changelog-fixture"],
+    );
     assert!(id.starts_with("mem-"), "{id}");
 
-    let log = server.tool("memory_status", json!({"view": "changelog", "memoryId": id}));
+    let log = server.tool(
+        "memory_status",
+        json!({"view": "changelog", "memoryId": id}),
+    );
     assert_eq!(log["mode"], "per_memory", "{log}");
     assert_eq!(log["memoryId"], id.as_str(), "{log}");
     assert!(log["transitions"].is_array(), "{log}");
     let operations = log["operations"].as_array().expect("operations");
-    assert!(!operations.is_empty(), "the memory's own write is in its changelog: {log}");
+    assert!(
+        !operations.is_empty(),
+        "the memory's own write is in its changelog: {log}"
+    );
     assert!(
         operations[0]["operationId"]
             .as_str()
@@ -440,7 +451,10 @@ fn memory_status_changelog_reads_a_strata_memory_over_real_stdio() {
         "memory_status",
         json!({"view": "changelog", "memoryId": "mem-zzzz"}),
     );
-    assert!(canonical(&malformed).contains("Invalid memory_id"), "{malformed}");
+    assert!(
+        canonical(&malformed).contains("Invalid memory_id"),
+        "{malformed}"
+    );
 
     let absent = server.tool_err(
         "memory_status",

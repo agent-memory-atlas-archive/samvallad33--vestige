@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use vestige_core::{
     ConnectionRecord, DreamCompileConfig, DreamCompilePhase, DreamCompileReport, KnowledgeNode,
-    Storage, run_dream_compile,
+    Storage,
 };
 
 const BOOST_MILLI: i64 = 100;
@@ -59,15 +59,10 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
     // Synchronous store work goes to the blocking pool, matching consolidate.
     let storage = Arc::clone(storage);
     let strata = crate::strata_memory::is_strata_backend(storage.as_ref());
-    let report = tokio::task::spawn_blocking(move || {
-        if strata {
-            run_strata_dream_compile(storage.as_ref(), &config)
-        } else {
-            run_dream_compile(storage.as_ref(), &config)
-        }
-    })
-    .await
-    .map_err(|e| format!("dream compile task failed: {e}"))??;
+    let report =
+        tokio::task::spawn_blocking(move || run_strata_dream_compile(storage.as_ref(), &config))
+            .await
+            .map_err(|e| format!("dream compile task failed: {e}"))??;
 
     let touched_edges = report.edges_strengthened
         + report.edges_downscaled
@@ -99,7 +94,7 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
 /// both replayed is a contradiction; `derived_from` / `evidence_of` edges in
 /// that set are the insight count. The log has no memory-pr or dream-history
 /// op, so those stay unfiled. Decisions never read content.
-fn run_strata_dream_compile(
+pub fn run_strata_dream_compile(
     storage: &Storage,
     config: &DreamCompileConfig,
 ) -> Result<DreamCompileReport, String> {
@@ -294,91 +289,6 @@ fn phase(
         duration_ms: elapsed_ms(started),
         memories_processed: processed,
         actions,
-    }
-}
-
-#[cfg(all(test, feature = "legacy-sqlite"))]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    async fn test_storage() -> (Arc<Storage>, TempDir) {
-        let dir = TempDir::new().unwrap();
-        let storage = vestige_core::open_storage(Some(dir.path().join("test.db"))).unwrap();
-        (storage, dir)
-    }
-
-    async fn ingest_n(storage: &Arc<Storage>, n: usize) {
-        for i in 0..n {
-            storage
-                .ingest(vestige_core::IngestInput {
-                    content: format!(
-                        "Dream compile wire test memory {i} about the deploy pipeline"
-                    ),
-                    node_type: "fact".to_string(),
-                    source: None,
-                    sentiment_score: 0.0,
-                    sentiment_magnitude: 0.0,
-                    tags: vec!["dream-compile-wire".to_string()],
-                    valid_from: None,
-                    valid_until: None,
-                    validity_inferred: false,
-                    source_envelope: None,
-                })
-                .unwrap();
-        }
-    }
-
-    #[test]
-    fn schema_is_compact_and_bounded() {
-        let s = schema();
-        assert_eq!(s["type"], "object");
-        assert_eq!(s["properties"]["memory_count"]["default"], 50);
-        assert_eq!(s["properties"]["memory_count"]["maximum"], 500);
-        assert_eq!(s["properties"]["max_prs"]["default"], 20);
-    }
-
-    #[tokio::test]
-    async fn insufficient_memories_is_a_clean_response() {
-        let (storage, _dir) = test_storage().await;
-        let value = execute(&storage, None).await.unwrap();
-        assert_eq!(value["status"], "insufficient_memories");
-        assert_eq!(value["memoriesSelected"], 0);
-        assert_eq!(value["prsFiled"].as_array().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn compiles_a_small_store_end_to_end() {
-        let (storage, _dir) = test_storage().await;
-        ingest_n(&storage, 10).await;
-
-        let value = execute(&storage, None).await.unwrap();
-        assert_eq!(value["status"], "compiled");
-        assert_eq!(value["memoriesSelected"], 10);
-        assert_eq!(value["dreamHistoryRecorded"], true);
-        let phases = value["phases"].as_array().unwrap();
-        assert_eq!(phases.len(), 4);
-        assert_eq!(phases[0]["phase"], "NREM1_Triage");
-        assert_eq!(phases[3]["phase"], "Integration");
-        assert!(value["edgesStrengthened"].is_number());
-        assert!(value["edgesDownscaled"].is_number());
-        assert!(value["contradictionsFound"].is_number());
-        assert!(value["prsFiled"].is_array());
-        // The history row resets the needsDream automation trigger.
-        assert!(storage.get_last_dream().unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn rejects_out_of_range_arguments() {
-        let (storage, _dir) = test_storage().await;
-        for args in [
-            serde_json::json!({"memory_count": 4}),
-            serde_json::json!({"memory_count": 501}),
-            serde_json::json!({"max_prs": 51}),
-            serde_json::json!({"scope": " "}),
-        ] {
-            assert!(execute(&storage, Some(args)).await.is_err());
-        }
     }
 }
 

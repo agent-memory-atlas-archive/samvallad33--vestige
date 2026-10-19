@@ -684,7 +684,10 @@ async fn serve() {
                     .unwrap_or(false)
                 {
                     let config = vestige_core::DreamCompileConfig::default();
-                    match vestige_core::run_dream_compile(&*storage_clone, &config) {
+                    match vestige_mcp::tools::dream_compile::run_strata_dream_compile(
+                        &*storage_clone,
+                        &config,
+                    ) {
                         Ok(report) if report.status == "compiled" => {
                             info!(
                                 memories_replayed = report.memories_replayed,

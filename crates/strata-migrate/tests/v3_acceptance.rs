@@ -93,7 +93,7 @@ fn guard_armed() -> bool {
         conn.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
     }
     matches!(
-        vestige_core::SqliteMemoryStore::new(Some(db)),
+        vestige_core::ensure_not_v3(&db),
         Err(vestige_core::storage::StorageError::V3StoreNeedsMigration { .. })
     )
 }
@@ -122,8 +122,7 @@ fn v3_open_refuses_and_leaves_file_byte_identical() {
     let (_dir, db) = copy_fixture("refusal");
     let before = fingerprint(&db);
 
-    // SqliteMemoryStore carries no Debug; match the refusal manually.
-    let err = match vestige_core::SqliteMemoryStore::new(Some(db.clone())) {
+    let err = match vestige_core::ensure_not_v3(&db) {
         Err(e) => e,
         Ok(_) => panic!("v3 store must be refused"),
     };
@@ -161,12 +160,13 @@ fn v3_open_refuses_any_sqlite_file_even_v40() {
         let conn = rusqlite::Connection::open(&db).expect("create");
         conn.execute_batch(
             "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-             INSERT INTO schema_version VALUES (40, '2026-09-28T00:00:00Z');",
+             INSERT INTO schema_version VALUES (40, '2026-09-28T00:00:00Z');
+             PRAGMA user_version = 40;",
         )
         .expect("schema");
     }
 
-    let err = match vestige_core::SqliteMemoryStore::new(Some(db.clone())) {
+    let err = match vestige_core::ensure_not_v3(&db) {
         Err(e) => e,
         Ok(_) => panic!("even a V40 sqlite file must be refused"),
     };
@@ -188,7 +188,7 @@ fn v3_open_refuses_any_sqlite_file_even_v40() {
             .expect("header write");
     }
     assert!(matches!(
-        vestige_core::SqliteMemoryStore::new(Some(bare)),
+        vestige_core::ensure_not_v3(&bare),
         Err(vestige_core::storage::StorageError::V3StoreNeedsMigration { .. })
     ));
 }

@@ -90,9 +90,6 @@ pub enum MemoryStoreError {
     SecretDetected(String),
 }
 
-// Conversion from the legacy SQLite error type (behind `legacy-sqlite`,
-// build/t5-legacy-isolation).
-#[cfg(feature = "legacy-sqlite")]
 impl From<crate::storage::StorageError> for MemoryStoreError {
     fn from(e: crate::storage::StorageError) -> Self {
         use crate::storage::StorageError as S;
@@ -4482,10 +4479,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "legacy-sqlite")]
     use crate::storage::StorageError;
 
-    #[cfg(feature = "legacy-sqlite")]
     #[test]
     fn memory_store_error_from_storage_error() {
         let se = StorageError::NotFound("abc".to_string());

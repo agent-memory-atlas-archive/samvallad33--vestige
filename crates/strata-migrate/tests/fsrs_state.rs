@@ -15,7 +15,6 @@ use strata_migrate::records::{decode_params, KIND_FSRS_STATE, KIND_PARAMS};
 use strata_migrate::{
     migrate, migrate_with_options, read_snapshot, FsrsStateRecord, MigrateOptions, PARAMS_ID,
 };
-use vestige_core::{IngestInput, SqliteMemoryStore};
 
 const DAY_MS: i64 = 86_400_000;
 /// The personalized decay on the real store this regression came from.
@@ -88,51 +87,90 @@ fn planted_rows() -> Vec<Planted> {
 /// A real v3 store with the planted scheduling state, `fsrs_config.w20`
 /// set, and no `fsrs_cards` rows. Returns the node ids in planted order.
 fn build_v3_store(db: &Path) -> Vec<String> {
-    let storage = SqliteMemoryStore::new(Some(db.to_path_buf())).expect("open store");
+    let conn = rusqlite::Connection::open(db).expect("raw sqlite");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+        INSERT INTO schema_version (version, applied_at) VALUES (38, '2026-09-29T00:00:00+00:00');
+        CREATE TABLE knowledge_nodes (
+            id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            node_type TEXT NOT NULL DEFAULT 'fact',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_accessed TEXT NOT NULL,
+            stability REAL NOT NULL DEFAULT 1.0,
+            difficulty REAL NOT NULL DEFAULT 5.0,
+            reps INTEGER NOT NULL DEFAULT 0,
+            lapses INTEGER NOT NULL DEFAULT 0,
+            learning_state TEXT NOT NULL DEFAULT 'new',
+            sentiment_magnitude REAL NOT NULL DEFAULT 0.0,
+            tags TEXT DEFAULT '[]',
+            source TEXT,
+            superseded_by TEXT
+        );
+        CREATE TABLE memory_connections (
+            source_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            strength REAL NOT NULL,
+            link_type TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_activated TEXT NOT NULL,
+            activation_count INTEGER DEFAULT 0,
+            PRIMARY KEY (source_id, target_id)
+        );
+        CREATE TABLE fsrs_cards (
+            memory_id TEXT PRIMARY KEY,
+            difficulty REAL NOT NULL DEFAULT 5.0,
+            stability REAL NOT NULL DEFAULT 1.0,
+            state TEXT NOT NULL DEFAULT 'new',
+            reps INTEGER DEFAULT 0,
+            lapses INTEGER DEFAULT 0,
+            last_review TEXT,
+            due_date TEXT,
+            elapsed_days INTEGER DEFAULT 0,
+            scheduled_days INTEGER DEFAULT 0
+        );
+        CREATE TABLE fsrs_config (
+            key TEXT PRIMARY KEY,
+            value REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .expect("create v3 schema");
+
     let rows = planted_rows();
+    let created = (source_clock() - Duration::days(60)).to_rfc3339();
     let mut ids = Vec::new();
-    for (index, _) in rows.iter().enumerate() {
-        let node = storage
-            .ingest(IngestInput {
-                content: format!("scheduling fixture memory {index}"),
-                node_type: "fact".to_string(),
-                ..Default::default()
-            })
-            .expect("ingest");
-        ids.push(node.id);
-    }
-    {
-        let conn = rusqlite::Connection::open(db).expect("raw sqlite");
-        let created = (source_clock() - Duration::days(60)).to_rfc3339();
-        for (id, row) in ids.iter().zip(&rows) {
-            conn.execute(
-                "UPDATE knowledge_nodes SET stability = ?1, difficulty = ?2, reps = ?3,
-                     lapses = ?4, learning_state = ?5, sentiment_magnitude = ?6,
-                     last_accessed = ?7, created_at = ?8, updated_at = ?8
-                 WHERE id = ?9",
-                rusqlite::params![
-                    row.stability,
-                    row.difficulty,
-                    row.reps,
-                    row.lapses,
-                    row.learning_state,
-                    row.sentiment_magnitude,
-                    row.last_accessed.to_rfc3339(),
-                    created,
-                    id,
-                ],
-            )
-            .expect("plant scheduling");
-        }
-        conn.execute("DELETE FROM fsrs_cards", [])
-            .expect("no cards");
+    for (index, row) in rows.iter().enumerate() {
+        let id = format!("00000000-0000-4000-8000-00000000000{}", index + 1);
         conn.execute(
-            "INSERT OR REPLACE INTO fsrs_config (key, value, updated_at) VALUES ('w20', ?1, ?2)",
-            rusqlite::params![W20, created],
+            "INSERT INTO knowledge_nodes (
+                 id, content, node_type, created_at, updated_at, last_accessed,
+                 stability, difficulty, reps, lapses, learning_state, sentiment_magnitude, tags
+             ) VALUES (?1, ?2, 'fact', ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '[]')",
+            rusqlite::params![
+                id,
+                format!("scheduling fixture memory {index}"),
+                created,
+                row.last_accessed.to_rfc3339(),
+                row.stability,
+                row.difficulty,
+                row.reps,
+                row.lapses,
+                row.learning_state,
+                row.sentiment_magnitude,
+            ],
         )
-        .expect("personalized w20");
+        .expect("plant scheduling");
+        ids.push(id);
     }
-    drop(storage);
+    conn.execute(
+        "INSERT OR REPLACE INTO fsrs_config (key, value, updated_at) VALUES ('w20', ?1, ?2)",
+        rusqlite::params![W20, created],
+    )
+    .expect("personalized w20");
     ids
 }
 

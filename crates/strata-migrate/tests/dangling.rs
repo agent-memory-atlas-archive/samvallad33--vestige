@@ -5,29 +5,65 @@ use std::path::Path;
 
 use strata::StrataLog;
 use strata_migrate::{migrate, migrate_with_options, read_snapshot, MigrateOptions};
-use vestige_core::{IngestInput, SqliteMemoryStore};
 
 const GONE: &str = "00000000-0000-4000-8000-00000000dead";
 
 fn build(db: &Path) -> Vec<String> {
-    let storage = SqliteMemoryStore::new(Some(db.to_path_buf())).expect("open store");
+    let conn = rusqlite::Connection::open(db).expect("raw sqlite");
+    conn.execute_batch(
+        r#"
+        PRAGMA foreign_keys = OFF;
+        CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+        INSERT INTO schema_version (version, applied_at) VALUES (38, '2026-09-01T00:00:00+00:00');
+        CREATE TABLE knowledge_nodes (
+            id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            node_type TEXT NOT NULL DEFAULT 'fact',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_accessed TEXT NOT NULL,
+            tags TEXT DEFAULT '[]',
+            source TEXT,
+            superseded_by TEXT
+        );
+        CREATE TABLE memory_connections (
+            source_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            strength REAL NOT NULL,
+            link_type TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_activated TEXT NOT NULL,
+            activation_count INTEGER DEFAULT 0,
+            PRIMARY KEY (source_id, target_id)
+        );
+        CREATE TABLE fsrs_cards (
+            memory_id TEXT PRIMARY KEY,
+            difficulty REAL NOT NULL DEFAULT 5.0,
+            stability REAL NOT NULL DEFAULT 1.0,
+            state TEXT NOT NULL DEFAULT 'new',
+            reps INTEGER DEFAULT 0,
+            lapses INTEGER DEFAULT 0,
+            last_review TEXT,
+            due_date TEXT,
+            elapsed_days INTEGER DEFAULT 0,
+            scheduled_days INTEGER DEFAULT 0
+        );
+        "#,
+    )
+    .unwrap();
+    let now = "2026-09-01T00:00:00+00:00";
     let ids: Vec<String> = (0..3)
         .map(|i| {
-            storage
-                .ingest(IngestInput {
-                    content: format!("dangling fixture memory {i}"),
-                    node_type: "fact".to_string(),
-                    ..Default::default()
-                })
-                .expect("ingest")
-                .id
+            let id = format!("00000000-0000-4000-8000-00000000000{}", i + 1);
+            conn.execute(
+                "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, tags)
+                 VALUES (?1, ?2, 'fact', ?3, ?3, ?3, '[]')",
+                rusqlite::params![id, format!("dangling fixture memory {i}"), now],
+            )
+            .expect("insert node");
+            id
         })
         .collect();
-    drop(storage);
-    let conn = rusqlite::Connection::open(db).expect("raw sqlite");
-    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
-    conn.execute("DELETE FROM fsrs_cards", []).unwrap();
-    let now = "2026-09-01T00:00:00+00:00";
     let edge = |s: &str, t: &str| {
         conn.execute(
             "INSERT INTO memory_connections (source_id, target_id, strength, link_type,

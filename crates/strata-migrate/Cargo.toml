@@ -60,12 +60,11 @@ vestige-core = { path = "../vestige-core", default-features = false }
 # `rusqlite` above is also used by tests to plant synthetic fixture rows.
 
 [dev-dependencies]
-# Fixture tooling builds synthetic v3 stores through the real migration
-# path; test builds only — never unified into the shipped binary.
+# Fixture tooling builds synthetic v3 stores through raw rusqlite;
 # default-features stays off so a future vestige-core default cannot unify
 # `connectors` into this test build. `codebase-git` is the current core default
 # and is named explicitly so the test graph does not depend on that default.
-vestige-core = { path = "../vestige-core", default-features = false, features = ["codebase-git", "bundled-sqlite", "v3-engine"] }
+vestige-core = { path = "../vestige-core", default-features = false, features = ["codebase-git"] }
 
 [[bin]]
 name = "make-v3-fixture"
