@@ -124,6 +124,23 @@ stop("force-push", "git push --force origin main", "OP-004")
 stop("recursive delete of a home folder", "rm -rf ~/Documents", "OP-003")
 allow("plain build command", "cargo check 2>&1 | tail -5")
 
+# 0.3.10 shell/parser/classifier bypasses (2000s / 2010s / 2020s) and benign controls
+stop("3-level nested command substitution", "echo $(echo $(rm -rf ~/Documents))", "OP-003")
+stop("command substitution inside $((...))", "echo $(( $(rm -rf ~/Documents) + 1 ))", "OP-003")
+stop("parameter expansion fallback ${X:-...}", "X=''; rm -rf ${X:-~/Documents}", "OP-003")
+stop("CVE-2026-29783 prompt expansion ${a@P}", 'a=\'\\$(rm -rf ~/Documents)\'; echo "${a@P}"', "OP-003")
+stop("CVE-2026-29783 single-segment := and @P", ': "${a:=rm -rf ~/Documents}" "${a@P}"', "OP-003")
+stop("CVE-2026-29783 indirect expansion ${!b}", 'a="rm -rf ~/Documents"; b=a; ${!b}', "OP-003")
+stop("bash arithmetic subscript in let", "let 'a[$(rm -rf ~/Documents)]'", "OP-003")
+stop("env -S split-string wrapper", 'env -S "rm -rf" ~/Documents', "OP-003")
+stop("sudo -u root wrapper", "sudo -u root rm -rf ~/Documents", "OP-003")
+stop("xargs -I{} replacement token", "echo ~/Documents | xargs -I{} rm -rf {}", "OP-003")
+stop("2010s brace command expansion", "{rm,-rf,~/Documents}", "OP-003")
+stop("2010s Shellshock function export", "env x='() { :;}; rm -rf ~/Documents' bash -c :", "OP-003")
+stop("2020s CVE-2026-72718 git -c core.fsmonitor", 'git -c core.fsmonitor="rm -rf ~/Documents" status', "OP-008")
+allow("benign git -c core.fsmonitor=false status", "git -c core.fsmonitor=false status")
+allow("benign tar -I zstd archive", "tar -I zstd -cf /tmp/opgate-archive.tar.zst README.md")
+
 # the stop message an agent reads right after a stop: three lines, the rule and the receipt,
 # what to do next (no retry, ask precedent), and who can allow it once
 p = subprocess.run([sys.executable, GATE, "hook", "--source", "claude"],
