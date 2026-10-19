@@ -150,8 +150,8 @@ pub fn v3_rw_guard_armed() -> bool {
     false
 }
 
-fn read_schema_version(_path: &Path, _header: &[u8; 100]) -> u32 {
-    0
+fn read_schema_version(_path: &Path, header: &[u8; 100]) -> u32 {
+    u32::from_be_bytes([header[60], header[61], header[62], header[63]])
 }
 
 #[cfg(test)]

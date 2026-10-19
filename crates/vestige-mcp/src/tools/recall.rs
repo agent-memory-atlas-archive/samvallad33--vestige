@@ -66,7 +66,7 @@ pub fn schema() -> Value {
                 "handle".to_string(),
                 serde_json::json!({
                     "type": "string",
-                    "description": "[handle mode] Exact handle: a full memory id or an exact tag (case-sensitive); a unique id prefix of 8+ characters also resolves. Commit sha, file path, symbol, test name, run id and tool-call id handles resolve on the legacy engine only. No fuzzy or lexical matching. Passing this key (even empty) switches recall to handle mode: a resolvable handle returns the node payloads plus one-hop recorded-edge neighbors; anything else returns the handle_required error with exact candidates."
+                    "description": "[handle mode] Exact handle: a full memory id or an exact tag (case-sensitive); a unique id prefix of 8+ characters also resolves. Commit sha, file path, symbol, test name, run id and tool-call id handles resolve on the legacy engine only. No fuzzy or lexical matching. Passing this key (even empty) switches recall to handle mode: a resolvable handle returns the node payloads (tag recall sorts newest first before cutting to limit) plus one-hop recorded-edge neighbors (200-char preview, 80 when repeated; pass detail_level='full_neighbors' for full neighbor text or call memory(action='get') on one neighbor); anything else returns the handle_required error with exact candidates."
                 }),
             );
             props.insert(
@@ -303,17 +303,37 @@ fn handle_resolution_payload(
     detail_level: &str,
 ) -> Value {
     if !resolution.ids.is_empty() {
-        let total_nodes = resolution.ids.len();
-        let active_ids: &[String] = match limit {
-            Some(l) if l < resolution.ids.len() => &resolution.ids[..l],
-            _ => &resolution.ids,
-        };
-        let nodes: Vec<Value> = active_ids
+        let mut indexed_nodes: Vec<(usize, String, KnowledgeNode)> = resolution
+            .ids
             .iter()
-            .filter_map(|id| storage.get_node(id).ok().flatten())
-            .map(|n| node_payload_with_detail(n, detail_level))
+            .enumerate()
+            .filter_map(|(idx, id)| {
+                storage
+                    .get_node(id)
+                    .ok()
+                    .flatten()
+                    .map(|node| (idx, id.clone(), node))
+            })
             .collect();
-        let neighbors = one_hop_neighbors(storage, active_ids);
+        let total_nodes = indexed_nodes.len();
+        if indexed_nodes.len() > 1 {
+            // Sort newest first before cutting to `limit`; ties break by later
+            // position in the append-only log (`idx_b > idx_a`).
+            indexed_nodes.sort_by(|(idx_a, _, a), (idx_b, _, b)| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| idx_b.cmp(idx_a))
+            });
+        }
+        if let Some(l) = limit {
+            indexed_nodes.truncate(l);
+        }
+        let active_ids: Vec<String> = indexed_nodes.iter().map(|(_, id, _)| id.clone()).collect();
+        let nodes: Vec<Value> = indexed_nodes
+            .into_iter()
+            .map(|(_, _, n)| node_payload_with_detail(n, detail_level))
+            .collect();
+        let neighbors = one_hop_neighbors(storage, &active_ids, detail_level);
         let mut out = serde_json::json!({
             "handle": handle,
             "kind": resolution.kind.as_str(),
@@ -447,11 +467,15 @@ fn node_payload_with_detail(node: KnowledgeNode, detail_level: &str) -> Value {
     }
 }
 
-fn neighbor_node_payload(node: KnowledgeNode, max_chars: usize) -> Value {
+fn neighbor_node_payload(node: KnowledgeNode, max_chars: Option<usize>) -> Value {
+    let content = match max_chars {
+        Some(limit) => truncate_content(&node.content, limit),
+        None => node.content,
+    };
     serde_json::json!({
         "id": node.id,
         "type": node.node_type,
-        "content": truncate_content(&node.content, max_chars),
+        "content": content,
         "tags": node.tags,
         "createdAt": node.created_at.to_rfc3339(),
     })
@@ -459,12 +483,14 @@ fn neighbor_node_payload(node: KnowledgeNode, max_chars: usize) -> Value {
 
 /// One hop over `memory_connections` typed edges, strongest first, deduped,
 /// capped. Each neighbor entry carries the edge (link_type + strength +
-/// direction) and a bounded neighbor node preview so multi-KB bodies are not
-/// duplicated across up to 20 edges.
-fn one_hop_neighbors(storage: &Arc<Storage>, ids: &[String]) -> Vec<Value> {
+/// direction) and a bounded neighbor node preview (unless `detail_level` is
+/// `"full_neighbors"`) so multi-KB bodies are not duplicated across up to 20
+/// edges.
+fn one_hop_neighbors(storage: &Arc<Storage>, ids: &[String], detail_level: &str) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     let mut seen_edges: Vec<(String, String)> = Vec::new();
     let mut seen_nodes: std::collections::HashSet<String> = ids.iter().cloned().collect();
+    let full_neighbors = detail_level == "full_neighbors";
     for id in ids {
         let connections = match storage.get_connections_for_memory(id) {
             Ok(conns) => conns,
@@ -484,10 +510,13 @@ fn one_hop_neighbors(storage: &Arc<Storage>, ids: &[String]) -> Vec<Value> {
             } else {
                 edge.source_id.clone()
             };
-            let max_chars = if seen_nodes.insert(other.clone()) {
-                200
+            let first_seen = seen_nodes.insert(other.clone());
+            let max_chars = if full_neighbors {
+                None
+            } else if first_seen {
+                Some(200)
             } else {
-                80
+                Some(80)
             };
             let node = storage
                 .get_node(&other)
@@ -656,13 +685,14 @@ mod strata_query {
     #[tokio::test]
     async fn recall_respects_limit_and_detail_level_on_tag_handles() {
         let (storage, _dir, _tagged, _other) = store();
-        storage
+        let second = storage
             .ingest(IngestInput {
                 content: "second deploy-env memory with extra payload".to_string(),
                 tags: vec!["deploy-env".to_string()],
                 ..Default::default()
             })
-            .unwrap();
+            .unwrap()
+            .id;
         let out = recall(
             &storage,
             serde_json::json!({
@@ -676,6 +706,59 @@ mod strata_query {
         let nodes = out["nodes"].as_array().unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(out["totalNodes"], 2);
+        assert_eq!(
+            nodes[0]["id"], second,
+            "tag recall must sort newest first before cutting to limit"
+        );
         assert!(nodes[0].get("content").is_none());
+    }
+
+    #[tokio::test]
+    async fn recall_neighbor_preview_truncates_by_default_and_full_neighbors_expands() {
+        let (storage, _dir, tagged, _other) = store();
+        let long_neighbor_text = "N".repeat(320);
+        let neighbor_id = storage
+            .ingest(IngestInput {
+                content: long_neighbor_text.clone(),
+                tags: vec!["neighbor-tag".to_string()],
+                ..Default::default()
+            })
+            .unwrap()
+            .id;
+        let now = chrono::Utc::now();
+        storage
+            .save_connection(&vestige_core::ConnectionRecord {
+                source_id: tagged.clone(),
+                target_id: neighbor_id.clone(),
+                strength: 0.9,
+                link_type: "derived_from".to_string(),
+                created_at: now,
+                last_activated: now,
+                activation_count: 1,
+            })
+            .unwrap();
+
+        let default_out = recall(&storage, serde_json::json!({ "handle": tagged }))
+            .await
+            .unwrap();
+        let preview = default_out["neighbors"][0]["node"]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(preview.chars().count(), 201, "200 chars + ellipsis");
+        assert!(preview.ends_with('…'));
+
+        let full_out = recall(
+            &storage,
+            serde_json::json!({
+                "handle": tagged,
+                "detail_level": "full_neighbors"
+            }),
+        )
+        .await
+        .unwrap();
+        let full_neighbor = full_out["neighbors"][0]["node"]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(full_neighbor, long_neighbor_text);
     }
 }

@@ -13,79 +13,140 @@ use strata::StrataLog;
 use strata_kernel::event::ReviewEvent;
 use strata_kernel::fsrs::{CardPhase, ALGO_V1};
 use strata_kernel::kernel::Kernel;
-use vestige_core::{ConnectionRecord, IngestInput, SqliteMemoryStore};
 
 use strata_migrate::{migrate, read_snapshot};
 
 /// Build a small populated store at `db`, optionally exporting its portable
-/// archive to `archive_out` while the (single, legitimate) read-write
-/// handle is open — a built store carries the SQLite magic, so 4.0 refuses
-/// any later read-write open by design. Returns the ingested node ids.
+/// archive to `archive_out`. Returns the ingested node ids.
 fn build_store(db: &std::path::Path, archive_out: Option<&std::path::Path>) -> Vec<String> {
-    let storage = SqliteMemoryStore::new(Some(db.to_path_buf())).expect("open store");
+    let conn = rusqlite::Connection::open(db).expect("open raw sqlite");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+        INSERT INTO schema_version (version, applied_at) VALUES (38, '2026-09-28T00:00:00Z');
+        CREATE TABLE knowledge_nodes (
+            id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            node_type TEXT NOT NULL DEFAULT 'fact',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_accessed TEXT NOT NULL,
+            stability REAL NOT NULL DEFAULT 1.0,
+            difficulty REAL NOT NULL DEFAULT 5.0,
+            reps INTEGER NOT NULL DEFAULT 0,
+            lapses INTEGER NOT NULL DEFAULT 0,
+            learning_state TEXT NOT NULL DEFAULT 'new',
+            sentiment_magnitude REAL NOT NULL DEFAULT 0.0,
+            tags TEXT DEFAULT '[]',
+            source TEXT,
+            superseded_by TEXT
+        );
+        CREATE TABLE memory_connections (
+            source_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            strength REAL NOT NULL,
+            link_type TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_activated TEXT NOT NULL,
+            activation_count INTEGER DEFAULT 0,
+            PRIMARY KEY (source_id, target_id)
+        );
+        CREATE TABLE fsrs_cards (
+            memory_id TEXT PRIMARY KEY,
+            difficulty REAL NOT NULL DEFAULT 5.0,
+            stability REAL NOT NULL DEFAULT 1.0,
+            state TEXT NOT NULL DEFAULT 'new',
+            reps INTEGER DEFAULT 0,
+            lapses INTEGER DEFAULT 0,
+            last_review TEXT,
+            due_date TEXT,
+            elapsed_days INTEGER DEFAULT 0,
+            scheduled_days INTEGER DEFAULT 0
+        );
+        CREATE TABLE sync_tombstones (
+            table_name TEXT NOT NULL,
+            row_id TEXT NOT NULL,
+            deleted_at TEXT NOT NULL,
+            reason TEXT,
+            PRIMARY KEY (table_name, row_id)
+        );
+        CREATE TABLE deletion_tombstones (
+            memory_id TEXT PRIMARY KEY,
+            deleted_at TEXT NOT NULL,
+            reason TEXT,
+            node_type TEXT NOT NULL,
+            tags TEXT NOT NULL DEFAULT '[]',
+            edges_pruned INTEGER NOT NULL DEFAULT 0,
+            insights_rewritten INTEGER NOT NULL DEFAULT 0,
+            insights_deleted INTEGER NOT NULL DEFAULT 0,
+            children_orphaned INTEGER NOT NULL DEFAULT 0
+        );
+        "#,
+    )
+    .expect("create schema");
 
-    let inputs = [
-        IngestInput {
-            content: "Rust borsh encodes enums as u8 ordinals".to_string(),
-            node_type: "fact".to_string(),
-            tags: vec!["rust".to_string(), "wire".to_string()],
-            ..Default::default()
-        },
-        IngestInput {
-            content: "STRATA seals signed segment trailers".to_string(),
-            node_type: "fact".to_string(),
-            tags: vec!["strata".to_string()],
-            ..Default::default()
-        },
-        IngestInput {
-            content: "Run the migration once, then write new memories to STRATA".to_string(),
-            node_type: "procedure".to_string(),
-            tags: vec![],
-            ..Default::default()
-        },
+    let now = Utc::now().to_rfc3339();
+    let rows = [
+        (
+            "11111111-1111-4111-8111-111111111111",
+            "Rust borsh encodes enums as u8 ordinals",
+            "fact",
+            r#"["rust","wire"]"#,
+        ),
+        (
+            "22222222-2222-4222-8222-222222222222",
+            "STRATA seals signed segment trailers",
+            "fact",
+            r#"["strata"]"#,
+        ),
+        (
+            "33333333-3333-4333-8333-333333333333",
+            "Run the migration once, then write new memories to STRATA",
+            "procedure",
+            "[]",
+        ),
     ];
     let mut ids = Vec::new();
-    for input in inputs {
-        let node = storage.ingest(input).expect("ingest");
-        ids.push(node.id.clone());
+    for (id, content, node_type, tags) in rows {
+        conn.execute(
+            "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, tags)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?4, ?5)",
+            rusqlite::params![id, content, node_type, now, tags],
+        )
+        .expect("insert node");
+        ids.push(id.to_string());
     }
 
-    let now = Utc::now();
-    storage
-        .save_connection(&ConnectionRecord {
-            source_id: ids[0].clone(),
-            target_id: ids[1].clone(),
-            strength: 0.75,
-            link_type: "semantic".to_string(),
-            created_at: now,
-            last_activated: now,
-            activation_count: 3,
-        })
-        .expect("save connection");
+    conn.execute(
+        "INSERT INTO memory_connections (source_id, target_id, strength, link_type, created_at, last_activated, activation_count)
+         VALUES (?1, ?2, 0.75, 'semantic', ?3, ?3, 3)",
+        rusqlite::params![ids[0], ids[1], now],
+    )
+    .expect("save connection");
 
-    // Plant FSRS review history while the store handle is open: a separate
-    // raw connection commits the rows, and the export below must see them.
-    // (The public API does not create review history.)
-    {
-        let conn = rusqlite::Connection::open(db).expect("open raw sqlite");
-        for (memory_id, reps, lapses) in [(&ids[0], 4i64, 1i64), (&ids[1], 2, 0)] {
-            conn.execute(
-                "INSERT OR REPLACE INTO fsrs_cards (
-                     memory_id, difficulty, stability, state, reps, lapses,
-                     last_review, due_date, elapsed_days, scheduled_days
-                 ) VALUES (?1, 5.0, 3.2, 'review', ?2, ?3, ?4, ?4, 1, 1)",
-                rusqlite::params![memory_id, reps, lapses, now.to_rfc3339(),],
-            )
-            .expect("plant fsrs_cards");
-        }
+    for (memory_id, reps, lapses) in [(&ids[0], 4i64, 1i64), (&ids[1], 2, 0)] {
+        conn.execute(
+            "INSERT OR REPLACE INTO fsrs_cards (
+                 memory_id, difficulty, stability, state, reps, lapses,
+                 last_review, due_date, elapsed_days, scheduled_days
+             ) VALUES (?1, 5.0, 3.2, 'review', ?2, ?3, ?4, ?4, 1, 1)",
+            rusqlite::params![memory_id, reps, lapses, now],
+        )
+        .expect("plant fsrs_cards");
     }
+    drop(conn);
 
     if let Some(archive_path) = archive_out {
-        storage
-            .export_portable_archive_to_path(archive_path)
-            .expect("export archive");
+        let mut scratch = strata_migrate::source::Scratch::new(db.parent().unwrap());
+        let (files, _) = strata_migrate::source::prepare_source(db, false, &mut scratch)
+            .expect("prepare source");
+        let snapshot = strata_migrate::source::load_snapshot(&files).expect("load snapshot");
+        std::fs::write(
+            archive_path,
+            serde_json::to_vec(&snapshot.archive).expect("serialize archive"),
+        )
+        .expect("write archive");
     }
-    drop(storage);
 
     ids
 }
@@ -296,14 +357,20 @@ fn directory_source_resolves_vestige_db() {
 #[test]
 fn empty_store_migrates_to_verifying_log() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let db = tmp.path().join("vestige.db");
     let archive_path = tmp.path().join("empty.json");
-    {
-        let storage = SqliteMemoryStore::new(Some(db)).expect("open");
-        storage
-            .export_portable_archive_to_path(&archive_path)
-            .expect("export");
-    }
+    let empty_archive = vestige_core::PortableArchive {
+        archive_format: strata_migrate::source::PORTABLE_ARCHIVE_FORMAT.to_string(),
+        vestige_version: "3.1.1".to_string(),
+        schema_version: 38,
+        exported_at: Utc::now(),
+        mode: "exact".to_string(),
+        tables: Vec::new(),
+    };
+    std::fs::write(
+        &archive_path,
+        serde_json::to_vec(&empty_archive).expect("serialize empty archive"),
+    )
+    .expect("write empty archive");
 
     let report = migrate(&archive_path, &tmp.path().join("strata")).expect("migrate empty");
     assert_eq!(report.nodes, 0);

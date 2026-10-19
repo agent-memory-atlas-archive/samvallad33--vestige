@@ -59,8 +59,8 @@ pub fn schema() -> Value {
             },
             "detail_level": {
                 "type": "string",
-                "description": "'brief': id, type, tags, score. 'summary' (default): 8 fields. 'full': everything, including FSRS state.",
-                "enum": ["brief", "summary", "full"],
+                "description": "'brief': id, type, tags, createdAt (no content). 'summary': 240-char content preview. 'full' (default on handle recall): full node content; one-hop neighbors get a 200-char preview (80 when repeated; read one in full with memory(action='get')). 'full_neighbors': full content on both nodes and one-hop neighbors.",
+                "enum": ["brief", "summary", "full", "full_neighbors"],
                 "default": "summary"
             },
             "context_topics": {
@@ -299,9 +299,9 @@ pub async fn execute(
         .detail_level
         .as_deref()
         .unwrap_or(&output_config.detail_level);
-    if !matches!(detail_level, "brief" | "full" | "summary") {
+    if !matches!(detail_level, "brief" | "full" | "summary" | "full_neighbors") {
         return Err(format!(
-            "Invalid detail_level '{}'. Must be 'brief', 'summary', or 'full'.",
+            "Invalid detail_level '{}'. Must be 'brief', 'summary', 'full', or 'full_neighbors'.",
             detail_level
         ));
     }

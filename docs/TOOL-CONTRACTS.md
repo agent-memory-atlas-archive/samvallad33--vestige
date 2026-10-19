@@ -81,9 +81,12 @@ runs `gh` or a local test suite, but `ghostlink` is not marked open-world.
 Find records by exact handle: `handle` is a record id, a unique id prefix (8+ characters)
 or an exact tag. Lookup order is exact id, then unique prefix, then exact tag.
 
-- A tag returns **every** live record carrying it, from every scope, with `nodes` (`id`,
+- A tag returns live records carrying it newest first, from every scope, with `nodes` (`id`,
   `type`, `content`, `tags`, `createdAt`) and the one-hop recorded `neighbors` (direction,
-  `link_type`, strength; at most 20 edges). It ignores `limit`.
+  `link_type`, strength, and a 200-character preview, 80 when repeated; at most 20 edges;
+  pass `detail_level: "full_neighbors"` or call `memory(action="get")` for full neighbor text).
+  Honors `limit` (cutting after sorting newest first and reporting `totalNodes` when truncated)
+  and `detail_level` (`brief`, `summary`, `full`, `full_neighbors`).
 - An ambiguous prefix is refused as `ambiguous`, with its `candidates`.
 - A miss is `handle_required` (with `candidates: []`), not an empty list. Free text is
   never split into words to look for a tag or an id inside it (4.2.0): only the whole
