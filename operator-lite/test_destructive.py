@@ -295,7 +295,7 @@ CASES = [
     ('OP-008', 'proj', 'openssl engine -t /tmp/evil.so'),
     # Group 4: Symlink aliasing & in-command symlink escape closure
     ('OP-000', 'proj', 'ln -s ~/.operator ./op_link'),
-    ('OP-002', 'proj', 'ln -s "$HOME/Library/Application Support/com.vestige.core" ./v_link'),
+    ('OP-002', 'proj', 'ln -s "$HOME/Library/Application Support/com.vestige.core" ./v_link' if MAC else 'ln -s ~/.local/share/vestige ./v_link'),
     ('OP-011', 'proj', 'ln -s ~/.ssh ./ssh_link'),
     ('OP-003', 'proj', 'ln -s ~/Documents ./docs_link && rm -rf ./docs_link'),
     # Group 6: Background daemon, detached multiplexer & scheduler persistence (`OP-008` Enforce)
