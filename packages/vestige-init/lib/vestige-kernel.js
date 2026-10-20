@@ -204,26 +204,32 @@ function isRulesHook(command) {
   return typeof command === 'string' && /vestige/.test(command) && /\bhook\s+session-start\b/.test(command);
 }
 
+// ~/.claude/settings.json as an object, or a review result. A settings file that does not parse is
+// the owner's file mid-edit and is left as it is.
+function readSettings(settingsPath) {
+  if (!fs.existsSync(settingsPath)) return { settings: {} };
+  const raw = fs.readFileSync(settingsPath, 'utf8');
+  let settings;
+  try {
+    settings = raw.trim() ? JSON.parse(raw) : {};
+  } catch (error) {
+    return { review: { status: 'review', settingsPath, reason: `${settingsPath} is not valid JSON (${error.message}); it was left as it is` } };
+  }
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    return { review: { status: 'review', settingsPath, reason: `${settingsPath} does not hold a JSON object; it was left as it is` } };
+  }
+  return { settings };
+}
+
 // Step 04: register `vestige hook session-start` for Claude Code, merged into ~/.claude/settings.json.
 // The hook reads only: at every startup, resume, clear and compact it hands the session the decision
 // and correction memories tagged `pinned` (and the tags in a repo's .vestige-rules), by exact tag.
-// A settings file that does not parse is the owner's file mid-edit and is left as it is.
 function wireRulesHook(vestigeBin, { home = os.homedir(), dryRun = false, writeJson } = {}) {
   if (!hasClaudeCode(home)) return { status: 'skipped', reason: 'Claude Code is not installed here' };
   if (!vestigeBin || (!dryRun && !fs.existsSync(vestigeBin))) return { status: 'skipped', reason: 'the vestige binary was not found beside vestige-mcp' };
   const settingsPath = path.join(home, '.claude', 'settings.json');
-  let settings = {};
-  if (fs.existsSync(settingsPath)) {
-    const raw = fs.readFileSync(settingsPath, 'utf8');
-    try {
-      settings = raw.trim() ? JSON.parse(raw) : {};
-    } catch (error) {
-      return { status: 'review', settingsPath, reason: `${settingsPath} is not valid JSON (${error.message}); it was left as it is` };
-    }
-    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
-      return { status: 'review', settingsPath, reason: `${settingsPath} does not hold a JSON object; it was left as it is` };
-    }
-  }
+  const { settings, review } = readSettings(settingsPath);
+  if (review) return review;
   const hooks = settings.hooks && typeof settings.hooks === 'object' ? settings.hooks : {};
   const groups = Array.isArray(hooks.SessionStart) ? hooks.SessionStart : [];
   const present = groups.some((group) => Array.isArray(group && group.hooks) && group.hooks.some((hook) => isRulesHook(hook && hook.command)));
@@ -236,6 +242,77 @@ function wireRulesHook(vestigeBin, { home = os.homedir(), dryRun = false, writeJ
   groups.push({ matcher: RULES_MATCHER, hooks: [{ type: 'command', command, timeout: 10 }] });
   const backupPath = writeJson(settingsPath, settings);
   return { status: 'written', settingsPath, command, backupPath };
+}
+
+// The stop-to-memory hook (hooks/operator-stop-memory.py): every Operator stop becomes a Vestige
+// memory derived_from a memory for its rule, and the agent is told the exact handle that recalls it.
+// It ships in this package and is copied to a fixed place, because npx runs from a cache that does
+// not last.
+const STOP_MEMORY_EVENTS = ['PostToolUse', 'UserPromptSubmit', 'Stop', 'SessionStart'];
+const STOP_MEMORY_MATCHERS = { PostToolUse: '*', SessionStart: RULES_MATCHER };
+
+function stopMemorySource() {
+  return path.join(__dirname, '..', 'hooks', 'operator-stop-memory.py');
+}
+
+function stopMemoryTarget(home = os.homedir()) {
+  return path.join(home, '.vestige', 'hooks', 'operator-stop-memory.py');
+}
+
+function hookVersion(file) {
+  try {
+    const match = /^VERSION = "(\d+\.\d+\.\d+)"/m.exec(fs.readFileSync(file, 'utf8'));
+    return match ? parseVersion(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+function isStopMemoryHook(command) {
+  return typeof command === 'string' && /operator-stop-memory\.py/.test(command);
+}
+
+function stopMemoryCommand(hookPath, mcpBin, platform = os.platform()) {
+  return `${platform === 'win32' ? 'python' : 'python3'} ${shellQuote(hookPath)} --mcp ${shellQuote(mcpBin)}`;
+}
+
+// Step 05, second half: once a gate is in place, its stops become memory. Copies the hook (an
+// installed copy as new as this one is kept) and registers it in ~/.claude/settings.json, once per
+// event, beside every hook already there: PostToolUse, UserPromptSubmit and Stop record new stops,
+// and SessionStart hands each new session the recent ones with the handles that recall them.
+function wireStopMemoryHook(mcpBin, { home = os.homedir(), dryRun = false, writeJson, source = stopMemorySource(), platform = os.platform() } = {}) {
+  if (!hasClaudeCode(home)) return { status: 'skipped', reason: 'Claude Code is not installed here' };
+  if (!mcpBin || (!dryRun && !fs.existsSync(mcpBin))) return { status: 'skipped', reason: 'vestige-mcp was not found' };
+  if (!fs.existsSync(source)) return { status: 'skipped', reason: 'the stop-memory hook did not come with this package' };
+  const settingsPath = path.join(home, '.claude', 'settings.json');
+  const { settings, review } = readSettings(settingsPath);
+  if (review) return review;
+  const hooks = settings.hooks && typeof settings.hooks === 'object' ? settings.hooks : {};
+  const wired = (event) => Array.isArray(hooks[event]) && hooks[event].some((group) =>
+    Array.isArray(group && group.hooks) && group.hooks.some((hook) => isStopMemoryHook(hook && hook.command)));
+  const events = STOP_MEMORY_EVENTS.filter((event) => !wired(event));
+
+  const target = stopMemoryTarget(home);
+  const command = stopMemoryCommand(target, mcpBin, platform);
+  const sourceVersion = hookVersion(source);
+  const targetVersion = hookVersion(target);
+  const copy = !targetVersion || Boolean(sourceVersion && compareVersions(sourceVersion, targetVersion) > 0);
+  if (dryRun) return { status: 'planned', settingsPath, command, target, events, copy };
+
+  if (copy) {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    placeFile(source, target);
+  }
+  if (events.length === 0) return { status: 'present', settingsPath, target, copied: copy };
+  settings.hooks = hooks;
+  for (const event of events) {
+    const groups = Array.isArray(hooks[event]) ? hooks[event] : [];
+    const entry = { type: 'command', command, timeout: 30 };
+    groups.push(STOP_MEMORY_MATCHERS[event] ? { matcher: STOP_MEMORY_MATCHERS[event], hooks: [entry] } : { hooks: [entry] });
+    hooks[event] = groups;
+  }
+  const backupPath = writeJson(settingsPath, settings);
+  return { status: 'written', settingsPath, command, target, events, copied: copy, backupPath };
 }
 
 function gateLauncher() {
@@ -317,6 +394,12 @@ module.exports = {
   hasClaudeCode,
   isRulesHook,
   wireRulesHook,
+  STOP_MEMORY_EVENTS,
+  stopMemorySource,
+  stopMemoryTarget,
+  stopMemoryCommand,
+  isStopMemoryHook,
+  wireStopMemoryHook,
   gateLauncher,
   gateVersion,
   installGate,

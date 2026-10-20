@@ -12,7 +12,7 @@ Run it in your own terminal. In order, it:
 2. **Opens your Strata memory.** It starts `vestige-mcp` once, the way a client would, which creates the store, and checks that it answers with its 18 tools. Strata is an append-only, hash-chained log: every write passes a gate and leaves a receipt, and a memory is found by its exact id or tag, never by vector similarity.
 3. **Connects your clients.** Claude Code, Claude Desktop, Cursor, VS Code, OpenCode, Xcode, JetBrains and Windsurf, whichever it finds. Each file is backed up before it changes.
 4. **Adds the rules hook.** In Claude Code, `vestige hook session-start` hands every new session, and every session after a compaction, the decisions and corrections you tagged `pinned`, each with its memory id. It only reads, and it prints nothing when there is nothing to say.
-5. **Installs Operator Lite,** the free gate, in enforce mode, and wires every agent host it finds. From your agent's next tool call, every command a STOP rule matches is stopped before it runs, with a hash-chained receipt for every decision.
+5. **Installs Operator Lite,** the free gate, in enforce mode, and wires every agent host it finds. From your agent's next tool call, every command a STOP rule matches is stopped before it runs, with a hash-chained receipt for every decision. In Claude Code it then closes the loop: every stop becomes a Vestige memory linked to the rule that caught it, the agent is told the exact handle that recalls it, and each new session starts knowing what was stopped on this machine in the last seven days, so it takes the safe path instead of trying the same thing again.
 6. **Checks the gate.** The gate replays the 46-case GuardFall bypass corpus it carries. It classifies every command and runs none.
 
 Then it prints what it configured, and what to verify once you restart your clients.
@@ -33,7 +33,7 @@ One stop from your own machine: what the agent tried and the gate stopping it, i
 | `--yes` | Connect every detected client without a prompt |
 | `--client <name>` | Connect one client (`claude-code`, `cursor`, `vscode`, `opencode`, `xcode`, `jetbrains`, `windsurf`) |
 | `--no-gate` | Skip Operator Lite |
-| `--no-hooks` | Skip the Claude Code rules hook |
+| `--no-hooks` | Skip the Claude Code hooks (the rules hook and stops to memory) |
 | `--json` | Print a machine-readable result |
 
 ## What it never does

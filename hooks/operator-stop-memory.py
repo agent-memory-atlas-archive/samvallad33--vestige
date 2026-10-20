@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""operator-stop-memory: every Operator stop becomes a Vestige memory. An opt-in Claude Code hook.
+"""operator-stop-memory: every Operator stop becomes a Vestige memory. A Claude Code hook that
+`npx @vestige/init` registers once a gate is installed.
 
 The Operator gate (Lite or paid) writes a hash-chained receipt for every verdict to
 ~/.operator/receipts/<UTC date>.jsonl. This hook reads the STOP receipts it has not recorded yet and
@@ -14,7 +15,8 @@ recall it later by exact handle:
 These are the handles `recall` and the PRECEDENT journey (`npx @vestige/init`) look up. A stop already
 in memory under its op-receipt tag, from this hook or any other writer, is not written again.
 
-Write path: the hook starts `vestige-mcp` (VESTIGE_MCP_BIN, else the one on PATH). It attaches to the
+Write path: the hook starts `vestige-mcp` (the --mcp <path> argument, else VESTIGE_MCP_BIN, else the one on
+PATH; `npx @vestige/init` registers it with --mcp so no PATH is needed). It attaches to the
 server that already owns the store, or opens the store when none does, and the hook speaks MCP over its
 stdin: initialize, notifications/initialized, then tools/call. A write from here passes the same gate and
 gets the same receipt as an agent's own smart_ingest.
@@ -22,12 +24,16 @@ gets the same receipt as an agent's own smart_ingest.
 The hook never blocks a tool call. It works within a time budget, logs any failure to
 ~/.operator/state/stop-memory.log, tries that stop again on a later call, and always exits 0. On
 PostToolUse and UserPromptSubmit it tells the agent, as additional context, which stops of its own
-session it just recorded and the handle that recalls each one.
+session it just recorded and the handle that recalls each one. On SessionStart it hands the new session
+the most recent stops it recorded on this machine (the last RECENT_DAYS days, at most RECENT_SHOWN), each
+with its handle, so the next session knows what was stopped and why before it tries the same thing.
 
-Wire it after the gate's own PreToolUse hook: hooks/settings.stop-memory.fragment.json.
+Wire it after the gate's own PreToolUse hook: hooks/settings.stop-memory.fragment.json, or let
+`npx @vestige/init` do it, which copies this file to ~/.vestige/hooks/ once Operator Lite is installed.
 Env: OPERATOR_HOME (default ~/.operator), VESTIGE_MCP_BIN, OPERATOR_STOP_MEMORY_BUDGET (seconds, default 20).
 Stdlib only, Python 3.9 and later.
 """
+import calendar
 import json
 import os
 import queue
@@ -43,7 +49,7 @@ try:
 except ImportError:                                   # Windows: one writer is not enforced there
     fcntl = None
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HOME = os.path.expanduser("~")
 OP_HOME = os.environ.get("OPERATOR_HOME") or os.path.join(HOME, ".operator")
 RECEIPTS = os.path.join(OP_HOME, "receipts")
@@ -55,6 +61,9 @@ MAX_PER_RUN = 8                                       # stops written per hook c
 MAX_PENDING = 500
 MAX_DONE = 5000
 FIRST_RUN_FILES = 30                                  # day files read the first time, newest first
+RECENT_KEEP = 20                                      # recorded stops remembered for SessionStart
+RECENT_SHOWN = 5                                      # stops a new session is told about
+RECENT_DAYS = 7
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 RULE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 NODE_RE = re.compile(r"^(mem-[0-9a-f]{16}|[0-9a-f-]{36})$")
@@ -80,14 +89,16 @@ def load_state():
             st.setdefault("pending", [])
             st.setdefault("done", {})
             st.setdefault("rules", {})
+            st.setdefault("recent", [])
             return st
     except Exception:
         pass
-    return {"offsets": {}, "pending": [], "done": {}, "rules": {}}
+    return {"offsets": {}, "pending": [], "done": {}, "rules": {}, "recent": []}
 
 
 def save_state(st):
     st["pending"] = st["pending"][-MAX_PENDING:]
+    st["recent"] = st.get("recent", [])[-RECENT_KEEP:]
     if len(st["done"]) > MAX_DONE:
         st["done"] = dict(list(st["done"].items())[-MAX_DONE:])
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -277,7 +288,17 @@ def stop_item(row, rule_node):
                            row["gate_version"] or "unknown", row["action"] or "none", rule_node))}
 
 
-def record(st):
+def mcp_binary(argv):
+    """The vestige-mcp to start: --mcp <path>, else VESTIGE_MCP_BIN, else the one on PATH."""
+    for i, arg in enumerate(argv):
+        if arg == "--mcp" and i + 1 < len(argv) and argv[i + 1]:
+            return argv[i + 1]
+        if arg.startswith("--mcp=") and len(arg) > 6:
+            return arg[6:]
+    return os.environ.get("VESTIGE_MCP_BIN") or shutil.which("vestige-mcp")
+
+
+def record(st, binary=None):
     """Write the pending stops, newest first, within the budget. Returns [(row, node_id)] written now."""
     try:
         budget = float(os.environ.get("OPERATOR_STOP_MEMORY_BUDGET") or 20)
@@ -286,9 +307,9 @@ def record(st):
     todo = [r for r in reversed(st["pending"]) if r["digest"][:16] not in st["done"]][:MAX_PER_RUN]
     if not todo:
         return []
-    binary = os.environ.get("VESTIGE_MCP_BIN") or shutil.which("vestige-mcp")
+    binary = binary or mcp_binary([])
     if not binary:
-        log("vestige-mcp is not on PATH and VESTIGE_MCP_BIN is unset; %d stops wait" % len(todo))
+        log("no vestige-mcp: no --mcp, VESTIGE_MCP_BIN is unset and none is on PATH; %d stops wait" % len(todo))
         return []
     written, mcp = [], None
     try:
@@ -298,6 +319,8 @@ def record(st):
             node = tagged(mcp, "op-receipt-" + d16)
             if node:                                  # already in memory, from this hook or another writer
                 st["done"][d16] = node
+                st.setdefault("recent", []).append({"d16": d16, "node": node, "rule": row["rule"], "ts": row["ts"],
+                                                    "preview": row["preview"][:120]})
                 continue
             rule_node = st["rules"].get(row["rule"]) or tagged(mcp, "op-rule-" + row["rule"])
             if not rule_node:
@@ -305,6 +328,8 @@ def record(st):
             st["rules"][row["rule"]] = rule_node
             node = ingest(mcp, stop_item(row, rule_node))
             st["done"][d16] = node
+            st.setdefault("recent", []).append({"d16": d16, "node": node, "rule": row["rule"], "ts": row["ts"],
+                                                "preview": row["preview"][:120]})
             written.append((row, node))
     except Exception as exc:
         log("record: %r" % (exc,))
@@ -313,6 +338,29 @@ def record(st):
             mcp.close()
     st["pending"] = [r for r in st["pending"] if r["digest"][:16] not in st["done"]]
     return written
+
+
+def recent_lines(recent, now):
+    """What a new session is told: the newest recorded stops of the last RECENT_DAYS days, with handles."""
+    shown = []
+    for item in reversed(recent):
+        try:
+            when = calendar.timegm(time.strptime(item["ts"], "%Y-%m-%dT%H:%M:%SZ"))
+        except Exception:
+            continue
+        if now - when <= RECENT_DAYS * 86400:
+            shown.append(item)
+        if len(shown) == RECENT_SHOWN:
+            break
+    if not shown:
+        return []
+    lines = ["Operator stopped %d action%s on this machine in the last %d days. Each stop is saved in Vestige memory; "
+             "recall its handle to see why, and take the safe path it names instead of trying the same thing again:"
+             % (len(shown), "" if len(shown) == 1 else "s", RECENT_DAYS)]
+    for item in shown:
+        lines.append("- %s %s: %s -> recall(handle=\"op-receipt-%s\")"
+                     % (item["rule"], item["ts"], item.get("preview") or "(no preview)", item["d16"]))
+    return lines
 
 
 def main():
@@ -341,13 +389,18 @@ def main():
             if row["digest"][:16] not in known:
                 st["pending"].append(row)
                 known.add(row["digest"][:16])
-        written = record(st)
+        written = record(st, mcp_binary(sys.argv[1:]))
         save_state(st)
     except Exception as exc:
         log("main: %r" % (exc,))
         return 0
     finally:
         lock.close()
+    if event == "SessionStart":
+        lines = recent_lines(st.get("recent", []), time.time())
+        if lines:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": "\n".join(lines)}}))
+        return 0
     mine = [(r, n) for r, n in written if session and r["session"] == session]
     if mine and event in ("PostToolUse", "UserPromptSubmit"):
         lines = ["Vestige recorded %d Operator stop%s from this session as memory:"
