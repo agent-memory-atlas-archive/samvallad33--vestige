@@ -42,7 +42,8 @@
   },
   "files": [
     "bin",
-    "lib"
+    "lib",
+    "hooks/operator-stop-memory.py"
   ],
   "scripts": {
     "test": "node --test test/*.test.js"

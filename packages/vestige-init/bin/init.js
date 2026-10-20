@@ -732,7 +732,7 @@ const GATE_LINES = {
   skipped: () => 'skipped (--no-gate)',
 };
 
-function renderProofPulse({ detected, configured, skipped, backups, store, rules, gate, selfTest }) {
+function renderProofPulse({ detected, configured, skipped, backups, store, rules, gate, loop, selfTest }) {
   const ok = (good) => (good ? tone.green('●') : tone.amber('○'));
   print(tone.cyan('  07  PROOF PULSE'));
   if (store) {
@@ -746,6 +746,10 @@ function renderProofPulse({ detected, configured, skipped, backups, store, rules
   if (gate) {
     const gateGood = gate.status === 'installed' || gate.status === 'kept-existing';
     print(`      ${ok(gateGood)}  GATE         ${(GATE_LINES[gate.status] || GATE_LINES.failed)(gate)}`);
+  }
+  if (loop) {
+    const loopGood = loop.status === 'written' || loop.status === 'present';
+    print(`      ${ok(loopGood)}  LOOP         ${loopGood ? 'every stop is saved to memory, linked to its rule, and the agent is told how to recall it' : loop.reason || loop.status}`);
   }
   if (selfTest) {
     print(`      ${ok(selfTest.ok)}  SELF-TEST    ${selfTest.cases ? `${selfTest.passed} of ${selfTest.cases} ${selfTest.corpus} bypass cases caught` : selfTest.reason}`);
@@ -942,6 +946,30 @@ async function main() {
     } else {
       print(`      ${tone.amber('NOTE')}  ${(GATE_LINES[gate.status] || GATE_LINES.failed)(gate)}`);
     }
+    // The loop: once a gate is in place, every stop it writes becomes a memory linked to its rule.
+    if (NO_HOOKS) {
+      report.loop = { status: 'skipped', reason: 'skipped (--no-hooks)' };
+    } else if (['installed', 'kept-existing', 'planned'].includes(gate.status)) {
+      let loop;
+      try {
+        loop = kernel.wireStopMemoryHook(binaryPath, { dryRun: DRY_RUN, writeJson: writeJsonAtomic });
+      } catch (err) {
+        loop = { status: 'review', reason: err.message };
+      }
+      report.loop = loop;
+      if (loop.status === 'written') {
+        print(`      ${tone.green('WIRED')}  every stop is saved to memory, linked to its rule → ${loop.settingsPath}`);
+        if (loop.backupPath) print(`  [backup] ${path.basename(loop.backupPath)}`);
+      } else if (loop.status === 'present') {
+        print(`      ${tone.green('PRESENT')}  stops already become memory`);
+      } else if (loop.status === 'planned') {
+        plan(`copy the stop-memory hook to ${loop.target} and add it to ${loop.events.join(', ') || 'nothing new'} in ${loop.settingsPath}`);
+      } else {
+        print(`      ${tone.amber(loop.status === 'skipped' ? 'SKIPPED' : 'NEEDS REVIEW')}  stops to memory: ${loop.reason}`);
+      }
+    } else {
+      report.loop = { status: 'skipped', reason: 'no gate is installed yet, so there are no stops to save' };
+    }
     print('');
     if (!DRY_RUN && gate.status !== 'missing') {
       print(tone.cyan('  06  GATE SELF-TEST'));
@@ -973,7 +1001,7 @@ async function main() {
     print('');
     print(tone.dim('  Client connections only. For the store, the rules hook and Operator Lite as well: npx @vestige/init'));
   } else {
-    renderProofPulse({ detected: detected.length, configured, skipped, backups: backups.length, store: report.store, rules: report.rules, gate, selfTest });
+    renderProofPulse({ detected: detected.length, configured, skipped, backups: backups.length, store: report.store, rules: report.rules, gate, loop: report.loop, selfTest });
   }
   print('');
   print('  1. Restart your clients.');
