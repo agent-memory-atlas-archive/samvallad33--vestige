@@ -7,6 +7,10 @@
       "reason": "Nonpublishing preparation, audit, artifact validation and first-run evidence"
     },
     {
+      "path": ".github/workflows/release.yml",
+      "reason": "Keep all six release uploads draft until archives and package previews are verified"
+    },
+    {
       "path": "CHANGELOG.md",
       "reason": "Align product version and desktop binary pins at 5.0.1; first-party manifests aligned"
     },
