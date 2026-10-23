@@ -42,7 +42,7 @@ before you trust the gate, and again after any upgrade.
 
 | Claim | Check it | It prints |
 |---|---|---|
-| It blocks from your agent's first tool call | `operator-gate status` | `Operator Lite 0.3.11   mode: enforce (blocking)   Claude Code hook: registered` |
+| It blocks from your agent's first tool call | `operator-gate status` | `Operator Lite 5.0.1   mode: enforce (blocking)   Claude Code hook: registered` |
 | What it stops is a closed list you can read | `operator-gate status --rules` | all 30 rules: 15 STOP, 15 SHADOW |
 | It sees through 46 adapted GuardFall bypass cases | `npx operator-lite test` | `corpus=guardfall cases=46 passed=46 failed=0` |
 | A fresh install stops 210 destructive commands and lets 62 normal ones run | `python3 operator-lite/test_destructive.py`, from a clone | `failures: 0 of 272` |

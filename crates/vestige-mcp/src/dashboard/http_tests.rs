@@ -475,7 +475,6 @@ async fn withheld_features_answer_with_a_structured_reason() {
             "/api/deep_reference".into(),
             Some(r#"{"query":"x"}"#),
         ),
-        ("POST", "/api/backfill".into(), Some("{}")),
         ("POST", "/api/explore".into(), Some(explore.as_str())),
         ("POST", format!("/api/memories/{id}/unsuppress"), None),
     ];
@@ -502,6 +501,53 @@ async fn withheld_features_answer_with_a_structured_reason() {
             "{method} {uri}: {error:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn backfill_is_available_and_http_preview_writes_nothing() {
+    fn snapshot(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut rows = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rows.extend(snapshot(&path));
+            } else {
+                rows.push((path.clone(), std::fs::read(path).unwrap()));
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+    let (dir, storage) = strata();
+    let target = remember(
+        &storage,
+        "Maya felt off after dinner at Bangkok Garden",
+        &["person:Maya", "place:Bangkok Garden"],
+    );
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let trigger = remember(&storage, "Review Maya's older memories", &["person:Maya"]);
+    let app = router_with_engine(&storage);
+    let before = snapshot(dir.path());
+    let missing = own(&app, "POST", "/api/backfill", Some("{}")).await;
+    assert_eq!(missing.status, StatusCode::BAD_REQUEST, "{}", missing.body);
+    let body = serde_json::json!({"trigger_id":trigger,"manual":true}).to_string();
+    let preview = own(&app, "POST", "/api/backfill", Some(&body)).await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.body);
+    assert_eq!(preview.json()["would_change"], 1);
+    assert_eq!(
+        snapshot(dir.path()),
+        before,
+        "HTTP preview or invalid input wrote to Strata"
+    );
+    let body = serde_json::json!({"trigger_id":trigger,"manual":true,"dry_run":false}).to_string();
+    let applied = own(&app, "POST", "/api/backfill", Some(&body)).await;
+    assert_eq!(applied.status, StatusCode::OK, "{}", applied.body);
+    assert_eq!(applied.json()["changes"][0]["memory_id"], target);
+    assert!(
+        applied.json()["changes"][0]["receipt_id"]
+            .as_str()
+            .is_some()
+    );
 }
 
 // ---------------------------------------------------------------------------

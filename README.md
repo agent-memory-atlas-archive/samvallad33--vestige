@@ -4,11 +4,11 @@
 
 # Vestige
 
-Vestige gives AI agents a memory you can check and a guard that stops them before they do damage. Memory lives in Strata, an append-only log where every write passes a gate and leaves a receipt, and a memory is found by its exact id or tag, never by vector similarity. The guard runs outside the model on every tool call, stops destructive commands before they run, keeps a receipt of every decision, and lets a stopped command through only after the owner approves that exact command from their own terminal, so an old yes is never treated as permission to act now. When something breaks, `causal_walk` follows the recorded history back to the real cause.
+Vestige gives AI agents a memory you can check and a guard that checks connected tool calls before execution. Memory lives in Strata, an append-only log where writes pass a gate and leave a receipt, and a memory is found by its exact id or tag, never by vector similarity. Operator Lite stops recognized destructive actions routed through its hooks, records its decisions, and supports one-use owner permits for eligible stopped actions. A remembered approval is history, never current permission. `causal_walk` follows recorded relationships backward to investigate a failure; Retroactive Salience Backfill updates how much earlier connected memories matter when new information arrives.
 
 [![Release](https://img.shields.io/github/v/release/samvallad33/vestige?color=06b6d4)](https://github.com/samvallad33/vestige/releases/latest)
 [![Tests](https://img.shields.io/github/actions/workflow/status/samvallad33/vestige/ci.yml?branch=main&label=CI)](https://github.com/samvallad33/vestige/actions)
-[![Binary](https://img.shields.io/badge/platforms-5_release_targets-informational)](https://github.com/samvallad33/vestige/releases/latest)
+[![Binary](https://img.shields.io/badge/platforms-6_release_targets-informational)](https://github.com/samvallad33/vestige/releases/latest)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-3b82f6)](LICENSE)
 
 ## The problem
@@ -38,24 +38,73 @@ Operator Lite is free and stays free. Vestige Operator is the owner's version of
 
 [Buy Vestige Operator](https://payhip.com/b/d4xvu)
 
-## Quick start
+## Retroactive Salience Backfill returns in v5.0.1
 
-One command installs the whole system. Run it in your own terminal:
+New information can change the importance of an older memory. Backfill walks
+backward through Strata's recorded relationships and exact shared entities,
+then raises or lowers earlier memories' salience. It does not rank by text or
+embedding similarity, invent a relationship, or update a memory newer than the
+trigger. `causal_walk` remains the separate investigation tool: "what caused
+this?"
+
+For a personal-memory example, save **"Maya felt off after dinner at Bangkok
+Garden"** with entities `person:Maya` and `place:Bangkok Garden`. Later, save
+**"Maya has a peanut allergy"** with entity `person:Maya` and attribute
+`allergy:peanut`. The shared entity is Maya. Backfill raises the earlier reaction
+because the new health fact makes it relevant. It makes no claim that Bangkok
+Garden serves peanuts, and it leaves a different person's experience at the
+same restaurant unchanged.
+
+When an agent plans Maya's birthday dinner, it resolves Maya to the exact handle
+`person:Maya` and calls `recall` with that handle. Recall orders the connected
+memories using the updated salience, so Maya's reaction can be considered before
+choosing a venue. Natural-language text is not silently turned into a fuzzy
+memory query.
+
+Backfill runs automatically when a new memory is saved. Set
+`VESTIGE_BACKFILL_AUTOFIRE=0` (`false`, `off`, and `no` also work) to disable
+automatic runs. Manual review and exact undo remain available:
 
 ```bash
-npx @vestige/init
+vestige backfill <trigger-memory-id> --dry-run
+vestige backfill <trigger-memory-id>
+vestige backfill undo <receipt-id>
 ```
 
-In order, it:
+The MCP tool accepts `backfill` with `trigger_id`, `dry_run`, and an `action`
+(`run`, `receipts`, or `undo`). Each applied change records the earlier memory,
+old and new scores, triggering memory, exact shared entity, reason, and time.
+Dry runs write nothing. A repeated cause/trigger pair does not compound; undo
+restores the score recorded before that change. Raises retain the original
+bounded stability step, `min(stability * 1.5, stability + 365)`, with a matching
+bounded decrease and floor for lowering.
 
-1. installs the `vestige-mcp`, `vestige`, `vestige-restore` and `vestige-upgrade` binaries for your machine from npm, unless the same or a newer version is already installed;
-2. starts `vestige-mcp` once, which creates your Strata store, and checks that it answers with its 18 tools;
-3. connects the MCP clients it finds (Claude Code, Claude Desktop, Cursor, VS Code, OpenCode, Xcode, JetBrains, Windsurf), backing up each file before changing it;
-4. adds the Claude Code rules hook, so the decisions and corrections you tag `pinned` come back at every session start and after every compaction;
-5. installs Operator Lite, the free gate, in enforce mode, and wires every agent host it finds;
-6. runs the gate's own bypass test, then lists what it configured and what to verify after a restart.
+See the [release procedure](docs/releases/v5.0.1.md) for source verification,
+platform archives, checksums, package review, and rollback requirements.
 
-It never downgrades: a newer binary, or a newer or paid gate, stays where it is. `--dry-run` shows every change and writes nothing, `--yes` connects every detected client without a prompt, and `--no-gate` and `--no-hooks` skip those steps. Operator Lite needs Python 3.9 or newer, and it refuses to install from inside an AI agent's shell. Tested end to end on macOS and Linux; the Windows x64 binaries ship in the same package but that path has not been tested end to end yet.
+## Quick start
+
+1. Install the **v5.0.1 binaries** for your platform from [GitHub Releases](https://github.com/samvallad33/vestige/releases) and put `vestige-mcp` on your PATH. The initializer checks the existing binary and gives these steps without changing anything when it is missing or too old.
+2. Run `npx @vestige/init`. Choose **Memory only** (default) or **Memory plus guard**, inspect the file preview, then confirm once. Existing configurations are backed up and hooks are merged alongside your own. `--yes` selects memory only without prompts; `--guard --yes` requests the guard as well.
+3. Restart your clients and trust the new hook definitions where the client requires it. Run `npx @vestige/init doctor`, then try: **Tell me something about a friend, then ask me about them later.**
+
+The v5.0.1 initializer installs session, prompt, turn-save, pre-compaction and
+session-end memory hooks for Claude Code, Codex and Gemini CLI. Cursor has
+session context and turn capture; its prompt hook cannot inject context, so
+recall context arrives through its supported post-tool hook. Other detected
+MCP clients receive a connection and a clear coverage note. Configured hooks
+still require the client's trust/reload step; a file on disk does not prove
+that a client has run it.
+
+On prompt submission, editable literal trigger phrases and exact recorded
+entity surfaces select a recall packet; its ordering uses current salience,
+never text similarity. With no trigger the packet contains the top three
+memories. Hooks save supported explicit user declarations verbatim through
+`smart_ingest`; richer facts are extracted by the connected agent using the
+same tool and explicit metadata. Backfill therefore runs on each admitted
+save. Memory hooks have a bounded deadline, fail open and log errors locally.
+Optional guard hooks fail closed. See the [installer guide](packages/vestige-init/README.md)
+for the full client coverage, receipt paths, doctor, status and uninstall.
 
 ### Operator Lite on its own
 

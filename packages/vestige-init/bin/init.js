@@ -1039,7 +1039,8 @@ if (SUBCOMMAND === 'precedent' || SUBCOMMAND === 'journey') {
     .then((code) => process.exit(code || 0))
     .catch((error) => { console.error('vestige episodes: ' + error.message); process.exit(1); });
 } else {
-  main().catch((error) => {
+  const setup = kernel && !CLIENTS_ONLY ? require('../lib/vestige-memory-setup.js').main : main;
+  setup().catch((error) => {
     console.error(`vestige init: ${error.message}`);
     process.exitCode = 1;
   });

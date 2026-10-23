@@ -28,7 +28,7 @@ function run(script, args, env) {
   return { ...result, report: result.stdout.trim() ? JSON.parse(result.stdout) : null };
 }
 
-test('a dry run of the whole system plans every step and writes nothing', { skip: !POSIX }, () => {
+test('memory-first dry run previews installed binary connections and writes nothing', { skip: !POSIX }, () => {
   const home = scratch('dry-home');
   fs.mkdirSync(path.join(home, '.claude'));
   fs.mkdirSync(path.join(home, '.cursor'));
@@ -41,16 +41,13 @@ test('a dry run of the whole system plans every step and writes nothing', { skip
     HOME: home,
     VESTIGE_BUNDLED_BIN_DIR: bundled,
     VESTIGE_INSTALL_DIR: target,
-    VESTIGE_MCP_PATH: path.join(home, 'nothing-here'),
+    VESTIGE_MCP_PATH: fakeBinary(bundled, 'vestige-mcp', '5.0.1'),
   });
   assert.equal(status, 0, stderr);
-  assert.equal(report.mode, 'dry-run');
-  assert.equal(report.binaries.status, 'planned');
-  assert.equal(report.binaries.binaryPath, path.join(target, 'vestige-mcp'));
-  assert.deepEqual(report.selected, ['Cursor']);
+  assert.equal(report.status, 'preview');
+  assert.deepEqual(report.detected, ['cursor']);
+  assert(report.files.some(row => row.file === path.join(home, '.cursor', 'hooks.json')));
   assert.equal(fs.existsSync(target), false, 'no binary is copied in a dry run');
-  assert.equal(report.rules.status, 'planned');
-  assert.equal(report.rules.command, `${path.join(target, 'vestige')} hook session-start`);
   assert.equal(fs.readFileSync(path.join(home, '.cursor', 'mcp.json'), 'utf8'), '{}\n', 'no client config is written in a dry run');
   assert.equal(fs.existsSync(path.join(home, '.claude', 'settings.json')), false, 'no hook is written in a dry run');
 });

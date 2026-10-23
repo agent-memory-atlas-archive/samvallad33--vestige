@@ -1372,11 +1372,25 @@ description: Some("Inhibit a memory without deleting it: out of retrieval, faste
                 ..Default::default()
             },
             // ================================================================
-            // CAUSAL WALK — successor to retroactive backfill
-            // "Memory with hindsight", now anchored to explicit evidence
-            // handles: failing test, stack frame, CI run, logged write,
-            // version range. `backfill` remains dispatchable as a hidden
-            // back-compat alias (see handle_tools_call).
+            // BACKFILL — re-score earlier memories through explicit shared
+            // entities. This is salience revision, not a causal verdict.
+            // ================================================================
+            ToolDescription {
+                name: "backfill".to_string(),
+                title: Some("Retroactive Salience Backfill".to_string()),
+                annotations: Some(ToolAnnotations {
+                    read_only_hint: false,
+                    destructive_hint: false,
+                    idempotent_hint: true,
+                    open_world_hint: false,
+                }),
+                description: Some("Re-score older memories through shared entities; preview, receipt, or undo.".to_string()),
+                input_schema: tools::compact::of(&tools::backfill::schema()),
+                ..Default::default()
+            },
+            // ================================================================
+            // CAUSAL WALK — investigate "what caused this?" through explicit
+            // recorded evidence handles. Backfill revises salience separately.
             // ================================================================
             ToolDescription {
                 name: "causal_walk".to_string(),
@@ -1481,12 +1495,9 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
     ) -> Result<serde_json::Value, JsonRpcError> {
         reject_unknown_cursor(params)?;
 
-        // 4.x: 16 advertised tools after adding the controlled `receipt`
-        // surface; v3.2 swaps the flagship `backfill` primitive for its
-        // successor `causal_walk` (same count — backfill stays dispatchable
-        // as a hidden redirect). 22+ deprecated/folded names still work as
-        // hidden redirects in handle_tools_call. See
-        // the 4.x catalog in tools/compact.rs.
+        // Backfill and causal_walk are distinct advertised tools. Deprecated
+        // folded names remain hidden redirects in handle_tools_call; the full
+        // schema registry in tools/compact.rs must match this catalog.
         let mut tools = Self::tool_catalog();
         if crate::strata_memory::is_strata_backend(self.storage.as_ref()) {
             withhold_on_strata(&mut tools);
@@ -1635,6 +1646,15 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
         // stdio mode (no dashboard socket), so this is NOT gated on event_tx —
         // only the WebSocket broadcast inside record()/emit is.
         let saved_args = request.arguments.clone();
+        // Backfill previews promise zero durable writes, including the generic
+        // call/result recorder. A normal run keeps its trace and own receipts.
+        let backfill_preview = request.name == "backfill"
+            && saved_args
+                .as_ref()
+                .and_then(|args| args.get("dry_run"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+        let trace_this_call = trace_enabled() && !backfill_preview;
 
         // Agent Black Box: record the opening mcp.call event for this tool
         // invocation. run_id groups the events of one agent turn; it is derived
@@ -1642,7 +1662,7 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
         // can attach the downstream memory events (retrieve/suppress/veto) to the
         // same run.
         let trace_run_id = crate::trace_recorder::run_id_for(&saved_args);
-        if trace_enabled() {
+        if trace_this_call {
             crate::trace_recorder::record_call(
                 &self.storage,
                 self.event_tx.as_ref(),
@@ -1736,7 +1756,7 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
             // downstream memory events (retrieve/suppress/veto/dream) under the
             // same run_id as the opening mcp.call, so /api/traces, /api/receipts
             // and the trace:// resource are actually populated.
-            if trace_enabled() {
+            if trace_this_call {
                 crate::trace_recorder::record_result(
                     &self.storage,
                     self.event_tx.as_ref(),
@@ -2055,7 +2075,7 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
             "source_sync" => tools::source_sync::execute(&self.storage, request.arguments).await,
 
             // ================================================================
-            // CAUSAL WALK — the advertised flagship (successor to backfill)
+            // CAUSAL WALK — investigate recorded causal evidence
             // ================================================================
             "causal_walk" => tools::causal_walk::execute(&self.storage, request.arguments).await,
             "gather" => {
@@ -2064,8 +2084,7 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
             }
 
             // ================================================================
-            // HIDDEN ALIAS (v3.2): backfill → causal_walk replaced it on the
-            // advertised surface; the original stays dispatchable verbatim.
+            // BACKFILL — revise salience, inspect receipts, or undo a revision
             // ================================================================
             "backfill" => tools::backfill::execute(&self.storage, request.arguments).await,
 

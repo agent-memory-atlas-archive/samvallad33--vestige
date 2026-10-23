@@ -32,6 +32,23 @@ use vestige_core::{
 pub mod ghostlink;
 
 const Q32_SCALE: f64 = 4294967296.0;
+
+fn salience_receipt_json(receipt: strata_store::BackfillReceipt) -> Value {
+    json!({
+        "receipt_id": receipt.receipt_id,
+        "memory_id": receipt.memory_id,
+        "trigger_id": receipt.trigger_id,
+        "shared_entity": receipt.shared_entity,
+        "reason": receipt.reason,
+        "old_score": q32(receipt.old_stability_q),
+        "new_score": q32(receipt.new_stability_q),
+        "old_stability_q": receipt.old_stability_q,
+        "new_stability_q": receipt.new_stability_q,
+        "timestamp_ms": receipt.timestamp_ms,
+        "timestamp": ms_to_dt(receipt.timestamp_ms).to_rfc3339(),
+        "undo_of": receipt.undo_of,
+    })
+}
 const RECEIPT_PREFIX: &str = "eff-";
 const STRATA_REPLAY_BOUNDARY: &str = "Replay re-derives state from the Strata log and compares it to the receipt. A match checks the log; it is not a claim about the world.";
 
@@ -1128,6 +1145,7 @@ fn mutation_kind(proof: &strata_store::EffectProof) -> &'static str {
         (strata_store::EffectAction::Anchor, _) => "anchor_recorded",
         (strata_store::EffectAction::AnchorVerdict, _) => "anchor_verified",
         (strata_store::EffectAction::Edge, _) => "edge_recorded",
+        (strata_store::EffectAction::Backfill, _) => "salience_adjusted",
     }
 }
 
@@ -1221,7 +1239,8 @@ fn listed_memory_effect(
         EffectAction::Create
         | EffectAction::Rewrite
         | EffectAction::Edit
-        | EffectAction::Review => live(&proof.node_id),
+        | EffectAction::Review
+        | EffectAction::Backfill => live(&proof.node_id),
         EffectAction::Edge => {
             live(&proof.node_id)
                 && proof
@@ -2041,7 +2060,68 @@ impl MemoryStoreSend for StrataMemory {
     }
 
     fn run_consolidation(&self) -> Result<ConsolidationResult, StorageError> {
+        if crate::tools::backfill::autofire_enabled() {
+            let mut nodes = self.get_all_nodes(i32::MAX, 0)?;
+            nodes.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            for node in nodes {
+                let scope = self.lock().get_node(&node.id).map(|r| r.scope);
+                if let Some(scope) = scope {
+                    crate::tools::backfill::autofire(self, &node.id, &scope)
+                        .map_err(StorageError::Refused)?;
+                }
+            }
+        }
         Ok(ConsolidationResult::default())
+    }
+
+    fn apply_salience_change(
+        &self,
+        change: &vestige_core::advanced::retroactive_backfill::SalienceChange,
+    ) -> Result<Option<Value>, StorageError> {
+        if !change.new_stability.is_finite() || change.new_stability <= 0.0 {
+            return Err(StorageError::Refused("invalid salience stability".into()));
+        }
+        let mut store = self.lock();
+        let expected = (change.old_stability * Q32_SCALE).round() as i64;
+        if store
+            .card_state(&change.memory_id)
+            .is_none_or(|card| card.stability_q != expected)
+        {
+            return Err(StorageError::Refused(
+                "backfill state changed after planning; rerun the idempotent pass".into(),
+            ));
+        }
+        store
+            .apply_backfill(strata_store::BackfillAdjustment {
+                memory_id: change.memory_id.clone(),
+                trigger_id: change.trigger_id.clone(),
+                shared_entity: change.shared_entity.clone(),
+                reason: change.reason.clone(),
+                new_stability_q: (change.new_stability * Q32_SCALE).round() as i64,
+                timestamp_ms: Utc::now().timestamp_millis(),
+            })
+            .map(|receipt| receipt.map(salience_receipt_json))
+            .map_err(map_store)
+    }
+
+    fn salience_receipts(&self) -> Result<Vec<Value>, StorageError> {
+        Ok(self
+            .lock()
+            .backfill_receipts()
+            .into_iter()
+            .map(salience_receipt_json)
+            .collect())
+    }
+
+    fn undo_salience_change(&self, receipt_id: &str) -> Result<Value, StorageError> {
+        self.lock()
+            .undo_backfill(receipt_id, Utc::now().timestamp_millis())
+            .map(salience_receipt_json)
+            .map_err(map_store)
     }
 
     fn ingest(&self, input: IngestInput) -> Result<KnowledgeNode, StorageError> {
@@ -2086,7 +2166,14 @@ impl MemoryStoreSend for StrataMemory {
         let record = store
             .get_node(&id)
             .ok_or_else(|| StorageError::NotFound(id.clone()))?;
-        Ok(project_node(&store, &record))
+        let saved = project_node(&store, &record);
+        drop(store);
+        if let Err(error) = crate::tools::backfill::autofire(self, &id, scope) {
+            // The save is already admitted. Never misreport it as failed and
+            // cause a caller retry; a manual idempotent pass can recover.
+            tracing::warn!(trigger_id = %id, %error, "backfill autofire failed after admitted save");
+        }
+        Ok(saved)
     }
 
     fn find_duplicate_by_canonical_hash(

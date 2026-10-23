@@ -7,26 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### @vestige/init 5.0.1: one command for the whole system
+## [5.0.1] - 2026-10-23
 
-- **`npx @vestige/init` installs everything.** It installs the four Vestige
-  binaries from the pinned `@vestige/mcp-<os>-<arch>` package into
-  `~/.local/bin`, starts `vestige-mcp` once to create the Strata store and
-  confirm its tools, connects the detected MCP clients, merges the
-  `vestige hook session-start` rules hook into `~/.claude/settings.json`,
-  installs Operator Lite 0.3.10 through its own installer, and runs the gate's
-  GuardFall self-test. Before this release it only wired clients, and stopped
-  with "vestige-mcp was not found" on a machine without the binary.
-- **Never downgrades.** An installed `vestige-mcp` as new as the bundled one is
-  kept; a binary is placed by rename, so a symlinked pin is replaced as a link
-  and the file it points at is never written through. The gate's installer
-  still refuses to replace a newer or paid gate, and still refuses to run in an
-  agent's shell; the summary says which.
-- **New flags:** `--yes` (all detected clients), `--no-gate`, `--no-hooks`.
-  `--dry-run` now plans every step.
+### Retroactive Salience Backfill returns
 
-Operator Lite 0.3.11. Version 0.3.8 is skipped: it was published to npm and
-withdrawn, so the number cannot be used again.
+- Restore Backfill as a first-class Strata feature, recovering the original
+  implementation and keeping `causal_walk` for backward failure investigation.
+  Backfill uses exact shared entities and recorded relationships, without
+  embedding or text-similarity ranking.
+- Re-score earlier memories upward when new information makes them relevant,
+  and downward when an explicit newer preference contradicts an earlier one.
+  Automatic saves and manual runs use the same bounded salience mutation.
+- Support companion and personal-memory identities. Maya's later allergy fact
+  can raise her earlier reaction after Bangkok Garden through `person:Maya`,
+  without inferring restaurant ingredients or changing another person's memory.
+- Add the manual `backfill` MCP tool, `vestige backfill`, change receipts, dry
+  runs that write nothing, exact-score undo, and cause/trigger idempotency.
+  `VESTIGE_BACKFILL_AUTOFIRE` stays enabled by default and accepts
+  `0`/`false`/`off`/`no` to disable automatic runs.
+- Rank exact-handle recall results by updated salience. Keep exact lookup
+  semantics: natural-language queries do not become fuzzy or keyword search.
+- Align product manifests and `@vestige/init` binary-package pins at 5.0.1.
+  Add six-target artifact-only release preparation and isolated npm staging;
+  these commands do not tag, upload to a release, or publish packages.
+
+### Memory-first installer
+
+- Default `npx @vestige/init` to memory-only setup; make the free guard an explicit choice.
+- Detect supported client configurations and the installed v5.0.1+ binary, preview each file and owned addition, then merge after one confirmation. Back up edited files; make reruns idempotent and uninstall preserve later user edits.
+- Install supported session, prompt, turn, compaction and end hooks. Use one editable trigger list, explicit entity selection, salience packets and top-three fallback. Record trigger metadata and Backfill receipt handles locally.
+- Save explicit user declarations through `smart_ingest` with provenance and metadata; request richer fact capture through the connected agent. Bound memory hook execution, fail open silently, and retain pending writes for retry. Preserve the optional guard's fail-closed behavior.
+- Add `doctor`, `status`, and `uninstall`, native Maya/Backfill acceptance, timing tests and a real bundled Lite STOP-to-Strata reflex test. Document client trust and unsupported lifecycle surfaces.
+
+The bundled Operator Lite runtime now uses the product version, 5.0.1. Its
+rule-set additions below originated in Lite 0.3.11. Version 0.3.8 was published
+to npm and withdrawn, so that historical number cannot be used again.
 
 ### Added (0.3.11)
 

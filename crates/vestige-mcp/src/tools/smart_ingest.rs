@@ -198,7 +198,92 @@ pub fn schema() -> Value {
         "enum": ["compact", "standard", "full"],
         "description": "'compact': proof fields only ({decision, nodeId, receiptId, canonicalHash, scope}). 'standard' (default): proof fields plus entities and importance."
     });
+    for field in ["entities", "attributes"] {
+        let description = if field == "entities" {
+            "Explicit case-sensitive identities, e.g. person:Maya or place:Bangkok Garden. Stored as exact tags; never inferred from prose."
+        } else {
+            "Explicit facts, e.g. allergy:peanut or preference:ambience=quiet. Stored as exact tags."
+        };
+        let property = serde_json::json!({"type":"array","maxItems":64,"items":{"type":"string","maxLength":512},"description":description});
+        s["properties"][field] = property.clone();
+        s["properties"]["items"]["items"]["properties"][field] = property;
+    }
     s
+}
+
+/// Fold caller-declared identities and attributes into the existing exact tag
+/// representation. Validate every batch item before its first write.
+fn personal_metadata(args: Option<Value>) -> Result<Option<Value>, String> {
+    fn normalize(item: &mut Value) -> Result<(), String> {
+        let object = item
+            .as_object_mut()
+            .ok_or("ingest item must be an object")?;
+        let mut metadata = Vec::new();
+        for field in ["entities", "attributes"] {
+            if let Some(value) = object.remove(field) {
+                let values = value
+                    .as_array()
+                    .ok_or_else(|| format!("{field} must be an array"))?;
+                if values.len() > 64 {
+                    return Err(format!("at most 64 {field} per memory"));
+                }
+                for value in values {
+                    let text = value
+                        .as_str()
+                        .ok_or_else(|| format!("{field} must contain strings"))?;
+                    let (kind, name) = text
+                        .split_once(':')
+                        .ok_or_else(|| format!("{field} need typed values"))?;
+                    if name.trim().is_empty()
+                        || text.len() > 512
+                        || text.chars().any(char::is_control)
+                    {
+                        return Err(format!("invalid {field} value"));
+                    }
+                    if field == "entities"
+                        && !matches!(
+                            kind,
+                            "person"
+                                | "place"
+                                | "food"
+                                | "file"
+                                | "service"
+                                | "symbol"
+                                | "path"
+                                | "commit"
+                                | "issue"
+                                | "url"
+                        )
+                    {
+                        return Err("unsupported explicit entity kind".into());
+                    }
+                    metadata.push(Value::String(text.to_string()));
+                }
+            }
+        }
+        if !metadata.is_empty() {
+            let tags = object
+                .entry("tags")
+                .or_insert_with(|| serde_json::json!([]));
+            let tags = tags.as_array_mut().ok_or("tags must be an array")?;
+            for value in metadata {
+                if !tags.contains(&value) {
+                    tags.push(value);
+                }
+            }
+        }
+        Ok(())
+    }
+    let Some(mut args) = args else {
+        return Ok(None);
+    };
+    normalize(&mut args)?;
+    if let Some(items) = args.get_mut("items").and_then(Value::as_array_mut) {
+        for item in items {
+            normalize(item)?;
+        }
+    }
+    Ok(Some(args))
 }
 
 #[derive(Debug, Deserialize)]
@@ -569,6 +654,7 @@ pub async fn execute(
     cognitive: &Arc<Mutex<CognitiveEngine>>,
     args: Option<Value>,
 ) -> Result<Value, String> {
+    let args = personal_metadata(args)?;
     let compact_profile = args
         .as_ref()
         .and_then(|v| v.get("outputProfile").or_else(|| v.get("output_profile")))

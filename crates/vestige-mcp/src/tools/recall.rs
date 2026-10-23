@@ -66,7 +66,7 @@ pub fn schema() -> Value {
                 "handle".to_string(),
                 serde_json::json!({
                     "type": "string",
-                    "description": "[handle mode] Exact handle: a full memory id or an exact tag (case-sensitive); a unique id prefix of 8+ characters also resolves. Commit sha, file path, symbol, test name, run id and tool-call id handles resolve on the legacy engine only. No fuzzy or lexical matching. Passing this key (even empty) switches recall to handle mode: a resolvable handle returns the node payloads (tag recall sorts newest first before cutting to limit) plus one-hop recorded-edge neighbors (200-char preview, 80 when repeated; pass detail_level='full_neighbors' for full neighbor text or call memory(action='get') on one neighbor); anything else returns the handle_required error with exact candidates."
+                            "description": "[handle mode] Exact memory id or case-sensitive tag, including explicit person:Maya entities; a unique id prefix of 8+ characters also resolves. No fuzzy or lexical matching. Multi-memory results rank by updated salience, then recency, before limit, with recorded-edge neighbors."
                 }),
             );
             props.insert(
@@ -317,13 +317,9 @@ fn handle_resolution_payload(
             .collect();
         let total_nodes = indexed_nodes.len();
         if indexed_nodes.len() > 1 {
-            // Sort newest first before cutting to `limit`; ties break by later
-            // position in the append-only log (`idx_b > idx_a`).
-            indexed_nodes.sort_by(|(idx_a, _, a), (idx_b, _, b)| {
-                b.created_at
-                    .cmp(&a.created_at)
-                    .then_with(|| idx_b.cmp(idx_a))
-            });
+            let salience = super::memory_packet::scores(storage.as_ref());
+            indexed_nodes
+                .sort_by(|(_, _, a), (_, _, b)| super::memory_packet::compare(a, b, &salience));
         }
         if let Some(l) = limit {
             indexed_nodes.truncate(l);

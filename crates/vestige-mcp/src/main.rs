@@ -125,6 +125,9 @@ fn parse_args_from(args: Vec<OsString>, env_data_dir: Option<PathBuf>) -> Config
                 println!("    VESTIGE_DASHBOARD_ENABLED Enable dashboard (default: disabled)");
                 println!("    VESTIGE_DASHBOARD_PORT     Dashboard port (default: 3927)");
                 println!(
+                    "    VESTIGE_BACKFILL_AUTOFIRE  Backfill each new memory (default: on; 0/false/off/no disables)"
+                );
+                println!(
                     "    VESTIGE_SYSTEM_PROMPT_MODE Inject the full composition mandate into every MCP session (minimal|full, default: minimal)"
                 );
                 println!();
