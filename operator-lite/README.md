@@ -14,6 +14,8 @@ copy one file, wire one hook, and your agent has a deterministic gate.
 
 Click the picture to watch the full film.
 
+Operator Lite is free and stays free. Vestige Operator is the owner's version of the same gate: $149 once, and every later version is yours at no charge, with laws you write, a Board of today's stops, and a weekly Letter of what your agents tried and what stopped them. Operator also judges the chain of steps in a session, so an agent that reads `.env` and later posts a file to an outside host is stopped with the earlier step's time and receipt, and it carries six more stop rules than Lite. You download a small archive the moment you pay; from an installed Operator Lite, `upgrade --install <the archive you downloaded>` unpacks it and starts the wizard. [Buy Vestige Operator](https://payhip.com/b/d4xvu).
+
 ## Install (one command)
 
     curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/operator-lite/operator-gate.py -o /tmp/operator-gate.py && python3 /tmp/operator-gate.py install
@@ -203,6 +205,9 @@ live filesystem, subshell time-bombs (`(sleep 300; rm -rf) &`), session variable
 (`T=~/x; rm -rf $T`), cd tracking, heredocs, data-vs-code pipe discrimination,
 fork bombs, `mv x /dev/null`, a command written after a redirection
 (`>log rm -rf x`). Every STOP tells you which transforms it applied.
+
+Since 0.3.10 it also reads the shell commands inside `python -c` and `node -e`
+code, and sees through wrappers such as `sudo -u root`, `env -S` and `busybox`.
 
 ## 0.3.11 next-gen anti-bypass
 
