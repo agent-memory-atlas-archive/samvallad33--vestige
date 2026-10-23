@@ -32,9 +32,11 @@ JSON_MANIFESTS = [
     "packages/vestige-mcp-npm/package.json", "packages/vestige-mcpb/manifest.json",
     "lhm.plugin.json", "server.json", "plugins/vestige-strata/package.json",
     "plugins/vestige-strata/openclaw.plugin.json",
+    "operator-lite/npm/package.json", "operator-lite/openclaw-plugin/package.json",
 ] + [f"packages/mcp-{platform}/package.json" for platform in TARGETS.values() if platform]
 CARGO_MANIFESTS = ["Cargo.toml"] + [
-    f"crates/{name}/Cargo.toml" for name in ("vestige-core", "vestige-mcp", "vestige-upgrade")
+    f"crates/{name}/Cargo.toml" for name in ("vestige-core", "vestige-mcp", "vestige-upgrade", "strata", "strata-gate",
+                                   "strata-kernel", "strata-migrate", "strata-store", "strata-verify")
 ]
 
 

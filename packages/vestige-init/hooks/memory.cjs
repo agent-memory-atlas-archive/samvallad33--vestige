@@ -20,12 +20,13 @@ function rpc(binary, args = [], timeoutMs = 210, env = process.env) {
   const child = spawn(binary, args, { stdio: ['pipe', 'pipe', 'pipe'], env });
   let diagnostics = '';
   child.stderr.on('data', chunk => { if (env.VESTIGE_HOOK_DIAGNOSTICS === '1') diagnostics = (diagnostics + chunk).slice(-2000); });
-  const pending = new Map(); let seq = 0; let closed = false;
+  const pending = new Map(); let seq = 0; let closed = false; let disposed = false; let timer;
   const rejectAll = error => { closed = true; for (const [,p] of pending) p.reject(error); pending.clear(); };
   child.on('error', rejectAll);
   child.on('exit', () => rejectAll(new Error('Vestige disconnected')));
   child.stdin.on('error', rejectAll);
-  readline.createInterface({ input: child.stdout }).on('line', line => {
+  const lines = readline.createInterface({ input: child.stdout });
+  lines.on('line', line => {
     let msg; try { msg = JSON.parse(line); } catch { return; }
     const p = pending.get(msg.id); if (!p) return;
     pending.delete(msg.id);
@@ -36,7 +37,18 @@ function rpc(binary, args = [], timeoutMs = 210, env = process.env) {
     const id = ++seq; pending.set(id, { resolve, reject, method });
     child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   });
-  const timer = setTimeout(() => { const stages = [...pending.values()].map(p => p.method).join(','); rejectAll(new Error(`memory deadline exceeded (${stages})${diagnostics ? `: ${diagnostics}` : ''}`)); child.kill(); }, timeoutMs);
+  const close = () => {
+    if (disposed) return;
+    disposed = true; clearTimeout(timer);
+    rejectAll(new Error('Vestige transport closed'));
+    // The result is already admitted, or its queue entry remains for retry. A slow
+    // child shutdown must not keep the chat hook alive beyond its work budget.
+    lines.close();
+    child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy();
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    child.unref();
+  };
+  timer = setTimeout(() => { const stages = [...pending.values()].map(p => p.method).join(','); rejectAll(new Error(`memory deadline exceeded (${stages})${diagnostics ? `: ${diagnostics}` : ''}`)); close(); }, timeoutMs);
   return {
     diagnostics() { return diagnostics; },
     async tool(name, arguments_) {
@@ -48,7 +60,7 @@ function rpc(binary, args = [], timeoutMs = 210, env = process.env) {
       await call('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'vestige-memory-hook', version: '5.0.1' } });
       child.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n');
     },
-    close() { clearTimeout(timer); child.stdin.end(); child.kill(); },
+    close,
   };
 }
 

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [5.0.1] - Unreleased
+## [5.0.1] - 2026-10-23
 
 ### Retroactive Salience Backfill returns
 
@@ -31,10 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Add six-target artifact-only release preparation and isolated npm staging;
   these commands do not tag, upload to a release, or publish packages.
 
-Release status: source candidate, pending full verification and owner approval.
-No v5.0.1 tag, GitHub release, or npm publication is created by preparation.
-
-### Memory-first setup
+### Memory-first installer
 
 - Default `npx @vestige/init` to memory-only setup; make the free guard an explicit choice.
 - Detect supported client configurations and the installed v5.0.1+ binary, preview each file and owned addition, then merge after one confirmation. Back up edited files; make reruns idempotent and uninstall preserve later user edits.

@@ -180,3 +180,38 @@ test('registered stop-memory relay fails open under 300ms with a stalled server'
   assert.equal(result.status,0,result.stderr); assert.equal(result.stderr,'');
   assert(performance.now()-started<300);
 });
+
+for (const responds of [true, false]) {
+  test(`memory CLI bounds child shutdown after ${responds ? 'success' : 'deadline'}`, () => {
+    const f = fixture(); const server = path.join(f.home, 'slow-shutdown.cjs');
+    // A child that keeps its pipes open after SIGTERM used to hold the hook
+    // beyond its deadline even after a valid response had been written.
+    fs.writeFileSync(server, `
+      const readline = require('node:readline');
+      process.on('SIGTERM', () => setTimeout(() => process.exit(0), 500));
+      setInterval(() => {}, 1000);
+      readline.createInterface({ input: process.stdin }).on('line', line => {
+        const msg = JSON.parse(line); if (!msg.id || !${responds}) return;
+        const result = msg.method === 'initialize'
+          ? { protocolVersion: '2025-06-18', capabilities: {}, serverInfo: { name: 'fixture', version: '5.0.1' } }
+          : { structuredContent: { memories: [], entities: [], backfill_receipts: [] } };
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }) + '\\n');
+      });
+    `);
+    const triggers = path.join(f.home, 'triggers.json'); fs.writeFileSync(triggers, JSON.stringify(defaults));
+    const config = path.join(f.home, 'config.json');
+    fs.writeFileSync(config, JSON.stringify({ binary: process.execPath, binaryArgs: [server], triggers }));
+    const start = performance.now();
+    const result = spawnSync(process.execPath, [path.join(__dirname, '../hooks/memory.cjs'), '--config', config, '--client', 'claude', '--event', 'session'],
+      { input: JSON.stringify({ session_id: 'slow-shutdown' }), encoding: 'utf8', timeout: 2000 });
+    const elapsed = performance.now() - start;
+    assert.equal(result.status, 0, result.stderr); assert.equal(result.stderr, '');
+    assert(elapsed < 300, `complete hook process took ${elapsed}ms`);
+    const value = JSON.parse(result.stdout);
+    if (responds) assert(value.hookSpecificOutput?.additionalContext, result.stdout);
+    else {
+      assert.deepEqual(value, {});
+      assert(fs.readFileSync(path.join(f.home, 'errors.log'), 'utf8').includes('deadline exceeded'));
+    }
+  });
+}

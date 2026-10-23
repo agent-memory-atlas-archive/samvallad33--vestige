@@ -1,6 +1,8 @@
 name: Prepare release artifacts (no publication)
 
 on:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       source_ref:
@@ -20,8 +22,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  SOURCE_REF: ${{ inputs.source_ref }}
-  PRODUCT_VERSION: ${{ inputs.version }}
+  SOURCE_REF: ${{ github.event.pull_request.head.sha || inputs.source_ref }}
+  PRODUCT_VERSION: ${{ inputs.version || '5.0.1' }}
 
 jobs:
   desktop:
@@ -48,7 +50,7 @@ jobs:
           [[ "$PRODUCT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ env.SOURCE_REF }}
           persist-credentials: false
       - uses: pnpm/action-setup@v4
         with:
@@ -76,7 +78,7 @@ jobs:
           python3 scripts/prepare-release.py archive --target '${{ matrix.target }}' --output dist/release
       - uses: actions/upload-artifact@v4
         with:
-          name: vestige-${{ inputs.version }}-${{ matrix.target }}
+          name: vestige-${{ env.PRODUCT_VERSION }}-${{ matrix.target }}
           path: dist/release/*
           if-no-files-found: error
 
@@ -102,7 +104,7 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config cmake python3 perl xz-utils unzip binutils libssl-dev
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ env.SOURCE_REF }}
           persist-credentials: false
       - uses: pnpm/action-setup@v4
         with:
@@ -132,7 +134,7 @@ jobs:
           python3 scripts/prepare-release.py archive --target '${{ matrix.target }}' --output dist/release
       - uses: actions/upload-artifact@v4
         with:
-          name: vestige-${{ inputs.version }}-${{ matrix.target }}
+          name: vestige-${{ env.PRODUCT_VERSION }}-${{ matrix.target }}
           path: dist/release/*
           if-no-files-found: error
 
@@ -149,7 +151,7 @@ jobs:
           [[ "$PRODUCT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ env.SOURCE_REF }}
           persist-credentials: false
       - uses: pnpm/action-setup@v4
         with:
@@ -193,6 +195,6 @@ jobs:
           python3 scripts/prepare-release.py archive --target aarch64-linux-android --output dist/release
       - uses: actions/upload-artifact@v4
         with:
-          name: vestige-${{ inputs.version }}-aarch64-linux-android
+          name: vestige-${{ env.PRODUCT_VERSION }}-aarch64-linux-android
           path: dist/release/*
           if-no-files-found: error
