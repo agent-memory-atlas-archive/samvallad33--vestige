@@ -104,7 +104,7 @@ GREEN Backfill autofire enabled in responding process
 Memories: 2
 Recent Backfill receipts: eff-0000000000000008
 
-First-run setup wall time: 97.05 ms (binary already installed; excludes human reading time).
-Hook process wall times: [{"event":"session","ms":109.85},{"event":"prompt","ms":111.41},{"event":"turn","ms":183.25},{"event":"prompt","ms":113.99},{"event":"turn","ms":275.86},{"event":"prompt","ms":115.66},{"event":"compact","ms":84.39},{"event":"end","ms":85.91}]
+First-run setup wall time: 94.44 ms (binary already installed; excludes human reading time).
+Hook process wall times: [{"event":"session","ms":106.08},{"event":"prompt","ms":106.86},{"event":"turn","ms":191.85},{"event":"prompt","ms":108.79},{"event":"turn","ms":276.85},{"event":"prompt","ms":116.79},{"event":"compact","ms":86.21},{"event":"end","ms":81.66}]
 
 Fixture only: native client trust, reload and execution in each GUI/CLI remain separate checks.

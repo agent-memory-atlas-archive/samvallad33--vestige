@@ -64,6 +64,7 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_REF"
           python3 scripts/prepare-release.py check-version --version "$PRODUCT_VERSION"
+          python3 -B -m unittest discover -s tests -p test_release_no_reqwest.py
           bash scripts/check-release-no-reqwest.sh
           pnpm install --frozen-lockfile
           pnpm --filter @vestige/dashboard check
@@ -116,8 +117,10 @@ jobs:
       - name: Validate and build dashboard
         shell: bash
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           test "$(git rev-parse HEAD)" = "$SOURCE_REF"
           python3 scripts/prepare-release.py check-version --version "$PRODUCT_VERSION"
+          python3 -B -m unittest discover -s tests -p test_release_no_reqwest.py
           bash scripts/check-release-no-reqwest.sh
           pnpm install --frozen-lockfile
           pnpm --filter @vestige/dashboard check
@@ -165,6 +168,7 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_REF"
           python3 scripts/prepare-release.py check-version --version "$PRODUCT_VERSION"
+          python3 -B -m unittest discover -s tests -p test_release_no_reqwest.py
           bash scripts/check-release-no-reqwest.sh
           pnpm install --frozen-lockfile
           pnpm --filter @vestige/dashboard check

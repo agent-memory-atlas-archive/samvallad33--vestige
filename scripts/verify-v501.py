@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'dist' / 'v501-shipping-audit'
 CHECKS = [
     ('versions', ['python3','-B','scripts/prepare-release.py','check-version','--version','5.0.1']),
+    ('release-dependency-tests', ['python3','-B','-m','unittest','discover','-s','tests','-p','test_release_no_reqwest.py']),
+    ('release-dependency-check', ['/bin/bash','scripts/check-release-no-reqwest.sh']),
     ('format', ['cargo','fmt','--all','--','--check']),
     ('store-format', ['cargo','fmt','--manifest-path','crates/strata-store/Cargo.toml','--','--check']),
     ('native-build', ['cargo','build','-p','vestige-mcp','--offline']),
