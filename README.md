@@ -79,9 +79,8 @@ restores the score recorded before that change. Raises retain the original
 bounded stability step, `min(stability * 1.5, stability + 365)`, with a matching
 bounded decrease and floor for lowering.
 
-This section describes the v5.0.1 source candidate. The release remains
-unpublished until its checks, target builds, and owner review are complete.
-See the [release preparation guide](docs/releases/v5.0.1.md).
+See the [release procedure](docs/releases/v5.0.1.md) for source verification,
+platform archives, checksums, package review, and rollback requirements.
 
 ## Quick start
 
@@ -106,9 +105,6 @@ same tool and explicit metadata. Backfill therefore runs on each admitted
 save. Memory hooks have a bounded deadline, fail open and log errors locally.
 Optional guard hooks fail closed. See the [installer guide](packages/vestige-init/README.md)
 for the full client coverage, receipt paths, doctor, status and uninstall.
-
-This is the unpublished v5.0.1 candidate. Publication and target builds remain
-subject to the [release gates](docs/releases/v5.0.1.md).
 
 ### Operator Lite on its own
 

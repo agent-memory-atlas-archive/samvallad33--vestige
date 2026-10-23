@@ -90,9 +90,9 @@ owned entries, preserves other edits, and retains backups and the memory store.
 Re-running setup is idempotent. A client editing a target after preview makes
 setup refuse before writing; rerun to review a fresh preview.
 
-The source candidate has native fixture coverage on macOS. Windows paths and
-quoting have unit coverage; native Windows and Linux client runs remain release
-verification gates. This candidate is not an npm publication.
+The initializer has native fixture coverage on macOS. Windows paths and quoting
+have unit coverage; execution inside native Windows and Linux clients requires
+separate verification. Registration fixtures do not establish client execution.
 
 ## Follow one real stop around the loop
 

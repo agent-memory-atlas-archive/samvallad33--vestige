@@ -39,8 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Save explicit user declarations through `smart_ingest` with provenance and metadata; request richer fact capture through the connected agent. Bound memory hook execution, fail open silently, and retain pending writes for retry. Preserve the optional guard's fail-closed behavior.
 - Add `doctor`, `status`, and `uninstall`, native Maya/Backfill acceptance, timing tests and a real bundled Lite STOP-to-Strata reflex test. Document client trust and unsupported lifecycle surfaces.
 
-Operator Lite 0.3.11. Version 0.3.8 is skipped: it was published to npm and
-withdrawn, so the number cannot be used again.
+The bundled Operator Lite runtime now uses the product version, 5.0.1. Its
+rule-set additions below originated in Lite 0.3.11. Version 0.3.8 was published
+to npm and withdrawn, so that historical number cannot be used again.
 
 ### Added (0.3.11)
 

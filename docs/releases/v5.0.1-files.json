@@ -16,7 +16,7 @@
     },
     {
       "path": "CHANGELOG.md",
-      "reason": "Align product version and desktop binary pins at 5.0.1; first-party manifests aligned"
+      "reason": "Record v5.0.1 Backfill and memory-first installer; distinguish bundled Lite version from its historical rule-set version"
     },
     {
       "path": "Cargo.lock",
@@ -28,7 +28,7 @@
     },
     {
       "path": "README.md",
-      "reason": "Align product version and desktop binary pins at 5.0.1; first-party manifests aligned"
+      "reason": "Explain Backfill and memory-first setup with release-neutral verification and rollback links"
     },
     {
       "path": "apps/dashboard/package.json",
@@ -216,11 +216,11 @@
     },
     {
       "path": "docs/releases/v5.0.1-notes.md",
-      "reason": "Release history, owner shipping steps, first-run capture and verification evidence"
+      "reason": "Describe both Backfill and the memory-first installer without preparation-only publication claims"
     },
     {
       "path": "docs/releases/v5.0.1.md",
-      "reason": "Release history, owner shipping steps, first-run capture and verification evidence"
+      "reason": "Record version-specific verification, draft release, package review and rollback procedure"
     },
     {
       "path": "hooks/operator-stop-memory.py",
@@ -288,7 +288,7 @@
     },
     {
       "path": "packages/vestige-init/README.md",
-      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+      "reason": "Document memory-first setup and preserve actual native-client verification boundaries"
     },
     {
       "path": "packages/vestige-init/bin/init.js",
