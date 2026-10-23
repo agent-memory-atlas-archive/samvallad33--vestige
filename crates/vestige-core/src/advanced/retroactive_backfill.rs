@@ -32,7 +32,7 @@
 //! is an aversive→neutral paradigm; we mirror that scope intentionally.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // ============================================================================
 // CONSTANTS
@@ -125,9 +125,42 @@ pub const FAILURE_MARKERS: &[&str] = &[
 ];
 
 /// How strongly to promote the backfilled cause: multiply its stability by this
-/// (capped). A real boost so the cause stops decaying and surfaces in future
-/// recalls — without overwriting the FSRS history.
-pub const PROMOTION_STABILITY_FACTOR: f64 = 2.5;
+/// (capped). v2.2.1 deliberately reduced the original 2.5 display factor to
+/// this bounded write factor, shared by automatic and manual backfill paths.
+pub const PROMOTION_STABILITY_FACTOR: f64 = 1.5;
+
+/// The positive floor used when lowering salience. A backfill may make a prior
+/// record quieter, but it must never erase the record or make its stability
+/// non-positive.
+pub const MIN_SALIENCE_STABILITY: f64 = 0.01;
+
+/// Hard work and output limits for the every-save planner. The storage adapter
+/// should normally pass a much smaller traversed set; these caps are the final
+/// defense against a malformed or adversarial caller turning one save into an
+/// unbounded scan or mutation flood.
+pub const MAX_SALIENCE_CANDIDATES: usize = 500;
+pub const MAX_SALIENCE_TAGS_PER_MEMORY: usize = 64;
+pub const MAX_PLANNED_SALIENCE_CHANGES: usize = 16;
+pub const MAX_SALIENCE_CONTENT_BYTES: usize = 64 * 1024;
+const MAX_SALIENCE_VALUE_BYTES: usize = 512;
+
+/// Typed identities admitted by the personal salience planner. Matching is
+/// exact and case-sensitive: `person:Maya` and `person:maya` are different
+/// identities. Free text never becomes an identity in this path.
+const SALIENCE_IDENTITY_PREFIXES: &[&str] =
+    &["person:", "place:", "food:", "file:", "service:", "symbol:"];
+
+/// Attribute namespaces that can make an ordinary save salient without
+/// pretending it is a software failure. They remain inert unless an older
+/// candidate shares an admitted typed identity.
+const PERSONAL_ATTRIBUTE_PREFIXES: &[&str] = &[
+    "allergy:",
+    "preference:",
+    "health:",
+    "condition:",
+    "medication:",
+    "diet:",
+];
 
 /// Bonus for candidates that ARE a change record (a commit) rather than a
 /// description of one. Real histories are full of reports quoting the same
@@ -177,6 +210,42 @@ pub struct FailureEvent {
     pub prediction_error: f32,
     /// True if a caller explicitly marked this salient (manual override path).
     pub manual: bool,
+}
+
+/// Storage-independent input to the personal salience planner. The caller is
+/// responsible for supplying an already-bounded, already-walked candidate set;
+/// this layer only validates chronology, exact identities and bounded changes.
+/// `created_at_ms`, `stability`, and typed tags must come from one trusted store
+/// snapshot rather than request JSON. Applying a returned change must compare
+/// the stored value with `old_stability` atomically before writing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SalienceMemory {
+    pub id: String,
+    pub content: String,
+    pub tags: Vec<String>,
+    pub created_at_ms: i64,
+    pub stability: f64,
+}
+
+/// Whether a planned salience mutation raises or lowers an older memory.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SalienceDirection {
+    Raise,
+    Lower,
+}
+
+/// One reviewable, reversible salience mutation. Persistence layers can turn
+/// this pure plan into a receipt containing the exact before/after values.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SalienceChange {
+    pub memory_id: String,
+    pub trigger_id: String,
+    pub shared_entity: String,
+    pub reason: String,
+    pub old_stability: f64,
+    pub new_stability: f64,
+    pub direction: SalienceDirection,
 }
 
 /// Pull shared-entity join keys from content + tags (single source of truth used
@@ -421,6 +490,364 @@ impl FailureEvent {
         }
         looks_like_failure(&self.content, &self.tags)
     }
+}
+
+fn typed_tag_value<'a>(tag: &'a str, prefix: &str) -> Option<&'a str> {
+    let value = tag.strip_prefix(prefix)?;
+    (!value.is_empty()
+        && value.len() <= MAX_SALIENCE_VALUE_BYTES
+        && value == value.trim()
+        && !value.chars().any(char::is_control))
+    .then_some(value)
+}
+
+fn is_bounded_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SALIENCE_VALUE_BYTES
+        && value == value.trim()
+        && !value.chars().any(char::is_control)
+}
+
+fn is_salience_identity(tag: &str) -> bool {
+    SALIENCE_IDENTITY_PREFIXES
+        .iter()
+        .any(|prefix| typed_tag_value(tag, prefix).is_some())
+}
+
+fn parse_preference(tag: &str) -> Option<(&str, &str)> {
+    let value = typed_tag_value(tag, "preference:")?;
+    let (key, selected) = value.split_once('=')?;
+    if key.is_empty() || selected.is_empty() || key != key.trim() || selected != selected.trim() {
+        return None;
+    }
+    Some((key, selected))
+}
+
+fn is_personal_attribute(tag: &str) -> bool {
+    PERSONAL_ATTRIBUTE_PREFIXES.iter().any(|prefix| {
+        if *prefix == "preference:" {
+            parse_preference(tag).is_some()
+        } else {
+            typed_tag_value(tag, prefix).is_some()
+        }
+    })
+}
+
+fn is_health_attribute(tag: &str) -> bool {
+    ["allergy:", "health:", "condition:", "medication:"]
+        .iter()
+        .any(|prefix| typed_tag_value(tag, prefix).is_some())
+}
+
+/// Cheap eligibility check for an every-save caller, before a store scan.
+pub fn has_salient_personal_attribute(tags: &[String]) -> bool {
+    tags.iter().any(|tag| is_personal_attribute(tag))
+}
+
+/// Preserve only metadata this planner interprets. Generic project/topic tags
+/// do not consume its per-memory entity budget or become relevance evidence.
+pub fn salience_metadata_tags(tags: &[String]) -> Vec<String> {
+    tags.iter()
+        .filter(|tag| {
+            is_salience_identity(tag)
+                || is_personal_attribute(tag)
+                || typed_tag_value(tag, "contradicts:").is_some()
+                || typed_tag_value(tag, "supersedes:").is_some()
+        })
+        .cloned()
+        .collect()
+}
+
+fn shared_salience_identities(trigger: &SalienceMemory, candidate: &SalienceMemory) -> Vec<String> {
+    let candidate_identities: HashSet<&str> = candidate
+        .tags
+        .iter()
+        .map(String::as_str)
+        .filter(|tag| is_salience_identity(tag))
+        .collect();
+    let mut shared: Vec<String> = trigger
+        .tags
+        .iter()
+        .map(String::as_str)
+        .filter(|tag| is_salience_identity(tag) && candidate_identities.contains(tag))
+        .map(str::to_owned)
+        .collect();
+    shared.sort_unstable();
+    shared.dedup();
+    shared
+}
+
+fn explicit_relation(trigger: &SalienceMemory, candidate_id: &str) -> Option<&'static str> {
+    if trigger
+        .tags
+        .iter()
+        .any(|tag| typed_tag_value(tag, "contradicts:") == Some(candidate_id))
+    {
+        return Some("contradicts");
+    }
+    trigger
+        .tags
+        .iter()
+        .any(|tag| typed_tag_value(tag, "supersedes:") == Some(candidate_id))
+        .then_some("supersedes")
+}
+
+fn conflicting_preference<'a>(
+    trigger: &'a SalienceMemory,
+    candidate: &'a SalienceMemory,
+) -> Option<(&'a str, &'a str, &'a str)> {
+    for trigger_tag in &trigger.tags {
+        let Some((trigger_key, trigger_value)) = parse_preference(trigger_tag) else {
+            continue;
+        };
+        for candidate_tag in &candidate.tags {
+            let Some((candidate_key, candidate_value)) = parse_preference(candidate_tag) else {
+                continue;
+            };
+            if trigger_key == candidate_key && trigger_value != candidate_value {
+                return Some((trigger_key, candidate_value, trigger_value));
+            }
+        }
+    }
+    None
+}
+
+fn has_ambiguous_preferences(memory: &SalienceMemory) -> bool {
+    let mut preferences: HashMap<&str, &str> = HashMap::new();
+    for tag in &memory.tags {
+        let Some((key, value)) = parse_preference(tag) else {
+            continue;
+        };
+        if matches!(
+            preferences.insert(key, value),
+            Some(previous) if previous != value
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+fn attributes_are_unchanged(trigger: &SalienceMemory, candidate: &SalienceMemory) -> bool {
+    let trigger_attributes: Vec<&str> = trigger
+        .tags
+        .iter()
+        .map(String::as_str)
+        .filter(|tag| is_personal_attribute(tag))
+        .collect();
+    !trigger_attributes.is_empty()
+        && trigger_attributes.iter().all(|tag| {
+            candidate
+                .tags
+                .iter()
+                .any(|candidate_tag| candidate_tag == tag)
+        })
+}
+
+fn raised_stability(stability: f64) -> f64 {
+    (stability * PROMOTION_STABILITY_FACTOR).min(stability + 365.0)
+}
+
+fn lowered_stability(stability: f64) -> f64 {
+    if stability <= MIN_SALIENCE_STABILITY {
+        return stability;
+    }
+    (stability / PROMOTION_STABILITY_FACTOR)
+        .max(stability - 365.0)
+        .max(MIN_SALIENCE_STABILITY)
+        .min(stability)
+}
+
+fn personal_health_reason(candidate: &SalienceMemory, shared_person: &str) -> String {
+    let person = typed_tag_value(shared_person, "person:").unwrap_or(shared_person);
+    let place = candidate
+        .tags
+        .iter()
+        .find_map(|tag| typed_tag_value(tag, "place:"));
+    let content: String = candidate
+        .content
+        .chars()
+        .take(512)
+        .flat_map(char::to_lowercase)
+        .collect();
+    let describes_reaction = content.contains("felt off after")
+        && !content.contains("never felt off")
+        && !content.contains("not felt off");
+
+    if let Some(place) = place.filter(|_| describes_reaction) {
+        return format!(
+            "A new health fact about {person} makes the earlier bad reaction after {place} relevant. The exact shared identity is {shared_person}; this does not imply anything about ingredients at {place} or prove what caused the reaction."
+        );
+    }
+
+    format!(
+        "A new health fact about {person} makes this older memory about the same person relevant. The exact shared identity is {shared_person}; shared identity supports relevance, not causation."
+    )
+}
+
+/// Plan bounded, reversible salience changes for a new save.
+///
+/// The caller supplies older candidate records already selected by a bounded
+/// traversal. This function performs no storage reads, text search, embeddings
+/// or graph walk. It accepts only exact, case-sensitive typed identity tags and
+/// independently enforces backward-only chronology. `manual` bypasses the
+/// automatic trigger test, but never the identity or chronology requirements.
+/// The adapter must derive tags from the same trusted store scope as the
+/// timestamps and stability values; raw request tags are not provenance.
+///
+/// Automatic triggers are explicit personal attributes such as
+/// `allergy:peanut` or `preference:cuisine=Thai`. Software-failure auto-fire
+/// on the recovered legacy engine uses [`FailureEvent::is_salient`]. A Strata
+/// caller can pass `manual=true` for a recorded coding failure recognized by
+/// `looks_like_failure`; it must still supply explicit identities. A personal attribute may link only through
+/// exactly one `person:` identity, which prevents a shared venue from
+/// transferring one person's health fact to another person. On the reviewed
+/// manual path, exact `contradicts:<memory-id>` and
+/// `supersedes:<memory-id>` tags can lower a named older record. An explicit
+/// conflicting preference for the same person and preference key can lower on
+/// either path.
+pub fn plan_salience(
+    trigger: &SalienceMemory,
+    candidates: &[SalienceMemory],
+    manual: bool,
+) -> Vec<SalienceChange> {
+    if !is_bounded_value(&trigger.id)
+        || trigger.content.len() > MAX_SALIENCE_CONTENT_BYTES
+        || trigger.tags.len() > MAX_SALIENCE_TAGS_PER_MEMORY
+        || trigger
+            .tags
+            .iter()
+            .any(|tag| tag.len() > MAX_SALIENCE_VALUE_BYTES)
+        || candidates.len() > MAX_SALIENCE_CANDIDATES
+        || has_ambiguous_preferences(trigger)
+    {
+        return Vec::new();
+    }
+    let has_personal_attribute = trigger.tags.iter().any(|tag| is_personal_attribute(tag));
+    if !manual && !has_personal_attribute {
+        return Vec::new();
+    }
+
+    let trigger_people: HashSet<&str> = trigger
+        .tags
+        .iter()
+        .filter_map(|tag| typed_tag_value(tag, "person:"))
+        .collect();
+    if has_personal_attribute && trigger_people.len() != 1 {
+        return Vec::new();
+    }
+    let requires_shared_person = !trigger_people.is_empty();
+    let health_trigger = trigger.tags.iter().any(|tag| is_health_attribute(tag));
+    let mut candidate_ids = HashSet::new();
+    if candidates.iter().any(|candidate| {
+        !is_bounded_value(&candidate.id)
+            || !candidate_ids.insert(candidate.id.as_str())
+            || candidate.tags.len() > MAX_SALIENCE_TAGS_PER_MEMORY
+            || candidate
+                .tags
+                .iter()
+                .any(|tag| tag.len() > MAX_SALIENCE_VALUE_BYTES)
+            || !candidate.stability.is_finite()
+            || candidate.stability <= 0.0
+            || has_ambiguous_preferences(candidate)
+    }) {
+        return Vec::new();
+    }
+
+    let mut changes: Vec<SalienceChange> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            if candidate.id == trigger.id
+                || candidate.created_at_ms >= trigger.created_at_ms
+            {
+                return None;
+            }
+
+            let shared = shared_salience_identities(trigger, candidate);
+            if shared.is_empty() {
+                return None;
+            }
+            let shared_person = shared
+                .iter()
+                .find(|identity| identity.starts_with("person:"));
+            if requires_shared_person && shared_person.is_none() {
+                return None;
+            }
+
+            let relation = manual
+                .then(|| explicit_relation(trigger, &candidate.id))
+                .flatten();
+            let preference_conflict = shared_person
+                .is_some()
+                .then(|| conflicting_preference(trigger, candidate))
+                .flatten();
+            if relation.is_none()
+                && preference_conflict.is_none()
+                && attributes_are_unchanged(trigger, candidate)
+            {
+                return None;
+            }
+
+            let (direction, new_stability, reason, shared_entity) =
+                if let Some(relation) = relation {
+                    let shared_entity = shared_person.cloned().unwrap_or_else(|| shared[0].clone());
+                    (
+                        SalienceDirection::Lower,
+                        lowered_stability(candidate.stability),
+                        format!(
+                            "The trigger explicitly {relation} this older memory and shares the exact identity {shared_entity}; lower its salience while preserving the record."
+                        ),
+                        shared_entity,
+                    )
+                } else if let Some((key, previous, current)) = preference_conflict {
+                    let shared_entity = shared_person
+                        .cloned()
+                        .expect("preference conflicts require an exact shared person");
+                    let person = typed_tag_value(&shared_entity, "person:")
+                        .unwrap_or(shared_entity.as_str());
+                    (
+                        SalienceDirection::Lower,
+                        lowered_stability(candidate.stability),
+                        format!(
+                            "A newer explicit preference for {person} changes {key} from {previous} to {current}; lower the older preference without deleting it."
+                        ),
+                        shared_entity,
+                    )
+                } else {
+                    let shared_entity = shared_person.cloned().unwrap_or_else(|| shared[0].clone());
+                    let reason = if health_trigger {
+                        personal_health_reason(candidate, &shared_entity)
+                    } else {
+                        format!(
+                            "The newer trigger shares the exact identity {shared_entity} with this older memory. Shared identity supports relevance, not causation."
+                        )
+                    };
+                    (
+                        SalienceDirection::Raise,
+                        raised_stability(candidate.stability),
+                        reason,
+                        shared_entity,
+                    )
+                };
+
+            if (new_stability - candidate.stability).abs() <= f64::EPSILON {
+                return None;
+            }
+
+            Some(SalienceChange {
+                memory_id: candidate.id.clone(),
+                trigger_id: trigger.id.clone(),
+                shared_entity,
+                reason,
+                old_stability: candidate.stability,
+                new_stability,
+                direction,
+            })
+        })
+        .collect();
+    changes.sort_by(|left, right| left.memory_id.cmp(&right.memory_id));
+    changes.truncate(MAX_PLANNED_SALIENCE_CHANGES);
+    changes
 }
 
 // ============================================================================
@@ -1310,5 +1737,397 @@ mod tests {
             .expect("excluded match must still report the break");
         assert!(gap.missing_entities.is_empty());
         assert!(gap.note.contains("excluded"), "{}", gap.note);
+    }
+
+    fn salience_memory(
+        id: &str,
+        content: &str,
+        tags: &[&str],
+        created_at_ms: i64,
+        stability: f64,
+    ) -> SalienceMemory {
+        SalienceMemory {
+            id: id.into(),
+            content: content.into(),
+            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            created_at_ms,
+            stability,
+        }
+    }
+
+    #[test]
+    fn personal_health_fact_raises_only_the_same_persons_older_reaction() {
+        let trigger = salience_memory(
+            "maya-allergy",
+            "Maya has a peanut allergy",
+            &["person:Maya", "allergy:peanut"],
+            200,
+            4.0,
+        );
+        let maya_reaction = salience_memory(
+            "maya-reaction",
+            "Maya felt off after dinner at Bangkok Garden",
+            &["person:Maya", "place:Bangkok Garden"],
+            100,
+            5.0,
+        );
+        let other_person = salience_memory(
+            "noah-dinner",
+            "Noah felt off after dinner at Bangkok Garden",
+            &["person:Noah", "place:Bangkok Garden"],
+            90,
+            5.0,
+        );
+
+        let changes = plan_salience(&trigger, &[maya_reaction, other_person], false);
+
+        assert_eq!(changes.len(), 1, "venue overlap must not cross people");
+        let change = &changes[0];
+        assert_eq!(change.memory_id, "maya-reaction");
+        assert_eq!(change.shared_entity, "person:Maya");
+        assert_eq!(change.direction, SalienceDirection::Raise);
+        assert_eq!(change.old_stability, 5.0);
+        assert_eq!(change.new_stability, 7.5);
+        assert!(
+            change
+                .reason
+                .contains("new health fact about Maya makes the earlier bad reaction after Bangkok Garden relevant"),
+            "{}",
+            change.reason
+        );
+        assert!(
+            change
+                .reason
+                .contains("does not imply anything about ingredients"),
+            "the reason must preserve the no-ingredient-inference boundary: {}",
+            change.reason
+        );
+
+        let trigger_with_untrusted_venue = salience_memory(
+            "maya-allergy-with-venue",
+            "Maya has a peanut allergy",
+            &["person:Maya", "allergy:peanut", "place:Bangkok Garden"],
+            200,
+            4.0,
+        );
+        let venue_only = salience_memory(
+            "noah-dinner-again",
+            "Noah ate at Bangkok Garden",
+            &["person:Noah", "place:Bangkok Garden"],
+            80,
+            4.0,
+        );
+        assert!(
+            plan_salience(&trigger_with_untrusted_venue, &[venue_only], false).is_empty(),
+            "even an extra venue tag cannot substitute for the exact person identity"
+        );
+    }
+
+    #[test]
+    fn manual_non_failure_still_requires_identity_and_backward_time() {
+        let trigger = salience_memory(
+            "manual",
+            "Review the deployment note",
+            &["service:checkout"],
+            200,
+            4.0,
+        );
+        let older = salience_memory(
+            "older",
+            "Changed checkout retries",
+            &["service:checkout"],
+            100,
+            4.0,
+        );
+        let unshared = salience_memory(
+            "unshared",
+            "Changed billing retries",
+            &["service:billing"],
+            100,
+            4.0,
+        );
+        let future = salience_memory(
+            "future",
+            "Will change checkout retries",
+            &["service:checkout"],
+            300,
+            4.0,
+        );
+
+        assert!(plan_salience(&trigger, std::slice::from_ref(&older), false).is_empty());
+        let changes = plan_salience(&trigger, &[older, unshared, future], true);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].memory_id, "older");
+        assert_eq!(changes[0].direction, SalienceDirection::Raise);
+
+        let person_trigger = salience_memory(
+            "maya-review",
+            "Review Maya's dinner",
+            &["person:Maya", "place:Bangkok Garden"],
+            200,
+            4.0,
+        );
+        let other_person = salience_memory(
+            "noah-dinner",
+            "Noah ate at Bangkok Garden",
+            &["person:Noah", "place:Bangkok Garden"],
+            100,
+            4.0,
+        );
+        assert!(
+            plan_salience(&person_trigger, &[other_person], true).is_empty(),
+            "manual mode cannot cross people through a shared venue"
+        );
+    }
+
+    #[test]
+    fn conflicting_preference_lowers_only_same_person_and_key() {
+        let trigger = salience_memory(
+            "new-preference",
+            "Maya now prefers Italian food",
+            &[
+                "person:Maya",
+                "preference:cuisine=Italian",
+                "place:Downtown",
+            ],
+            200,
+            4.0,
+        );
+        let old_preference = salience_memory(
+            "old-preference",
+            "Maya preferred Thai food",
+            &["person:Maya", "preference:cuisine=Thai"],
+            100,
+            1_000.0,
+        );
+        let other_key = salience_memory(
+            "other-key",
+            "Maya prefers window seats",
+            &["person:Maya", "preference:seating=Window"],
+            90,
+            6.0,
+        );
+        let other_person = salience_memory(
+            "other-person",
+            "Noah preferred Thai food downtown",
+            &["person:Noah", "preference:cuisine=Thai", "place:Downtown"],
+            80,
+            6.0,
+        );
+
+        let changes = plan_salience(&trigger, &[old_preference, other_key, other_person], false);
+
+        let lowered = changes
+            .iter()
+            .find(|change| change.memory_id == "old-preference")
+            .expect("the conflicting same-person preference must be lowered");
+        assert_eq!(lowered.direction, SalienceDirection::Lower);
+        assert!((lowered.new_stability - (1_000.0 / 1.5)).abs() < 1e-9);
+        assert!(
+            lowered
+                .reason
+                .contains("changes cuisine from Thai to Italian")
+        );
+        assert!(
+            !changes
+                .iter()
+                .any(|change| change.memory_id == "other-person"),
+            "a shared venue must not transfer a personal preference"
+        );
+        assert_eq!(
+            changes
+                .iter()
+                .find(|change| change.memory_id == "other-key")
+                .map(|change| change.direction),
+            Some(SalienceDirection::Raise),
+            "a different preference key remains relevant, not contradictory"
+        );
+    }
+
+    #[test]
+    fn salience_bounds_cover_multiply_additive_and_positive_floor() {
+        let failure = salience_memory(
+            "failure",
+            "checkout service crashed",
+            &["service:checkout"],
+            200,
+            4.0,
+        );
+        let high = salience_memory(
+            "high",
+            "changed checkout config",
+            &["service:checkout"],
+            100,
+            1_000.0,
+        );
+        let low = salience_memory(
+            "low",
+            "changed checkout timeout",
+            &["service:checkout"],
+            90,
+            10.0,
+        );
+        let raised = plan_salience(&failure, &[high, low], true);
+        assert_eq!(raised[0].new_stability, 1_365.0);
+        assert_eq!(raised[1].new_stability, 15.0);
+
+        let contradiction = salience_memory(
+            "correction",
+            "The old checkout note is superseded",
+            &[
+                "service:checkout",
+                "supersedes:additive",
+                "supersedes:floor",
+            ],
+            300,
+            4.0,
+        );
+        let additive = salience_memory(
+            "additive",
+            "older high-stability checkout note",
+            &["service:checkout"],
+            90,
+            2_000.0,
+        );
+        let floor = salience_memory(
+            "floor",
+            "old checkout note",
+            &["service:checkout"],
+            100,
+            MIN_SALIENCE_STABILITY,
+        );
+        assert!(plan_salience(&contradiction, std::slice::from_ref(&additive), false).is_empty());
+        let lowered = plan_salience(&contradiction, &[additive, floor], true);
+        assert_eq!(lowered.len(), 1);
+        assert_eq!(lowered[0].memory_id, "additive");
+        assert_eq!(lowered[0].new_stability, 1_635.0);
+        assert!(
+            !lowered.iter().any(|change| change.memory_id == "floor"),
+            "a lower at the positive floor is an unchanged no-op"
+        );
+    }
+
+    #[test]
+    fn unchanged_attributes_and_case_mismatched_identities_are_noops() {
+        let trigger = salience_memory(
+            "duplicate",
+            "Maya still prefers Thai food",
+            &["person:Maya", "preference:cuisine=Thai"],
+            200,
+            4.0,
+        );
+        let unchanged = salience_memory(
+            "unchanged",
+            "Maya prefers Thai food",
+            &["person:Maya", "preference:cuisine=Thai"],
+            100,
+            4.0,
+        );
+        let wrong_case = salience_memory(
+            "wrong-case",
+            "maya prefers Italian food",
+            &["person:maya", "preference:cuisine=Italian"],
+            90,
+            4.0,
+        );
+
+        assert!(plan_salience(&trigger, &[unchanged.clone(), wrong_case], false).is_empty());
+
+        let ambiguous = salience_memory(
+            "ambiguous",
+            "Maya has two conflicting cuisine tags",
+            &[
+                "person:Maya",
+                "preference:cuisine=Thai",
+                "preference:cuisine=Italian",
+            ],
+            300,
+            4.0,
+        );
+        assert!(
+            plan_salience(&ambiguous, std::slice::from_ref(&unchanged), false).is_empty(),
+            "ambiguous values for one preference key fail closed"
+        );
+    }
+
+    #[test]
+    fn personal_attributes_without_a_person_and_duplicate_candidates_are_bounded() {
+        let unscoped_health = salience_memory(
+            "unscoped-health",
+            "A peanut allergy was recorded",
+            &["allergy:peanut", "place:Bangkok Garden"],
+            200,
+            4.0,
+        );
+        let venue_memory = salience_memory(
+            "venue",
+            "Dinner at Bangkok Garden",
+            &["place:Bangkok Garden"],
+            100,
+            4.0,
+        );
+        assert!(plan_salience(&unscoped_health, &[venue_memory], false).is_empty());
+
+        let ambiguous_health = salience_memory(
+            "ambiguous-health",
+            "A shared allergy note",
+            &["person:Maya", "person:Noah", "allergy:peanut"],
+            200,
+            4.0,
+        );
+        let maya = salience_memory("maya", "Maya felt off", &["person:Maya"], 100, 4.0);
+        assert!(plan_salience(&ambiguous_health, &[maya], false).is_empty());
+
+        let failure = salience_memory(
+            "failure",
+            "checkout crashed",
+            &["service:checkout"],
+            200,
+            4.0,
+        );
+        let cause = salience_memory(
+            "cause",
+            "changed checkout retries",
+            &["service:checkout"],
+            100,
+            4.0,
+        );
+        let duplicate = cause.clone();
+        assert!(
+            plan_salience(&failure, &[cause, duplicate], true).is_empty(),
+            "ambiguous duplicate candidate ids fail closed"
+        );
+    }
+
+    #[test]
+    fn planner_caps_output_and_rejects_oversized_trigger_metadata() {
+        let trigger = salience_memory(
+            "manual",
+            "Review checkout history",
+            &["service:checkout"],
+            1_000,
+            4.0,
+        );
+        let candidates: Vec<SalienceMemory> = (0..(MAX_PLANNED_SALIENCE_CHANGES + 5))
+            .map(|index| {
+                salience_memory(
+                    &format!("candidate-{index}"),
+                    "checkout change",
+                    &["service:checkout"],
+                    index as i64,
+                    4.0,
+                )
+            })
+            .collect();
+        assert_eq!(
+            plan_salience(&trigger, &candidates, true).len(),
+            MAX_PLANNED_SALIENCE_CHANGES
+        );
+
+        let mut oversized = trigger;
+        oversized.tags = (0..=MAX_SALIENCE_TAGS_PER_MEMORY)
+            .map(|index| format!("service:checkout-{index}"))
+            .collect();
+        assert!(plan_salience(&oversized, &candidates, true).is_empty());
     }
 }

@@ -1,21 +1,98 @@
 # @vestige/init
 
-**One command installs Vestige on your machine:** memory your AI agents can check, rules that come back after every compaction, and a gate that stops destructive commands before they run.
+Local memory setup for supported AI clients, with optional free Operator Lite.
+
+## Three steps
+
+1. Install the v5.0.1 binaries from [GitHub Releases](https://github.com/samvallad33/vestige/releases) and put `vestige-mcp` on PATH. A missing or older binary gets clear instructions and no configuration changes.
+2. Run `npx @vestige/init`. Choose **Memory only** (default) or **Memory plus guard**, review every file and appended hook, then confirm once. `--yes` uses memory only; `--guard --yes` also requests the guard. A new guard installation requires your own terminal.
+3. Restart your client and approve/trust new hooks in the client's settings when required. Run `npx @vestige/init doctor`. Try: **Tell me something about a friend, then ask me about them later.**
+
+## Memory from the first chat
+
+Say “Maya felt off after dinner at Bangkok Garden”, then “Maya has a peanut
+allergy”. The hook's explicit-declaration parser records the exact words,
+`person:Maya`, `place:Bangkok Garden` and `allergy:peanut` through `smart_ingest`.
+Backfill raises the earlier reaction through Maya, with a change receipt.
+“Where should we take Maya for her birthday dinner?” selects the recorded
+`person:Maya` identity and recalls the raised reaction. Nothing infers that
+the restaurant serves peanuts or that another person's reaction concerns Maya.
+
+The declaration parser covers a small explicit grammar. It does not run a
+model or extract arbitrary facts from assistant prose. Session context tells
+the connected agent to save richer durable facts with `smart_ingest` and
+explicit entities/attributes. Saved statements retain user-statement provenance;
+they are remembered reports, not independently verified health facts.
+
+## Hook coverage
+
+| Client | Session | Prompt recall | Turn save | Before compaction | Session end |
+|---|---|---|---|---|---|
+| Claude Code | `SessionStart` | `UserPromptSubmit` | `Stop` | `PreCompact` | `SessionEnd` |
+| Codex | `SessionStart` | `UserPromptSubmit` | `Stop` | `PreCompact` | `SessionEnd` |
+| Gemini CLI | `SessionStart` | `BeforeAgent` | `AfterAgent` | `PreCompress` | `SessionEnd` |
+| Cursor | `sessionStart` | Capture/recall; inject on `postToolUse` | `afterAgentResponse` | `preCompact` | `sessionEnd` |
+
+Cursor's documented `beforeSubmitPrompt` output cannot carry context. Its
+session hook and post-tool hook inject context using supported fields. On
+MCP-only clients (Claude Desktop, VS Code, OpenCode, Windsurf, Junie, Zed,
+Kiro, Antigravity, and Xcode on macOS), this installer connects tools; lifecycle
+automation requires a supported client adapter. Detection uses known config
+locations and executable names, not an exhaustive scan of arbitrary applications.
+
+Codex requires review/trust of each changed hook definition through `/hooks`.
+The installer does not edit that trust record. Actual client execution is a
+separate check from registration; `doctor` labels it accordingly.
+
+## Recall and receipts
+
+`~/.vestige/memory/triggers.json` contains the editable question, memory,
+time, planning, preference and back-reference phrase lists. Matching is
+case-insensitive with Unicode word boundaries; phrases are literal, not regexes.
+Exact recorded entity surfaces also trigger recall. With no match, light recall
+returns the top three memories. Selection by entity is separate from salience
+ranking; no embeddings, fuzzy search or inferred identity links are used.
+
+`~/.vestige/memory/receipts.jsonl` records hook events, trigger labels, memory
+handles, Backfill receipt handles and elapsed time. This local hook log is an
+unsigned activity log. The admitted salience changes have their own Strata
+receipts. Errors go to `errors.log` and never become conversation text.
+
+Hooks reserve time for process startup, bound their work, and fail open. A
+pending declaration stays queued when MCP is unavailable and retries with a
+stable idempotency key. Pre-compaction and end hooks flush pending declarations
+and revisit their exact Backfill triggers; every admitted save already runs
+Backfill. Queueing does not promise that a crashed client emitted its end hook.
+The optional guard has a separate fail-closed adapter and keeps the existing
+Operator decision/permit logic. Existing paid/newer gates are preserved.
+Existing native gate registrations are kept single, so one permit is consumed
+once. The adapter and its routing config live under the gate-protected
+`~/.operator/state/vestige-memory/`; editable memory settings cannot redirect
+the guard. The guard's stop-to-Strata reflex is registered for Claude Code and
+Codex through a bounded fail-open relay. A deadline leaves the gate's original
+receipts available for retry; exact receipt tags prevent duplicate stop memories.
+
+## Maintenance
 
 ```bash
-npx @vestige/init
+npx @vestige/init doctor
+npx @vestige/init status
+npx @vestige/init uninstall --dry-run
+npx @vestige/init uninstall
 ```
 
-Run it in your own terminal. In order, it:
+`doctor` checks the binary, each registered hook, runtime assets, store response
+and autofire in the responding process. `status` also lists memory count and
+recent Backfill receipts. These commands do not prove a host has trusted or
+executed a hook. Uninstall restores byte-identical backups when a file is still
+exactly what Vestige installed. If a user edited it later, it removes only the
+owned entries, preserves other edits, and retains backups and the memory store.
+Re-running setup is idempotent. A client editing a target after preview makes
+setup refuse before writing; rerun to review a fresh preview.
 
-1. **Installs the binaries.** `vestige-mcp`, `vestige`, `vestige-restore` and `vestige-upgrade` come from npm for your machine (`@vestige/mcp-<os>-<arch>`) and go into `~/.local/bin`. A version that is already installed and as new is kept.
-2. **Opens your Strata memory.** It starts `vestige-mcp` once, the way a client would, which creates the store, and checks that it answers with its 18 tools. Strata is an append-only, hash-chained log: every write passes a gate and leaves a receipt, and a memory is found by its exact id or tag, never by vector similarity.
-3. **Connects your clients.** Claude Code, Claude Desktop, Cursor, VS Code, OpenCode, Xcode, JetBrains and Windsurf, whichever it finds. Each file is backed up before it changes.
-4. **Adds the rules hook.** In Claude Code, `vestige hook session-start` hands every new session, and every session after a compaction, the decisions and corrections you tagged `pinned`, each with its memory id. It only reads, and it prints nothing when there is nothing to say.
-5. **Installs Operator Lite,** the free gate, in enforce mode, and wires every agent host it finds. From your agent's next tool call, every command a STOP rule matches is stopped before it runs, with a hash-chained receipt for every decision. In Claude Code it then closes the loop: every stop becomes a Vestige memory linked to the rule that caught it, the agent is told the exact handle that recalls it, and each new session starts knowing what was stopped on this machine in the last seven days, so it takes the safe path instead of trying the same thing again.
-6. **Checks the gate.** The gate replays the 46-case GuardFall bypass corpus it carries. It classifies every command and runs none.
-
-Then it prints what it configured, and what to verify once you restart your clients.
+The source candidate has native fixture coverage on macOS. Windows paths and
+quoting have unit coverage; native Windows and Linux client runs remain release
+verification gates. This candidate is not an npm publication.
 
 ## Follow one real stop around the loop
 
@@ -27,21 +104,19 @@ One stop from your own machine: what the agent tried and the gate stopping it, i
 
 ## Options
 
-| Flag | What it does |
+| Flag | Behavior |
 |---|---|
-| `--dry-run` | Show every change; write nothing |
-| `--yes` | Connect every detected client without a prompt |
-| `--client <name>` | Connect one client (`claude-code`, `cursor`, `vscode`, `opencode`, `xcode`, `jetbrains`, `windsurf`) |
-| `--no-gate` | Skip Operator Lite |
-| `--no-hooks` | Skip the Claude Code hooks (the rules hook and stops to memory) |
-| `--json` | Print a machine-readable result |
+| `--dry-run` | Preview all planned files and write nothing |
+| `--yes` | Memory-only setup without prompts |
+| `--guard` | Add the optional pre-tool guard |
+| `--client <id>` | Limit setup to selected detected clients |
+| `--json` | Machine-readable result |
+| `--clients-only` | Compatibility path for the previous connection-only wizard |
 
-## What it never does
+Docs and primary client hook references:
 
-- It never downgrades. A newer binary stays where it is, and the gate's own installer never replaces a newer gate or the paid Vestige Operator.
-- It never installs the gate from an AI agent's shell. Operator Lite's installer refuses there, so an agent cannot put a gate of its choosing in front of itself.
-- It never sends anything anywhere: no cloud account, no telemetry. Your records stay on your machine.
-
-Operator Lite needs Python 3.9 or newer. Tested end to end on macOS and Linux; the Windows x64 binaries ship in the same package, but that path has not been tested end to end yet.
-
-Docs: https://github.com/samvallad33/vestige
+- https://learn.chatgpt.com/docs/hooks
+- https://code.claude.com/docs/en/hooks
+- https://cursor.com/docs/hooks
+- https://geminicli.com/docs/hooks/reference/
+- https://github.com/samvallad33/vestige

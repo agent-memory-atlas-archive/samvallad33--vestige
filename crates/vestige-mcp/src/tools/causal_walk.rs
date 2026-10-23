@@ -376,7 +376,7 @@ fn recorded_backward_walk(storage: &Arc<Storage>, args: Option<Value>) -> Result
     let mut truncated = false;
     let mut held: BTreeSet<HeldEdge> = BTreeSet::new();
     for start in starts.iter().chain(git.anchors.iter()) {
-        let walked = walk_from(storage, scope, start, node_cap)?;
+        let walked = walk_from(storage.as_ref(), scope, start, node_cap)?;
         truncated |= walked.truncated;
         held.extend(walked.held);
         walks.push((start.clone(), walked.reached));
@@ -482,7 +482,7 @@ struct Walked {
 /// reached is therefore every memory with an admissible path of at most
 /// `MAX_DEPTH` hops, whatever order the edges are read in.
 fn walk_from(
-    storage: &Arc<Storage>,
+    storage: &Storage,
     scope: &str,
     start_id: &str,
     node_cap: usize,
@@ -583,6 +583,22 @@ fn walk_from(
         truncated,
         held,
     })
+}
+
+/// Reuse the recorded backward walker for salience planning. This read-only
+/// adapter retains the same depth, node and one-touch bounds as causal_walk.
+pub(crate) fn salience_candidate_ids(
+    storage: &Storage,
+    scope: &str,
+    trigger_id: &str,
+    node_cap: usize,
+) -> Result<Vec<String>, String> {
+    Ok(walk_from(storage, scope, trigger_id, node_cap)?
+        .reached
+        .into_iter()
+        .filter(|node| node.depth > 0)
+        .map(|node| node.id)
+        .collect())
 }
 
 /// Union the per-start walks. `nodes` holds every node once, at its shallowest
@@ -1064,7 +1080,7 @@ fn classify_starts(
         if !seen.insert(id.clone()) {
             row.status = "duplicate";
             row.reason = Some("names a node an earlier start point already walks".to_string());
-        } else if !in_scope(storage, &id, scope)? {
+        } else if !in_scope(storage.as_ref(), &id, scope)? {
             row.status = "not_in_scope";
             row.reason = Some(format!("node is not recorded in scope '{scope}'"));
         } else {
@@ -1127,7 +1143,7 @@ fn nonempty(value: &Option<String>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn in_scope(storage: &Arc<Storage>, id: &str, scope: &str) -> Result<bool, String> {
+fn in_scope(storage: &Storage, id: &str, scope: &str) -> Result<bool, String> {
     storage
         .node_is_in_scope(id, scope)
         .map_err(|err| err.to_string())
@@ -1137,7 +1153,7 @@ fn in_scope(storage: &Arc<Storage>, id: &str, scope: &str) -> Result<bool, Strin
 /// memory it has not listed? `used_touch` says whether the path to `node_id`
 /// has used its one `touched` edge.
 fn has_admissible_cause(
-    storage: &Arc<Storage>,
+    storage: &Storage,
     node_id: &str,
     scope: &str,
     used_touch: bool,
@@ -1164,7 +1180,7 @@ fn has_admissible_cause(
 
 /// The commit a child of `node_id` reverts. The child itself is not a cause:
 /// the hop is the recorded `corrects` edge, from the revert to the older commit.
-fn child_corrections(storage: &Arc<Storage>, node_id: &str) -> Result<Vec<(String, Hop)>, String> {
+fn child_corrections(storage: &Storage, node_id: &str) -> Result<Vec<(String, Hop)>, String> {
     let edges = storage
         .get_connections_for_memory(node_id)
         .map_err(|err| err.to_string())?;
@@ -1247,7 +1263,7 @@ pub(crate) fn upstream_end<'a>(
 /// The recorded causal edges that lead upstream from `node_id`, each with the
 /// id of the memory at the upstream end. Ordered by kind, then id.
 fn upstream_causal(
-    storage: &Arc<Storage>,
+    storage: &Storage,
     node_id: &str,
 ) -> Result<Vec<(String, vestige_core::ConnectionRecord)>, String> {
     let edges = storage
@@ -1400,7 +1416,7 @@ fn why_empty(storage: &Arc<Storage>, scope: &str, starts: &[String]) -> (String,
                 continue;
             }
             if let Some(upstream) = upstream_end(&edge, start) {
-                if !in_scope(storage, upstream, scope).unwrap_or(false) {
+                if !in_scope(storage.as_ref(), upstream, scope).unwrap_or(false) {
                     other_scope += 1;
                 }
             } else if CAUSAL_LINKS.contains(&edge.link_type.as_str()) {
@@ -1587,7 +1603,7 @@ fn package_anchors_in_scope(
         if !edge.target_id.starts_with("pkg:") {
             continue;
         }
-        if in_scope(storage, &edge.source_id, scope)? {
+        if in_scope(storage.as_ref(), &edge.source_id, scope)? {
             out.insert(edge.target_id);
         }
     }
@@ -1658,7 +1674,7 @@ fn file_anchors_in_scope(
         if path.is_empty() {
             continue;
         }
-        if !in_scope(storage, &edge.source_id, scope)? {
+        if !in_scope(storage.as_ref(), &edge.source_id, scope)? {
             continue;
         }
         if seen.insert(edge.target_id.clone()) {
@@ -1854,7 +1870,7 @@ fn git_root_from_touchers(
         if !files.iter().any(|file| file == path) {
             continue;
         }
-        if !in_scope(storage, &edge.source_id, scope)? {
+        if !in_scope(storage.as_ref(), &edge.source_id, scope)? {
             continue;
         }
         if let Some(node) = storage
@@ -2134,8 +2150,8 @@ fn extend_revert_ancestry(
         if edge.target_id == failure_id || causes.iter().any(|cause| cause.id == edge.target_id) {
             continue;
         }
-        if !in_scope(storage, &edge.source_id, scope).unwrap_or(false)
-            || !in_scope(storage, &edge.target_id, scope).unwrap_or(false)
+        if !in_scope(storage.as_ref(), &edge.source_id, scope).unwrap_or(false)
+            || !in_scope(storage.as_ref(), &edge.target_id, scope).unwrap_or(false)
         {
             continue;
         }

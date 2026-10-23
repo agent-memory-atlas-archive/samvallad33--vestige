@@ -59,6 +59,7 @@
 #![warn(missing_docs)]
 
 mod anchor;
+mod backfill;
 pub mod canonical;
 mod card;
 mod error;
@@ -69,11 +70,15 @@ mod store;
 mod types;
 
 #[cfg(test)]
+mod backfill_tests;
+#[cfg(test)]
 mod ghostlink_tests;
 #[cfg(test)]
 mod import_tests;
 #[cfg(test)]
 mod tests;
+
+pub use backfill::{BackfillAdjustment, BackfillReceipt};
 
 pub use canonical::{
     canonical_hash, canonical_hash_hex, canonicalize, intent_digest, CANONICAL_PIPELINE_VERSION,

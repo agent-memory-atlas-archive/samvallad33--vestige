@@ -21,6 +21,9 @@ pub fn schema() -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
+            "memory_hook": {"type":"object", "description":"Read-only local-hook salience packet. Exact recorded entities select; salience ranks.",
+                "properties":{"prompt":{"type":"string","maxLength":65536},"limit":{"type":"integer","minimum":1,"maximum":8},
+                    "trigger":{"type":"object"}}},
             "queries": {
                 "type": "array",
                 "items": { "type": "string" },
@@ -75,6 +78,7 @@ pub fn schema() -> Value {
 
 #[derive(Debug, Deserialize, Default)]
 struct SessionContextArgs {
+    memory_hook: Option<Value>,
     queries: Option<Vec<String>>,
     token_budget: Option<i32>,
     scope: Option<String>,
@@ -120,6 +124,13 @@ pub async fn execute(
         Some(v) => serde_json::from_value(v).map_err(|e| format!("Invalid arguments: {}", e))?,
         None => SessionContextArgs::default(),
     };
+    if let Some(hook) = &args.memory_hook {
+        let scope = args.scope.as_deref().unwrap_or("user").trim();
+        if scope.is_empty() || scope.len() > 200 || scope.chars().any(char::is_control) {
+            return Err("invalid hook scope".into());
+        }
+        return super::memory_packet::packet(storage.as_ref(), scope, hook);
+    }
 
     // Per-query search width honors the active profile (e.g. `research` widens
     // it, `lean` narrows it). No explicit MCP param exists here, so the config

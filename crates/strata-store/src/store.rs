@@ -21,6 +21,7 @@ use strata_kernel::state::State;
 use strata_kernel::verify::verify_with_head;
 
 use crate::anchor::AnchorIndex;
+use crate::backfill::{bounded_stability, records_entity, BackfillAdjustment, BackfillReceipt};
 use crate::canonical::{canonical_hash, DUPLICATE_SOURCE};
 use crate::card::{CardEvent, ImportedCard};
 use crate::error::StoreError;
@@ -565,6 +566,9 @@ pub enum EffectAction {
     /// effect per edge, all citing the same EFFECT. Not a card: it never
     /// shadows the source's own receipt in [`StrataStore::latest_effect`].
     Edge,
+    /// Exact stability adjustment or its compensating undo. Full before,
+    /// after and entity evidence is in [`StrataStore::backfill_receipts`].
+    Backfill,
 }
 
 /// One node, intention or anchor effect proved from the log: covering
@@ -753,6 +757,12 @@ fn effect_proofs_for_op(
             };
             single(node_id, EffectAction::Review, Some(*rating), None)
         }
+        StoreOp::AdjustSalience { adjustment, .. } => single(
+            adjustment.memory_id.clone(),
+            EffectAction::Backfill,
+            None,
+            None,
+        ),
         // One admitted batch: every row cites this effect.
         StoreOp::UpsertIntentions { records } => Ok(records
             .iter()
@@ -817,6 +827,7 @@ fn op_clock_ms(op: &StoreOp) -> Option<i64> {
         StoreOp::SaveEdges { edges } => edges.first().map(|edge| edge.created_at_ms),
         StoreOp::ReviewNode { reviewed_at_ms, .. } => *reviewed_at_ms,
         StoreOp::RecordAnchorVerdict { checked_at_ms, .. } => Some(*checked_at_ms),
+        StoreOp::AdjustSalience { adjustment, .. } => Some(adjustment.timestamp_ms),
         StoreOp::SupersedeNode { .. }
         | StoreOp::UpsertIntentions { .. }
         | StoreOp::RecordAnchors { .. }
@@ -1035,6 +1046,11 @@ pub struct StrataStore {
     /// `(scope, original id)` -> echo nodes in log order. Rebuilt by replay.
     /// Reads filter to live nodes, so a supersede does not edit the vec.
     echo_index: BTreeMap<(String, String), Vec<EchoSlot>>,
+    /// Adjustment receipts in landing order, plus their data-frame seqs.
+    /// Rebuilt only from admitted `AdjustSalience` payloads.
+    backfill_history: Vec<(BackfillReceipt, u64)>,
+    /// A pair remains used after undo, preventing re-run compounding.
+    backfill_pairs: BTreeSet<(String, String)>,
 }
 
 impl StrataStore {
@@ -1101,6 +1117,8 @@ impl StrataStore {
             intent_index: intents.index,
             intent_log_len: intents.log_len,
             echo_index: BTreeMap::new(),
+            backfill_history: Vec::new(),
+            backfill_pairs: BTreeSet::new(),
         };
         store.replay()?;
         store.verify_checkpoint_chain()?;
@@ -1298,6 +1316,45 @@ impl StrataStore {
                         self.reviewed_at.remove(card_id);
                     }
                 }
+            }
+            StoreOp::AdjustSalience {
+                adjustment,
+                old_stability_q,
+                prior_card_event_seq,
+                undo_of,
+            } => {
+                self.validate_backfill_op(
+                    adjustment,
+                    *old_stability_q,
+                    *prior_card_event_seq,
+                    undo_of.as_deref(),
+                )?;
+                self.fold_card(
+                    CardEvent::AdjustStability {
+                        card_id: handle_of(&adjustment.memory_id),
+                        event_seq: frame_seq,
+                        stability_q: adjustment.new_stability_q,
+                    },
+                    ALGO_V2,
+                )?;
+                if undo_of.is_none() {
+                    self.backfill_pairs
+                        .insert((adjustment.memory_id.clone(), adjustment.trigger_id.clone()));
+                }
+                self.backfill_history.push((
+                    BackfillReceipt {
+                        receipt_id: effect_receipt_id(gate_effect_seq),
+                        memory_id: adjustment.memory_id.clone(),
+                        trigger_id: adjustment.trigger_id.clone(),
+                        shared_entity: adjustment.shared_entity.clone(),
+                        reason: adjustment.reason.clone(),
+                        old_stability_q: *old_stability_q,
+                        new_stability_q: adjustment.new_stability_q,
+                        timestamp_ms: adjustment.timestamp_ms,
+                        undo_of: undo_of.clone(),
+                    },
+                    frame_seq,
+                ));
             }
             StoreOp::UpsertIntentions { records } => {
                 for record in records {
@@ -2427,6 +2484,252 @@ impl StrataStore {
         Ok(effect_seq)
     }
 
+    /// Apply a backward-only, exact-entity salience adjustment atomically.
+    /// Returns `None` if this pair already ran or quantized bounds leave the
+    /// score unchanged. Reads and these no-ops append no gate/data frames.
+    pub fn apply_backfill(
+        &mut self,
+        mut adjustment: BackfillAdjustment,
+    ) -> Result<Option<BackfillReceipt>, StoreError> {
+        if self
+            .backfill_pairs
+            .contains(&(adjustment.memory_id.clone(), adjustment.trigger_id.clone()))
+        {
+            return Ok(None);
+        }
+        if adjustment.new_stability_q <= 0 {
+            return Err(StoreError::InvalidInput(
+                "backfill stability must be positive Q32.32 days".into(),
+            ));
+        }
+        let card_id = handle_of(&adjustment.memory_id);
+        let old = self
+            .card_state(&adjustment.memory_id)
+            .ok_or_else(|| StoreError::NotFound(adjustment.memory_id.clone()))?
+            .stability_q;
+        adjustment.new_stability_q = bounded_stability(old, adjustment.new_stability_q);
+        let prior = self
+            .last_card_event_seq(card_id)
+            .ok_or_else(|| StoreError::NotFound(adjustment.memory_id.clone()))?;
+        self.validate_backfill_op(&adjustment, old, prior, None)?;
+        if adjustment.new_stability_q == old {
+            return Ok(None);
+        }
+        let context = self.context_for(&[&adjustment.memory_id, &adjustment.trigger_id]);
+        self.admit_write(
+            StoreOp::AdjustSalience {
+                adjustment,
+                old_stability_q: old,
+                prior_card_event_seq: prior,
+                undo_of: None,
+            },
+            action_kind::WRITE,
+            context,
+        )?;
+        Ok(self
+            .backfill_history
+            .last()
+            .map(|(receipt, _)| receipt.clone()))
+    }
+
+    /// Restore an adjustment's exact old score with a compensating admitted
+    /// write. A later review or salience update conflicts even if it happened
+    /// to leave the same score. Repeating an undo returns its existing receipt
+    /// and appends nothing; an undo cannot itself be undone by this API.
+    pub fn undo_backfill(
+        &mut self,
+        receipt_id: &str,
+        timestamp_ms: i64,
+    ) -> Result<BackfillReceipt, StoreError> {
+        if let Some((receipt, _)) = self
+            .backfill_history
+            .iter()
+            .find(|(receipt, _)| receipt.undo_of.as_deref() == Some(receipt_id))
+        {
+            return Ok(receipt.clone());
+        }
+        let (original, original_seq) = self
+            .backfill_history
+            .iter()
+            .find(|(receipt, _)| receipt.receipt_id == receipt_id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound(receipt_id.to_string()))?;
+        if original.undo_of.is_some() {
+            return Err(StoreError::InvalidInput(
+                "cannot undo a backfill undo".into(),
+            ));
+        }
+        let adjustment = BackfillAdjustment {
+            memory_id: original.memory_id.clone(),
+            trigger_id: original.trigger_id.clone(),
+            shared_entity: original.shared_entity.clone(),
+            reason: format!("Undo backfill {receipt_id}: restore the exact previous stability"),
+            new_stability_q: original.old_stability_q,
+            timestamp_ms,
+        };
+        self.validate_backfill_op(
+            &adjustment,
+            original.new_stability_q,
+            original_seq,
+            Some(receipt_id),
+        )?;
+        let context = self.context_for(&[&original.memory_id, &original.trigger_id]);
+        self.admit_write(
+            StoreOp::AdjustSalience {
+                adjustment,
+                old_stability_q: original.new_stability_q,
+                prior_card_event_seq: original_seq,
+                undo_of: Some(receipt_id.to_string()),
+            },
+            action_kind::WRITE,
+            context,
+        )?;
+        self.backfill_history
+            .last()
+            .map(|(receipt, _)| receipt.clone())
+            .ok_or_else(|| StoreError::Verify("admitted backfill undo has no receipt".into()))
+    }
+
+    /// Every admitted adjustment and undo, in log order. Reading this index
+    /// appends nothing. The index is reconstructed on reopen and replay.
+    pub fn backfill_receipts(&self) -> Vec<BackfillReceipt> {
+        self.backfill_history
+            .iter()
+            .map(|(receipt, _)| receipt.clone())
+            .collect()
+    }
+
+    fn last_card_event_seq(&self, card_id: u64) -> Option<u64> {
+        self.review_events
+            .iter()
+            .rev()
+            .find_map(|(seq, _, event)| (event.card_id() == card_id).then_some(*seq))
+    }
+
+    /// Called before admission and during replay, so a malformed admitted
+    /// payload can never silently corrupt a card or its pair index.
+    fn validate_backfill_op(
+        &self,
+        adjustment: &BackfillAdjustment,
+        old: i64,
+        prior: u64,
+        undo_of: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let invalid = |reason: &str| StoreError::InvalidInput(format!("backfill: {reason}"));
+        if adjustment.reason.trim().is_empty() || adjustment.shared_entity.trim().is_empty() {
+            return Err(invalid(
+                "an exact shared entity and plain-language reason are required",
+            ));
+        }
+        if adjustment.timestamp_ms < 0 || adjustment.new_stability_q <= 0 {
+            return Err(invalid(
+                "timestamp must be nonnegative and stability positive",
+            ));
+        }
+        let target = self.require_node(&adjustment.memory_id)?;
+        let trigger = self.require_node(&adjustment.trigger_id)?;
+        if !target.is_live() {
+            return Err(invalid("target memory is retired"));
+        }
+        if target.id == trigger.id || target.scope != trigger.scope {
+            return Err(invalid("distinct memories in the same scope are required"));
+        }
+        let card_id = handle_of(&adjustment.memory_id);
+        let card = self
+            .card_state(&adjustment.memory_id)
+            .ok_or_else(|| StoreError::NotFound(adjustment.memory_id.clone()))?;
+        if card.stability_q != old || self.last_card_event_seq(card_id) != Some(prior) {
+            return Err(invalid(
+                "score changed after the referenced adjustment; no changes applied",
+            ));
+        }
+        if old < strata_kernel::canonical::to_q32_32(strata_kernel::fsrs::S_MIN)
+            || old > strata_kernel::canonical::to_q32_32(strata_kernel::fsrs::S_MAX)
+        {
+            return Err(invalid("current stability is outside kernel bounds"));
+        }
+        if let Some(original_id) = undo_of {
+            let (original, seq) = self
+                .backfill_history
+                .iter()
+                .find(|(receipt, _)| receipt.receipt_id == original_id)
+                .ok_or_else(|| StoreError::NotFound(original_id.to_string()))?;
+            if original.undo_of.is_some()
+                || *seq != prior
+                || original.memory_id != adjustment.memory_id
+                || original.trigger_id != adjustment.trigger_id
+                || original.shared_entity != adjustment.shared_entity
+                || original.old_stability_q != adjustment.new_stability_q
+                || original.new_stability_q != old
+            {
+                return Err(invalid(
+                    "undo does not exactly restore its original adjustment",
+                ));
+            }
+            if self
+                .backfill_history
+                .iter()
+                .any(|(receipt, _)| receipt.undo_of.as_deref() == Some(original_id))
+            {
+                return Err(invalid("the adjustment was already undone"));
+            }
+            return Ok(());
+        }
+        if !trigger.is_live() || target.created_at_ms > trigger.created_at_ms {
+            return Err(invalid(
+                "trigger must be live and target cannot be newer than trigger",
+            ));
+        }
+        if let (Some(target_writes), Some(trigger_writes)) =
+            (self.upserts.get(&target.id), self.upserts.get(&trigger.id))
+        {
+            if target_writes.first().map(|write| write.0)
+                >= trigger_writes.first().map(|write| write.0)
+            {
+                return Err(invalid("target must precede trigger in the log"));
+            }
+        }
+        if !records_entity(target, &adjustment.shared_entity)
+            || !records_entity(trigger, &adjustment.shared_entity)
+        {
+            return Err(invalid(
+                "shared entity is not recorded exactly on both memories",
+            ));
+        }
+        // An attribute belongs to its explicitly recorded person. A shared
+        // restaurant, food or topic cannot transfer Maya's health/preferences
+        // to Alex. Require the actual join to name that person as well.
+        if trigger.tags.iter().any(|tag| {
+            [
+                "allergy:",
+                "preference:",
+                "health:",
+                "condition:",
+                "medication:",
+                "diet:",
+            ]
+            .iter()
+            .any(|prefix| tag.starts_with(prefix))
+        }) && !adjustment.shared_entity.starts_with("person:")
+        {
+            return Err(invalid(
+                "health and preference attributes require the same explicit person identity",
+            ));
+        }
+        if self
+            .backfill_pairs
+            .contains(&(adjustment.memory_id.clone(), adjustment.trigger_id.clone()))
+        {
+            return Err(invalid("target/trigger pair was already applied"));
+        }
+        if bounded_stability(old, adjustment.new_stability_q) != adjustment.new_stability_q {
+            return Err(invalid(
+                "adjustment exceeds the 1.5/+365 cap or reciprocal floor",
+            ));
+        }
+        Ok(())
+    }
+
     /// Replace `id` with a successor, then retire `id` under rule `edit`.
     ///
     /// Lands `UpsertNode` then `SupersedeNode` inside one tool call. The
@@ -2489,7 +2792,7 @@ impl StrataStore {
             .iter()
             .filter_map(|(_, _, event)| match event {
                 CardEvent::Review(review) => Some(*review),
-                CardEvent::Import(_) => None,
+                CardEvent::Import(_) | CardEvent::AdjustStability { .. } => None,
             })
             .collect()
     }
@@ -3007,6 +3310,8 @@ impl StrataStore {
             intent_index: BTreeMap::new(),
             intent_log_len: 0,
             echo_index: BTreeMap::new(),
+            backfill_history: Vec::new(),
+            backfill_pairs: BTreeSet::new(),
         };
         scratch.replay()?;
         let mut retrievability = BTreeMap::new();

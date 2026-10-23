@@ -1,0 +1,309 @@
+{
+  "base_commit": "f68112298f60560f9adf21110e473a4cd9372125",
+  "branch": "feat/rsb-v5.0.1",
+  "committed": false,
+  "published": false,
+  "files": [
+    {
+      "path": ".github/workflows/prepare-release.yml",
+      "reason": "Nonpublishing preparation, audit, artifact validation and first-run evidence"
+    },
+    {
+      "path": "CHANGELOG.md",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "Cargo.lock",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "Cargo.toml",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "README.md",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "apps/dashboard/package.json",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "crates/strata-store/Cargo.lock",
+      "reason": "Append-only exact salience adjustments, receipts, replay, idempotency and undo"
+    },
+    {
+      "path": "crates/strata-store/src/backfill.rs",
+      "reason": "Append-only exact salience adjustments, receipts, replay, idempotency and undo"
+    },
+    {
+      "path": "crates/strata-store/src/backfill_tests.rs",
+      "reason": "Append-only exact salience adjustments, receipts, replay, idempotency and undo"
+    },
+    {
+      "path": "crates/strata-store/src/card.rs",
+      "reason": "Append-only exact salience adjustments, receipts, replay, idempotency and undo"
+    },
+    {
+      "path": "crates/strata-store/src/lib.rs",
+      "reason": "Append-only exact salience adjustments, receipts, replay, idempotency and undo"
+    },
+    {
+      "path": "crates/strata-store/src/op.rs",
+      "reason": "Append-only exact salience adjustments, receipts, replay, idempotency and undo"
+    },
+    {
+      "path": "crates/strata-store/src/store.rs",
+      "reason": "Append-only exact salience adjustments, receipts, replay, idempotency and undo"
+    },
+    {
+      "path": "crates/strata-store/src/tests.rs",
+      "reason": "Append-only exact salience adjustments, receipts, replay, idempotency and undo"
+    },
+    {
+      "path": "crates/strata-verify/Cargo.lock",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "crates/vestige-core/Cargo.toml",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "crates/vestige-core/src/advanced/retroactive_backfill.rs",
+      "reason": "Retain original Backfill engine and add bounded personal salience planning and tests"
+    },
+    {
+      "path": "crates/vestige-core/src/storage/memory_store.rs",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/Cargo.toml",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/src/bin/cli.rs",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/src/dashboard/handlers.rs",
+      "reason": "Restore HTTP Backfill; validate inputs and keep dry-run free of writes"
+    },
+    {
+      "path": "crates/vestige-mcp/src/dashboard/http_tests.rs",
+      "reason": "Restore HTTP Backfill; validate inputs and keep dry-run free of writes"
+    },
+    {
+      "path": "crates/vestige-mcp/src/main.rs",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/src/server.rs",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/src/strata_memory.rs",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/src/tools/backfill.rs",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/src/tools/causal_walk.rs",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/src/tools/compact.rs",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/src/tools/memory_packet.rs",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/src/tools/mod.rs",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/src/tools/recall.rs",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/src/tools/search_unified.rs",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/src/tools/session_context.rs",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/src/tools/smart_ingest.rs",
+      "reason": "Wire every-save Backfill, shared causal traversal, exact recall ranking and CLI/MCP interfaces"
+    },
+    {
+      "path": "crates/vestige-mcp/tests/boot_no_network.rs",
+      "reason": "Real MCP/CLI Backfill acceptance and protocol regression checks"
+    },
+    {
+      "path": "crates/vestige-mcp/tests/cli_strata.rs",
+      "reason": "Real MCP/CLI Backfill acceptance and protocol regression checks"
+    },
+    {
+      "path": "crates/vestige-mcp/tests/ghostlink_stdio.rs",
+      "reason": "Real MCP/CLI Backfill acceptance and protocol regression checks"
+    },
+    {
+      "path": "crates/vestige-mcp/tests/rsb_personal_stdio.rs",
+      "reason": "Real MCP/CLI Backfill acceptance and protocol regression checks"
+    },
+    {
+      "path": "crates/vestige-upgrade/Cargo.toml",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "docs/releases/v5.0.1-files.json",
+      "reason": "Enumerate the candidate source, configuration and documentation changes for owner review"
+    },
+    {
+      "path": "docs/releases/v5.0.1-first-run.txt",
+      "reason": "Release history, owner shipping steps, first-run capture and verification evidence"
+    },
+    {
+      "path": "docs/releases/v5.0.1-notes.md",
+      "reason": "Release history, owner shipping steps, first-run capture and verification evidence"
+    },
+    {
+      "path": "docs/releases/v5.0.1.md",
+      "reason": "Release history, owner shipping steps, first-run capture and verification evidence"
+    },
+    {
+      "path": "hooks/operator-stop-memory.py",
+      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+    },
+    {
+      "path": "lhm.plugin.json",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "package.json",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "packages/mcp-darwin-arm64/package.json",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "packages/mcp-darwin-x64/package.json",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "packages/mcp-linux-arm64/package.json",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "packages/mcp-linux-x64/package.json",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "packages/mcp-win32-x64/package.json",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "packages/vestige-init/README.md",
+      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+    },
+    {
+      "path": "packages/vestige-init/bin/init.js",
+      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+    },
+    {
+      "path": "packages/vestige-init/hooks/guard.cjs",
+      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+    },
+    {
+      "path": "packages/vestige-init/hooks/memory.cjs",
+      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+    },
+    {
+      "path": "packages/vestige-init/hooks/operator-lite.py",
+      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+    },
+    {
+      "path": "packages/vestige-init/hooks/operator-stop-memory.py",
+      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+    },
+    {
+      "path": "packages/vestige-init/hooks/stop-memory.cjs",
+      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+    },
+    {
+      "path": "packages/vestige-init/lib/memory-triggers.cjs",
+      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+    },
+    {
+      "path": "packages/vestige-init/lib/vestige-memory-setup.js",
+      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+    },
+    {
+      "path": "packages/vestige-init/package.json",
+      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+    },
+    {
+      "path": "packages/vestige-init/test/init-modes.test.js",
+      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+    },
+    {
+      "path": "packages/vestige-init/test/memory-native.test.js",
+      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+    },
+    {
+      "path": "packages/vestige-init/test/memory-setup.test.js",
+      "reason": "Memory-first setup, bounded lifecycle hooks, optional guarded calls, backup/merge/uninstall and tests"
+    },
+    {
+      "path": "packages/vestige-mcp-npm/package.json",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "packages/vestige-mcpb/manifest.json",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "plugins/vestige-strata/openclaw.plugin.json",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "plugins/vestige-strata/package.json",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "pnpm-lock.yaml",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "scripts/capture-memory-setup.cjs",
+      "reason": "Nonpublishing preparation, audit, artifact validation and first-run evidence"
+    },
+    {
+      "path": "scripts/prepare-release.py",
+      "reason": "Nonpublishing preparation, audit, artifact validation and first-run evidence"
+    },
+    {
+      "path": "scripts/test-tool-frontier.py",
+      "reason": "Nonpublishing preparation, audit, artifact validation and first-run evidence"
+    },
+    {
+      "path": "scripts/verify-v501.py",
+      "reason": "Nonpublishing preparation, audit, artifact validation and first-run evidence"
+    },
+    {
+      "path": "server.json",
+      "reason": "Align product version and desktop binary pins at 5.0.1; independent component versions retained"
+    },
+    {
+      "path": "tests/test_prepare_release.py",
+      "reason": "Nonpublishing preparation, audit, artifact validation and first-run evidence"
+    }
+  ],
+  "generated_assets": "apps/dashboard/build/ was regenerated by the verified production build; content hashes change with output. Review generated assets separately."
+}

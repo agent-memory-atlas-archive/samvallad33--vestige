@@ -685,6 +685,8 @@ fn replay_store_and_migration_frames_do_not_cross_classify() {
                 | StoreOp::RecordAnchorVerdict { .. } => {}
                 // Nor an edge batch: this fixture saves its one edge alone.
                 StoreOp::SaveEdges { .. } => {}
+                // Nor a salience adjustment.
+                StoreOp::AdjustSalience { .. } => {}
             }
         } else if frame.kind == KIND_STORE_CHECKPOINT {
             store_checkpoints += 1;

@@ -288,6 +288,9 @@ def handler_extras(tool, action, ctx):
             "scope": "user",
             "start_points": [{"kind": "failing_test", "name": "fixture_test"}],
         },
+        ("backfill", "run"): {"trigger_id": mem, "dry_run": True},
+        ("backfill", "receipts"): {"trigger_id": mem},
+        ("backfill", "undo"): {"receipt_id": "backfill-fixture-missing"},
         ("forgotten_lesson", "default"): {"failure_id": mem, "scope": "user"},
         ("purge", "default"): {"id": mem, "confirm": True},
     }
@@ -638,7 +641,8 @@ def run(binary, output):
             handshake()
             catalog = rpc("tools/list", {})["tools"]
             names = [x["name"] for x in catalog]
-            assert len(names) == 18, names
+            assert len(names) == 19, names
+            assert "backfill" in names and "causal_walk" in names, names
             assert "precedent" in names and "gather" in names, names
             assert "source_sync" not in names, names
             assert "purge" not in names and "suppress" in names, names
@@ -973,6 +977,9 @@ def run(binary, output):
             lessons = tool("forgotten_lesson", {"failure_id": successor})
             assert lessons["failure_id"] == successor and isinstance(lessons["forgotten_lessons"], list)
             passed("causal_walk, selftest and forgotten_lesson answer from recorded edges only")
+            preview = tool("backfill", {"trigger_id": successor, "dry_run": True})
+            assert preview["dry_run"] is True, preview
+            passed("backfill previews explicit-entity salience revisions separately from causal_walk")
             ruling = tool("precedent", {"since": "24h"})
             assert ruling["summary"] == "1 stop in the last 24h", ruling
             assert ruling["items"][0]["rule"] == "no-unrestorable-loss", ruling

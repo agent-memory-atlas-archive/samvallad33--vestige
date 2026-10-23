@@ -47,6 +47,23 @@ pub(crate) enum CardEvent {
     /// An imported card. Sets the card when it has none; a card that
     /// already exists is left as it is.
     Import(ImportedCard),
+    /// Exact stability change. It is not a review: counters, review clock,
+    /// phase and the card's last review seq stay unchanged.
+    AdjustStability {
+        card_id: u64,
+        event_seq: u64,
+        stability_q: i64,
+    },
+}
+
+impl CardEvent {
+    pub(crate) fn card_id(&self) -> u64 {
+        match self {
+            Self::Review(event) => event.card_id,
+            Self::Import(card) => card.card_id,
+            Self::AdjustStability { card_id, .. } => *card_id,
+        }
+    }
 }
 
 impl StrataEvent for CardEvent {
@@ -54,7 +71,15 @@ impl StrataEvent for CardEvent {
         match self {
             CardEvent::Review(event) => event.event_seq,
             CardEvent::Import(card) => card.event_seq,
+            CardEvent::AdjustStability { event_seq, .. } => *event_seq,
         }
+    }
+}
+
+fn adjust(state: &mut State, card_id: u64, event_seq: u64, stability_q: i64) {
+    state.applied_seq = state.applied_seq.max(event_seq);
+    if let Some(card) = state.cards.get_mut(&card_id) {
+        card.stability_q = stability_q;
     }
 }
 
@@ -77,6 +102,11 @@ fn fold_card_v1(state: &mut State, event: &CardEvent) {
     match event {
         CardEvent::Review(review) => fold_v1(state, review),
         CardEvent::Import(card) => import(state, card),
+        CardEvent::AdjustStability {
+            card_id,
+            event_seq,
+            stability_q,
+        } => adjust(state, *card_id, *event_seq, *stability_q),
     }
 }
 
@@ -84,6 +114,11 @@ fn fold_card_v2(state: &mut State, event: &CardEvent) {
     match event {
         CardEvent::Review(review) => fold_v2(state, review),
         CardEvent::Import(card) => import(state, card),
+        CardEvent::AdjustStability {
+            card_id,
+            event_seq,
+            stability_q,
+        } => adjust(state, *card_id, *event_seq, *stability_q),
     }
 }
 

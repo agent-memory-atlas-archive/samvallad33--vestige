@@ -299,7 +299,10 @@ pub async fn execute(
         .detail_level
         .as_deref()
         .unwrap_or(&output_config.detail_level);
-    if !matches!(detail_level, "brief" | "full" | "summary" | "full_neighbors") {
+    if !matches!(
+        detail_level,
+        "brief" | "full" | "summary" | "full_neighbors"
+    ) {
         return Err(format!(
             "Invalid detail_level '{}'. Must be 'brief', 'summary', 'full', or 'full_neighbors'.",
             detail_level

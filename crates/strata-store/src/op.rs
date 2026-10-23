@@ -4,6 +4,7 @@
 //! admitting `EFFECT.payload_digest`.
 
 use crate::types::{AnchorRecord, ConnectionRecord, IntentionRecord, NodeRecord};
+use crate::BackfillAdjustment;
 use borsh::{BorshDeserialize, BorshSerialize};
 
 /// Frame kind: a store data frame (payload = `borsh(StoreOp)`).
@@ -100,5 +101,17 @@ pub enum StoreOp {
     SaveEdges {
         /// The edges; each `link_type` was vocabulary-validated at write time.
         edges: Vec<ConnectionRecord>,
+    },
+    /// Exact, bounded stability change with its entity evidence (discriminant
+    /// `9`). Appended to preserve every pre-existing log's wire encoding.
+    AdjustSalience {
+        /// Request with the actual bounded after-score.
+        adjustment: BackfillAdjustment,
+        /// Exact before-score, compared again during replay.
+        old_stability_q: i64,
+        /// Latest card event at admission; guards conflicting score changes.
+        prior_card_event_seq: u64,
+        /// Original effect receipt when this is an exact compensating undo.
+        undo_of: Option<String>,
     },
 }

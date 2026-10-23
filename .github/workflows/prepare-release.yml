@@ -1,0 +1,198 @@
+name: Prepare release artifacts (no publication)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Reviewed full 40-character commit SHA to build'
+        required: true
+        type: string
+      version:
+        description: 'Product version (no v prefix)'
+        required: true
+        default: '5.0.1'
+        type: string
+
+# This workflow only uploads Actions artifacts. It cannot create a release,
+# move a tag, publish npm, or mark anything latest.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SOURCE_REF: ${{ inputs.source_ref }}
+  PRODUCT_VERSION: ${{ inputs.version }}
+
+jobs:
+  desktop:
+    name: Prepare ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            flags: '--no-default-features'
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            flags: ''
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            flags: ''
+    steps:
+      - name: Require immutable source and numeric version
+        shell: bash
+        run: |
+          [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PRODUCT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate and build dashboard
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_REF"
+          python3 scripts/prepare-release.py check-version --version "$PRODUCT_VERSION"
+          bash scripts/check-release-no-reqwest.sh
+          pnpm install --frozen-lockfile
+          pnpm --filter @vestige/dashboard check
+          pnpm --filter @vestige/dashboard test
+          pnpm --filter @vestige/dashboard build
+      - name: Build release binaries
+        shell: bash
+        run: |
+          rustup target add '${{ matrix.target }}'
+          cargo build --locked --release -p vestige-mcp --target '${{ matrix.target }}' ${{ matrix.flags }}
+          cargo build --locked --release -p vestige-upgrade --target '${{ matrix.target }}'
+          python3 scripts/prepare-release.py archive --target '${{ matrix.target }}' --output dist/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vestige-${{ inputs.version }}-${{ matrix.target }}
+          path: dist/release/*
+          if-no-files-found: error
+
+  linux:
+    name: Prepare ${{ matrix.target }} (glibc 2.35)
+    runs-on: ${{ matrix.os }}
+    container: ubuntu:22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    steps:
+      - name: Install build prerequisites and validate inputs
+        shell: bash
+        run: |
+          [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PRODUCT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config cmake python3 perl xz-utils unzip binutils libssl-dev
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate and build dashboard
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_REF"
+          python3 scripts/prepare-release.py check-version --version "$PRODUCT_VERSION"
+          bash scripts/check-release-no-reqwest.sh
+          pnpm install --frozen-lockfile
+          pnpm --filter @vestige/dashboard check
+          pnpm --filter @vestige/dashboard test
+          pnpm --filter @vestige/dashboard build
+      - name: Build and check release binaries
+        shell: bash
+        run: |
+          rustup target add '${{ matrix.target }}'
+          cargo build --locked --release -p vestige-mcp --target '${{ matrix.target }}'
+          cargo build --locked --release -p vestige-upgrade --target '${{ matrix.target }}'
+          bash scripts/check-linux-glibc.sh 'target/${{ matrix.target }}/release/vestige-mcp'
+          bash scripts/smoke-vestige-mcp.sh 'target/${{ matrix.target }}/release/vestige-mcp'
+          python3 scripts/prepare-release.py archive --target '${{ matrix.target }}' --output dist/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vestige-${{ inputs.version }}-${{ matrix.target }}
+          path: dist/release/*
+          if-no-files-found: error
+
+  android:
+    name: Prepare aarch64-linux-android
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_API: '24'
+    steps:
+      - name: Require immutable source and numeric version
+        shell: bash
+        run: |
+          [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PRODUCT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate and build dashboard
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_REF"
+          python3 scripts/prepare-release.py check-version --version "$PRODUCT_VERSION"
+          bash scripts/check-release-no-reqwest.sh
+          pnpm install --frozen-lockfile
+          pnpm --filter @vestige/dashboard check
+          pnpm --filter @vestige/dashboard test
+          pnpm --filter @vestige/dashboard build
+      - name: Prepare NDK
+        shell: bash
+        run: |
+          rustup target add aarch64-linux-android
+          cargo install cargo-ndk --locked
+          echo "ANDROID_NDK_ROOT=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+      - name: Build and check release binaries
+        shell: bash
+        env:
+          CXXSTDLIB: c++_static
+        run: |
+          cargo ndk -t arm64-v8a --platform "$ANDROID_API" build --locked --release -p vestige-mcp --no-default-features
+          cargo ndk -t arm64-v8a --platform "$ANDROID_API" build --locked --release -p vestige-upgrade
+          BIN=target/aarch64-linux-android/release/vestige-mcp
+          READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          "$READELF" -h "$BIN" | grep -E 'Machine:\s+AArch64'
+          "$READELF" -d "$BIN" | grep NEEDED > needed.txt
+          if grep -vE '\[(libc|libm|libdl|liblog)\.so\]' needed.txt; then
+            echo 'Unexpected Android runtime dependency' >&2
+            exit 1
+          fi
+          python3 scripts/prepare-release.py archive --target aarch64-linux-android --output dist/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vestige-${{ inputs.version }}-aarch64-linux-android
+          path: dist/release/*
+          if-no-files-found: error
