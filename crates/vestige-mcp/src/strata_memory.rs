@@ -5639,8 +5639,10 @@ mod tests {
     /// to back, holding the store `HOLD` per write the way each gated write
     /// does on a large log. Like gather, the writer takes the store again
     /// almost at once; like a dashboard handler, the reader does a little
-    /// work between its acquisitions.
-    fn reads_during_bulk_writer(background: bool) -> Duration {
+    /// work between its acquisitions. Also returns the longest of the
+    /// reader's pauses, which a loaded machine's timer can stretch well past
+    /// the 2 ms asked for.
+    fn reads_during_bulk_writer(background: bool) -> (Duration, Duration) {
         const HOLD: Duration = Duration::from_millis(40);
         const READS: usize = 15;
         // Bounds the writer, so the run ends even if a read never got in.
@@ -5677,15 +5679,18 @@ mod tests {
         // Let the writer get going, so the first read lands mid-write.
         std::thread::sleep(HOLD * 2);
         let started = Instant::now();
+        let mut longest_pause = Duration::ZERO;
         for _ in 0..READS {
             assert!(memory.get_node(&id).unwrap().is_some());
             // The reader's own work between two acquisitions.
+            let pause = Instant::now();
             std::thread::sleep(Duration::from_millis(2));
+            longest_pause = longest_pause.max(pause.elapsed());
         }
         let elapsed = started.elapsed();
         stop.store(true, Ordering::Release);
         writer.join().unwrap();
-        elapsed
+        (elapsed, longest_pause)
     }
 
     /// The bug gather hit: a bulk writer re-takes the store between every
@@ -5694,9 +5699,7 @@ mod tests {
     /// most the one write already in flight.
     #[test]
     fn background_work_yields_the_store_to_foreground_reads() {
-        let queued = reads_during_bulk_writer(false);
-        let yielded = reads_during_bulk_writer(true);
-        eprintln!("15 reads behind a bulk writer: queued {queued:?}, yielded {yielded:?}");
+        let (queued, _) = reads_during_bulk_writer(false);
         // 15 reads x 40 ms holds: queued reads pay roughly one hold each
         // (about 600 ms); yielded reads pay one at most, plus their own
         // 15 x 2 ms of work. A slower machine stretches both runs alike, so
@@ -5706,6 +5709,31 @@ mod tests {
             queued >= Duration::from_millis(300),
             "reads behind a foreground writer took {queued:?}; the test no longer reproduces the queueing"
         );
+        // The writer yields while a foreground caller holds the store or let
+        // go of it less than FOREGROUND_GRACE ago. When a loaded runner's
+        // timer stretches the reader's 2 ms pause past that, the writer
+        // rightly takes the store again, and that run says nothing about the
+        // yield. Up to three runs are tried for one whose pauses all stayed
+        // inside the grace (seen on a macOS CI runner, 2026-10-20: queued
+        // 1.85 s, yielded 994 ms).
+        let mut judged = None;
+        for attempt in 1..=3 {
+            let (yielded, longest_pause) = reads_during_bulk_writer(true);
+            eprintln!(
+                "15 reads behind a bulk writer: queued {queued:?}, yielded {yielded:?} \
+                 (run {attempt}, longest pause {longest_pause:?})"
+            );
+            if longest_pause < FOREGROUND_GRACE {
+                judged = Some(yielded);
+                break;
+            }
+        }
+        let Some(yielded) = judged else {
+            eprintln!(
+                "every yielded run paused past FOREGROUND_GRACE on this machine's timer, so the yield was not judged here"
+            );
+            return;
+        };
         assert!(
             yielded * 3 < queued,
             "reads behind a background writer took {yielded:?}, not under a third of the queued {queued:?}"
