@@ -148,6 +148,65 @@ Since 4.0, Vestige does not rank text that resembles your query. There are no em
 
 `causal_walk` never guesses. With no start point it returns `needs_report` and names what is missing. A start point with no `node_id` is not walked: `start_points` in the response says so, with the reason, for each one. A walk that finds no cause says why in `emptyBecause`, from the edges the log holds. `forgotten_lesson` walks backward from a failure the same way and ranks fix or lesson memories by how far they have faded.
 
+<a id="retroactive-salience-backfill"></a>
+## Retroactive Salience Backfill
+
+New information can change the importance of an older memory. Backfill walks
+backward through Strata's recorded relationships and exact shared entities,
+then raises or lowers earlier memories' salience. It does not rank by text or
+embedding similarity, invent a relationship, or update a memory newer than the
+trigger. `causal_walk` remains the separate investigation tool: "what caused
+this?"
+
+For a personal-memory example, save **"Maya felt off after dinner at Bangkok
+Garden"** with entities `person:Maya` and `place:Bangkok Garden`. Later, save
+**"Maya has a peanut allergy"** with entity `person:Maya` and attribute
+`allergy:peanut`. The shared entity is Maya. Backfill raises the earlier reaction
+because the new health fact makes it relevant. It makes no claim that Bangkok
+Garden serves peanuts, and it leaves a different person's experience at the
+same restaurant unchanged.
+
+When an agent plans Maya's birthday dinner, it resolves Maya to the exact handle
+`person:Maya` and calls `recall` with that handle. Recall orders the connected
+memories using the updated salience, so Maya's reaction can be considered before
+choosing a venue. Natural-language text is not silently turned into a fuzzy
+memory query.
+
+Backfill runs automatically when a new memory is saved. Set
+`VESTIGE_BACKFILL_AUTOFIRE=0` (`false`, `off`, and `no` also work) to disable
+automatic runs. Manual review and exact undo remain available:
+
+```bash
+vestige backfill <trigger-memory-id> --dry-run
+vestige backfill <trigger-memory-id>
+vestige backfill undo <receipt-id>
+```
+
+The MCP tool accepts `backfill` with `trigger_id`, `dry_run`, and an `action`
+(`run`, `receipts`, or `undo`). Each applied change records the earlier memory,
+old and new scores, triggering memory, exact shared entity, reason, and time.
+Dry runs write nothing. A repeated cause/trigger pair does not compound; undo
+restores the score recorded before that change. Raises retain the original
+bounded stability step, `min(stability * 1.5, stability + 365)`, with a matching
+bounded decrease and floor for lowering.
+
+See the [release procedure](releases/v5.0.1.md) for source verification,
+platform archives, checksums, package review, and rollback requirements.
+
+<a id="whats-new-in-v5"></a>
+## What's new in v5
+
+[5.0.0 PRECEDENT](https://github.com/samvallad33/vestige/releases/tag/v5.0.0) shipped on October 18, 2026. Vestige now reads its own enforcement record.
+
+- **`precedent`.** Any connected agent can ask what the gate stopped or allowed, under which rule, and which permit answered each stop. It reads the gate's own receipts, writes nothing and cannot issue a permit, so a stopped agent can see why instead of retrying.
+- **18 tools and no vectors.** Vestige advertises 18 MCP tools, adds `precedent` and `gather`, and ships no embedding runtime. Free-text recall returns `similarity_disabled`; a memory is found by its exact id or tag.
+- **`gather`.** Point it at a GitHub issue and it records the issue, its comments, the linked pull requests and the commit window as receipts, then walks back toward the cause. It reads GitHub through the `gh` CLI. When something was missing, `missingReceipts` names it instead of guessing a cause.
+- **Rules that survive compaction.** `vestige hook session-start` brings your pinned decisions and corrections back after every compaction. `npx @vestige/init` registers it for Claude Code; see the [rules hook guide](integrations/claude-code-rules-hook.md).
+- **The PRECEDENT journey.** `npx @vestige/init precedent` follows one real stop from your machine around the loop: the stop, its receipt re-derived from its own bytes, the precedent and the verdict.
+- **A rebuilt dashboard** on WebGPU, with the gate's receipts in its Guard view.
+- **Operator Lite 0.3.10.** It blocks from install with 30 rules, reads the shell commands inside `python -c` and `node -e` code, sees through wrappers such as `sudo -u root`, `env -S` and `busybox`, and stops an agent from throwing away uncommitted git work.
+- **Tested end to end.** [`full_flow_stdio.rs`](../crates/vestige-mcp/tests/full_flow_stdio.rs) runs the whole loop on the shipped binaries in CI on Linux and macOS: the gate stops a call, the stop is recorded, a second agent recalls it and walks it back to its rule, and an ALLOW ONCE runs exactly once.
+
 <a id="ghostlink-the-negative-space"></a>
 ## GhostLink: the negative space
 
@@ -164,6 +223,8 @@ Since 4.0, Vestige does not rank text that resembles your query. There are no em
 `map`, `inspect`, `explore`, `bounty`, `predict` and `harden` read and seed around the same graph. Reading never writes to the log.
 
 ## 🛡️ Every write is admitted
+
+Each Strata frame carries the BLAKE3 hash of the frame before it, sealed segments carry an Ed25519 signature (a segment is sealed at backup, nightly by default), and `vestige strata-verify` checks all of it while the server keeps running.
 
 On a Strata log a write is proposed, checked by the gate, and admitted as an effect, and the call returns an `eff-` receipt. `receipt get` shows what that write did. `receipt replay` rebuilds the state from the log and reports any mismatch. `selftest` plants a known cause in a throwaway copy of your store and checks that the walk finds it, without touching the live store.
 
