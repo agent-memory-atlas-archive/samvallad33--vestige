@@ -34,6 +34,7 @@ Nothing here is a claim that Vestige models a brain. The labels are the claim.
 | Explicit review | Testing effect, Roediger & Karpicke, 2006 | `promote` is an FSRS review rated Easy and `demote` one rated Again. A read is never a review | Inspired by |
 | Dreaming | Sleep replay and consolidation, Diekelmann & Born, 2010; synaptic downscaling, Tononi & Cirelli, 2006 | `maintain` actions `dream` and `dream_compile` replay recorded edges and re-weight them | Inspired by |
 | Suppression | Top-down inhibitory control of memory, Anderson et al., 2025 | `suppress` takes a record out of every read and keeps its bytes | Inspired by |
+| Retroactive Salience Backfill (5.0.1) | Offline co-reactivation links memories across days, Zaki, Cai et al., 2024 | `backfill` raises or lowers older records that share an exact typed identity with a new save, backward in time only, bounded, receipted and undoable | Inspired by |
 | Causal walk | None. Provenance and lineage tracing | A bounded backward search over recorded edges | Engineering |
 | GhostLink | None. Graph distance and set overlap | Bridge and divergent lenses over recorded edges, with a deterministic sampler | Engineering |
 
@@ -149,6 +150,55 @@ Label: Inspired by. The v3 behavior built on the same paper (a 24-hour reversal 
 and a 72-hour neighbor-fading cascade, after Cervantes-Sandoval & Davis, 2020) is v3
 engine behavior and is not part of a Strata log.
 
+## Retroactive Salience Backfill (5.0.1)
+
+Zaki, Cai et al. (2024) found that a neutral memory formed earlier becomes important
+when a salient event later shares its neural ensemble, and that the link runs backward
+only: the later event reaches the earlier memory, never the other way. Backfill takes two
+ideas from that paper, the backward-only direction and the shared ensemble, and turns
+them into a bounded rule over recorded state.
+
+- **What triggers a pass.** Every admitted save runs one pass with the new record as
+  its trigger, unless `VESTIGE_BACKFILL_AUTOFIRE` is `0`, `false`, `off` or `no`. The pass
+  only does work when the trigger carries an explicit personal attribute tag
+  (`allergy:`, `preference:<key>=<value>`, `health:`, `condition:`, `medication:`,
+  `diet:`) or reads like a failure. The failure test is a fixed whole-word list
+  (`error`, `crash`, `timeout`, `regression` and similar). That list decides only
+  whether a pass runs. It never selects or ranks an older record. A caller can also run
+  a pass by hand with `manual=true`.
+- **What it can reach.** An older record is a candidate only when it carries one of the
+  trigger's typed identity tags exactly, byte for byte: `person:`, `place:`, `food:`,
+  `file:`, `service:` or `symbol:`. `person:Maya` and `person:maya` are different
+  identities. A personal attribute links through exactly one `person:` identity, so a
+  shared restaurant cannot carry one person's allergy to someone else. Only records
+  created before the trigger, inside the lookback window (30 days by default, 1 to 365),
+  are considered. Candidates the causal walk reaches from the trigger are taken first,
+  then newer before older.
+- **What it changes.** A raise multiplies the record's FSRS stability by 1.5, adding at
+  most 365 days. A lower divides by 1.5 and never goes below 0.01, so a record is made
+  quieter but never erased. A lower happens only on an explicit signal: a newer
+  `preference:` value for the same person and key, or, on a manual pass, a
+  `contradicts:<id>` or `supersedes:<id>` tag naming the older record. One pass changes
+  at most 16 records and scans at most 500.
+- **What it records.** Every change is its own frame on the log with a receipt: the
+  older record, the trigger, the shared identity, a plain-language reason, and the
+  stability before and after. A change is applied only if the stored stability still
+  equals the planned value. `dry_run` previews and appends nothing. A trigger and record
+  pair is changed once, so running the same pass again changes nothing. `undo` restores
+  the exact earlier value from a receipt.
+- **What reads it.** Tag recall and the session hook's context packet rank by the net
+  change those receipts recorded, then stability, then recency. A read never changes a
+  score.
+
+The reason a change gives is relevance, not cause: "shared identity supports relevance,
+not causation." Every response says `causality_verified: false`. `causal_walk` stays the
+investigation tool, and Backfill reuses its backward search only to order candidates.
+
+Label: Inspired by. The direction and the shared-identity join come from the paper. The
+1.5 factor, the bounds and the attribute vocabulary are engineering choices. Read the
+planner in `crates/vestige-core/src/advanced/retroactive_backfill.rs` (`plan_salience`)
+and the tool in `crates/vestige-mcp/src/tools/backfill.rs`.
+
 ## Bounded causal walks
 
 A walk starts at a record that holds a symptom, which you name, and goes backward over
@@ -225,8 +275,11 @@ for the harnesses that test it, and none of it runs on a Strata log:
 - **Dual-strength memory** (Bjork & Bjork, 1992) as separate storage and retrieval
   strengths: a Strata log has one derived value, retrievability, plus FSRS stability and
   difficulty. The stability-versus-retrievability split in FSRS is the nearest relative.
-- **Retroactive Salience Backfill** and post-retrieval failure feedback: they joined
-  records by shared names. `causal_walk` replaces them.
+- **v3 Retroactive Salience Backfill** and post-retrieval failure feedback: they
+  extracted names from content, weighted them by rarity, and joined records that used
+  the same words. That engine is gone. The 5.0.1 Backfill above is a different
+  mechanism: it joins only on exact typed identity tags, and every change is bounded,
+  receipted and undoable.
 - **`recall` modes `reason` and `contradictions`** (trust scoring and contradiction
   detection by topic overlap): they return `similarity_disabled`.
 
@@ -236,6 +289,7 @@ for the harnesses that test it, and none of it runs on a Strata log:
 - Roediger, H. L. & Karpicke, J. D. (2006). Test-enhanced learning: taking memory tests improves long-term retention. *Psychological Science*, 17(3), 249-255.
 - Diekelmann, S. & Born, J. (2010). The memory function of sleep. *Nature Reviews Neuroscience*, 11.
 - Tononi, G. & Cirelli, C. (2006). Sleep function and synaptic homeostasis. *Sleep Medicine Reviews*, 10(1).
+- Zaki, Y., Cai, D. J. et al. (2024). Offline ensemble co-reactivation links memories across days. *Nature*, 637, 145-155.
 - Anderson, M. C. et al. (2025). Brain mechanisms underlying the inhibitory control of thought. *Nature Reviews Neuroscience*. DOI 10.1038/s41583-025-00929-y
 - Cervantes-Sandoval, I. & Davis, R. L. (2020). Rac1 impairs forgetting-induced cellular plasticity. *Frontiers in Cellular Neuroscience* (v3 behavior only).
 - Bjork, R. A. & Bjork, E. L. (1992). A new theory of disuse and an old theory of stimulus fluctuation. [PDF](https://bjorklab.psych.ucla.edu/wp-content/uploads/sites/13/2016/07/RBjork_EBjork_1992.pdf) (v3 only).
