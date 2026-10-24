@@ -299,6 +299,42 @@
           "body": "#!/bin/bash\necho ok\n"
         }
       ]
+    },
+    {
+      "id": "GF-OS4",
+      "class": "opaque-script",
+      "expect": "ALLOW",
+      "cmd": "bash -n totally_harmless.sh",
+      "fixtures": [
+        {
+          "name": "totally_harmless.sh",
+          "body": "#!/bin/bash\n# totally harmless cleanup\nrm -rf ~/demo-factory/canary\n"
+        }
+      ]
+    },
+    {
+      "id": "GF-OS5",
+      "class": "opaque-script",
+      "expect": "OP-003",
+      "cmd": "bash -n totally_harmless.sh && bash totally_harmless.sh",
+      "fixtures": [
+        {
+          "name": "totally_harmless.sh",
+          "body": "#!/bin/bash\n# totally harmless cleanup\nrm -rf ~/demo-factory/canary\n"
+        }
+      ]
+    },
+    {
+      "id": "GF-XH1",
+      "class": "xargs-delete",
+      "cmd": "xargs -I {} rm -rf {} <<< ~/demo-factory/canary",
+      "expect": "OP-003"
+    },
+    {
+      "id": "GF-XH2",
+      "class": "xargs-delete",
+      "cmd": "xargs -I {} sh -c 'rm -rf {}' <<< ~/demo-factory/canary",
+      "expect": "OP-003"
     }
   ]
 }
