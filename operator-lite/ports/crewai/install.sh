@@ -76,9 +76,9 @@ if [ -s "$TMP_GATE" ] && grep -q '^VERSION = ' "$TMP_GATE"; then
 else
     rm -f "$TMP_GATE"
 fi
-# the checkout's own gate wins when it is newer than main's (a branch being tested, a release not yet merged)
+# the checkout's own gate wins unless main's is newer (a branch being tested, a release not yet merged)
 if [ -f "$REPO_GATE" ] && grep -q '^VERSION = ' "$REPO_GATE" && \
-    { [ "$SRC" = "" ] || ! version_ge "$(gate_version "$SRC")" "$(gate_version "$REPO_GATE")"; }; then
+    { [ "$SRC" = "" ] || version_ge "$(gate_version "$REPO_GATE")" "$(gate_version "$SRC")"; }; then
     [ "$SRC" = "$TMP_GATE" ] && rm -f "$TMP_GATE"
     SRC="$REPO_GATE"
 fi
