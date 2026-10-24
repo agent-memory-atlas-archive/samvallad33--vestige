@@ -215,6 +215,8 @@ jobs:
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
+          # Keep every matrix upload private until all six targets are verified.
+          draft: true
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             vestige-mcp-${{ matrix.target }}.${{ matrix.archive }}
@@ -428,6 +430,8 @@ jobs:
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
+          # Keep every matrix upload private until all six targets are verified.
+          draft: true
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             dist/vestige-mcp-x86_64-unknown-linux-gnu.tar.gz
@@ -638,6 +642,8 @@ jobs:
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
+          # Keep every matrix upload private until all six targets are verified.
+          draft: true
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             dist/vestige-mcp-aarch64-unknown-linux-gnu.tar.gz
@@ -868,6 +874,8 @@ jobs:
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
+          # Keep every matrix upload private until all six targets are verified.
+          draft: true
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             dist/vestige-mcp-aarch64-linux-android.tar.gz

@@ -157,7 +157,9 @@ fn default_boot_opens_no_outbound_socket_or_dns() {
         "purge is withheld on Strata: {names:?}"
     );
     assert!(names.contains(&"suppress"), "{names:?}");
-    assert_eq!(names.len(), 18, "default tools/list: {names:?}");
+    assert!(names.contains(&"backfill"), "{names:?}");
+    assert!(names.contains(&"causal_walk"), "{names:?}");
+    assert_eq!(names.len(), 19, "default tools/list: {names:?}");
 
     let called = session.result(
         "tools/call",

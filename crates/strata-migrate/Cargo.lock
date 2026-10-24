@@ -739,7 +739,7 @@ dependencies = [
 
 [[package]]
 name = "strata"
-version = "0.1.0"
+version = "5.0.1"
 dependencies = [
  "blake3",
  "borsh",
@@ -750,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "strata-kernel"
-version = "0.1.0"
+version = "5.0.1"
 dependencies = [
  "blake3",
  "borsh",
@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "strata-migrate"
-version = "0.1.0"
+version = "5.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

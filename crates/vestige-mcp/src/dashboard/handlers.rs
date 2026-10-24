@@ -2331,6 +2331,15 @@ pub async fn deep_reference_query(
 
 #[derive(Debug, Deserialize)]
 pub struct BackfillBody {
+    pub action: Option<String>,
+    #[serde(alias = "triggerId")]
+    pub trigger_id: Option<String>,
+    #[serde(alias = "receiptId")]
+    pub receipt_id: Option<String>,
+    pub scope: Option<String>,
+    #[serde(alias = "dryRun")]
+    pub dry_run: Option<bool>,
+    pub scan_limit: Option<usize>,
     pub failure_id: Option<String>,
     #[serde(default)]
     pub manual: bool,
@@ -2350,14 +2359,59 @@ pub async fn backfill_query(
     Json(body): Json<BackfillBody>,
 ) -> Result<Json<Value>, ApiError> {
     let lookback_days = body.lookback_days.unwrap_or(30).clamp(1, 365);
-    let promote = body.promote.unwrap_or(false);
+    let action = body.action.as_deref().unwrap_or("run");
+    let invalid = |message: &str| {
+        ApiError::reason(
+            StatusCode::BAD_REQUEST,
+            "invalid_backfill_args",
+            message.to_string(),
+        )
+    };
+    if !matches!(action, "run" | "undo" | "receipts") {
+        return Err(invalid("unknown backfill action"));
+    }
+    if action == "run"
+        && body
+            .trigger_id
+            .as_deref()
+            .or(body.failure_id.as_deref())
+            .is_none_or(|id| id.trim().is_empty())
+    {
+        return Err(invalid(
+            "trigger_id is required; Backfill never guesses the trigger",
+        ));
+    }
+    if action == "undo"
+        && body
+            .receipt_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+    {
+        return Err(invalid("receipt_id is required for undo"));
+    }
+    if body
+        .scan_limit
+        .is_some_and(|limit| !(1..=500).contains(&limit))
+    {
+        return Err(invalid("scan_limit must be between 1 and 500"));
+    }
+    // Preserve the dashboard's preview-first default. Its dry path bypasses
+    // all trace/receipt/event writes, just like the MCP and CLI dry paths.
+    let dry_run = body.dry_run.unwrap_or(body.promote != Some(true));
     let call_args = serde_json::json!({
+        "action":action,"trigger_id":body.trigger_id,"receipt_id":body.receipt_id,
+        "scope":body.scope,"dry_run":dry_run,"scan_limit":body.scan_limit,
         "failure_id": body.failure_id,
         "manual": body.manual,
         "lookback_days": lookback_days,
-        "promote": promote,
         "run_id": body.run_id,
     });
+    if dry_run {
+        return crate::tools::backfill::execute(&state.storage, Some(call_args))
+            .await
+            .map(Json)
+            .map_err(tool_error);
+    }
     let run_id = crate::trace_recorder::run_id_for(&Some(call_args.clone()));
     crate::trace_recorder::record_call(
         &state.storage,

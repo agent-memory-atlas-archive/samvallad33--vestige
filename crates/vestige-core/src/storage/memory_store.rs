@@ -1932,6 +1932,28 @@ pub trait LocalMemoryStore: Sync + 'static {
         ))
     }
 
+    /// Admit a bounded, evidence-linked salience adjustment. Unsupported backends refuse.
+    fn apply_salience_change(
+        &self,
+        _change: &crate::advanced::retroactive_backfill::SalienceChange,
+    ) -> StoreResult<Option<Value>> {
+        Err(StorageError::Refused(
+            "backfill is not supported by this backend".into(),
+        ))
+    }
+
+    /// Read admitted salience receipts without appending anything.
+    fn salience_receipts(&self) -> StoreResult<Vec<Value>> {
+        Ok(Vec::new())
+    }
+
+    /// Compensate one salience receipt; later conflicting updates must be refused.
+    fn undo_salience_change(&self, _receipt_id: &str) -> StoreResult<Value> {
+        Err(StorageError::Refused(
+            "backfill undo is not supported by this backend".into(),
+        ))
+    }
+
     /// Bounded FSRS promotion used by backfill promotion.
     fn promote_memory_backfill(&self, _id: &str) -> StoreResult<KnowledgeNode> {
         Err(StorageError::Init(
@@ -3185,6 +3207,12 @@ pub trait MemoryStore: Send + Sync + 'static {
         claimed_role: Option<&str>,
         tool: &str,
     ) -> StoreResult<ActorMutationOutcome>;
+    fn apply_salience_change(
+        &self,
+        change: &crate::advanced::retroactive_backfill::SalienceChange,
+    ) -> StoreResult<Option<Value>>;
+    fn salience_receipts(&self) -> StoreResult<Vec<Value>>;
+    fn undo_salience_change(&self, receipt_id: &str) -> StoreResult<Value>;
     fn promote_memory_backfill(&self, id: &str) -> StoreResult<KnowledgeNode>;
     fn prune_agent_traces(&self) -> StoreResult<i64>;
     fn purge_node(&self, id: &str, reason: Option<&str>) -> StoreResult<PurgeReport>;
@@ -4142,6 +4170,18 @@ where
     }
     fn promote_memory_backfill(&self, id: &str) -> StoreResult<KnowledgeNode> {
         <T as MemoryStoreSend>::promote_memory_backfill(self, id)
+    }
+    fn apply_salience_change(
+        &self,
+        change: &crate::advanced::retroactive_backfill::SalienceChange,
+    ) -> StoreResult<Option<Value>> {
+        <T as MemoryStoreSend>::apply_salience_change(self, change)
+    }
+    fn salience_receipts(&self) -> StoreResult<Vec<Value>> {
+        <T as MemoryStoreSend>::salience_receipts(self)
+    }
+    fn undo_salience_change(&self, receipt_id: &str) -> StoreResult<Value> {
+        <T as MemoryStoreSend>::undo_salience_change(self, receipt_id)
     }
     fn prune_agent_traces(&self) -> StoreResult<i64> {
         <T as MemoryStoreSend>::prune_agent_traces(self)

@@ -2,7 +2,7 @@
 //!
 //! Spawns the shipped `vestige-mcp` binary on a fresh data directory and
 //! checks, over line-framed JSON-RPC: the advertised surface (ghostlink in,
-//! graph out, 16 tools), both propose lenses with their proofs, weave writing
+//! graph out, backfill and causal_walk distinct), both propose lenses with their proofs, weave writing
 //! through the gate with a receipt per write and removing the pair, inspect,
 //! harden seeding once and then reporting every law as already present, a
 //! laws file taking precedence, a malformed laws file naming itself, the
@@ -32,13 +32,17 @@ impl Server {
     /// A server on `data_dir` whose HOME is `home`, so a developer's own
     /// `~/.vestige/ghostlink-laws.json` can never leak into a test.
     fn spawn(data_dir: &Path, home: &Path) -> Self {
+        Self::spawn_with_trace(data_dir, home, false)
+    }
+
+    fn spawn_with_trace(data_dir: &Path, home: &Path, tracing: bool) -> Self {
         let mut child = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_vestige-mcp")))
             .env("VESTIGE_DATA_DIR", data_dir)
             .env("HOME", home)
             .env("VESTIGE_DASHBOARD_ENABLED", "false")
             .env("VESTIGE_HTTP_ENABLED", "0")
             .env("VESTIGE_AUTOPILOT_ENABLED", "0")
-            .env("VESTIGE_TRACE", "0")
+            .env("VESTIGE_TRACE", if tracing { "1" } else { "0" })
             .env("VESTIGE_BACKFILL_AUTOFIRE", "0")
             .env("VESTIGE_FAILURE_FEEDBACK", "0")
             .env_remove("RUST_LOG")
@@ -320,13 +324,20 @@ fn ghostlink_is_the_advertised_composition_tool() {
     let home = data_dir();
     let mut server = spawn(dir.path(), home.path());
     let listed = server.result("tools/list", None);
+    assert!(
+        listed.to_string().len() <= 22 * 1024,
+        "tools/list exceeds the 22 KiB wire budget: {} bytes",
+        listed.to_string().len()
+    );
     let names: Vec<&str> = listed["tools"]
         .as_array()
         .unwrap()
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 18, "{names:?}");
+    assert_eq!(names.len(), 19, "{names:?}");
+    assert!(names.contains(&"backfill"), "{names:?}");
+    assert!(names.contains(&"causal_walk"), "{names:?}");
     assert!(names.contains(&"ghostlink"), "{names:?}");
     assert!(names.contains(&"precedent"), "{names:?}");
     assert!(names.contains(&"gather"), "{names:?}");
@@ -350,6 +361,111 @@ fn ghostlink_is_the_advertised_composition_tool() {
             "mode {mode} missing: {modes}"
         );
     }
+    server.shutdown();
+}
+
+#[test]
+fn backfill_discovery_exposes_run_preview_receipts_and_undo() {
+    let dir = data_dir();
+    let home = data_dir();
+    let mut server = spawn(dir.path(), home.path());
+    let listed = server.result("tools/list", None);
+    let backfill = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "backfill")
+        .expect("backfill is advertised independently");
+    assert_eq!(backfill["annotations"]["readOnlyHint"], json!(false));
+    let properties = &backfill["inputSchema"]["properties"];
+    for action in ["run", "undo", "receipts"] {
+        assert!(
+            properties["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == action),
+            "missing {action}: {backfill}"
+        );
+    }
+    for field in [
+        "trigger_id",
+        "receipt_id",
+        "dry_run",
+        "manual",
+        "lookback_days",
+    ] {
+        assert!(
+            properties.get(field).is_some(),
+            "missing {field}: {backfill}"
+        );
+    }
+    let full = server.call_tool_ok(
+        "memory_status",
+        json!({"view": "tools", "tool": "backfill"}),
+    );
+    assert_eq!(full["tools"][0]["name"], json!("backfill"));
+    assert_eq!(
+        full["tools"][0]["inputSchema"]["properties"]["dry_run"]["default"],
+        json!(false)
+    );
+    server.shutdown();
+}
+
+#[test]
+fn backfill_dry_run_writes_nothing_even_with_call_tracing_enabled() {
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(
+            root: &Path,
+            dir: &Path,
+            files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(dir).expect("read log directory") {
+                let path = entry.expect("log entry").path();
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(path).expect("read log file"),
+                    );
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    let dir = data_dir();
+    let home = data_dir();
+    let mut server = Server::spawn_with_trace(dir.path(), home.path(), true);
+    let earlier = server.call_tool_ok(
+        "smart_ingest",
+        json!({
+            "content": "Maya felt off after dinner at Bangkok Garden",
+            "tags": ["person:Maya", "place:Bangkok Garden"],
+        }),
+    );
+    let trigger = server.call_tool_ok(
+        "smart_ingest",
+        json!({
+            "content": "Maya has a peanut allergy",
+            "tags": ["person:Maya", "allergy:peanut"],
+        }),
+    );
+    assert_ne!(earlier["nodeId"], trigger["nodeId"]);
+    let before = snapshot(&dir.path().join("log"));
+    let preview = server.call_tool_ok(
+        "backfill",
+        json!({"trigger_id": trigger["nodeId"], "dry_run": true}),
+    );
+    assert_eq!(preview["dry_run"], json!(true), "{preview}");
+    assert_eq!(
+        snapshot(&dir.path().join("log")),
+        before,
+        "a dry run changed the log"
+    );
     server.shutdown();
 }
 

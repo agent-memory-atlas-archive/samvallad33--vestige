@@ -15,7 +15,8 @@ with open(GATE, encoding="utf-8") as f:
     V = re.search(r'^VERSION = "([^"]+)"', f.read(), re.M).group(1)
 LITE = "Operator Lite " + V
 a, b, c = (int(x) for x in V.split("."))
-NUMERIC_NEWER = "%d.%d.%d" % (a, b, 10 ** len(str(c)))    # newer by number, older by string: 0.3.10 vs 0.3.7
+NEWER = "%d.%d.%d" % (a, b + 1, 0)
+NUMERIC_NEWER = "%d.0.0" % (10 ** len(str(a)))    # newer by number, older by string: 10.0.0 vs 5.0.1
 fails = []
 root = tempfile.mkdtemp(prefix="oplite-guard-")
 
@@ -74,7 +75,7 @@ refusals = [
      "Operator 0.3.13"),
     ("the paid gate at a LOWER version (edition outranks version)", "paid-old", 'VERSION = "0.3.1"\nEDITION = "operator"\n',
      (), "Operator 0.3.1"),
-    ("a newer Operator Lite", "lite-newer", 'VERSION = "0.3.99"\n' + LITE_SAYS, (), "Operator Lite 0.3.99"),
+    ("a newer Operator Lite", "lite-newer", 'VERSION = "%s"\n' % NEWER + LITE_SAYS, (), "Operator Lite " + NEWER),
     ("a newer Lite by number, older by string (%s > %s)" % (NUMERIC_NEWER, V), "lite-numeric",
      'VERSION = "%s"\n' % NUMERIC_NEWER + LITE_SAYS, (), "Operator Lite " + NUMERIC_NEWER),
     ("a gate whose version cannot be read", "no-version", "# a gate with no VERSION line\n", (), "version unreadable"),

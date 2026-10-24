@@ -284,18 +284,29 @@ fn recall_resolves_exact_handles_and_refuses_free_text() {
 }
 
 #[test]
-fn backfill_refuses_and_names_causal_walk() {
+fn backfill_uses_the_strata_planner_and_requires_an_explicit_trigger() {
     let seeded = seed();
-    let run = vestige(seeded.path(), &["backfill", "--failure-id", &seeded.alpha]);
-    assert!(!run.ok);
-    assert!(run.stderr.contains("unavailable_in_4_0"), "{}", run.text());
+    let run = vestige(
+        seeded.path(),
+        &[
+            "backfill",
+            "--failure-id",
+            &seeded.alpha,
+            "--dry-run",
+            "--json",
+        ],
+    );
+    assert!(run.ok, "{}", run.text());
+    let value: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(value["trigger_id"], seeded.alpha);
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["changed"], 0);
+    let missing = vestige(seeded.path(), &["backfill"]);
+    assert!(!missing.ok);
     assert!(
-        run.stderr.contains(&format!(
-            "vestige causal-walk --logged-write {}",
-            seeded.alpha
-        )),
+        missing.stderr.contains("explicit trigger"),
         "{}",
-        run.text()
+        missing.text()
     );
 }
 

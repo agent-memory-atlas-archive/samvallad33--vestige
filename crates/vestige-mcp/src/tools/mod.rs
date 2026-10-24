@@ -2,8 +2,8 @@
 //!
 //! Tool implementations for the Vestige MCP server.
 //!
-//! 4.x advertised surface is 16 tools: the v2.2 consolidated 12 plus the
-//! controlled `receipt` surface and the flagship `backfill` primitive. The
+//! The advertised surface includes exact recall, shared memory, receipts,
+//! retroactive salience backfill, and explicit-evidence causal walks. The
 //! unified facade modules (recall, dedup, memory_status, graph_unified, maintain, plus
 //! the earlier *_unified) dispatch on an action/mode/view discriminator and
 //! delegate to the granular handler modules below, which stay in the crate as
@@ -75,6 +75,7 @@ pub mod predict;
 pub mod restore;
 
 // v1.8: Context Packets
+mod memory_packet;
 pub mod session_context;
 
 // v1.9: Autonomic tools
@@ -102,12 +103,11 @@ pub mod suppress;
 // Blast Radius — exact downstream reach of a cause/source record
 pub mod blast_radius;
 
-// Retroactive Salience Backfill — Cai 2024 Nature (memory with hindsight).
-// v3.2: superseded as the advertised flagship by `causal_walk` below; still
-// dispatched as a hidden back-compat alias.
+// Retroactive Salience Backfill — memory with hindsight. Re-score older
+// memories through explicit shared entities; separate from causal diagnosis.
 pub mod backfill;
 
-// Causal Walk — the successor to backfill: explicit start points (failing
+// Causal Walk — explicit start points (failing
 // test, stack frame, CI run, logged write, version range) walked through
 // exact mechanism edges to the change records behind a failure.
 pub mod causal_walk;

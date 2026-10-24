@@ -174,9 +174,13 @@ class Mcp(object):
         self.proc = subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL)
         threading.Thread(target=self._pump, daemon=True).start()
-        self.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
-                                    "clientInfo": {"name": "operator-stop-memory", "version": VERSION}})
-        self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        try:
+            self.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                        "clientInfo": {"name": "operator-stop-memory", "version": VERSION}})
+            self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except Exception:
+            self.close()  # construction failure must not leave an orphan MCP process
+            raise
 
     def _pump(self):
         for raw in self.proc.stdout:
@@ -232,7 +236,7 @@ class Mcp(object):
         except Exception:
             pass
         try:
-            self.proc.wait(timeout=3)
+            self.proc.wait(timeout=max(0.001, min(0.02, self.deadline - time.time())))
         except Exception:
             self.proc.kill()
 

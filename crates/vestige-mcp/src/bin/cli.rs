@@ -468,48 +468,26 @@ enum Commands {
         limit: Option<usize>,
     },
 
-    /// Retroactive Salience Backfill (legacy SQLite stores; use causal-walk)
-    ///
-    /// Reaches backward from a failure and lists earlier memories that share
-    /// an exact entity (env var, path, identifier) with it. Candidates are
-    /// associations, not proven causes. A shared name is not a recorded edge,
-    /// so a Strata log in 4.0 refuses: use `vestige causal-walk
-    /// --logged-write <memory-id>`, which walks recorded causal edges.
+    /// Re-score older memories through exact shared entities, or undo a receipt.
     Backfill {
-        /// ID of the failure memory; if omitted, the latest failure-like memory is used
+        /// Trigger memory id, or the action `undo` / `receipts`
+        trigger: Option<String>,
+        /// Receipt id when the action is `undo`
+        receipt: Option<String>,
+        /// Legacy alias for the trigger memory id
         #[arg(long)]
         failure_id: Option<String>,
-        /// Force the backfill even if the event isn't auto-detected as salient
         #[arg(long)]
         manual: bool,
-        /// How many days back to reach
         #[arg(long, default_value = "30")]
         lookback_days: i64,
-        /// Dry run: don't actually promote the surfaced cause
-        #[arg(long)]
-        no_promote: bool,
-        /// Demo mode: first show what a plain keyword (BM25) search returns
-        /// for the failure (the lookalike, NOT the cause), then the backfill.
-        #[arg(long)]
-        contrast: bool,
-        /// Machine-readable: print the raw backfill result as JSON (for tooling /
-        /// benchmarks). Suppresses the human-formatted output.
+        /// Preview without appending any store data
+        #[arg(long, alias = "no-promote")]
+        dry_run: bool,
+        #[arg(long, default_value = "user")]
+        scope: String,
         #[arg(long)]
         json: bool,
-        /// Git repository backing this scope's commit records; enables
-        /// version-range mapping from the failure text ("broke in X, worked in Y").
-        #[arg(long)]
-        git_repo: Option<PathBuf>,
-        /// Last-known-good tag for the version range (with --git-repo)
-        #[arg(long)]
-        worked_in: Option<String>,
-        /// First-bad tag for the version range (with --git-repo)
-        #[arg(long)]
-        broke_in: Option<String>,
-        /// Memory id (or commit sha prefix): report the exact rule that
-        /// excluded it, or its rank among the surfaced causes
-        #[arg(long)]
-        why_not: Option<String>,
     },
 
     /// Causal walk: investigate a failure from an explicit start point
@@ -849,27 +827,23 @@ fn main() -> anyhow::Result<()> {
             limit,
         } => run_scan_secrets(include_suspected, json, limit),
         Commands::Backfill {
+            trigger,
+            receipt,
             failure_id,
             manual,
             lookback_days,
-            no_promote,
-            contrast,
+            dry_run,
+            scope,
             json,
-            git_repo,
-            worked_in,
-            broke_in,
-            why_not,
         } => run_backfill(
+            trigger,
+            receipt,
             failure_id,
             manual,
             lookback_days,
-            !no_promote,
-            contrast,
+            dry_run,
+            scope,
             json,
-            git_repo,
-            worked_in,
-            broke_in,
-            why_not,
         ),
         Commands::CausalWalk {
             failing_test,
@@ -4366,236 +4340,67 @@ fn run_scan_secrets(
     Ok(())
 }
 
-/// Run Retroactive Salience Backfill from the CLI (the demo's payoff command).
+/// The CLI and MCP share one planner and receipt/undo path. A running MCP
+/// owner executes the request so a connected agent never causes a lock error.
 #[allow(clippy::too_many_arguments)]
 fn run_backfill(
+    trigger: Option<String>,
+    receipt: Option<String>,
     failure_id: Option<String>,
     manual: bool,
     lookback_days: i64,
-    promote: bool,
-    contrast: bool,
+    dry_run: bool,
+    scope: String,
     json: bool,
-    git_repo: Option<PathBuf>,
-    worked_in: Option<String>,
-    broke_in: Option<String>,
-    why_not: Option<String>,
 ) -> anyhow::Result<()> {
-    let storage = open_storage()?;
-    // Backfill joins memories by shared entity names. A shared name is not a
-    // recorded edge, so a Strata log refuses and names the successor, which
-    // walks recorded causal edges only.
-    if is_strata(&storage) {
-        let start = failure_id.as_deref().unwrap_or("<memory-id>");
-        anyhow::bail!(
-            "unavailable_in_4_0: backfill is not available on Strata in Vestige 4.0: it joins memories by shared entity names, which are not recorded edges. Use its successor, `vestige causal-walk --logged-write {start}`, which walks recorded causal edges (closed_by, derived_from, evidence_of, touched) backward from that memory."
-        );
+    let mut args = serde_json::json!({"scope":scope,"manual":manual,
+        "lookback_days":lookback_days,"dry_run":dry_run});
+    match trigger.as_deref() {
+        Some("undo") => {
+            anyhow::ensure!(failure_id.is_none(), "undo cannot take --failure-id");
+            args["action"] = "undo".into();
+            args["receipt_id"] = receipt
+                .context("backfill undo requires a receipt id")?
+                .into();
+        }
+        Some("receipts") => {
+            anyhow::ensure!(
+                receipt.is_none() && failure_id.is_none(),
+                "receipts takes no memory or receipt id"
+            );
+            args["action"] = "receipts".into();
+        }
+        _ => {
+            anyhow::ensure!(
+                receipt.is_none(),
+                "unexpected second argument; use backfill undo <receipt_id>"
+            );
+            if let (Some(a), Some(b)) = (&trigger, &failure_id) {
+                anyhow::ensure!(a == b, "trigger and --failure-id disagree");
+            }
+            args["trigger_id"] = trigger
+                .or(failure_id)
+                .context("backfill requires an explicit trigger memory id")?
+                .into();
+        }
     }
-
-    // Resolve the failure text up front (used by the contrast baseline).
-    // Use the SAME failure detector the backfill tool uses (content + tags, full
-    // marker list) so the CLI's pick and the tool's pick never diverge.
-    let failure_text: Option<String> = match &failure_id {
-        Some(id) => storage.get_node(id).ok().flatten().map(|n| n.content),
-        None => storage
-            .get_all_nodes(500, 0)
-            .ok()
-            .and_then(|nodes| {
-                nodes
-                    .into_iter()
-                    .find(vestige_mcp::tools::backfill::looks_like_failure)
-            })
-            .map(|n| n.content),
+    let dir = cli_data_dir()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = if take_cli_lock(&dir)? {
+        let storage = open_storage()?;
+        rt.block_on(vestige_mcp::tools::backfill::execute(&storage, Some(args)))
+            .map_err(anyhow::Error::msg)?
+    } else {
+        rt.block_on(vestige_mcp::attach::call_tool(&dir, "backfill", args))?
     };
-
-    // CONTRAST: show what a SIMILARITY SEARCH returns for the failure first — the
-    // lookalike it ranks at the top, which is NOT the cause. Same store, same
-    // query. Keyword search ranks by RESEMBLANCE, which is exactly the blind spot.
-    if contrast && let Some(ftext) = &failure_text {
-        // Generic salient-words query: keep alphanumerics, drop a leading
-        // "<word>:" label if present (e.g. "Service crashed:"). No hardcoding.
-        let query = match ftext.split_once(": ") {
-            Some((lead, rest)) if lead.split_whitespace().count() <= 2 => rest,
-            _ => ftext.as_str(),
-        };
-
-        // w1b: keyword-only. The engine label stays explicit so the contrast
-        // never presents lexical resemblance as semantic ranking (the audit's
-        // top finding: never present keyword search as "semantic").
-        let engine = "keyword (BM25)";
-        let mut shown = false;
+    if !json {
         println!(
-            "{}",
-            format!("── 1. SIMILARITY SEARCH · {engine} ──")
-                .dimmed()
-                .bold()
-        );
-        println!("   query: {}", truncate(query, 60).dimmed());
-
-        // best OTHER match (exclude the failure itself, which trivially matches).
-        // keyword/BM25 — ranks by lexical resemblance.
-        if !shown {
-            // keyword/BM25 (always works) — still ranks by lexical resemblance.
-            if let Ok(hits) = storage.search(query, 6) {
-                let others: Vec<_> = hits
-                    .iter()
-                    .filter(|h| h.content != *ftext)
-                    .take(3)
-                    .collect();
-                for (i, h) in others.iter().enumerate() {
-                    let tag = if i == 0 {
-                        " ← top match".red().bold().to_string()
-                    } else {
-                        String::new()
-                    };
-                    println!("   {}. {}{}", i + 1, truncate(&h.content, 60).normal(), tag);
-                    shown = true;
-                }
-            }
-        }
-        if shown {
-            println!(
-                "   {}",
-                "→ ranked by RESEMBLANCE. its top hit is a lookalike, not the cause.".red()
-            );
-        } else {
-            println!(
-                "   {}",
-                "(no lookalikes — nothing resembles the crash)".dimmed()
-            );
-        }
-        println!();
-        println!(
-            "{}",
-            "── 2. POSTDICT (reach backward for the CAUSE) ──"
-                .magenta()
-                .bold()
+            "Retroactive Salience Backfill — exact shared entities; salience, not causal proof"
         );
     }
-
-    let args = serde_json::json!({
-        "failure_id": failure_id,
-        "manual": manual,
-        "lookback_days": lookback_days,
-        "promote": promote,
-        "git_repo": git_repo.as_ref().map(|p| p.display().to_string()),
-        "worked_in": worked_in,
-        "broke_in": broke_in,
-        "why_not": why_not,
-    });
-
-    let rt = tokio::runtime::Runtime::new()?;
-    let result = rt
-        .block_on(vestige_mcp::tools::backfill::execute(&storage, Some(args)))
-        .map_err(|e| anyhow::anyhow!(e))?;
-
-    // Machine-readable path: dump the raw tool result (includes per-cause
-    // memory_id, shared_entities, similarity_rank) and stop. Used by tooling
-    // and by any scoring harness that needs real engine output rather than the
-    // human-readable rendering. (It once named CauseBench, which is retracted.)
-    if json {
-        println!("{}", serde_json::to_string(&result)?);
-        return Ok(());
-    }
-
-    println!(
-        "{}",
-        "=== Retroactive Salience Backfill ===".magenta().bold()
-    );
-    println!();
-    if result["triggered"] != serde_json::json!(true) {
-        println!(
-            "{} {}",
-            "Not triggered:".yellow().bold(),
-            result["reason"].as_str().unwrap_or("event not salient")
-        );
-        return Ok(());
-    }
-    if let Some(f) = result["failure"].as_object() {
-        println!(
-            "{} {}",
-            "Failure:".red().bold(),
-            f.get("content_preview")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-        );
-    }
-    println!();
-    println!(
-        "{}",
-        "Reached BACKWARD and surfaced associated candidates through shared entities:".white()
-    );
-    println!();
-    if let Some(causes) = result["causes"].as_array() {
-        for (i, c) in causes.iter().enumerate() {
-            let age = c["age_days_before_failure"].as_f64().unwrap_or(0.0);
-            let rank = c["similarity_rank"].as_u64();
-            println!(
-                "  {} {}",
-                format!("#{}", i + 1).cyan().bold(),
-                c["content_preview"].as_str().unwrap_or("").green().bold()
-            );
-            println!(
-                "     {} {:.1} days before the failure",
-                "↩ reached back".magenta(),
-                age
-            );
-            if let Some(shared) = c["shared_entities"].as_array() {
-                let ents: Vec<&str> = shared.iter().filter_map(|e| e.as_str()).collect();
-                println!("     {} {}", "🔗 causal join:".magenta(), ents.join(", "));
-            }
-            if let Some(r) = rank {
-                println!(
-                    "     {} ranked #{} on similarity {}",
-                    "🔍".magenta(),
-                    r,
-                    "(quiet on similarity at backfill time; association, not proven cause)"
-                        .dimmed()
-                );
-            }
-            if c["promoted"] == serde_json::json!(true) {
-                println!(
-                    "     {} promoted — it will resurface next time",
-                    "✅".green()
-                );
-            }
-            println!();
-        }
-    }
-    // why-not-X: name a suspect, get the rule that excluded it
-    if let Some(w) = result["why_not"].as_object() {
-        println!(
-            "{} {} — {}",
-            "Why not".yellow().bold(),
-            w.get("target").and_then(|v| v.as_str()).unwrap_or(""),
-            w.get("detail").and_then(|v| v.as_str()).unwrap_or("")
-        );
-        println!();
-    }
-    // strongest rejections, so a miss is explainable instead of silent
-    if let Some(rejected) = result["rejected"].as_array().filter(|r| !r.is_empty()) {
-        println!(
-            "{}",
-            "Rejected (top candidates that failed a rule):".white()
-        );
-        for r in rejected {
-            println!(
-                "  {} {} — {}",
-                "✗".red(),
-                r["content_preview"].as_str().unwrap_or("").dimmed(),
-                r["reason"].as_str().unwrap_or("")
-            );
-        }
-        println!();
-    }
-    // trail-break report: what to record so the chain closes next time
-    if let Some(gap) = result["gap"].as_object() {
-        println!("{}", "TRAIL GAP:".yellow().bold());
-        println!("  {}", gap["note"].as_str().unwrap_or(""));
-        if let Some(s) = gap["suggestion"].as_str() {
-            println!("  {} {}", "→".magenta(), s);
-        }
-        println!();
-    }
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 
@@ -6492,7 +6297,9 @@ mod strata_cli_tests {
         assert!(backup.contains("Strata log"), "{backup}");
         assert!(backup.contains("vestige.db is never copied"), "{backup}");
         let backfill = long_help(&["backfill"]);
-        assert!(backfill.contains("vestige causal-walk"), "{backfill}");
+        assert!(backfill.contains("exact shared entities"), "{backfill}");
+        assert!(backfill.contains("--dry-run"), "{backfill}");
+        assert!(backfill.contains("undo"), "{backfill}");
         let recall = long_help(&["recall"]);
         assert!(recall.contains("--handle"), "{recall}");
         assert!(recall.contains("exact tag"), "{recall}");
