@@ -1,0 +1,35 @@
+{
+  "name": {
+    "title": "Full legal name",
+    "description": "The name on your government ID, or the name you are commonly known by",
+    "type": "string",
+    "githubKey": "name",
+    "required": true
+  },
+  "email": {
+    "title": "Email",
+    "type": "string",
+    "githubKey": "email",
+    "required": true
+  },
+  "country": {
+    "title": "Country of residence",
+    "type": "string",
+    "required": true
+  },
+  "capacity": {
+    "title": "How do you sign?",
+    "type": {
+      "enum": [
+        "I am signing for myself, and I own what I contribute.",
+        "I contribute as part of my job, and my employer approved this or signed the Entity CLA."
+      ]
+    },
+    "required": true
+  },
+  "agreement": {
+    "title": "I have read and agree to the Vestige Individual Contributor License Agreement, version 1.0",
+    "type": "boolean",
+    "required": true
+  }
+}

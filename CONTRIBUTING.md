@@ -194,6 +194,7 @@ SvelteKit 2 + Three.js + Tailwind CSS. Pages are under `apps/dashboard/src/route
 - [ ] Dashboard builds (if modified): `cd apps/dashboard && pnpm build`
 - [ ] No secrets, API keys or credentials in code
 - [ ] A new claim in the docs is backed by a command you ran or code you read
+- [ ] You signed the [Contributor License Agreement](CLA.md). CLA assistant asks on your first pull request.
 
 ### Good First Issues
 
@@ -224,9 +225,21 @@ Use the issue templates:
 
 We are committed to providing a welcoming and inclusive environment. All contributors are expected to be respectful, constructive, and collaborative. Harassment and discrimination will not be tolerated.
 
-## License
+## License and Contributor License Agreement
 
-By contributing, you agree that your contributions will be licensed under **AGPL-3.0-only** ([LICENSE](LICENSE)), the same license as the project.
+Vestige is licensed under AGPL-3.0-only. The full text is in [LICENSE](LICENSE).
+
+Before we merge your first pull request, you sign the [Vestige Contributor License Agreement](CLA.md). CLA assistant posts a link on your pull request, and you sign with your GitHub account. You sign once, and it covers your past and future contributions.
+
+What the agreement means for you:
+
+- You keep the copyright in your work.
+- Your contribution stays available under the license Vestige used on the day you contributed. Today that license is AGPL-3.0-only.
+- Sam Valladares, who maintains Vestige, may also offer Vestige under a commercial license to companies that cannot use AGPL code. That helps fund Vestige.
+- You may use AI tools. You review what you submit, and we ask you to name the tools in your pull request.
+- If you contribute as part of your job, your employer approves it or signs the [Entity agreement](CLA-ENTITY.md).
+
+The agreement is based on the Harmony contributor agreement template. The summary above is for convenience, and the agreement itself is what counts.
 
 ---
 
