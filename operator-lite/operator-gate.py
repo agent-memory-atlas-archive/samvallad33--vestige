@@ -5148,6 +5148,11 @@ def floor_reach(text, cwd):
     return None
 
 
+# `cmd /c`, `rmdir /s /q`, `del /q`: a slash and one letter is a switch, not the Git Bash form of a drive
+CMD_SWITCH_PROGS = {"cmd", "rmdir", "rd", "del", "erase"}
+CMD_SWITCH_RE = re.compile(r"^/[A-Za-z?](?::\S*)?$")
+
+
 def floor_hits(e, cwd):
     """OP-012 for one recursive delete. A resolved target is judged as it stands. A target only the
     running shell can fill in is judged at its worst case, every unknown piece empty, because that
@@ -5155,12 +5160,17 @@ def floor_hits(e, cwd):
     if e.get("kind") != "delete" or not e.get("recursive") or e.get("filtered"):
         return []
     try:
-        words = shlex.split(e.get("seg") or "", posix=True)[1:]
+        words = shlex.split(e.get("seg") or "", posix=True)
     except ValueError:
         words = []
-    words = [w for w in words if w and not w.startswith("-")]
+    prog = re.sub(r"\.exe$", "", posixpath.basename(words[0].replace("\\", "/")).lower()) if words else ""
+    words = [w for w in words[1:] if w and not w.startswith("-")]
+    if prog in CMD_SWITCH_PROGS:
+        words = [w for w in words if not CMD_SWITCH_RE.match(w)]
     found = []
     for t in e.get("targets") or []:
+        if prog in CMD_SWITCH_PROGS and CMD_SWITCH_RE.match(t):
+            continue
         why = floor_reach(t, cwd)
         if why:
             found.append("recursive delete of %s" % why)

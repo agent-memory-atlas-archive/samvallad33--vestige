@@ -162,7 +162,9 @@ os.makedirs(work, exist_ok=True)
 
 
 def hook(cmd, cwd=None, tool="Bash"):
-    payload = json.dumps({"tool_name": tool, "tool_input": {"command": cmd}, "cwd": cwd or work, "session_id": "t"})
+    # each case in its own session: a stop holds for the rest of its session (OP-020, OP-024)
+    payload = json.dumps({"tool_name": tool, "tool_input": {"command": cmd}, "cwd": cwd or work,
+                          "session_id": "t-" + os.urandom(6).hex()})
     p = subprocess.run([sys.executable, GATE, "hook", "--source", "claude"], input=payload,
                        capture_output=True, text=True, env=env)
     return p.returncode, (p.stderr.strip().splitlines() or [""])[0]
