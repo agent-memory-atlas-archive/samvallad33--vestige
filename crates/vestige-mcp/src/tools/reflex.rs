@@ -53,6 +53,9 @@ use vestige_core::{OutputConfig, Storage};
 use crate::cognitive::CognitiveEngine;
 
 mod pairing;
+mod stale;
+
+pub use stale::record as record_retirement;
 
 /// The dispatch name hooks call.
 pub const NAME: &str = "reflex";
@@ -180,6 +183,7 @@ pub fn fold(
     let Ok(mut g) = global.lock() else {
         return;
     };
+    let seq_now = g.p.retire_seq;
     let s = g.session(&session);
     let Some(agent) = s
         .snapshots
@@ -209,6 +213,7 @@ pub fn fold(
     let explicit = named_ids(args);
     let original = result.to_string();
     let ctx = s.context(&agent);
+    ctx.seq_now = seq_now;
     let folded = fold_value(ctx, turn, tool, &explicit, result);
     let manifest = ctx.digest();
     let held = ctx.held.len();
@@ -425,6 +430,7 @@ pub fn admit_injection(storage: &Arc<Storage>, hook: &Value, result: &mut Value)
     let Ok(mut g) = global.lock() else {
         return;
     };
+    let seq_now = g.p.retire_seq;
     let s = g.session(&session);
     let now = Utc::now().timestamp();
     if event == "UserPromptSubmit" {
@@ -439,6 +445,7 @@ pub fn admit_injection(storage: &Arc<Storage>, hook: &Value, result: &mut Value)
     let turn = s.turn;
     let via = format!("hook:{event}");
     let ctx = s.context("");
+    ctx.seq_now = seq_now;
     let (mut injected, mut skipped, mut dropped) = (Vec::new(), Vec::new(), Vec::new());
     let mut spent = 0usize;
     if let Some(rows) = result.get_mut("memories").and_then(Value::as_array_mut) {
@@ -908,6 +915,11 @@ struct Persisted {
     /// Fixes Failure Pairing recorded, by failure signature.
     #[serde(default)]
     fixes: Vec<(String, pairing::Fix)>,
+    /// Memories any agent retired, in order, for the stale-belief push.
+    #[serde(default)]
+    retired: Vec<stale::Retirement>,
+    #[serde(default)]
+    retire_seq: u64,
 }
 
 fn lookup<'a, T>(list: &'a [(String, T)], key: &str) -> Option<&'a T> {
@@ -954,6 +966,10 @@ struct Held {
     chars: usize,
     /// Fingerprints of every body variant the agent was shown.
     hashes: Vec<String>,
+    /// The store's retirement count when it entered the agent's context; a
+    /// later retirement of it is news to this agent.
+    #[serde(default)]
+    seq: u64,
 }
 
 /// The exact memories one agent holds, oldest first.
@@ -962,6 +978,9 @@ struct Context {
     held: Vec<(String, Held)>,
     #[serde(default)]
     touched: i64,
+    /// The store's retirement count now, stamped on what is held next.
+    #[serde(skip)]
+    seq_now: u64,
 }
 
 impl Context {
@@ -975,6 +994,7 @@ impl Context {
             None => Held {
                 turn,
                 via: via.to_string(),
+                seq: self.seq_now,
                 ..Held::default()
             },
         };
@@ -2017,6 +2037,8 @@ fn stop_line(n: &StopNote) -> String {
 
 /// Marks a background note in the told list, apart from stop receipts.
 const NOTE_MARK: &str = "note\u{0}";
+/// Marks a retired belief in the told list.
+const STALE_MARK: &str = "stale\u{0}";
 
 /// Compose this firing's context within the event and turn budgets, and mark
 /// what it tells. `lead` goes first: what this very firing found. Returns the
@@ -2027,6 +2049,8 @@ fn compose(g: &mut Global, inp: &Input, lead: &[String]) -> (String, Vec<String>
         return (String::new(), Vec::new());
     }
     let recent = g.p.recent.clone();
+    let retired = g.p.retired.clone();
+    let seq_now = g.p.retire_seq;
     let commands = if inp.event == "PreToolUse" && !inp.command.is_empty() {
         let h = command_hash(&inp.command);
         lookup(&g.p.commands, &h).and_then(|d16| {
@@ -2123,6 +2147,12 @@ fn compose(g: &mut Global, inp: &Input, lead: &[String]) -> (String, Vec<String>
             }
         }
     }
+    // A belief another session retired goes before background notes.
+    if let Some(ctx) = s.contexts.get(&inp.agent) {
+        for (line, old) in stale::lines(&retired, &inp.session, ctx) {
+            lines.push((line, Some(format!("{STALE_MARK}{old}"))));
+        }
+    }
     for note in &s.notes {
         lines.push((note.clone(), Some(format!("{NOTE_MARK}{note}"))));
     }
@@ -2146,6 +2176,14 @@ fn compose(g: &mut Global, inp: &Input, lead: &[String]) -> (String, Vec<String>
         }
     }
     s.turn_chars += text.len();
+    let (stale_told, told): (Vec<String>, Vec<String>) =
+        told.into_iter().partition(|d| d.starts_with(STALE_MARK));
+    if let Some(ctx) = s.contexts.get_mut(&inp.agent) {
+        for old in &stale_told {
+            let old = &old[STALE_MARK.len()..];
+            ctx.held.retain(|(k, _)| k != old);
+        }
+    }
     let (notes, told): (Vec<String>, Vec<String>) =
         told.into_iter().partition(|d| d.starts_with(NOTE_MARK));
     for n in notes {
@@ -2165,6 +2203,7 @@ fn compose(g: &mut Global, inp: &Input, lead: &[String]) -> (String, Vec<String>
         .collect();
     let turn = s.turn;
     let ctx = s.context(&inp.agent);
+    ctx.seq_now = seq_now;
     for id in told_nodes {
         ctx.hold(&id, turn, "reflex", None);
     }
@@ -3393,6 +3432,105 @@ mod tests {
             .fire(json!({"event": "PreToolUse", "session": "s1", "call": "t2", "tool": "Bash"}))
             .await;
         assert_eq!(again, json!({}));
+    }
+
+    fn other_connection(session: &str) -> ConnectionState {
+        let conn = new_connection();
+        conn.lock().unwrap().session = Some(session.to_string());
+        conn
+    }
+
+    #[tokio::test]
+    async fn a_retired_belief_reaches_every_other_session_holding_it_once() {
+        let fx = Fixture::new();
+        fx.read(
+            "s1",
+            "toolu_r1",
+            "",
+            "recall",
+            json!({"handle": "topic"}),
+            recall_result(A, &body("a")),
+        )
+        .await;
+        fx.read(
+            "s2",
+            "toolu_r2",
+            "",
+            "recall",
+            json!({"handle": "topic"}),
+            recall_result(A, &body("a")),
+        )
+        .await;
+        // Session s2 corrects the memory; s1 still holds the old version.
+        stale::record(
+            &other_connection("s2"),
+            &fx.storage,
+            "memory",
+            &json!({"action": "edit", "nodeId": B, "supersedes": A,
+                    "newContentPreview": "The service listens on port 4000. The old note said 3000.",
+                    "receiptId": "eff-0000000000000009"}),
+        );
+        let out = fx
+            .fire(
+                json!({"event": "PreToolUse", "session": "s1", "call": "toolu_n1", "tool": "Bash"}),
+            )
+            .await;
+        let text = context(&out);
+        assert!(text.contains(A) && text.contains(B), "{out}");
+        assert!(text.contains("eff-0000000000000009"), "{out}");
+        assert!(text.contains("port 4000"), "{out}");
+        let again = fx
+            .fire(
+                json!({"event": "PreToolUse", "session": "s1", "call": "toolu_n2", "tool": "Bash"}),
+            )
+            .await;
+        assert_eq!(again, json!({}), "told once");
+        let editor = fx
+            .fire(
+                json!({"event": "PreToolUse", "session": "s2", "call": "toolu_n3", "tool": "Bash"}),
+            )
+            .await;
+        assert_eq!(
+            editor,
+            json!({}),
+            "the session that made the change is not told"
+        );
+        let stranger = fx
+            .fire(
+                json!({"event": "PreToolUse", "session": "s3", "call": "toolu_n4", "tool": "Bash"}),
+            )
+            .await;
+        assert_eq!(
+            stranger,
+            json!({}),
+            "a session that never held it is not told"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_memory_read_after_its_retirement_is_not_news() {
+        let fx = Fixture::new();
+        stale::record(
+            &other_connection("s2"),
+            &fx.storage,
+            "memory",
+            &json!({"action": "demoted", "nodeId": A}),
+        );
+        fx.read(
+            "s1",
+            "toolu_r1",
+            "",
+            "recall",
+            json!({"handle": "topic"}),
+            recall_result(A, &body("a")),
+        )
+        .await;
+        let out = fx
+            .fire(
+                json!({"event": "PreToolUse", "session": "s1", "call": "toolu_n1", "tool": "Bash"}),
+            )
+            .await;
+        assert_eq!(out, json!({}), "{out}");
     }
 
     #[test]
