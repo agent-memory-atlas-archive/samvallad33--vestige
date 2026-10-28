@@ -91,6 +91,31 @@ vestige reflex --replay ~/.claude/projects/*/*.jsonl
 It reports, per tool, the characters each Vestige result sent and what it would have sent with the fold,
 with one context per transcript and per subagent sidechain, emptied at each compaction. It writes nothing.
 
+## Failure Pairing
+
+When a call fails, Reflex reads the tool, the command, the exit code and the first error line, and
+classifies the failure by a fixed table. No model is involved.
+
+| Not recorded | Why |
+|---|---|
+| `ls`, `test`, `stat` and similar on a missing path | A probe that answers by failing |
+| `grep`, `rg` and `pgrep` finding nothing, `git diff --quiet`, `diff` | Exit code 1 is their answer, not a failure |
+| An interrupt, a refused tool call, an Operator stop | Not a failure of the call; stops have their own memories |
+
+Every other failure gets a signature: the tool, the first words of the command and the first error
+line, with paths, numbers and hashes masked, hashed to 16 hex characters. The failure is saved once as
+an `event` memory tagged `fail-<signature>`, with the command, the error line, the working directory,
+the checked-out commit and the call id, and a `derived_from` edge to the last memory the session wrote.
+Anything shaped like a credential is masked before the command is saved.
+
+| What happens | When |
+|---|---|
+| The agent is told the fix right away, with the failure, the fix memory and the command that worked | An earlier failure with the same signature has a recorded fix |
+| A fix memory tagged `fix-<signature>` is saved with a `closes` edge to the failure, naming the command that worked and the files edited in between | The same command next succeeds for the same agent in the same session |
+| A `causal_walk` and a `forgotten_lesson` walk run off the hook's path, and a linked lesson below 50 percent retention is told at the next firing | Every recorded failure |
+
+A first-time failure puts nothing in front of the agent.
+
 ## The Hook Ledger
 
 Every firing appends one line to `<data dir>/reflex/ledger.jsonl` with the event, the session, the

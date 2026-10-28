@@ -261,6 +261,7 @@ test('claude gets mcp_tool reflex hooks plus a SessionStart shim; nothing is a g
     assert.equal(handlers[0].server, 'vestige'); assert.equal(handlers[0].tool, 'reflex');
     assert.equal(handlers[0].input.session, '${session_id}'); assert.equal(handlers[0].input.call, '${tool_use_id}');
     assert.equal(handlers[0].input.agent, '${agent_id}', 'each read lands in the context of the agent that made it');
+    assert.equal(handlers[0].input.error, '${error}', 'Failure Pairing reads the error the tool reported');
   }
   assert(hooks.PreToolUse.every(g => g.hooks.every(h => h.type === 'mcp_tool')), 'memory plus reflex adds no command gate');
   const shim = hooks.SessionStart.flatMap(g => g.hooks).find(h => h.command && h.command.includes('reflex.cjs'));
@@ -287,6 +288,8 @@ test('the reflex shim maps host events and answers in each host shape', () => {
   const args = shim.argumentsFor('codex', 'PreToolUse', { session_id: 's1', tool_name: 'Bash', tool_use_id: 't1', tool_input: { command: 'rm -rf x' } });
   assert.deepEqual([args.event, args.session, args.call, args.command, args.format], ['PreToolUse', 's1', 't1', 'rm -rf x', 'plain']);
   assert.equal(shim.argumentsFor('codex', 'PreToolUse', { session_id: 's1', agent_id: 'ag1' }).agent, 'ag1');
+  const failed = shim.argumentsFor('codex', 'PostToolUseFailure', { session_id: 's1', error: 'Exit code 1\nboom', is_interrupt: true, cwd: '/repo', tool_input: { file_path: '/repo/a.rs' } });
+  assert.deepEqual([failed.error, failed.interrupt, failed.file, failed.cwd], ['Exit code 1\nboom', 'true', '/repo/a.rs', '/repo']);
   assert.equal(shim.argumentsFor('codex', 'PreToolUse', { session_id: 's1' }).agent, '');
   assert.deepEqual(shim.hostOutput('claude', 'SessionStart', 'hi'), { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: 'hi' } });
   assert.deepEqual(shim.hostOutput('cursor', 'postToolUse', 'hi'), { additional_context: 'hi' });

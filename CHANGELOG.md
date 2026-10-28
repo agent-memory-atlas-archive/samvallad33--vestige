@@ -49,6 +49,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `vestige reflex --replay <transcripts>` to measure the fold offline on
   recorded Claude Code sessions.
 
+### Failure Pairing
+
+- Classify every failed call by a fixed table. Probes that answer by failing,
+  interrupts, refusals and Operator stops are never recorded.
+- Save each failure once, tagged with a signature of the tool, the command's
+  first words and its masked first error line, with a `derived_from` edge to
+  the session's last write and credentials masked.
+- When the same command next succeeds, save the fix with a `closes` edge to
+  the failure, naming the files edited in between.
+- Tell the agent at once when an earlier failure with the same signature has a
+  recorded fix. Walk back from every failure in the background and mention a
+  linked lesson that has faded.
+
 ## [5.0.1] - 2026-10-23
 
 ### Retroactive Salience Backfill returns

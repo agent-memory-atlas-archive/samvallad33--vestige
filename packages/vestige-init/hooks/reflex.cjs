@@ -31,6 +31,10 @@ function argumentsFor(client, event, input) {
     agent: pick('agent_id', 'agentId'),
     command: typeof toolInput.command === 'string' ? toolInput.command : pick('command'),
     source: pick('source'),
+    error: pick('error'),
+    interrupt: input.is_interrupt === true ? 'true' : '',
+    file: typeof toolInput.file_path === 'string' ? toolInput.file_path : '',
+    cwd: pick('cwd'),
   };
 }
 
