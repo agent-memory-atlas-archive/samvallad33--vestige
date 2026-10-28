@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Reflex: every hook firing reaches Vestige
+
+- Add `reflex`, a tool agent hooks call directly. It is not listed in
+  `tools/list`, so it adds nothing to the tool schema budget. Claude Code
+  calls it from `mcp_tool` hooks; Codex, Gemini CLI and Cursor reach it through
+  a command shim installed by `@vestige/init`.
+- Move the stop-to-Strata reflex into the server. Each Operator gate receipt
+  is checked against the gate's digest chain before it is read, and a line that
+  breaks the chain never becomes a memory. Stop memories keep the same tags and
+  text as `operator-stop-memory.py`.
+- Link a permit, or a law's own compliant path, to the stop it answers with a
+  `closes` edge, and name that answer the next time the same rule stops a call.
+- Tell the stopped session once, at its next tool call, inside a per-event and
+  per-turn character budget. Warn before the exact same command is tried again.
+- Record the memories an agent held at the tool call that was stopped.
+- Write only the calling session's stops on the hook path; drain the rest in
+  one background task per store.
+- Append every firing to a hash-chained Hook Ledger and add
+  `vestige reflex --since <window>` to read and check it while a server runs.
+- `operator-stop-memory.py` steps aside while a Reflex server is active.
+- See [docs/REFLEX.md](docs/REFLEX.md).
+
 ## [5.0.1] - 2026-10-23
 
 ### Retroactive Salience Backfill returns

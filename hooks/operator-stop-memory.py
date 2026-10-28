@@ -31,6 +31,11 @@ with its handle, so the next session knows what was stopped and why before it tr
 Wire it after the gate's own PreToolUse hook: hooks/settings.stop-memory.fragment.json, or let
 `npx @vestige/init` do it, which copies this file to ~/.vestige/hooks/ once Operator Lite is installed.
 Env: OPERATOR_HOME (default ~/.operator), VESTIGE_MCP_BIN, OPERATOR_STOP_MEMORY_BUDGET (seconds, default 20).
+
+From Vestige 6.0.0 the server records these stops itself, through the `reflex` tool its hooks call. While
+that server is active it touches <data dir>/reflex/heartbeat, and this hook steps aside so a stop is never
+handled twice. With an older server, or none, this hook works exactly as before.
+Env for that check: VESTIGE_DATA_DIR, else the platform's default Vestige data directory.
 Stdlib only, Python 3.9 and later.
 """
 import calendar
@@ -67,6 +72,7 @@ RECENT_DAYS = 7
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 RULE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 NODE_RE = re.compile(r"^(mem-[0-9a-f]{16}|[0-9a-f-]{36})$")
+REFLEX_FRESH_SECS = 900                               # a reflex heartbeat younger than this means reflex owns stops
 
 
 def log(msg):
@@ -78,6 +84,34 @@ def log(msg):
             f.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg))
     except Exception:
         pass
+
+
+def data_dirs():
+    """Where a Vestige server keeps its data directory on this machine, most specific first."""
+    dirs = []
+    custom = (os.environ.get("VESTIGE_DATA_DIR") or "").strip()
+    if custom:
+        dirs.append(os.path.expanduser(custom))
+    if sys.platform == "darwin":
+        dirs.append(os.path.join(HOME, "Library", "Application Support", "com.vestige.core"))
+    elif sys.platform.startswith("win"):
+        dirs.append(os.path.join(os.environ.get("APPDATA") or os.path.join(HOME, "AppData", "Roaming"), "vestige", "core", "data"))
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+        dirs += [os.path.join(base, "vestige"), os.path.join(base, "core")]
+    return dirs
+
+
+def reflex_active(now=None):
+    """True while a Vestige 6.0.0+ server records gate stops itself through `reflex`."""
+    now = time.time() if now is None else now
+    for d in data_dirs():
+        try:
+            if now - os.path.getmtime(os.path.join(d, "reflex", "heartbeat")) <= REFLEX_FRESH_SECS:
+                return True
+        except OSError:
+            pass
+    return False
 
 
 def load_state():
@@ -376,6 +410,8 @@ def main():
     payload = payload if isinstance(payload, dict) else {}
     event = str(payload.get("hook_event_name") or "")
     session = str(payload.get("session_id") or "")
+    if reflex_active():
+        return 0                                      # the server's reflex records and tells these stops
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
         lock = open(LOCK, "a+")

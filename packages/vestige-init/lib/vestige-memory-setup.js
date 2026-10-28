@@ -16,6 +16,39 @@ function supportedVersion(text) {
   const [major, minor, patch] = match.slice(1).map(Number);
   return major > 5 || major === 5 && (minor > 0 || patch >= 1);
 }
+// Reflex hooks call a server tool that ships in 6.0.0. An older binary would
+// answer every hook with an unknown-tool error, so they register only when the
+// installed server is new enough.
+const REFLEX_MIN = [6, 0, 0];
+function reflexReady(binaryPath, env) {
+  if (!binaryPath) return false;
+  let out = '';
+  try { out = spawnSync(binaryPath, ['--version'], { timeout: 2000, env, encoding: 'utf8' }).stdout || ''; } catch { return false; }
+  const match = /\b(\d+)\.(\d+)\.(\d+)\b/.exec(out);
+  if (!match) return false;
+  const have = match.slice(1).map(Number);
+  for (let i = 0; i < 3; i++) if (have[i] !== REFLEX_MIN[i]) return have[i] > REFLEX_MIN[i];
+  return true;
+}
+// Claude Code calls reflex straight from `mcp_tool` hooks on the agent's own MCP
+// connection. SessionStart at launch fires before MCP servers connect, so it, and
+// every host without `mcp_tool` hooks, goes through the command shim.
+const REFLEX_INPUT = { event: '${hook_event_name}', session: '${session_id}', tool: '${tool_name}', call: '${tool_use_id}', command: '${tool_input.command}', host: 'claude' };
+const REFLEX_EVENTS = {
+  claude: [['PreToolUse', '*'], ['PostToolUse', '*'], ['PostToolUseFailure', '*'], ['UserPromptSubmit'], ['SubagentStart'], ['Stop']],
+  codex: [['SessionStart'], ['UserPromptSubmit'], ['PreToolUse', '*'], ['PostToolUse', '*'], ['SubagentStart'], ['Stop']],
+  gemini: [['SessionStart'], ['BeforeAgent'], ['BeforeTool', '*'], ['AfterTool', '*'], ['AfterAgent']],
+  cursor: [['sessionStart'], ['beforeSubmitPrompt'], ['preToolUse'], ['postToolUse'], ['subagentStart'], ['stop']],
+};
+function reflexHooks(dialect, shimCommand) {
+  const shim = matcher => dialect === 'cursor' ? { command: shimCommand, timeout: 2, failClosed: false }
+    : { ...(matcher ? { matcher } : {}), hooks: [{ type: 'command', command: shimCommand, timeout: 2 }] };
+  const rows = (REFLEX_EVENTS[dialect] || []).map(([event, matcher]) => [event, dialect === 'claude'
+    ? { ...(matcher ? { matcher } : {}), hooks: [{ type: 'mcp_tool', server: 'vestige', tool: 'reflex', input: REFLEX_INPUT }] }
+    : shim(matcher)]);
+  if (dialect === 'claude') rows.push(['SessionStart', { matcher: 'startup|resume|clear|compact', hooks: [{ type: 'command', command: shimCommand, timeout: 2 }] }]);
+  return rows;
+}
 const read = file => fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
 function object(file) {
   const raw = read(file); const value = raw === null ? {} : JSON.parse(raw);
@@ -102,6 +135,7 @@ function plan({ home = os.homedir(), platform = os.platform(), env = process.env
   const base = path.join(home, '.vestige', 'memory'); const manifestFile = path.join(base, 'manifest.json');
   if (!found) return { missing: true, detected, changes: [], home, base, manifestFile };
   const previous = fs.existsSync(manifestFile) ? object(manifestFile) : { files: [] };
+  const reflex = reflexReady(found, env);
   const changes = new Map();
   const change = (file, description) => {
     if (!changes.has(file)) {
@@ -147,9 +181,13 @@ function plan({ home = os.homedir(), platform = os.platform(), env = process.env
         const entry = client.dialect === 'cursor' ? { command, timeout: 1, failClosed: false } : { hooks: [handler] };
         add(client.hookFile, ['hooks', eventName], entry, 'merge memory hooks alongside existing hooks', true);
       }
+      if (reflex) {
+        const shimCommand = [node, path.join(base, 'hooks', 'reflex.cjs'), '--config', path.join(base, 'config.json'), '--client', client.dialect].map(p => quote(p, platform)).join(' ');
+        for (const [eventName, entry] of reflexHooks(client.dialect, shimCommand)) add(client.hookFile, ['hooks', eventName], entry, 'merge reflex hooks: every hook firing reaches Vestige', true);
+      }
     }
   }
-  for (const [relative, source] of [ ['hooks/memory.cjs', '../hooks/memory.cjs'], ['lib/memory-triggers.cjs', './memory-triggers.cjs'] ]) {
+  for (const [relative, source] of [ ['hooks/memory.cjs', '../hooks/memory.cjs'], ['hooks/reflex.cjs', '../hooks/reflex.cjs'], ['lib/memory-triggers.cjs', './memory-triggers.cjs'] ]) {
     const row = change(path.join(base, relative), 'install bounded memory hook'); row.after = fs.readFileSync(path.resolve(__dirname, source), 'utf8');
   }
   const triggers = change(path.join(base, 'triggers.json'), 'user-editable recall trigger phrases');
@@ -379,4 +417,4 @@ async function main(args = process.argv.slice(2)) {
   say('  Try: Tell me something about a friend, then ask me about them later.');
   say('  Check: npx @vestige/init doctor');
 }
-module.exports = { plan, apply, uninstall, inspect, catalog, quote, binary, supportedVersion, nativeGuardRegistered, EVENTS, main };
+module.exports = { plan, apply, uninstall, inspect, catalog, quote, binary, supportedVersion, reflexReady, reflexHooks, nativeGuardRegistered, EVENTS, main };

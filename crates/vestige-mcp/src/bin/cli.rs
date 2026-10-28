@@ -275,6 +275,17 @@ enum Commands {
         expect_key: Option<String>,
     },
 
+    /// What the reflex hooks recorded: the Hook Ledger and the gate receipts read
+    ///
+    /// Reads only `<data dir>/reflex/`, never the log, so it works while a
+    /// server owns the store. Every ledger line is checked against the digest
+    /// of the line before it.
+    Reflex {
+        /// Ledger window, e.g. 30m, 24h, 7d
+        #[arg(long, default_value = "24h")]
+        since: String,
+    },
+
     /// Export memories in JSON or JSONL format
     ///
     /// Memories from every scope are written. On a Strata log each one
@@ -771,6 +782,7 @@ fn main() -> anyhow::Result<()> {
             accept_wal_snapshot,
         } => run_migrate_to_strata(from, to, dry_run, accept_wal_snapshot),
         Commands::StrataVerify { dir, expect_key } => run_strata_verify(dir, expect_key),
+        Commands::Reflex { since } => run_reflex(since),
         Commands::Export {
             output,
             format,
@@ -2332,6 +2344,12 @@ fn run_health() -> anyhow::Result<()> {
         println!("  {} {}", icon, text);
     }
 
+    Ok(())
+}
+
+fn run_reflex(since: String) -> anyhow::Result<()> {
+    let view = vestige_mcp::tools::reflex::report(&cli_data_dir()?, &since);
+    println!("{}", serde_json::to_string_pretty(&view)?);
     Ok(())
 }
 
