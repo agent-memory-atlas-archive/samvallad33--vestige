@@ -61,7 +61,7 @@ def make_store(d):
 
 
 def judge(home, payload, cwd, **extra):
-    payload = dict(payload, cwd=cwd, session_id="strata-guard", hook_event_name="PreToolUse")
+    payload = dict(payload, cwd=cwd, session_id="strata-guard-" + os.urandom(6).hex(), hook_event_name="PreToolUse")
     p = subprocess.run([sys.executable, "-I", GATE, "hook", "--source", "claude"], input=json.dumps(payload),
                        capture_output=True, text=True, env=env_for(home, **extra), cwd=cwd, timeout=60)
     return p.returncode, p.stdout + p.stderr
@@ -233,7 +233,7 @@ r = install(h)
 with open(sp) as f:
     merged = json.load(f)
 check("a valid settings.json keeps its keys and hooks", merged.get("model") == "opus"
-      and merged["hooks"].get("SessionStart") == good["hooks"]["SessionStart"] and len(operator_commands(h)) == 1, merged)
+      and merged["hooks"].get("SessionStart", [])[:1] == good["hooks"]["SessionStart"] and len(operator_commands(h)) == 1, merged)
 baks = [n for n in os.listdir(os.path.join(h, ".claude")) if n.startswith("settings.json.bak")]
 check("a backup of the settings it rewrote is kept", len(baks) == 1
       and open(os.path.join(h, ".claude", baks[0])).read() == good_bytes, baks)

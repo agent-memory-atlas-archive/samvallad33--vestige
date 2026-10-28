@@ -65,6 +65,13 @@ jobs:
       - if: runner.os != 'Windows'
         name: a fresh install stops every clearly destructive command
         run: python3 operator-lite/test_destructive.py
+      - if: runner.os != 'Windows'
+        name: OP-012 through OP-025, each rule's own suite
+        run: |
+          for t in floor root gitspawn written arming sequence session_hold memory_rules protected remote_delete brake turnover; do
+            echo "== test_$t"
+            python3 "operator-lite/test_$t.py" || exit 1
+          done
       - name: an upgrade from 0.3.7 blocks
         run: python operator-lite/test_upgrade.py
       - if: runner.os != 'Windows'

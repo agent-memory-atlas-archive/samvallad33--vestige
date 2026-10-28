@@ -281,7 +281,7 @@ for case in corpus:
         cwd = tmpd
     payload = json.dumps({
         "agent_action_name": "pre_run_command",
-        "trajectory_id": "guardfall",
+        "trajectory_id": "guardfall-%s" % case.get("id", ""),  # each case its own conversation
         "execution_id": "guardfall-exec",
         "timestamp": "2026-09-29T12:00:00Z",
         "model_name": "corpus",

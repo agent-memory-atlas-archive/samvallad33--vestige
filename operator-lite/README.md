@@ -14,7 +14,7 @@ copy one file, wire one hook, and your agent has a deterministic gate.
 
 Click the picture to watch the full film.
 
-Operator Lite is free and stays free. Vestige Operator is the owner's version of the same gate: $149 once with a 30-day refund, and every later version is yours at no charge, with laws you write, a Board of today's stops, and a weekly Letter of what your agents tried and what stopped them. Operator also judges the chain of steps in a session, so an agent that reads `.env` and later posts a file to an outside host is stopped with the earlier step's time and receipt, and it carries 13 more stop rules than Lite. You download a small archive the moment you pay; from an installed Operator Lite, `upgrade --install <the archive you downloaded>` unpacks it and starts the wizard. [Buy Vestige Operator](https://payhip.com/b/d4xvu).
+Operator Lite is free and stays free, and it carries every per-call rule from OP-000 to OP-025, including the chain of steps in a session: an agent that reads `.env` and later posts a file to an outside host is stopped with the earlier step's time and receipt. Vestige Operator is the owner's version of the same gate: $149 once with a 30-day refund, and every later version is yours at no charge, with laws you write, a Board of today's stops, a weekly Letter of what your agents tried and what stopped them, and one record of stops across every session, host and agent CLI on the machine. You download a small archive the moment you pay; from an installed Operator Lite, `upgrade --install <the archive you downloaded>` unpacks it and starts the wizard. [Buy Vestige Operator](https://payhip.com/b/d4xvu).
 
 ## Install (one command)
 
@@ -173,7 +173,7 @@ Windows can run. On Windows it is tested by `test_windows.py` on a CI runner.
 
 ## What it stops
 
-30 rules. In enforce mode the 15 STOP rules block; the 15 SHADOW rules only write a receipt.
+42 rules. In enforce mode the 27 STOP rules block; the 15 SHADOW rules only write a receipt.
 
 | Rule | Mode | Catches |
 |---|---|---|
@@ -189,8 +189,20 @@ Windows can run. On Windows it is tested by `test_windows.py` on a CI runner.
 | OP-009 | STOP | reverse shells (`/dev/tcp`, `nc -e`, DNS-tunnel tools, inline code that hands a socket a shell) |
 | OP-010 | STOP | cloud metadata endpoints (169.254.169.254, metadata.google.internal) |
 | OP-011 | STOP | loss nothing can undo: `git reset --hard`, `git clean -f`, `git checkout -- <path>`, `git checkout -f` and `git stash drop` when they would discard real work, deleting a project directory with uncommitted git changes, `shred`/`srm`/`rm -P`, deleting, overwriting or emptying a non-empty file outside the project, `crontab -r` |
+| OP-012 | STOP | the floor: a recursive delete that reaches a drive or filesystem root, a home folder or a parent of the working directory, refused in every mode with no permit |
+| OP-013 | STOP | root reach: a root job started in the background, a kill aimed at every process or at a process group as root |
 | OP-014 | STOP | machine wreck: `dd` onto a device, `mkfs`/`fdisk`-class tools, `diskutil erase*`, `shutdown`/`reboot`/`halt`/`poweroff`, `kill -9 -1`, recursive `chmod`/`chown`/`chgrp` on `/`, a system folder or home, fork bombs |
+| OP-015 | STOP | repo code run: setting a git option that runs a program (`core.fsmonitor`, `core.sshCommand`, an external diff or filter, a `!` alias), or running git where one is set, `GIT_SSH_COMMAND` |
+| OP-016 | STOP | a vulnerable write: code that carries a known critical flaw, such as a server key in client code, certificate or signature checks switched off, an unsafe loader, a secret baked into an image |
+| OP-017 | STOP | agent arming: a command written into a file an agent or editor runs on its own at its next start (MCP server lists, hook settings, notify commands, folder-open tasks, `.envrc`) |
 | OP-018 | STOP | a download run unread: `curl X \| sh`, `wget -qO- X \| python3`, `bash <(curl X)`, `sh -c "$(curl X)"`, `eval "$(wget -qO- X)"` |
+| OP-019 | STOP | a harmful chain: ordinary steps that together run a file this session fetched, carry a secret out, write through a link the session made, launch a process from a build file it wired, or push past a check it switched off |
+| OP-020 | STOP | a second spelling: reaching a target the gate already stopped in this session another way, by a script, inline code, a loop or a different command |
+| OP-021 | STOP | a found key: a remote write, delete or deploy carrying a credential this session read from a file |
+| OP-022 | STOP | a protected file: changing a file the owner marked append-only or read-only with `operator-gate protect` other than its contract allows |
+| OP-023 | STOP | a remote delete: an HTTP `DELETE`, or a GraphQL mutation that deletes, destroys, drops, purges, wipes or terminates |
+| OP-024 | STOP | the runaway brake: a session stopped again and again in a few minutes has its changing calls held until it goes quiet or the owner runs `operator-gate brake --release`; reads pass |
+| OP-025 | STOP | watch turnover: after a compaction, the session takes the watch with `operator-gate turnover --ack <id>` before it changes anything, reading what it was stopped from in the gate's own receipts; reads pass |
 | OP-CANARY | STOP | the verification canary string, which proves a host is wired |
 | OP-S01..S08 and S11..S17 | SHADOW | git commands that can lose work but did not here, comms, public mutation, secret writes, other pipe-to-interpreter, persistence, env-hijack (LD_PRELOAD/PATH=), exfil shapes, invisible chars, MCP argument exfil, agent-config writes, paste/tunnel egress, new git remotes, sandbox-escape primitives |
 
@@ -225,12 +237,21 @@ Seven groups. A payload staged on an earlier turn, aliased through a symlink, ha
 ## Commands
 
     operator-gate status | replay | mode | approve | verify | install | uninstall | upgrade | corpus guardfall
+    operator-gate protect | protected | append | brake | turnover
 
 `status` is the log: the mode, whether the hook is registered, the last call
 checked, the counts for the last 7 days, and the most recent commands the gate
 stopped or would have stopped, each with its project and reason. `status --rules`
 prints the rule table. `mode enforce` switches from recording to blocking, and
 `mode shadow` switches back; it is an owner command and needs your own terminal.
+
+`protect <path> --append-only` or `--read-only` gives a file a contract (OP-022), and
+`protected` checks every contract against its receipts; `append <path>` adds stdin to the
+end of an append-only file with a receipt written first. `brake` lists sessions the runaway
+brake holds (OP-024), and `brake --release <session>` lets one go. `turnover` lists the watch
+turnovers sealed at each compaction (OP-025); the session that continues runs `turnover --ack
+<id>` to take the watch. `install` registers the PreCompact and SessionStart hooks that seal
+and hand over a turnover. `protect` and `brake --release` are owner commands.
 
 `install` puts an `operator-gate` command on your PATH when `~/.local/bin` or
 `~/bin` is already on it. Otherwise run it as

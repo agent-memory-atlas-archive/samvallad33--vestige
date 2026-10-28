@@ -18,7 +18,7 @@ work = tempfile.mkdtemp(prefix="oplite-parser-work-")
 
 
 def hook(cmd, cwd=None):
-    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": cwd or work, "session_id": "t"})
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": cwd or work, "session_id": os.urandom(6).hex()})
     p = subprocess.run([sys.executable, GATE, "hook", "--source", "claude"], input=payload,
                        capture_output=True, text=True, env=env)
     return p.returncode, (p.stderr.strip().splitlines() or [""])[0]
@@ -137,7 +137,7 @@ stop("sudo -u root wrapper", "sudo -u root rm -rf ~/Documents", "OP-003")
 stop("xargs -I{} replacement token", "echo ~/Documents | xargs -I{} rm -rf {}", "OP-003")
 stop("2010s brace command expansion", "{rm,-rf,~/Documents}", "OP-003")
 stop("2010s Shellshock function export", "env x='() { :;}; rm -rf ~/Documents' bash -c :", "OP-003")
-stop("2020s CVE-2026-72718 git -c core.fsmonitor", 'git -c core.fsmonitor="rm -rf ~/Documents" status', "OP-008")
+stop("2020s CVE-2026-72718 git -c core.fsmonitor", 'git -c core.fsmonitor="rm -rf ~/Documents" status', "OP-015")
 allow("benign git -c core.fsmonitor=false status", "git -c core.fsmonitor=false status")
 allow("benign tar -I zstd archive", "tar -I zstd -cf /tmp/opgate-archive.tar.zst README.md")
 
@@ -162,7 +162,7 @@ stop("syntax check, then the script runs as a program", "bash -n %s; %s" % (sh, 
 # what to do next (no retry, ask precedent), and who can allow it once
 p = subprocess.run([sys.executable, GATE, "hook", "--source", "claude"],
                    input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "rm${IFS}-rf ~/Documents"},
-                                     "cwd": work, "session_id": "t"}),
+                                     "cwd": work, "session_id": os.urandom(6).hex()}),
                    capture_output=True, text=True, env=env)
 msg = p.stderr.strip().splitlines()
 for name, ok in [
@@ -179,7 +179,7 @@ for name, ok in [
 
 
 def hook_tool(tool_name, tool_input, cwd=None):
-    payload = json.dumps({"tool_name": tool_name, "tool_input": tool_input, "cwd": cwd or work, "session_id": "t"})
+    payload = json.dumps({"tool_name": tool_name, "tool_input": tool_input, "cwd": cwd or work, "session_id": os.urandom(6).hex()})
     p = subprocess.run([sys.executable, GATE, "hook", "--source", "claude"], input=payload,
                        capture_output=True, text=True, env=env)
     return p.returncode, (p.stderr.strip().splitlines() or [""])[0]

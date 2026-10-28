@@ -217,6 +217,48 @@ RULES = {
                "Writing a raw disk, formatting or erasing a volume, halting/rebooting, kill -1, a fork bomb, or changing permissions or owners recursively on / or home wrecks the machine."),
     "OP-018": ("no-blind-fetch-run", "STOP",
                "Piping a download straight into a shell or interpreter, or running it through <(...) or $(...), runs code nobody has read."),
+    "OP-012": ("the-floor", "STOP",
+               "A recursive delete that reaches a drive or filesystem root, a home folder or a parent of the "
+               "working directory is refused in every mode, and no permit exists for it."),
+    "OP-013": ("no-root-reach", "STOP",
+               "A root job started in the background, or a kill aimed at every process or at a process "
+               "group as root, needs the owner's approval."),
+    "OP-015": ("no-repo-code-run", "STOP",
+               "A git setting that runs a program (core.fsmonitor, core.sshCommand, an external diff or "
+               "filter, a ! alias) turns an ordinary git command into code execution. Setting one, or "
+               "running git where one is set, needs the owner's approval."),
+    "OP-016": ("no-vulnerable-write", "STOP",
+               "The code about to be written carries a known critical flaw (a server key in client code, "
+               "certificate or signature checking switched off, an unsafe loader, a secret baked into an "
+               "image). Writing it needs the owner's approval."),
+    "OP-017": ("no-agent-arming", "STOP",
+               "Some project files are run by an agent or an editor on its own the next time it starts "
+               "(MCP server lists, hook settings, notify commands, folder-open tasks, .envrc). Writing a "
+               "command into one needs the owner's approval."),
+    "OP-019": ("no-harmful-chain", "STOP",
+               "Steps that are each ordinary but together run a file this session fetched, carry a secret "
+               "out, write through a link the session made, run a build file it wired to launch a process, "
+               "or push past a check it switched off, need the owner's approval."),
+    "OP-020": ("no-second-spelling", "STOP",
+               "The gate already stopped an action on this target in this session. Reaching the same target "
+               "another way (a script, inline code, a loop, a different command) is the same action and "
+               "needs the owner's approval."),
+    "OP-021": ("no-found-key", "STOP",
+               "A credential this session found in a file is not permission to change a remote system: "
+               "a write, delete or deploy carrying that key needs the owner's approval."),
+    "OP-024": ("runaway-brake", "STOP",
+               "A session the gate stopped again and again in a few minutes is a runaway. Until it goes quiet or the "
+               "owner releases it, its calls that change anything are held; reads still pass."),
+    "OP-023": ("no-remote-delete", "STOP",
+               "An HTTP DELETE, or a GraphQL mutation that deletes, destroys, drops, purges, wipes or terminates, "
+               "sent to a remote API removes something the owner may not get back. It needs the owner's approval."),
+    "OP-022": ("protected-file", "STOP",
+               "The owner gave this file a contract: append-only files may only grow at the end, read-only "
+               "files may not change. Anything else needs the owner."),
+    "OP-025": ("watch-turnover", "STOP",
+               "A session that was compacted takes the watch before it changes anything: it reads what it was "
+               "stopped from, what the owner allowed and the permits still open, from the gate's own receipts, "
+               "not from a summary. Reads go ahead meanwhile."),
     "OP-CANARY": ("canary", "STOP",
                   "Verification canary: this string exists only to prove the gate is wired."),
     # shadow-only candidates: recorded, never blocking, promote after reviewing the log
@@ -285,7 +327,7 @@ MCP_SENSITIVE_PATH_RE = re.compile(
 
 def load_config():
     cfg = {"protected_roots": [], "protected_files": [], "disabled_rules": [], "mode_overrides": {},
-           "scratch_ok": []}
+           "scratch_ok": [], "file_contracts": []}     # file_contracts: OP-022, set by the owner's `protect`
     try:
         with open(pj(OP_HOME, "commitments.json"), encoding="utf-8") as f:
             user = json.load(f)
@@ -1951,8 +1993,9 @@ def shell_noexec(rest):
     return False
 
 
-SCRIPT_QUIET_PROGS = {"cat", "less", "more", "head", "tail", "grep", "wc", "ls", "stat", "file", "shasum",
-                      "sha256sum", "md5", "diff", "cmp", "cp", "git", "chmod", "shellcheck", "echo", "printf"}
+SCRIPT_QUIET_PROGS = {"cat", "less", "more", "head", "tail", "bat", "grep", "egrep", "rg", "awk", "sed", "base64",
+                      "xxd", "strings", "cut", "tee", "nl", "wc", "ls", "stat", "file", "shasum", "sha256sum", "md5",
+                      "diff", "cmp", "cp", "git", "chmod", "shellcheck", "echo", "printf"}
 
 
 def script_may_run(cmd, name, bodies=()):
@@ -3099,6 +3142,9 @@ def classify_effect(e, cfg, cwd):
             hits.append(("OP-006", "%s GraphQL infrastructure deletion mutation" % prog0,
                          "Infrastructure teardown mutations require a one-time permit from the owner."))
 
+    if kind == "delete":
+        hits += guarded(floor_hits, [], e, ecwd or cwd)
+
     if kind in ("delete", "move"):
         for t in e["targets"]:
             if e.get("filtered"):      # `find X -name ... -delete` never removes X itself
@@ -3704,6 +3750,2553 @@ def hook_settings_hit(path, text):
     return ("OP-S14", "write to Claude Code settings %s" % path, "")
 
 
+
+# ---------------------------------------------------------------------------
+# Session and per-call rules from Vestige Operator, open in Lite since 6.0.0:
+# OP-012 the floor, OP-013 root reach, OP-015 repo code run, OP-016 vulnerable
+# write, OP-017 agent arming, OP-019 harmful chain, OP-020 second spelling,
+# OP-021 found key, OP-022 protected file, OP-023 remote delete, OP-024 runaway
+# brake and OP-025 watch turnover. Owner laws, history across sessions and
+# agents, and team use stay in the paid Operator.
+# ---------------------------------------------------------------------------
+
+
+def active_laws():
+    """Lite carries no owner laws; the paid Operator's laws are not part of it."""
+    return {}, []
+
+
+# --------------------------------------------------------------------------- #
+# measured loss: what a stopped action would have removed (0.3.11)
+# --------------------------------------------------------------------------- #
+LOSS_WALK_CAP = 20000
+
+
+LOSS_WALK_S = 0.6
+
+
+def measure_loss(effects, cwd):
+    """Counted from the disk as it is now: the files and bytes under the delete targets, and how many
+    files or uncommitted changes nothing could bring back. The count stops at a size and time cap;
+    `capped` says the real figure is at least this."""
+    targets, discards = [], 0
+    for e in effects or []:
+        if e.get("kind") == "delete" and not e.get("filtered"):
+            targets += [t for t in e.get("targets") or [] if os.path.lexists(t) and t not in targets]
+        elif e.get("kind") == "git" and e.get("sub") in ("reset", "clean", "checkout", "restore", "stash"):
+            root = git_top(e.get("git_dir") or e.get("cwd") or cwd)
+            entries = _status(root, ["--untracked-files=all"], None) if root else None
+            for state, _rel in entries or []:
+                untracked = state == "??"
+                if e["sub"] == "stash" or untracked == (e["sub"] == "clean"):
+                    discards += 1
+    if not targets and not discards:
+        return None
+    files = size = 0
+    capped, start = False, time.time()
+    for t in targets:
+        if os.path.isdir(t) and not os.path.islink(t):
+            for base, _dirs, names in os.walk(t):
+                for n in names:
+                    try:
+                        size += os.lstat(os.path.join(base, n)).st_size
+                    except OSError:
+                        pass
+                    files += 1
+                if files >= LOSS_WALK_CAP or time.time() - start > LOSS_WALK_S:
+                    capped = True
+                    break
+        else:
+            try:
+                size += os.lstat(t).st_size
+            except OSError:
+                pass
+            files += 1
+        if capped:
+            break
+    lost = guarded(_lost_list, [], targets) if targets else []
+    return {"files": files, "bytes": size, "unrecoverable": len(lost) + discards, "capped": capped}
+
+
+def human_bytes(n):
+    for unit in ("bytes", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return "%d %s" % (n, unit) if unit == "bytes" else "%.1f %s" % (n, unit)
+        n /= 1024.0
+
+
+def loss_line(loss):
+    """One sentence for the stop message, the Board and the Letter, or ''."""
+    if not loss:
+        return ""
+    least = "at least " if loss.get("capped") else ""
+    files, gone = int(loss.get("files") or 0), int(loss.get("unrecoverable") or 0)
+    if not files:
+        return "%d uncommitted change%s nothing could bring back" % (gone, "" if gone == 1 else "s") if gone else ""
+    text = "%s%s file%s, %s" % (least, format(files, ","), "" if files == 1 else "s", human_bytes(int(loss.get("bytes") or 0)))
+    if gone:
+        text += "; %s%s of them exist%s nowhere else" % (least if gone >= 4000 else "", format(gone, ","), "s" if gone == 1 else "")
+    return text
+
+
+FLOOR_RULES = {"OP-012"}                  # the floor holds in every mode but off, and no permit exists for it
+BRAKE_TRIPPED = {"sid": ""}               # set by write_receipt when a stop trips the brake
+
+
+def call_of(payload):
+    """The host's id for this one tool call, recorded on the receipt so a stop names the exact call."""
+    p = payload or {}
+    return str(p.get("tool_use_id") or p.get("toolUseId") or p.get("call_id") or p.get("tool_call_id") or "")[:80]
+
+DEFECTS = []                                         # readers that failed during this judgement (see guarded)
+
+
+def command_text(cmd):
+    """The command with heredoc bodies and quoted strings blanked, followed by the strings a shell is
+    handed with -c. Text that is only written or printed is not a command; `sh -c '...'` is."""
+    body = extract_heredocs(cmd)[0]
+    inner = [m.group(2) for m in re.finditer(r"\b(?:sh|bash|zsh|dash|ksh)\s+(?:-[a-zA-Z]*c)\s+(['\"])(.*?)\1", cmd, re.S)]
+    return mask_quotes(body) + "\n" + "\n".join(inner)
+
+
+def short_home(p):
+    """A path under the home folder written from ~, the way the owner reads it."""
+    p = str(p or "")
+    return "~" + p[len(HOME):] if p == HOME or p.startswith(HOME + "/") else p
+
+
+# Every shell an agent can hand a command string or a script to. One list, used wherever the gate
+# asks "is this a shell": POSIX shells, their restricted and static builds, and the newer ones.
+ALL_SHELLS = ("sh", "bash", "zsh", "dash", "ksh", "ksh93", "mksh", "pdksh", "oksh", "loksh", "ash", "hush", "fish",
+              "csh", "tcsh", "nu", "nushell", "xonsh", "elvish", "osh", "ysh", "oil", "yash", "rc", "es", "ion",
+              "murex", "rbash", "rksh", "rzsh", "bash-static", "zsh-static", "posh", "sash", "bosh")
+
+
+CODE_PROG = {"python": "py", "pypy": "py", "ipython": "py", "node": "js", "nodejs": "js", "deno": "js", "bun": "js",
+             "tsx": "js", "ts-node": "js", "ts-node-esm": "js", "zx": "js", "ruby": "rb", "jruby": "rb",
+             "perl": "pl", "php": "php", "lua": "lua", "luajit": "lua", "osascript": "applescript", "rscript": "r",
+             "awk": "awk", "gawk": "awk", "mawk": "awk", "nawk": "awk"}
+
+
+def guarded(fn, default, *args, **kw):
+    """Run one of the readers added in 0.3.8. On a defect it reports nothing instead of failing the
+    whole judgement, so the older checks still decide. OPERATOR_DEBUG=1 lets the defect through (tests)."""
+    try:
+        return fn(*args, **kw)
+    except Exception:
+        if os.environ.get("OPERATOR_DEBUG"):
+            raise
+        DEFECTS.append(getattr(fn, "__name__", "reader"))    # strict mode stops a call a reader failed on
+        return default
+
+
+def code_prog(prog):
+    """The language an interpreter runs (`python3.12` is py, `ts-node` is js), or None."""
+    p = re.sub(r"\.exe$", "", (prog or "").lower())
+    return CODE_PROG.get(p) or CODE_PROG.get(re.sub(r"[\d.]+$", "", p))
+
+
+# --------------------------------------------------------------------------- #
+# work nothing can bring back (OP-011): read from the state of the files and the repository
+# --------------------------------------------------------------------------- #
+FRESH_S = 3600                           # a file made in the last hour is the session's own scratch
+
+
+LOSS_HINT = "Commit it, stash it (`git stash -u`) or move it first, or ask the owner for a one-time permit."
+
+
+# ignored by git and still not replaceable: secrets, keys, local databases, infrastructure state
+PRECIOUS_RE = re.compile(r"(?:^|/)(?:\.env(?:\.[\w.\-]+)?|[^/]*\.(?:sqlite3?|db|pem|key|p12|pfx|keystore|jks|kdbx|"
+                         r"tfstate|tfstate\.backup)|id_(?:rsa|ed25519|ecdsa)|credentials(?:\.json)?|secrets?\.\w+)$", re.I)
+
+
+def git_top(path):
+    """The repository a path sits in: the nearest folder at or above it that holds .git. None outside one."""
+    p = path if os.path.isdir(path) else posixpath.dirname(path.rstrip("/"))
+    for _ in range(40):
+        if p and os.path.exists(pj(p, ".git")):
+            return p
+        up = posixpath.dirname(p.rstrip("/")) if p else ""
+        if not up or up == p:
+            return None
+        p = up
+    return None
+
+
+GIT_ASKED = {}                           # answers for the command being judged; cleared with SEEN_FILES
+
+
+def git_out(root, args, timeout=3):
+    """The output of a read-only git query, or None. The file monitor, prompts and optional locks are
+    off, so asking changes nothing and runs nothing the repository configures."""
+    key = (root, tuple(args))
+    if key in GIT_ASKED:
+        return GIT_ASKED[key]
+    if len(GIT_ASKED) >= 24:                                 # a command that needs more is not judged this way
+        return None
+    GIT_ASKED[key] = _git_out(root, args, timeout)
+    return GIT_ASKED[key]
+
+
+def _git_out(root, args, timeout):
+    try:
+        r = subprocess.run(["git", "-C", root, "-c", "core.fsmonitor=false", "-c", "core.quotepath=false"] + args,
+                           capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace",
+                           env=dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0"))
+        return r.stdout if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _old(path, now):
+    """True when the file was there before this session's last hour. Where the system records when a
+    file was made (macOS, Windows) that is used; elsewhere, when it was last changed."""
+    try:
+        st = os.lstat(path)
+        made = getattr(st, "st_birthtime", None) or (st.st_ctime if IS_WINDOWS else st.st_mtime)
+        return now - min(made, st.st_mtime) > FRESH_S
+    except OSError:
+        return False
+
+
+def _files_under(path, limit=4000):
+    """Up to `limit` files under a path, build and cache folders left out."""
+    if not os.path.isdir(path) or os.path.islink(path):
+        return [path] if os.path.lexists(path) else []
+    out = []
+    for base, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if d not in BUILD_DIRS and d != ".git"]
+        out += [pj(canon(base), f) for f in files]
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def _status(root, args, paths):
+    """(two-letter state, path) for each entry of `git status` under these paths, or None."""
+    out = git_out(root, ["status", "--porcelain", "-z"] + args + ["--"] + (paths or ["."]))
+    if out is None:
+        return None
+    entries, parts, i = [], out.split("\0"), 0
+    while i < len(parts):
+        ent = parts[i]
+        i += 1
+        if len(ent) < 4:
+            continue
+        if ent[0] in "RC":
+            i += 1                                           # a rename carries its old name as the next field
+        entries.append((ent[:2], ent[3:]))
+    return entries
+
+
+def _named(lost):
+    return "%d file%s nothing can bring back, such as %s" % (len(lost), "" if len(lost) == 1 else "s", lost[0])
+
+
+def _lost_list(targets):
+    """The files that deleting these paths loses for good. Inside a repository that
+    is the files with uncommitted changes, the untracked files, and the ignored files that hold
+    secrets or data (.env, a key, a local database, infrastructure state). Outside any repository
+    it is every file. Files made in the last hour are the session's own and are not counted."""
+    now, lost, by_root = time.time(), [], {}
+    for t in targets:
+        if not is_scratch(t) and os.path.lexists(t):
+            by_root.setdefault(git_top(t), []).append(t)
+    for root, paths in by_root.items():
+        entries = _status(root, ["--untracked-files=all", "--ignored=matching"], paths) if root else None
+        if entries is None:                                  # no repository, or git could not answer
+            for t in paths:
+                lost += [f.replace(HOME, "~") for f in _files_under(t) if _old(f, now)]
+            continue
+        for state, rel in entries:
+            full = pj(root, rel.rstrip("/"))
+            if any(part in BUILD_DIRS for part in rel.split("/")):
+                continue
+            if state == "!!":                                # ignored: only what cannot be made again
+                if rel.endswith("/"):
+                    lost += [f.replace(root + "/", "") for f in _files_under(full, 2000)
+                             if PRECIOUS_RE.search(f) and _old(f, now)]
+                elif PRECIOUS_RE.search(rel) and _old(full, now):
+                    lost.append(rel)
+            elif state != "??" or _old(full, now):            # an uncommitted change is work whenever it was saved
+                if os.path.lexists(full):
+                    lost.append(rel)
+    return lost
+
+
+def lost_work(targets):
+    """Why deleting these paths loses work for good, as a phrase, or None."""
+    lost = _lost_list(targets)
+    return _named(lost) if lost else None
+
+
+# --------------------------------------------------------------------------- #
+# root reach: root work nobody is watching, and signals that leave their target (0.3.12)
+# --------------------------------------------------------------------------- #
+ROOT_PROGS = {"sudo", "doas", "pkexec", "run0"}
+
+
+SUDO_VALUE_FLAGS = {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "-U", "-R", "--user", "--group",
+                    "--close-from", "--chdir", "--host", "--prompt", "--role", "--type",
+                    "--command-timeout", "--other-user", "--chroot"}
+
+
+DETACH_WRAPPERS = {"nohup", "setsid"}
+
+
+SHELL_PROGS = set(ALL_SHELLS)
+
+
+BACKGROUND_RE = re.compile(r"(?<![&|><])&(?![&>])")
+
+
+KILL_ALL_CODE_RE = re.compile(r"\bos\.kill\(\s*-\s*1\s*,")
+
+
+KILL_GROUP_CODE_RE = re.compile(r"\bos\.killpg\(")
+
+
+ROOT_HINT = ("Start long root work as a transient service: `sudo systemd-run --unit=<name> --collect "
+             "<command>`. The service manager owns it, outside this session's process group. Stop it "
+             "with `sudo systemctl stop <name>`, read it with `journalctl -u <name>`. Ask the owner.")
+
+
+KILL_HINT = ("Signal the one process id you mean. A negative id is a whole process group, -1 is every "
+             "process, and procps-ng 4 reads only the first digit of a negative id. Ask the owner.")
+
+
+def kill_targets(args):
+    """The process ids a `kill` command line names, as written. The first dash word is the signal
+    unless -s or -n already gave one; after `--` every word is an id."""
+    ids, signal_seen, i = [], False, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return ids + args[i + 1:]
+        if a in ("-s", "-n", "--signal"):
+            signal_seen = True; i += 2; continue
+        if a in ("-l", "-L", "--list", "--table"):
+            return []
+        if a.startswith("-") and not signal_seen:
+            signal_seen = True; i += 1; continue
+        ids.append(a); i += 1
+    return ids
+
+
+def root_form(toks):
+    """How one command segment is launched: (runs as root, detached by its own words, fed by
+    xargs, the bare command, the command string handed to a shell or to su). Reads through
+    `( ... )` and `{ ...; }` grouping, VAR=x prefixes, wrappers, sudo's flags, and `su -c`."""
+    toks = list(toks)
+    while toks and toks[0] in ("(", "{", "!"):
+        toks = toks[1:]
+    if toks and toks[0].startswith("(") and len(toks[0]) > 1:
+        toks[0] = toks[0].lstrip("(")
+    while toks and toks[-1] in (")", "}"):
+        toks = toks[:-1]
+    if toks and toks[-1].endswith(")") and "(" not in toks[-1]:
+        toks[-1] = toks[-1].rstrip(")")
+    root = detached = via_xargs = False
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\+?=", t):
+            i += 1; continue
+        base = os.path.basename(t)
+        if base in ROOT_PROGS:
+            root = True; i += 1
+            while i < len(toks) and toks[i].startswith("-"):
+                f = toks[i]; i += 1
+                if f == "--":
+                    break
+                if f == "--background" or (base == "sudo" and re.match(r"^-[A-Za-z]*b[A-Za-z]*$", f)):
+                    detached = True
+                if f in SUDO_VALUE_FLAGS and i < len(toks):
+                    i += 1
+            continue
+        if base in WRAPPERS:
+            detached = detached or base in DETACH_WRAPPERS
+            via_xargs = via_xargs or base == "xargs"
+            i += 1
+            while i < len(toks) and toks[i].startswith("-"):
+                i += 1
+                if base in ("timeout", "nice") and i < len(toks) and re.match(r"^[0-9]+$", toks[i]):
+                    i += 1
+            if base == "timeout" and i < len(toks) and re.match(r"^[0-9.]+[smhd]?$", toks[i]):
+                i += 1
+            continue
+        break
+    bare, inner = toks[i:], None
+    if bare:
+        prog, args = os.path.basename(bare[0]), bare[1:]
+        if prog == "su":
+            user = None
+            for j, a in enumerate(args):
+                if a in ("-c", "--command") and j + 1 < len(args):
+                    inner = args[j + 1]
+                elif a.startswith("--command="):
+                    inner = a.split("=", 1)[1]
+                elif not a.startswith("-") and user is None and (j == 0 or args[j - 1] not in ("-c", "--command")):
+                    user = a
+            if inner is not None and user in (None, "root"):
+                root = True
+            elif inner is not None:
+                inner = None
+        elif prog in SHELL_PROGS:
+            for j, a in enumerate(args):
+                if re.match(r"^-[A-Za-z]*c[A-Za-z]*$", a) and j + 1 < len(args):
+                    inner = args[j + 1]
+                    break
+    return root, detached, via_xargs, bare, inner
+
+
+def peek_script(path):
+    """A script's text for the root-reach read, comments dropped. None when it is not a small text
+    file. Separate from read_script, which hands a file out once per command."""
+    try:
+        st = os.stat(path)
+        if not _stat.S_ISREG(st.st_mode) or st.st_size == 0 or st.st_size > MAX_SCRIPT_BYTES:
+            return None
+        with open(path, "rb") as f:
+            raw = f.read(MAX_SCRIPT_BYTES)
+    except Exception:
+        return None
+    if b"\0" in raw[:4096]:
+        return None
+    return "\n".join(l for l in raw.decode("utf-8", "replace").split("\n") if not l.lstrip().startswith("#"))
+
+
+def root_reach(cmd, background, cwd=None, depth=0, as_root=False, label=""):
+    """OP-013 for one shell command: a root job that outlives the call, and kills that reach past
+    one process. Reads the command's words, the string handed to `sh -c` or `su -c`, and one level
+    into a script the command runs. Runs nothing."""
+    found = []
+    detached = background or bool(BACKGROUND_RE.search(mask_quotes(cmd)))
+    tail = (" -- inside script %s" % label) if label else ""
+    for seg in split_segments(cmd):
+        root, own_detach, via_xargs, bare, inner = root_form(tokenize(seg))
+        root = root or as_root
+        if not bare:
+            continue
+        prog, args = os.path.basename(bare[0]), bare[1:]
+        gone = detached or own_detach
+        if inner is not None and depth < 2:
+            found += root_reach(inner, gone, cwd, depth + 1, root, label)
+            continue
+        if prog == "killall5":
+            found.append(("OP-013", "killall5 signals every process" + tail, KILL_HINT))
+        elif prog == "kill":
+            ids = kill_targets(args)
+            if root and via_xargs and not any(re.match(r"^-?\d+$", t) for t in ids):
+                found.append(("OP-013", "root kill of targets fed in by xargs, which the gate cannot see" + tail, KILL_HINT))
+            for t in ids:
+                if t == "-1":
+                    found.append(("OP-013", "kill aimed at every process (-1)" + tail, KILL_HINT))
+                elif root and re.match(r"^-\d+$", t):
+                    found.append(("OP-013", "root kill of process group %s%s" % (t[1:], tail), KILL_HINT))
+                elif root and re.match(r"^-[$`]", t):
+                    found.append(("OP-013", "root kill of a process group held in a variable" + tail, KILL_HINT))
+        elif prog in ("pkill", "killall") and root and any(       # killall's -s is a signal, pkill's a session
+                re.match(r"^(-[A-Za-z]*[%s]\d*|--(pgroup|session|euid|uid|user|process-group)(=.*)?)$"
+                         % ("gsuU" if prog == "pkill" else "gu"), a) for a in args):
+            found.append(("OP-013", "root %s by process group, session or user%s" % (prog, tail), KILL_HINT))
+        elif (code_prog(prog) == "py" or prog.startswith("python")) and KILL_ALL_CODE_RE.search(seg):
+            found.append(("OP-013", "os.kill(-1, ...) signals every process" + tail, KILL_HINT))
+        elif (code_prog(prog) == "py" or prog.startswith("python")) and root and KILL_GROUP_CODE_RE.search(seg):
+            found.append(("OP-013", "root os.killpg of a process group" + tail, KILL_HINT))
+        elif root and prog == "systemd-run" and "--scope" not in args:
+            pass                                             # a transient service: the service manager owns it
+        elif root and gone:
+            found.append(("OP-013", "root job started in the background: %s%s" % (prog, tail), ROOT_HINT))
+        elif root and (prog == "tmux" and any(re.match(r"^-[A-Za-z]*d", a) for a in args)
+                       or prog == "screen" and any(re.match(r"^-[A-Za-z]*d[A-Za-z]*m|^-[A-Za-z]*m[A-Za-z]*d", a) for a in args)):
+            found.append(("OP-013", "root job started detached in %s%s" % (prog, tail), ROOT_HINT))
+        elif depth == 0 and cwd:
+            path = None
+            if prog in SHELL_PROGS:
+                path = guarded(resolve_script_arg, None, args, cwd)
+            elif "/" in bare[0] or bare[0].endswith((".sh", ".bash", ".zsh")):
+                path = guarded(resolve, None, bare[0], cwd)
+            body = guarded(peek_script, None, path) if path else None
+            if body:
+                found += root_reach(body, gone, cwd, 1, root, os.path.basename(path))
+    return list(dict.fromkeys(found))[:2]
+
+
+WRECK_HINT = ("Work on an image file or a loop device, never on the disk itself; change permissions "
+              "on the one folder you mean, inside the project. The owner does the rest by hand.")
+
+
+# --------------------------------------------------------------------------- #
+# repo code run: git settings that execute a program (GitSpawn, October 2026) (0.3.12)
+# --------------------------------------------------------------------------- #
+GIT_BOOL = {"true", "false", "yes", "no", "on", "off", "1", "0", ""}
+
+
+GIT_NET_SUBS = {"fetch", "pull", "push", "clone", "ls-remote", "remote", "submodule"}
+
+
+GIT_DIFF_SUBS = {"diff", "show", "log", "status", "add", "checkout", "restore", "stash", "commit"}
+
+
+SPAWN_HINT = ("Read what the setting runs and show the owner; use `git -c core.fsmonitor=false` to look at "
+              "a repository you do not trust. The owner sets program-running git config by hand.")
+
+
+GIT_SECTION_RE = re.compile(r'^\s*\[\s*([A-Za-z0-9.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]')
+
+
+def git_exec_setting(key, value):
+    """Why a git setting runs a program, as a short phrase, or None. `key` is lower case."""
+    v = (value or "").strip()
+    if key == "core.fsmonitor" and v.lower() not in GIT_BOOL:
+        return "core.fsmonitor runs `%s` on git status, diff, add and other index reads" % v[:60]
+    if key in ("core.sshcommand", "core.gitproxy") and v:
+        return "%s runs `%s` on every fetch, pull and push" % (key, v[:60])
+    if key in ("diff.external", "uploadpack.packobjectshook") and v:
+        return "%s runs `%s`" % (key, v[:60])
+    if re.match(r"^diff\..+\.(command|textconv)$", key) and v:
+        return "%s runs `%s` when a diff is shown" % (key, v[:60])
+    if re.match(r"^filter\..+\.(clean|smudge|process)$", key) and v and not v.startswith("git-lfs "):
+        return "%s runs `%s` on checkout, add and status" % (key, v[:60])
+    if key.startswith("alias.") and v.startswith("!"):
+        return "%s is a shell alias: `%s`" % (key, v[:60])
+    if key == "credential.helper" and v.startswith("!") and not re.match(r"^!\s*gh\s+auth\s+git-credential\s*$", v):
+        return "credential.helper runs `%s`" % v[:60]      # `!gh auth git-credential` is gh's documented helper
+    return None
+
+
+def repo_git_config(cwd):
+    """(path, {key: value}) of the git config that governs `cwd`, read as text; git is not run.
+    Covers a normal checkout and a folder that is itself a bare repository."""
+    d, path = cwd, None
+    for _ in range(40):
+        if not d:
+            break
+        dot = pj(d, ".git")
+        if os.path.isdir(dot):
+            path = pj(dot, "config"); break
+        if os.path.isfile(pj(d, "HEAD")) and os.path.isfile(pj(d, "config")) and os.path.isdir(pj(d, "objects")) \
+                and os.path.isdir(pj(d, "refs")):
+            path = pj(d, "config"); break
+        up = posixpath.dirname(d.rstrip("/"))
+        if up == d or not up:
+            break
+        d = up
+    if not path:
+        return None, {}
+    try:
+        if os.path.getsize(path) > 262144:
+            return path, {}
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except Exception:
+        return path, {}
+    out, section = {}, ""
+    for line in text.split("\n"):
+        m = GIT_SECTION_RE.match(line)
+        if m:
+            section = m.group(1).lower() + ("." + m.group(2) if m.group(2) is not None else "")
+            continue
+        if "=" in line and section and not line.lstrip().startswith(("#", ";")):
+            k, v = line.split("=", 1)
+            out["%s.%s" % (section, k.strip().lower())] = v.strip().strip('"')
+    return path, out
+
+
+def repo_code_run(cmd, cwd):
+    """OP-015 for one shell command: planting a program-running git setting, and running git where
+    the repository's own config already carries one. Reads words and one config file; runs nothing."""
+    found = []
+    for seg in split_segments(cmd):
+        toks = tokenize(seg)
+        for t in toks:                                       # GIT_EXTERNAL_DIFF=x git diff, GIT_SSH_COMMAND=x git pull
+            m = re.match(r"^(GIT_EXTERNAL_DIFF|GIT_SSH_COMMAND|GIT_SSH|GIT_PROXY_COMMAND)=(.*)$", t)
+            if not m:
+                break
+            name, val = m.group(1), m.group(2).strip()
+            if val and not (name == "GIT_SSH_COMMAND" and re.match(r"^ssh(\s|$)", val)):
+                found.append(("OP-015", "%s makes git run `%s`" % (name, val[:60]), SPAWN_HINT))
+        _, _, _, bare, inner = root_form(toks)
+        if inner is not None:
+            found += repo_code_run(inner, cwd)
+            continue
+        if not bare or os.path.basename(bare[0]) != "git":
+            continue
+        args, here, i = bare[1:], cwd, 0
+        while i < len(args) and args[i].startswith("-"):     # git's own options, before the subcommand
+            if args[i] == "-c" and i + 1 < len(args):
+                k, _, v = args[i + 1].partition("=")
+                why = git_exec_setting(k.lower(), v)
+                if why:
+                    found.append(("OP-015", "git -c: " + why, SPAWN_HINT))
+                i += 2; continue
+            if args[i] == "-C" and i + 1 < len(args):
+                here = norm(args[i + 1], here); i += 2; continue
+            i += 1
+        sub, rest = (args[i] if i < len(args) else ""), args[i + 1:]
+        if sub == "config":
+            plain = [a for a in rest if not a.startswith("-")]
+            reading = any(a in ("--get", "--get-all", "--get-regexp", "--list", "-l", "--unset", "--unset-all",
+                                "--remove-section", "--show-origin") for a in rest)
+            if len(plain) >= 2 and not reading:
+                why = git_exec_setting(plain[0].lower(), plain[1])
+                if why:
+                    found.append(("OP-015", "git config sets a program: " + why, SPAWN_HINT))
+            continue
+        if not sub or any(a.lower() == "core.fsmonitor=false" for a in args[:i]):
+            continue
+        path, conf = repo_git_config(here)
+        for k, v in conf.items():
+            why = git_exec_setting(k, v)
+            if not why:
+                continue
+            fires = k == "core.fsmonitor" or (k in ("core.sshcommand", "core.gitproxy", "credential.helper") and sub in GIT_NET_SUBS) \
+                or (k.startswith("diff.") and sub in ("diff", "show", "log", "stash", "format-patch")) \
+                or (k.startswith("filter.") and sub in GIT_DIFF_SUBS) or (k.startswith("alias.") and k[6:] == sub.lower())
+            if fires:
+                found.append(("OP-015", "this repository's config (%s): %s" % (path, why), SPAWN_HINT))
+                break
+    return list(dict.fromkeys(found))[:2]
+
+
+# --------------------------------------------------------------------------- #
+# written code: critical flaws in what an agent is about to write (0.3.12)
+# --------------------------------------------------------------------------- #
+# The first eight detectors, ported from the Nullgaze scanner (ai_patterns.rs, patterns 1, 12, 14,
+# 104, 109, 117, 129, 140): each is rated Critical at 0.90 confidence or above there. They read the
+# text of a Write or an Edit line by line. Tests, fixtures, examples and prose are not judged.
+CLIENT_EXTS = (".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".html")
+
+
+SERVER_DIR_RE = re.compile(r"(^|/)(server|api|backend|functions|lambda|middleware|supabase/functions)(/|$)")
+
+
+NOT_SHIPPED_RE = re.compile(r"(^|/)(tests?|__tests__|spec|specs|fixtures?|examples?|samples?|docs?|node_modules|vendor)(/|$)"
+                            r"|(\.|_|-)(test|spec)\.[a-z]+$|^test_[^/]*$|\.(md|mdx|rst|txt|lock)$", re.I)
+
+
+EXAMPLE_LINE_RE = re.compile(r"<code|</code|<pre|</pre|<samp|&lt;|&gt;|&amp;|example|snippet|demo code|sample code", re.I)
+
+
+COMMENT_LINE_RE = re.compile(r"^\s*(//|#|\*|/\*|<!--|--)")
+
+
+WRITE_HINT = "Write it the safe way named above, or hand the owner the reason this file needs the exception."
+
+
+W_SERVICE_ROLE_RE = re.compile(r"service[_\-]?role", re.I)
+
+
+W_FIREBASE_ADMIN_RE = re.compile(r"""from\s+['"]firebase-admin|require\s*\(\s*['"]firebase-admin|initializeApp\s*\(\s*\{[^}]*credential""")
+
+
+W_SERVICE_ACCOUNT_RE = re.compile(r'"type"\s*:\s*"service_account"')
+
+
+W_JWT_NONE_RE = re.compile(r"""algorithms?\s*[=:]\s*\[?\s*["']none["']|\balg\s*[=:]\s*["']none["']""", re.I)
+
+
+W_JWT_NOVERIFY_RE = re.compile(r""""?verify_signature"?\s*[:=]\s*(false|False)""")
+
+
+W_TLS_OFF_RE = re.compile(r"""rejectUnauthorized\s*:\s*false|InsecureSkipVerify\s*:\s*true|ssl_verify\s*=\s*False"""
+                          r"""|NODE_TLS_REJECT_UNAUTHORIZED['"\]]*\s*=\s*['"]?0|CURLOPT_SSL_VERIFY(PEER|HOST)\s*,\s*(0|false)"""
+                          r"""|\bverify_ssl\s*=\s*False""")
+
+
+W_VERIFY_FALSE_RE = re.compile(r"\bverify\s*=\s*False")
+
+
+W_HTTP_CONTEXT_RE = re.compile(r"requests\.|httpx\.|aiohttp|urllib|session|Session|\.(get|post|put|patch|delete|request)\s*\(|ssl|tls|cert|https?:", re.I)
+
+
+W_DOCKER_SOCK_RE = re.compile(r"/var/run/docker\.sock\s*:|[-\s]v\s+/var/run/docker\.sock|path\s*:\s*/var/run/docker\.sock")
+
+
+W_YAML_LOAD_RE = re.compile(r"\byaml\.load\s*\(|\bYAML\.load\s*\(")
+
+
+W_YAML_SAFE_RE = re.compile(r"Loader\s*=\s*(yaml\.)?(Safe|Base|CSafe)Loader|\bsafe_load\b")
+
+
+W_DOCKER_SECRET_COPY_RE = re.compile(r"^(COPY|ADD)\s+(--\S+\s+)*(\.env(\.(?!example|sample|template|dist)[\w-]+)?(?=\s|$)|\S*(credential|secret|\.pem|\.p12|\.pfx|id_rsa|id_ecdsa|id_ed25519|\.kubeconfig)\S*)", re.I)
+
+
+def written_code(path, body):
+    """OP-016 for one file about to be written: (rule, what and where, the safe way). Reads text only."""
+    p = canon(path or "")
+    if not body or NOT_SHIPPED_RE.search(p) or len(body) > 2_000_000:
+        return []
+    base = posixpath.basename(p)
+    client = p.endswith(CLIENT_EXTS) and not SERVER_DIR_RE.search(p)
+    dockerfile = base == "Dockerfile" or base.startswith("Dockerfile.") or base.endswith(".dockerfile")
+    found = []
+
+    def hit(n, what, safe):
+        found.append(("OP-016", "%s (%s line %d)" % (what, base, n), safe + " " + WRITE_HINT))
+
+    for n, line in enumerate(body.split("\n"), 1):
+        if len(line) > 2000 or COMMENT_LINE_RE.match(line):
+            continue
+        if client and not EXAMPLE_LINE_RE.search(line):
+            if W_SERVICE_ROLE_RE.search(line):
+                hit(n, "a Supabase service_role key in client code bypasses every row-level policy",
+                    "Keep the service_role key on the server and use the anon key in the client.")
+            if W_FIREBASE_ADMIN_RE.search(line):
+                hit(n, "the Firebase Admin SDK in client code ships full project access to every visitor",
+                    "Use the Firebase client SDK in the browser and the Admin SDK only on the server.")
+        if W_SERVICE_ACCOUNT_RE.search(line):
+            hit(n, "a cloud service-account key is being written into the project",
+                "Load the key from the environment or a secret manager and keep it out of the tree.")
+        if W_JWT_NONE_RE.search(line) or W_JWT_NOVERIFY_RE.search(line):
+            hit(n, "JWT signature checking is switched off, so any token is accepted",
+                "Name the real algorithm and verify the signature.")
+        if W_TLS_OFF_RE.search(line) or (W_VERIFY_FALSE_RE.search(line) and W_HTTP_CONTEXT_RE.search(line)):
+            hit(n, "TLS certificate checking is switched off, so any server can pose as the real one",
+                "Leave verification on and add the CA you need to the trust store.")
+        if W_DOCKER_SOCK_RE.search(line):
+            hit(n, "the Docker socket is mounted into a container, which hands it the host",
+                "Use a socket proxy with a narrow allow-list or a rootless builder.")
+        if p.endswith((".py", ".rb")) and W_YAML_LOAD_RE.search(line) and not W_YAML_SAFE_RE.search(line):
+            hit(n, "yaml.load without a safe loader runs code from the file it reads",
+                "Use yaml.safe_load, or pass Loader=yaml.SafeLoader.")
+        if dockerfile and W_DOCKER_SECRET_COPY_RE.search(line.strip()):
+            hit(n, "a secret file is copied into the image, where every layer keeps it",
+                "Pass it at run time or use a build secret mount.")
+    return list(dict.fromkeys(found))[:3]
+
+
+# --------------------------------------------------------------------------- #
+# agent arming: project files a harness or editor runs by itself on start (0.3.12)
+# --------------------------------------------------------------------------- #
+# The class behind CurXecute and MCPoison (Cursor, CVE-2025-54135 and 54136), the Codex project
+# config advisories (CVE-2025-61260, the notify field), CVE-2026-25725 (a SessionStart hook written
+# into .claude/settings.json) and the Gemini .gemini/.env advisories (CVE-2026-12537, 13745): the
+# write looks like an edit to a config file, and the command in it runs with no further question.
+# (path pattern, what reads it, what in the content makes it a command; None = any write counts)
+ARMING_FILES = (
+    (re.compile(r"(^|/)\.codex/config\.toml$"), "Codex runs its notify command and MCP servers from this file",
+     re.compile(r"^\s*notify\s*=|^\s*\[mcp_servers|^\s*command\s*=", re.M)),
+    (re.compile(r"(^|/)\.gemini/\.env$"), "Gemini CLI loads this file into its own environment on start", None),
+    (re.compile(r"(^|/)\.gemini/settings\.json$"), "Gemini CLI starts the MCP servers named in this file",
+     re.compile(r'"command"\s*:|"mcpServers"\s*:')),
+    (re.compile(r"(^|/)(\.cursor/mcp\.json|\.mcp\.json|\.vscode/mcp\.json|\.roo/mcp\.json|\.windsurf/mcp_config\.json"
+                r"|mcp_settings\.json|cline_mcp_settings\.json|claude_desktop_config\.json)$"),
+     "the agent starts every MCP server command listed in this file", re.compile(r'"command"\s*:')),
+    (re.compile(r"(^|/)\.cursor/hooks\.json$"), "Cursor runs the hook commands in this file", re.compile(r'"command"\s*:')),
+    (re.compile(r"(^|/)\.claude/settings(\.local)?\.json$"), "Claude Code runs the hooks and helper commands in this file",
+     re.compile(r'"(hooks|command|apiKeyHelper|statusLine|awsAuthRefresh)"\s*:')),
+    (re.compile(r"(^|/)\.vscode/tasks\.json$"), "the editor runs a folder-open task from this file when the project is opened",
+     re.compile(r'"runOn"\s*:\s*"folderOpen"')),
+    (re.compile(r"(^|/)\.envrc$"), "direnv runs this file on every cd into the project",
+     re.compile(r"^(?!\s*(#|$|export\s+[A-Za-z_][A-Za-z0-9_]*=[^$`(;&|]*$|dotenv\b|dotenv_if_exists\b|layout\s|use\s|PATH_add\s|source_up\b|watch_file\s)).+", re.M)),
+)
+
+
+ARMING_HINT = ("Show the owner the exact command and let them add it by hand, or ask for a one-time permit.")
+
+
+def agent_arming(path, body):
+    """OP-017 for one file about to be written. `body` is the new text, or None when a shell command
+    writes it and the text cannot be seen, in which case the write itself is the finding."""
+    p = canon(path or "")
+    for rx, reads, signal in ARMING_FILES:
+        if not rx.search(p):
+            continue
+        if body is None:
+            return [("OP-017", "shell write to %s: %s" % (p, reads), ARMING_HINT)]
+        if signal is None or signal.search(body[:400000]):
+            return [("OP-017", "command written into %s: %s" % (p, reads), ARMING_HINT)]
+    return []
+
+
+# --------------------------------------------------------------------------- #
+# loss reach: the same losses by other routes (0.3.12)
+# --------------------------------------------------------------------------- #
+# A delete sent through a carrier, a delete that wears another tool's name, work thrown away by a
+# git maintenance verb, a file of secrets overwritten, a remote store emptied, and fetched code run
+# unread. Each uses the rule that already names the loss; only the route is new.
+CARRIED_DELETE_RE = re.compile(r"\brm\s+(?:-[A-Za-z]+\s+)*-[A-Za-z]*[rR]|\brm\s+--recursive\b|\bRemove-Item\b.*-Recurse"
+                                 r"|\bfind\b.*\s-delete\b|\bshred\s|\bmkfs|\bdd\s+.*\bof=/dev/")
+
+
+SSH_VALUE_FLAGS = set("-i -p -o -l -J -F -L -R -D -b -c -e -m -S -W -w -E -B -I -Q".split())
+
+
+FETCH_PIPE_RE = re.compile(r"\b(?:curl|wget)\b[^|;&\n]*?(https?://[^\s'\"|;&)]+)[^|;&\n]*\|\s*(?:sudo\s+(?:-\S+\s+)*)?(?:ba|z|da|k)?sh\b")
+# `bash <(curl URL)`; Lite's FETCH_SUBST_RE is the `$(curl ...)` form, without the URL as a group
+FETCH_PROC_SUBST_RE = re.compile(r"\b(?:(?:ba|z)?sh|source|\.)\s+<\(\s*(?:curl|wget)\b[^)]*?(https?://[^\s'\")]+)")
+
+
+KNOWN_INSTALLERS_RE = re.compile(
+    r"^https://(sh\.rustup\.rs|get\.docker\.com|bun\.sh/install|astral\.sh/uv/install\.sh|deno\.land/install\.sh|get\.pnpm\.io/"
+    r"|fly\.io/install\.sh|ollama\.com/install\.sh|claude\.ai/install\.sh|sh\.brew\.sh"
+    r"|raw\.githubusercontent\.com/(Homebrew/install|nvm-sh/nvm|pyenv/pyenv-installer|ohmyzsh/ohmyzsh|rbenv/rbenv-installer)/)")
+
+
+JUNK_NAME_RE = re.compile(r"^(\*\.(pyc|pyo|o|obj|class|log|tmp|temp|swp|swo|orig|rej|bak|map)|\*~|__pycache__|\.DS_Store|Thumbs\.db"
+                          r"|node_modules|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.cache|dist|build|target|\*\.egg-info|\.tox|coverage|\.coverage)$")
+
+
+SHARED_BRANCH_RE = re.compile(r"^(main|master|trunk|develop|release[/\-].*|prod.*)$")
+
+
+CARRIER_HINT = "Name the one path, show the owner the command, and let them run it where it lands."
+
+
+FETCH_HINT = "Download it to a file, read it, then run the file; or ask the owner for a one-time permit."
+
+
+REMOTE_HINT = "Run it with the tool's dry-run flag first and show the owner the list it would remove."
+
+
+FIND_SCAN_CAP = 30000                                        # directory entries looked at, matches or not
+
+
+def _find_matches(roots, patterns, cwd, limit=4000):
+    """The files a `find` with these -name patterns would select under these roots. Read-only. Capped
+    twice: by matches found, and by entries looked at, so a find over a home folder or a whole disk
+    costs the same small walk as one over a project. The cap is a count, not a clock, so the same
+    tree gives the same answer on any machine."""
+    import fnmatch
+    out, looked = [], 0
+    for r in roots:
+        base = norm(r, cwd)
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in BUILD_DIRS and d != ".git"]
+            looked += 1 + len(filenames)
+            for name in filenames:
+                if not patterns or any(fnmatch.fnmatch(name, pat) for pat in patterns):
+                    out.append(pj(dirpath, name))
+                    if len(out) >= limit:
+                        return out
+            if looked >= FIND_SCAN_CAP:
+                return out
+    return out
+
+
+def loss_reach(cmd, cwd):
+    """Extra STOP hits for one shell command. Reads words and file names; runs nothing."""
+    found = []
+    for rx in (FETCH_PIPE_RE, FETCH_PROC_SUBST_RE):
+        m = rx.search(command_text(cmd))                      # a URL inside a quoted argument is data (receipt cdbaf1cdeea5d8a6)
+        if m and not KNOWN_INSTALLERS_RE.match(m.group(1)):
+            found.append(("OP-018", "network code handed straight to a shell: %s" % m.group(1)[:80], FETCH_HINT))
+    if re.search(r"\|\s*(?:at|batch)\b", mask_quotes(cmd)) and CARRIED_DELETE_RE.search(cmd):
+        found.append(("OP-003", "recursive delete scheduled through at, to run when nobody is watching", CARRIER_HINT))
+    for seg in split_segments(cmd):
+        _, _, via_xargs, bare, inner = root_form(tokenize(seg))
+        if inner is not None:
+            found += [h for h in loss_reach(inner, cwd) if h not in found]
+            continue
+        if not bare:
+            continue
+        prog, args = os.path.basename(bare[0]), bare[1:]
+        flags = [a for a in args if a.startswith("-")]
+        plain = [a for a in args if not a.startswith("-")]
+        dry = any(f in ("--dry-run", "--dryrun", "-n") for f in flags)
+        sent = None
+        if prog in ("ssh", "mosh"):
+            i = 0
+            while i < len(args) and args[i].startswith("-"):
+                i += 2 if args[i] in SSH_VALUE_FLAGS else 1
+            sent = " ".join(args[i + 1:])
+        elif prog in ("docker", "podman", "nerdctl", "kubectl", "oc") and any(a in ("exec", "run") for a in args[:3]):
+            sent = " ".join(args[min(i for i, a in enumerate(args) if a in ("exec", "run")) + 1:])
+        elif prog == "tmux" and plain[:1] in (["send-keys"], ["send"]):
+            sent = " ".join(plain[1:])
+        elif prog in ("busybox", "toybox"):
+            sent = " ".join(args)
+        elif prog == "parallel":
+            sent = " ".join(args[:args.index(":::")] if ":::" in args else args)
+        if sent and CARRIED_DELETE_RE.search(sent):
+            found.append(("OP-003", "recursive delete sent through %s: %s" % (prog, sent[:70]), CARRIER_HINT))
+        elif via_xargs and prog == "rm" and any(re.match(r"^-[A-Za-z]*[rR]", f) for f in flags) \
+                and re.search(r"(?<![<\d])<(?![<(])", mask_quotes(seg)):
+            found.append(("OP-003", "recursive delete fed by xargs from a file: the targets cannot be seen", CARRIER_HINT))
+        elif prog == "tar" and "--remove-files" in flags and re.search(r"(-[A-Za-z]*f\s+|--file[= ])(/dev/null|-)(\s|$)", seg):
+            found.append(("OP-003", "tar --remove-files with the archive thrown away", CARRIER_HINT))
+        elif prog == "osascript" and re.search(r"Finder", seg) and re.search(r"\bdelete\b|\bempty\b.*\btrash\b", seg, re.I):
+            found.append(("OP-003", "Finder told to delete or empty the trash by script", CARRIER_HINT))
+        elif prog == "truncate" and re.search(r"(-s\s*|--size[= ])0\b", seg):
+            targets = resolve_targets([a for a in plain if a != "0"], cwd)
+            why = guarded(lost_work, None, targets)
+            if why:
+                found.append(("OP-011", "truncate empties %s" % why, LOSS_HINT))
+        elif prog == "shred":
+            why = guarded(lost_work, None, resolve_targets(plain, cwd))
+            if why:
+                found.append(("OP-011", "shred destroys %s" % why, LOSS_HINT))
+        elif prog == "find" and ("-delete" in args or re.search(r"-exec(?:dir)?\s+(?:\S*/)?rm\b", seg)):
+            roots = []
+            for a in args:
+                if a.startswith(("-", "(", "!")):
+                    break
+                roots.append(a)
+            names = [args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-name", "-iname")]
+            if not (names and all(JUNK_NAME_RE.match(n) for n in names)):
+                why = guarded(lost_work, None, guarded(_find_matches, [], roots or ["."], names, cwd)[:600])
+                if why:
+                    found.append(("OP-011", "find removes %s" % why, LOSS_HINT))
+        elif prog == "git" and plain[:1] == ["branch"] and (set(flags) & {"-D"} or {"--delete", "--force"} <= set(flags)) \
+                and any(SHARED_BRANCH_RE.match(b) for b in plain[1:]):
+            found.append(("OP-004", "forced delete of local branch %s" % next(b for b in plain[1:] if SHARED_BRANCH_RE.match(b)),
+                          "Leave the shared branch; delete your own feature branch by name."))
+        elif prog == "git" and plain[:2] == ["reflog", "expire"] and any(re.match(r"--expire(-unreachable)?=(now|all|0)", f) for f in flags):
+            found.append(("OP-011", "git reflog expire removes the record that makes lost commits recoverable", LOSS_HINT))
+        elif prog == "crontab" and "-r" in flags and "-l" not in flags:
+            found.append(("OP-011", "crontab -r removes every scheduled job and keeps no copy",
+                          "Save it first with `crontab -l > crontab.backup`, then edit with `crontab -e`."))
+        elif prog == "rclone" and plain[:1] in (["purge"], ["delete"]) and not dry:
+            found.append(("OP-006", "rclone %s empties %s" % (plain[0], " ".join(plain[1:2])[:60]), REMOTE_HINT))
+        elif prog == "aws" and plain[:2] == ["s3", "sync"] and "--delete" in flags and not dry:
+            found.append(("OP-006", "aws s3 sync --delete removes remote objects that are not in the source", REMOTE_HINT))
+        elif prog == "gsutil" and "rsync" in plain and any(re.match(r"^-[A-Za-z]*d", f) for f in flags) and not dry:
+            found.append(("OP-006", "gsutil rsync -d removes remote objects that are not in the source", REMOTE_HINT))
+        elif prog in ("npm", "pnpm", "yarn") and plain[:1] == ["unpublish"] and not dry:
+            found.append(("OP-005", "npm unpublish removes a published package version for everyone",
+                          "Deprecate it instead, or hand the owner the exact version to remove."))
+        # a file of secrets or data overwritten: `> .env`, `cp x .env`, `mv x .env`
+        dst = None
+        m = re.search(r"(?<![>&\d])>(?![>&])\s*([^\s;&|]+)", mask_quotes(seg))
+        if m:
+            dst = seg[m.start(1):m.end(1)].strip("'\"")
+        elif prog in ("cp", "mv") and len(plain) >= 2:
+            dst = plain[-1]
+        if dst and PRECIOUS_RE.search(norm(dst, cwd)) and not norm(dst, cwd).endswith(ENV_TEMPLATE_ENDS):
+            full = norm(dst, cwd)
+            try:
+                size = os.path.getsize(full) if os.path.isfile(full) else 0
+            except OSError:
+                size = 0
+            why = guarded(lost_work, None, [full]) if size else None
+            if why:
+                found.append(("OP-011", "overwriting %s replaces %s" % (posixpath.basename(full), why), LOSS_HINT))
+    return list(dict.fromkeys(found))[:3]
+
+
+# --------------------------------------------------------------------------- #
+# windows wreck: PowerShell and cmd.exe forms of the same losses (0.3.12)
+# --------------------------------------------------------------------------- #
+# These name their effect in the verb, so they are read on any host and from any shell tool: an
+# agent on Linux can still type `powershell -c` or `cmd /c`. (pattern, rule, what it does, safe way)
+WINDOWS_WRECK = (
+    (re.compile(r"\b(Format-Volume|Clear-Disk|Remove-Partition|Reset-PhysicalDisk)\b", re.I), "OP-014",
+     "a disk or volume is wiped", WRECK_HINT),
+    (re.compile(r"\bdiskpart(\.exe)?\s+/s\b|(?:^|[;&|]\s*)format(\.com)?\s+[A-Za-z]:", re.I), "OP-014",
+     "a disk or volume is formatted", WRECK_HINT),
+    (re.compile(r"\bcipher(\.exe)?\s+/w\b", re.I), "OP-014", "free space is overwritten, which ends file recovery", WRECK_HINT),
+    (re.compile(r"\bvssadmin(\.exe)?\s+delete\s+shadows\b|\bwmic\b.*\bshadowcopy\b.*\bdelete\b|\bwbadmin(\.exe)?\s+delete\b", re.I), "OP-011",
+     "the restore points are deleted, the copies Windows keeps for getting files back", LOSS_HINT),
+    (re.compile(r"\bwevtutil(\.exe)?\s+(cl|clear-log)\b|\bClear-EventLog\b", re.I), "OP-011",
+     "an event log is cleared and nothing keeps a copy", LOSS_HINT),
+    (re.compile(r"\brobocopy(\.exe)?\b.*\s/(MIR|PURGE)\b", re.I), "OP-003",
+     "robocopy /MIR deletes everything in the destination that is not in the source", CARRIER_HINT),
+    (re.compile(r"\[(?:System\.)?IO\.Directory\]::Delete\s*\([^)]*,\s*\$true", re.I), "OP-003",
+     "a .NET recursive directory delete", CARRIER_HINT),
+    (re.compile(r"\b(?:iex|Invoke-Expression)\b[^;|\n]*\b(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod|DownloadString)\b"
+                r"|\b(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b[^;\n]*\|\s*(?:iex|Invoke-Expression)\b"
+                r"|DownloadString\s*\([^)]*\)[^;\n]*\|\s*(?:iex|Invoke-Expression)\b", re.I), "OP-018",
+     "network code handed straight to PowerShell", FETCH_HINT),
+    (re.compile(r"\bStop-Process\b[^;|\n]*-Name\s+['\"]?\*|\btaskkill(\.exe)?\b[^;|\n]*/IM\s+['\"]?\*", re.I), "OP-013",
+     "every process is told to stop", KILL_HINT),
+    (re.compile(r"\breg(\.exe)?\s+delete\s+['\"]?(HKLM|HKEY_LOCAL_MACHINE|HKCR|HKEY_CLASSES_ROOT)(\\(SYSTEM|SOFTWARE|SAM|SECURITY))?['\"]?(\s|$)", re.I),
+     "OP-014", "a whole registry hive or its top key is deleted", WRECK_HINT),
+)
+
+
+def windows_wreck(cmd):
+    """Extra STOP hits for the PowerShell and cmd.exe verbs above. Quoted text that is only printed
+    or committed is not a command, so the scan runs on the command with quoted strings masked,
+    except for the fetch-and-run and .NET forms, whose arguments are quoted by nature."""
+    found, masked = [], mask_quotes(cmd)
+    for m in re.finditer(r"\b(?:powershell|pwsh|cmd)(?:\.exe)?\b[^\n]*?\s(?:-c(?:ommand)?|/c)\s+(['\"])(.*?)\1", cmd, re.I | re.S):
+        found += windows_wreck(m.group(2))                   # the string handed to powershell -c or cmd /c
+    for rx, rule, what, hint in WINDOWS_WRECK:
+        text = cmd if rule in ("OP-018",) or "IO" in rx.pattern else masked
+        if rule == "OP-018" and re.match(r"^\s*(echo|Write-Host|Write-Output|git\s+commit)\b", cmd, re.I):
+            continue
+        if rx.search(text):
+            found.append((rule, what, hint))
+    return list(dict.fromkeys(found))[:2]
+
+
+# --------------------------------------------------------------------------- #
+# chains: steps that are each ordinary and only harmful together (0.3.12)
+# --------------------------------------------------------------------------- #
+# The gate keeps a small ledger per session: one line for each step that could be the first half of
+# a chain, written only when that step was let through. A later call is judged against it. The
+# verdict is a function of the ledger and the call: the same history and the same call give the
+# same answer, and a stop names each earlier step with its time and its receipt.
+CHAIN_WINDOW_S = 12 * 3600
+
+
+CHAIN_PENDING = {"sid": "", "marks": []}
+
+
+LOCAL_HOST_RE = re.compile(r"^(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[?::1\]?|host\.docker\.internal|[\w.-]+\.(local|localhost|test|internal))$", re.I)
+
+
+SECRET_FILE_RE = re.compile(r"(^|/)(\.env(\.(?!example|sample|template|dist)[\w.-]+)?|id_(rsa|ed25519|ecdsa|dsa)|\.netrc|\.git-credentials|\.pypirc"
+                            r"|[^/]*service[_-]?account[^/]*\.json|[^/]*\.(pem|key|p12|pfx))$"
+                            r"|(^|/)\.aws/credentials$|(^|/)\.config/gh/hosts\.yml$|(^|/)\.kube/config$|(^|/)\.docker/config\.json$")
+
+
+READ_PROGS = {"cat", "less", "more", "head", "tail", "bat", "grep", "egrep", "rg", "awk", "sed", "base64", "xxd", "strings", "cut", "tee", "nl"}
+
+
+BUILD_HOOK_FILES = {"conftest.py": ("pytest", "tox", "nox"), "noxfile.py": ("nox",), "setup.py": ("pip", "pip3", "uv", "python", "python3"),
+                    "build.rs": ("cargo",)}
+
+
+PROCESS_CALL_RE = re.compile(r"\bos\.system\s*\(|\bsubprocess\.|\bos\.popen\s*\(|\bpty\.spawn\s*\(|std::process::Command|Command::new\s*\(")
+
+
+CHAIN_HINT = "Show the owner the earlier steps and this one together, and let them allow it once."
+
+
+def session_of(payload):
+    """The host's session for this call. Cursor names it conversation_id on tool events."""
+    p = payload or {}
+    return str(p.get("session_id") or p.get("sessionId") or p.get("conversation_id") or p.get("conversationId") or "")[:64]
+
+
+def _chain_path(sid):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", sid)[:80]
+    return pj(OP_HOME, "state", "chain", safe + ".jsonl") if safe else None
+
+
+def chain_ledger(sid):
+    """The marks this session has left, oldest first, inside the look-back window."""
+    path, out, now = _chain_path(sid), [], time.time()
+    if not path or not os.path.isfile(path):
+        return out
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f.readlines()[-600:]:
+                try:
+                    m = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(m, dict) and now - float(m.get("t", 0)) <= CHAIN_WINDOW_S:
+                    out.append(m)
+    except Exception:
+        pass
+    return out
+
+
+def chain_commit(receipt_digest):
+    """Write the pending marks of a call that was let through. Called from write_receipt."""
+    sid, marks = CHAIN_PENDING.get("sid"), CHAIN_PENDING.get("marks") or []
+    CHAIN_PENDING["marks"] = []
+    path = _chain_path(sid or "")
+    if not path or not marks:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            for m in marks:
+                f.write(json.dumps(dict(m, t=time.time(), receipt=(receipt_digest or "")[:16]), sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
+def _hosts(seg):
+    return [h for h in re.findall(r"https?://(\[[^\]]+\]|[^/\s:'\"@]+)", seg)]
+
+
+def _sends_out(prog, args, seg):
+    """Where this command sends data, or None. A local address is not out."""
+    hosts = [h for h in _hosts(seg) if not LOCAL_HOST_RE.match(h)]
+    if prog in ("curl", "wget", "http", "https", "xh"):
+        posts = any(re.match(r"^(-d|--data.*|-F|--form.*|-T|--upload-file|--post-data.*|--post-file.*|--json)$", a) for a in args) \
+            or re.search(r"(-X|--request)[= ]?\s*(POST|PUT|PATCH)\b", seg, re.I) or (prog in ("http", "https", "xh") and args[:1] in (["POST"], ["PUT"]))
+        return hosts[0] if posts and hosts else None
+    if prog in ("nc", "ncat", "netcat", "socat", "telnet"):
+        dest = next((a for a in args if not a.startswith("-") and not LOCAL_HOST_RE.match(a) and re.search(r"[A-Za-z]", a)), None)
+        return dest
+    if prog in ("scp", "rsync", "sftp"):
+        dest = next((a for a in args if re.match(r"^[\w.-]+@?[\w.-]*:[^/\\]|^[\w.-]+@[\w.-]+:", a)), None)
+        return dest.split(":")[0] if dest and not LOCAL_HOST_RE.match(dest.split("@")[-1].split(":")[0]) else None
+    if prog == "gh" and args[:2] == ["gist", "create"]:
+        return "a GitHub gist"
+    return None
+
+
+def chain_marks(payload, cwd, effects, known=None):
+    """What this call leaves behind for a later call to be judged against. `known` is what the
+    session already holds; left out, it is read from the session's ledger."""
+    tool = str(payload.get("tool_name") or payload.get("toolName") or "").lower()
+    ti = payload.get("tool_input") or payload.get("toolInput") or {}
+    if not isinstance(ti, dict):
+        ti = {"command": ti}
+    marks, cmd = [], str(ti.get("command") or ti.get("cmd") or "")
+    if known is None:
+        known = chain_ledger(session_of(payload))
+    note = lambda kind, path, **extra: marks.append(dict(extra, kind=kind, path=path, preview=redact(cmd or ("%s %s" % (tool, path)))[:140]))
+    if tool in ("read", "view", "read_file"):
+        fp = norm(str(ti.get("file_path") or ti.get("path") or ""), cwd)
+        if fp and SECRET_FILE_RE.search(fp):
+            note("read_secret", fp)
+        prints = file_key_prints(fp) if fp else set()
+        if prints:                                            # fingerprints only; the key itself is never kept
+            note("found_key", fp, prints=sorted(prints)[:20])
+    if tool in WRITE_TOOLS:
+        body = str(ti.get("content") or ti.get("new_string") or "")
+        for wp in write_paths(tool, ti, cwd):
+            m = PROCESS_CALL_RE.search(body) if posixpath.basename(wp) in BUILD_HOOK_FILES else None
+            if m:
+                note("build_hook", wp, line=body[:m.start()].count("\n") + 1)
+    for seg in split_segments(cmd) if cmd else []:
+        _, _, _, bare, inner = root_form(tokenize(seg))
+        if inner is not None:
+            sub = chain_marks({"tool_name": "bash", "tool_input": {"command": inner}}, cwd, [], list(known) + marks)
+            marks += [dict(m, preview=redact(cmd)[:140]) for m in sub]
+            continue
+        if not bare:
+            continue
+        prog, args = os.path.basename(bare[0]), bare[1:]
+        plain = [a for a in args if not a.startswith("-")]
+        if prog in ("curl", "wget"):
+            url = next((a for a in args if re.match(r"^https?://", a)), "")
+            out = None
+            for i, a in enumerate(args[:-1]):
+                if a in ("-o", "--output", "-O", "--output-document") and not args[i + 1].startswith("-"):
+                    out = args[i + 1]
+            m = re.search(r"(?<![>&\d])>(?![>&])\s*([^\s;&|]+)", mask_quotes(seg))
+            if m and not out:
+                out = seg[m.start(1):m.end(1)].strip("'\"")
+            if not out and url and (prog == "wget" or any(a in ("-O", "--remote-name") or re.match(r"^-[A-Za-z]*O", a) for a in args)):
+                out = posixpath.basename(url.split("?")[0]) or None
+            if out and url and out not in ("-", "/dev/null") and not KNOWN_INSTALLERS_RE.match(url):
+                note("fetched", norm(out, cwd), url=url[:120])
+        elif prog == "ln" and any(re.match(r"^-[A-Za-z]*s", a) for a in args) and len(plain) >= 2:
+            target, link = norm(plain[-2], cwd), norm(plain[-1], cwd)
+            if os.path.isdir(link):
+                link = pj(link, posixpath.basename(target))
+            if not is_inside(target, cwd) or SECRET_FILE_RE.search(target):
+                note("symlinked", link, target=target)
+        elif prog in READ_PROGS or prog == "cp":
+            for a in (plain[:-1] if prog == "cp" else plain):
+                fp = norm(a, cwd)
+                if SECRET_FILE_RE.search(fp):
+                    note("read_secret", fp)
+                    break
+            for a in (plain[:-1] if prog == "cp" else plain)[:12]:
+                fp = norm(a, cwd)
+                prints = file_key_prints(fp)
+                if prints:                                    # fingerprints only; the key itself is never kept
+                    note("found_key", fp, prints=sorted(prints)[:20])
+        elif prog == "git" and (plain[:1] == ["commit"] and (set(args) & {"--no-verify", "-n"})):
+            note("check_off", cwd, what="a commit made with --no-verify")
+        elif prog == "git" and plain[:2] == ["config", "core.hooksPath"] and len(plain) >= 3 and plain[2] in ("/dev/null", "", "/var/empty"):
+            note("check_off", cwd, what="git hooks pointed at nothing")
+        elif prog in ("rm", "mv", "chmod") and any(re.search(r"(^|/)(\.git/hooks/|\.husky/)", norm(a, cwd)) for a in plain):
+            if prog != "chmod" or any(re.match(r"^(-x|a-x|[0-6][0-6][0-6])$", a) for a in args):
+                note("check_off", cwd, what="a git hook removed or switched off")
+        if prog in ("cp", "mv") and len(plain) >= 2:          # a fetched file keeps its origin under a new name
+            src, dst = norm(plain[-2], cwd), norm(plain[-1], cwd)
+            origin = next((k for k in reversed(list(known) + marks) if k.get("kind") == "fetched" and k.get("path") == src), None)
+            if origin:
+                note("fetched", pj(dst, posixpath.basename(src)) if os.path.isdir(dst) else dst, url=origin.get("url"))
+    return marks
+
+
+CHAIN_RUNNABLE_RE = re.compile(r"\.(sh|bash|zsh|ksh|command|py|js|mjs|cjs|ts|rb|pl|php)$", re.I)
+
+
+CHAIN_LAUNCH_RE = re.compile(PROCESS_CALL_RE.pattern + r"|\bimport\s+subprocess\b|\bfrom\s+subprocess\b|\bos\.exec[lv]p?e?\s*\(|\bos\.spawn[lv]p?e?\s*\("
+                             r"|\bchild_process\b|\bexec(File)?(Sync)?\s*\(|\bspawn(Sync)?\s*\(|\bsystem\s*\(|\bpopen\s*\(|\bshell_exec\s*\("
+                             r"|\bpassthru\s*\(|\brunpy\.|%x[({\[]|`")
+
+
+CHAIN_ARGV_RE = re.compile(r"\bsys\.argv\b|\bprocess\.argv\b|\bARGV\b|\bargparse\b|\boptparse\b|\bgetopt\b")
+
+
+CODE_FLAGS = ("-c", "-e", "--eval")
+
+
+def chain_launched(args, cwd, fetched):
+    """Fetched files an interpreter would start as a process from its own code: inline code, or the
+    script it is handed, that makes a process call and either names the file in a string or hands on
+    its arguments while the file is one of them. A fetched file that is only data is not counted,
+    and neither is Operator's own sealed-copy runner, which keeps the run inside a sealed copy."""
+    inline, script, rest, i = None, None, [], 0
+    while i < len(args):
+        a = args[i]
+        if a in CODE_FLAGS and inline is None and script is None and i + 1 < len(args):
+            inline = args[i + 1]
+            i += 2
+            continue
+        if script is not None or inline is not None:
+            rest.append(a)
+        elif not a.startswith("-"):
+            script = a
+        i += 1
+    body, path = "", norm(script, cwd) if script else ""
+    if path and os.path.isfile(path) and os.path.getsize(path) <= 262144:
+        if os.path.realpath(path) == os.path.realpath(pj(os.path.dirname(os.path.abspath(__file__)), "sealed.py")):
+            return []
+        with open(path, encoding="utf-8", errors="replace") as f:
+            body = f.read()
+    code = inline if inline is not None else body
+    if not code or not CHAIN_LAUNCH_RE.search(code):
+        return []
+    handed = [norm(a, cwd) for a in rest if not a.startswith("-")] if CHAIN_ARGV_RE.search(code) else []
+    hits = []
+    for fp in fetched:
+        name = posixpath.basename(fp)
+        if not name or not (CHAIN_RUNNABLE_RE.search(name) or os.access(fp, os.X_OK)):
+            continue
+        named = (name in code) if inline is not None else bool(re.search(r"['\"][^'\"\n]*" + re.escape(name), code))
+        if named or fp in handed:
+            hits.append(fp)
+    return hits
+
+
+def chain_runs(bare, seg, cwd, piped=None, fetched=()):
+    """The files this step would execute: the program itself when it is named by path, the script
+    handed to a shell or an interpreter, a file fed to one on stdin, the file `cat` pipes into it,
+    or a fetched file the interpreter's own code starts as a process."""
+    while len(bare) > 1 and bare[0] in ("exec", "command", "builtin", "time"):
+        bare = bare[1:]
+    prog, args = os.path.basename(bare[0]), bare[1:]
+    plain = [a for a in args if not a.startswith("-")]
+    if prog in SHELL_PROGS or code_prog(prog) or prog in ("source", "."):
+        out = [norm(a, cwd) for a in plain[:1]]
+        masked = mask_quotes(seg)
+        m = re.search(r"(?<![<\d&])<(?![<(&])\s*([^\s;&|<>]+)", masked)
+        if m:
+            out.append(norm(seg[m.start(1):m.end(1)].strip("'\""), cwd))
+        if not plain and piped:
+            out.append(piped)
+        if code_prog(prog) and fetched:
+            out += guarded(chain_launched, [], args, cwd, list(fetched))
+        return out
+    if "/" in bare[0] or bare[0].endswith((".sh", ".py", ".js", ".rb", ".pl")):
+        return [norm(bare[0], cwd)]
+    return []
+
+
+def chain_reach(payload, cwd, effects, seen=None):
+    """OP-019: does this call complete a chain? The earlier step can be an earlier call of this
+    session, read from its ledger, or an earlier step of this same command (a && b, a; b, a | b)."""
+    sid = session_of(payload)
+    if seen is None:
+        seen = chain_ledger(sid) if sid else []
+    tool = str(payload.get("tool_name") or payload.get("toolName") or "").lower()
+    ti = payload.get("tool_input") or payload.get("toolInput") or {}
+    if not isinstance(ti, dict):
+        ti = {"command": ti}
+    cmd, found = str(ti.get("command") or ti.get("cmd") or ""), []
+    when = lambda m: time.strftime("%H:%M:%S", time.localtime(float(m.get("t", 0))))
+    step = lambda m: ("earlier in this same command, `%s`" % str(m.get("preview", ""))[:90]) if m.get("same") else \
+        "at %s `%s` (receipt %s)" % (when(m), str(m.get("preview", ""))[:90], m.get("receipt") or "n/a")
+    last = lambda kind, test=lambda m: True: next((m for m in reversed(seen) if m.get("kind") == kind and test(m)), None)
+    link_at = lambda path: last("symlinked", lambda m: m.get("path") == path)
+    through = lambda wp, m: ("OP-019", "write through %s, a link this session made to %s %s" % (wp, m.get("target"), step(m)), CHAIN_HINT)
+    # a write through a link an earlier call made
+    written = list(write_paths(tool, ti, cwd)) if tool in WRITE_TOOLS else []
+    written += [w for e in effects or [] for w in (e.get("writes") or [])]
+    for wp in written:
+        m = link_at(norm(wp, cwd))
+        if m:
+            found.append(through(wp, m))
+            break
+    piped = None                                              # the file the step before this one printed with cat
+    for seg in split_segments(cmd) if cmd else []:
+        _, _, _, bare, inner = root_form(tokenize(seg))
+        if inner is None and bare and os.path.basename(bare[0]) in SHELL_PROGS and "-c" in bare[1:-1]:
+            inner = bare[bare.index("-c", 1) + 1]             # sh -c '...' with no sudo in front
+        if inner is not None:
+            found += chain_reach(dict(payload, tool_input={"command": inner}), cwd, [], seen)
+            piped = None
+            continue
+        if bare:
+            prog, args = os.path.basename(bare[0]), bare[1:]
+            plain = [a for a in args if not a.startswith("-")]
+            # running a file this session fetched
+            for ran in chain_runs(bare, seg, cwd, piped, [x.get("path") for x in seen if x.get("kind") == "fetched"]):
+                m = last("fetched", lambda x, ran=ran: x.get("path") == ran)
+                if m:
+                    found.append(("OP-019", "running %s, which this session fetched from %s %s" % (ran, m.get("url"), step(m)),
+                                  ("Fetch it on its own first, read the file" if m.get("same") else "Read the file")
+                                  + ", show the owner what it does, and let them allow it once."))
+                    break
+            # sending data out after reading a secret
+            dest = _sends_out(prog, args, seg)
+            m = last("read_secret") if dest else None
+            if m:
+                found.append(("OP-019", "sending data to %s after this session read %s %s" % (dest, m.get("path"), step(m)), CHAIN_HINT))
+            # running the tool that executes a build file the session wired to launch a process
+            for name, tools in BUILD_HOOK_FILES.items():
+                runs = prog in tools and not (prog in ("python", "python3") and not any(a in ("setup.py", "pytest", "-m") for a in args)) \
+                    and not (prog in ("pip", "pip3", "uv") and not any(a in (".", "-e", "install") for a in args))
+                m = last("build_hook", lambda x, name=name: posixpath.basename(x.get("path", "")) == name and is_inside(x.get("path", ""), cwd)) if runs else None
+                if m:
+                    found.append(("OP-019", "%s will run %s, which this session wrote with a process call on line %s %s"
+                                  % (prog, m.get("path"), m.get("line"), step(m)), CHAIN_HINT))
+                    break
+            # pushing after a check was switched off
+            if prog == "git" and plain[:1] == ["push"]:
+                m = last("check_off", lambda x: same_path(x.get("path", ""), cwd) or is_inside(cwd, x.get("path", "")))
+                if m:
+                    found.append(("OP-019", "push after %s %s" % (m.get("what"), step(m)),
+                                  "Run the checks that were skipped, or show the owner why they were skipped."))
+            # a write through a link made earlier in this same command
+            if any(x.get("same") and x.get("kind") == "symlinked" for x in seen):
+                for wp in [w for e in guarded(analyze, [], seg, cwd, 1) for w in (e.get("writes") or [])]:
+                    m = link_at(norm(wp, cwd))
+                    if m and m.get("same"):
+                        found.append(through(wp, m))
+                        break
+        # what this step leaves behind for the steps after it in the same command
+        seen += [dict(m, same=True) for m in guarded(chain_marks, [], {"tool_name": "bash", "tool_input": {"command": seg}}, cwd, [], seen)]
+        cat = [a for a in bare[1:] if not a.startswith("-")] if bare and os.path.basename(bare[0]) == "cat" else []
+        piped = norm(cat[0], cwd) if len(cat) == 1 else None
+    return list(dict.fromkeys(found))[:2]
+
+
+FLOOR_HINT = ("Name the one folder you mean, inside the project, as a literal path; write \"${VAR:?}\" "
+              "when a variable is part of it. The owner deletes a root or a home folder by hand.")
+
+
+SHORT_NAME_RE = re.compile(r"~\d+$")
+
+
+WIN_DRIVE_RE = re.compile(r"^(?:([A-Za-z]):[\\/]*|/(cygdrive/|mnt/)?([A-Za-z])/?)$")
+
+
+WIN_PATH_RE = re.compile(r"^(?:([A-Za-z]):[\\/]+|/(cygdrive/|mnt/)?([A-Za-z])/)(.+)$")
+
+
+WIN_SYSTEM_DIRS = {"windows", "program files", "program files (x86)", "programdata"}
+
+
+PURE_SUBST_RE = re.compile(r"\$\(\s*([a-z]+)((?:\s+-[A-Za-z-]+)*)\s+('[^']*'|\"[^\"$`]*\"|[^\s()$`'\"]+)\s*\)")
+
+
+PWD_SUBST_RE = re.compile(r"\$\(\s*pwd(?:\s+-[LP])?\s*\)|`\s*pwd\s*`")
+
+
+UNKNOWN_RE = re.compile(r"\$\((?:[^()]|\([^()]*\))*\)|`[^`]*`|\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*")
+
+
+def floor_eval(word, cwd):
+    """One delete argument with the substitutions the gate can make the way the shell will: the home
+    folder, the working directory, cygpath, dirname, realpath. Returns the text, and the pieces only
+    the running shell can fill in."""
+    def pure(m):
+        prog, arg = m.group(1), m.group(3).strip("'\"")
+        if prog == "cygpath":
+            return canon_windows(arg)
+        if prog == "dirname":
+            return posixpath.dirname(norm(arg, cwd)) or "/"
+        if prog in ("realpath", "readlink"):
+            return norm(arg, cwd)
+        return m.group(0)
+
+    w = word
+    for _ in range(4):
+        before = w
+        w = w.replace("${HOME}", HOME).replace("$HOME", HOME)
+        if cwd:
+            w = w.replace("${PWD}", cwd).replace("$PWD", cwd)
+            w = PWD_SUBST_RE.sub(lambda m: cwd, w)
+        w = PURE_SUBST_RE.sub(pure, w)
+        if w == before:
+            break
+    return tilde(w), UNKNOWN_RE.findall(w)
+
+
+def floor_reach(text, cwd):
+    """Why this path is below the floor, as a phrase, or None: a filesystem or drive root, a home
+    folder or a parent of one, a Windows short-name alias for a top-level folder, a parent of the
+    working directory, a top-level system folder."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if not t.strip("/\\"):
+        return "the filesystem root"
+    m = WIN_DRIVE_RE.match(t)
+    if m and (m.group(1) or m.group(2) or IS_WINDOWS):
+        return "the root of drive %s:" % (m.group(1) or m.group(3)).upper()
+    m = WIN_PATH_RE.match(t)
+    if m and (m.group(1) or m.group(2) or IS_WINDOWS):
+        parts = [p for p in re.split(r"[\\/]+", m.group(4)) if p]
+        if parts and parts[0].lower() in ("users", "documents and settings", "home") and len(parts) <= 2:
+            return "a Windows home folder (%s)" % t if len(parts) == 2 else "the folder that holds every home folder (%s)" % t
+        if parts and len(parts) <= 2 and SHORT_NAME_RE.search(parts[-1]):
+            return "a short-name alias for a top-level folder (%s)" % t
+        if len(parts) == 1 and parts[0].lower() in WIN_SYSTEM_DIRS:
+            return "a Windows system folder (%s)" % t
+        if not IS_WINDOWS:
+            return None
+    p = real(norm(t, cwd))
+    if p == "/":
+        return "the filesystem root"
+    if same_path(p, HOME):
+        return "your home folder"
+    if is_same_or_ancestor(p, HOME):
+        return "a parent of your home folder (%s)" % p
+    c = real(canon(cwd)) if cwd and not cwd.startswith(UNKNOWN_CWD) else ""
+    if c and not same_path(p, c) and is_same_or_ancestor(p, c) and not (is_scratch(p) and p.count("/") > 2):
+        return "a parent of the working directory (%s)" % p
+    if p.count("/") == 1 and os.path.isdir(p) and not is_scratch(p):
+        return "a top-level system folder (%s)" % p
+    return None
+
+
+def floor_hits(e, cwd):
+    """OP-012 for one recursive delete. A resolved target is judged as it stands. A target only the
+    running shell can fill in is judged at its worst case, every unknown piece empty, because that
+    is how `rm -rf "$DIR/"` becomes a delete of the root."""
+    if e.get("kind") != "delete" or not e.get("recursive") or e.get("filtered"):
+        return []
+    try:
+        words = shlex.split(e.get("seg") or "", posix=True)[1:]
+    except ValueError:
+        words = []
+    words = [w for w in words if w and not w.startswith("-")]
+    found = []
+    for t in e.get("targets") or []:
+        why = floor_reach(t, cwd)
+        if why:
+            found.append("recursive delete of %s" % why)
+    for w in words:
+        text, unknown = floor_eval(w, cwd)
+        if not unknown:
+            if e.get("unresolved") or not (set(w) & set("$`")):
+                why = floor_reach(text, cwd)
+                if why:
+                    found.append("recursive delete of %s" % why)
+            continue
+        if not e.get("unresolved") or all(":?" in u for u in unknown):
+            continue                                         # resolved by the analyzer, or the shell aborts when empty
+        worst = UNKNOWN_RE.sub("", text).rstrip("*")
+        why = floor_reach(worst, cwd) if worst.strip() else None
+        if why:
+            found.append("recursive delete of %s if %s %s empty when this runs"
+                         % (why, " and ".join(unknown[:2]), "is" if len(unknown) == 1 else "are"))
+    return [("OP-012", d, FLOOR_HINT) for d in list(dict.fromkeys(found))[:1]]
+
+
+# ---- protected files: the owner's contracts on how a named file may change (OP-022) --------------- #
+# append-only: bytes may only be added at the end, so what is there now is never rewritten.
+# read-only:   no change at all without the owner.
+# Contracts live in commitments.json under "file_contracts", which only the owner writes (OP-000).
+FILE_CONTRACTS = ("append-only", "read-only")
+
+
+APPEND_ONLY_PROGS = {"echo", "printf", "cat", "date", "jq"}        # programs that write nothing but stdout
+
+
+FULL_WRITE_TOOLS = {"write", "create_file", "write_file"}
+
+
+INLINE_WRITE_RE = re.compile(
+    r"""open\s*\([^)]*,\s*(?:mode\s*=\s*)?['"][^'"]*[wax+]|\.write(?:_text|_bytes)?\s*\(|write(?:File|FileSync)|"""
+    r"""append(?:File|FileSync)|unlink|remove\s*\(|rename|replace\s*\(|truncate|rmSync|rmtree|copyfile|copy2?\s*\(|move\s*\(""")
+
+
+REDIRECT_RE = re.compile(r"(\d*|&)(>>|>\||>)\s*([^\s<>|&;()]+)")
+
+
+PROTECTED_EVIDENCE = []                  # append-only files a passing call adds to, with the bytes before
+
+
+def file_contracts(cfg, cwd):
+    """[(path, contract)] from the owner's commitments."""
+    out = []
+    for c in (cfg or {}).get("file_contracts") or []:
+        if isinstance(c, dict) and c.get("contract") in FILE_CONTRACTS and isinstance(c.get("path"), str) and c["path"].strip():
+            out.append((norm(c["path"], cwd), c["contract"]))
+    return out
+
+
+def _file_bytes(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def prefix_evidence(path):
+    """{path, size_before, sha256_before} for a file as it is now (size 0 when it does not exist yet)."""
+    data = _file_bytes(path) or b""
+    return {"path": path, "size_before": len(data), "sha256_before": hashlib.sha256(data).hexdigest()}
+
+
+def _pure_append(e, path, cwd):
+    """True when this segment adds to path only at the end: an append redirection from a program that
+    writes nothing else, or tee -a."""
+    prog = posixpath.basename(str(e.get("prog") or ""))
+    seg = str(e.get("seg") or "")
+    reds = [m.group(2) for m in REDIRECT_RE.finditer(seg)
+            if m.group(3) and not m.group(3).startswith("&") and same_path(norm(m.group(3).strip("'\""), e.get("cwd") or cwd), path)]
+    if prog == "tee":
+        return ("-a" in (e.get("flags") or []) or "--append" in seg) and not [r for r in reds if r != ">>"]
+    return prog in APPEND_ONLY_PROGS and bool(reds) and all(r == ">>" for r in reds)
+
+
+def _inline_writes(e, path):
+    """True when inline code (python -c, node -e) names this file and writes, moves or removes something."""
+    text = str(e.get("text") or e.get("seg") or "")
+    names = {path, posixpath.basename(path), short_home(path)}
+    return any(n and n in text for n in names) and bool(INLINE_WRITE_RE.search(text))
+
+
+def _git_touches(e, path, cwd):
+    """True when this git command would delete, move or throw away the current bytes of path. A file git
+    holds unchanged loses nothing to a discard; git rm and git mv change it whatever its state."""
+    root = git_top(e.get("git_dir") or e.get("cwd") or cwd)
+    if not root or not is_inside(path, root):
+        return False
+    sub, ga = str(e.get("sub") or ""), [str(a) for a in e.get("gargs") or []]
+    rel = os.path.relpath(path, root)
+    here = e.get("cwd") or cwd
+    named = any(a in (".", rel) or same_path(norm(a, here), path) or is_same_or_ancestor(norm(a, here), path)
+                for a in ga if not a.startswith("-"))
+    if sub in ("rm", "mv"):
+        return named
+    discards = {"clean": True, "restore": True, "stash": True,
+                "reset": any(a in ("--hard", "--merge", "--keep") for a in ga),
+                "checkout": "--" in ga or "-f" in ga or "--force" in ga or named,
+                "switch": any(a in ("-f", "--force", "--discard-changes") for a in ga)}
+    if not discards.get(sub):
+        return False
+    st = git_out(root, ["status", "--porcelain", "--untracked-files=all", "--", rel])
+    if st is None:
+        return True                          # git could not say: the contract holds
+    if not st.strip():
+        return False                         # git holds these bytes unchanged
+    untracked = st.startswith("??")
+    if sub == "clean":
+        return untracked
+    if sub == "stash":
+        return not untracked or any(a in ("-u", "--include-untracked", "-a", "--all") for a in ga)
+    return not untracked
+
+
+def protected_change(path, contract, tool, ti, effects, cwd):
+    """Why this call breaks the contract on path, or '' when it keeps it."""
+    if tool in WRITE_TOOLS:
+        if not any(same_path(w, path) for e in effects for w in e.get("writes") or []):
+            return ""
+        if contract == "append-only" and tool in FULL_WRITE_TOOLS:
+            body, old = ti.get("content"), _file_bytes(path) or b""
+            if isinstance(body, str) and body.encode("utf-8").startswith(old):
+                PROTECTED_EVIDENCE.append(prefix_evidence(path))
+                return ""                          # the whole old content, then more: a pure append
+        return "the %s tool would %s it" % (tool, "replace" if tool in FULL_WRITE_TOOLS else "edit")
+    appended = False
+    for e in effects:
+        seg = str(e.get("seg") or "")[:70]
+        for t in e.get("targets") or []:
+            if isinstance(t, str) and is_same_or_ancestor(t, path):
+                return "`%s` would %s it" % (seg, "move" if e.get("kind") == "move" else "delete")
+        if any(isinstance(w, str) and same_path(w, path) for w in e.get("writes") or []):
+            if contract == "append-only" and _pure_append(e, path, cwd):
+                appended = True
+                continue
+            return "`%s` would rewrite it" % seg
+        if e.get("kind") == "inline" and _inline_writes(e, path):
+            return "inline code in `%s` would write to it" % seg
+        if e.get("kind") == "git" and guarded(_git_touches, True, e, path, cwd):
+            return "`%s` would throw its current bytes away" % seg
+    if appended:
+        PROTECTED_EVIDENCE.append(prefix_evidence(path))
+    return ""
+
+
+def protected_hits(payload, cwd, effects, cfg):
+    """OP-022: a call that would change a protected file in a way its contract does not allow."""
+    contracts = file_contracts(cfg, cwd)
+    if not contracts:
+        return []
+    tool = str(payload.get("tool_name") or payload.get("toolName") or "").lower()
+    ti = payload.get("tool_input") or {}
+    ti = ti if isinstance(ti, dict) else {}
+    hits = []
+    for path, contract in contracts:
+        why = protected_change(path, contract, tool, ti, effects, cwd)
+        if why:
+            hint = ("Add to the end with `>>` or `%s append %s`; anything else needs the owner." % (self_cmd(), short_home(path))
+                    if contract == "append-only" else "Leave it as it is, or ask the owner.")
+            hits.append(("OP-022", "%s is %s, and %s" % (short_home(path), contract, why), hint))
+    return hits
+
+
+def receipt_rows():
+    """Every receipt row, oldest first."""
+    rows, rdir = [], pj(OP_HOME, "receipts")
+    try:
+        names = sorted(n for n in os.listdir(rdir) if n.endswith(".jsonl"))
+    except OSError:
+        return rows
+    for n in names:
+        try:
+            with open(pj(rdir, n), encoding="utf-8") as f:
+                rows += [json.loads(line) for line in f if line.strip()]
+        except (OSError, ValueError):
+            continue
+    return rows
+
+
+def protected_check(path, rows):
+    """(checked, first_broken_row) for one file: each recorded append says how many bytes were there
+    before and their digest; those bytes must still be there, byte for byte."""
+    data = _file_bytes(path) or b""
+    checked = 0
+    for r in rows:
+        for ev in ([r] if r.get("decision") == "APPEND" else (r.get("protected") or [])):
+            if not isinstance(ev, dict) or not same_path(str(ev.get("path") or ""), path):
+                continue
+            n = int(ev.get("size_before") or 0)
+            checked += 1
+            if len(data) < n or hashlib.sha256(data[:n]).hexdigest() != ev.get("sha256_before"):
+                return checked, r
+    return checked, None
+
+
+def _when(ts):
+    try:
+        return time.strftime("%m-%d %H:%M UTC", time.strptime(str(ts), "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return str(ts or "?")
+
+
+def cmd_append(argv):
+    """`append <path>`: add stdin to the end of a file under an append-only contract. The receipt, with
+    the size and digest of what was there before, is written first: no receipt, no append."""
+    if not argv:
+        print("usage: %s append <path>   (reads what to add from stdin)" % self_cmd())
+        return 2
+    cwd = os.getcwd()
+    path = norm(argv[0], cwd)
+    if not any(same_path(p, path) and c == "append-only" for p, c in file_contracts(load_config(), cwd)):
+        print("Refusing: %s has no append-only contract. The owner adds one with `%s protect %s --append-only`."
+              % (short_home(path), self_cmd(), short_home(path)))
+        return 2
+    data = sys.stdin.buffer.read()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        if fcntl:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        ev = prefix_evidence(path)
+        rd = write_receipt(dict(ev, decision="APPEND", source="owner-tty" if sys.stdin.isatty() else "append",
+                                contract="append-only", bytes=len(data)))
+        if rd is None:
+            print("Not appended: the receipt could not be written, and an append without one would be unprovable.")
+            return 1
+        left = memoryview(data)
+        while left:
+            n = os.write(fd, left)
+            left = left[n:]
+        os.fsync(fd)
+        after = os.fstat(fd).st_size
+    finally:
+        if fcntl:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
+    if after < ev["size_before"] + len(data):
+        write_receipt({"decision": "APPEND_PARTIAL", "path": path, "size_after": after, "of": ev["size_before"] + len(data)})
+        print("Appended only part: %d of %d bytes (receipt %s)." % (after - ev["size_before"], len(data), rd[:16]))
+        return 1
+    print("Appended %d bytes to %s; the %d bytes before them are recorded (receipt %s)."
+          % (len(data), short_home(path), ev["size_before"], rd[:16]))
+    return 0
+
+
+def cmd_protected(argv):
+    """`protected` lists the owner's file contracts and checks every one against its receipts."""
+    contracts = file_contracts(load_config(), os.getcwd())
+    if not contracts:
+        print("No protected files. The owner adds one with `%s protect <path> --append-only` (or --read-only)." % self_cmd())
+        return 0
+    rows, bad = receipt_rows(), 0
+    for path, contract in contracts:
+        checked, broken = protected_check(path, rows)
+        if broken:
+            bad += 1
+            print("BROKEN  %s (%s): bytes recorded before an append at %s have changed (receipt %s)"
+                  % (short_home(path), contract, broken.get("ts"), str(broken.get("digest") or "")[:16]))
+        elif checked:
+            print("OK      %s (%s): its earlier bytes match all %d recorded append%s"
+                  % (short_home(path), contract, checked, "" if checked == 1 else "s"))
+        else:
+            print("OK      %s (%s): no appends recorded yet" % (short_home(path), contract))
+    return 1 if bad else 0
+
+
+def cmd_protect(argv):
+    """`protect <path> --append-only|--read-only|--remove`: the owner names a file and its contract."""
+    if any(os.environ.get(k) for k in AGENT_ENV):
+        print("Refusing: protect changes the owner's rules, so the owner runs it from their own terminal.")
+        return 3
+    flags = [a for a in argv if a.startswith("--")]
+    paths = [a for a in argv if not a.startswith("--")]
+    want = {"--append-only": "append-only", "--read-only": "read-only", "--remove": None}
+    if len(paths) != 1 or len(flags) != 1 or flags[0] not in want:
+        print("usage: %s protect <path> --append-only|--read-only|--remove" % self_cmd())
+        return 2
+    path = norm(paths[0], os.getcwd())
+    cpath = pj(OP_HOME, "commitments.json")
+    try:
+        with open(cpath, encoding="utf-8") as f:
+            user = json.load(f)
+    except FileNotFoundError:
+        user = {}
+    except ValueError:
+        print("Refusing: %s does not parse; fix it first, it was left as it is." % cpath)
+        return 1
+    keep = [c for c in user.get("file_contracts") or [] if not (isinstance(c, dict) and same_path(norm(str(c.get("path") or ""), "/"), path))]
+    if want[flags[0]]:
+        keep.append({"path": path, "contract": want[flags[0]]})
+    user["file_contracts"] = keep
+    os.makedirs(OP_HOME, exist_ok=True)
+    tmp = cpath + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(user, f, indent=2)
+    os.replace(tmp, cpath)
+    write_receipt({"decision": "CONTRACT", "path": path, "contract": want[flags[0]] or "removed", "source": "owner-tty"})
+    print("%s is now %s." % (short_home(path), want[flags[0]] or "unprotected"))
+    return 0
+
+
+def xargs_substituted(cmd):
+    """The commands `xargs -I R cmd` runs when its input is a here-string or a literal echo/printf.
+    Heredoc bodies and quoted text are data: an xargs written there is not the one that runs."""
+    found = []
+    cmd = extract_heredocs(cmd)[0]
+    masked = mask_quotes(cmd)
+    live = lambda at: masked[at:at + 5] == "xargs"
+    for m in re.finditer(r"\bxargs\b" + _XARGS_OPTS + r"\s+-I\s*(\S+)\s+([^|;&]+?)\s*<<<\s*('[^']*'|\"[^\"]*\"|[^\s;&|]+)", cmd):
+        if live(m.start()):
+            found.append((m.group(2), m.group(3), m.group(4)))
+    for m in re.finditer(r"(?:^|[;&|]\s*)(?:echo|printf(?:\s+'[^']*'|\s+\"[^\"]*\")?)\s+([^|;&]+?)\s*\|\s*(xargs)\b"
+                         + _XARGS_OPTS + r"\s+-I\s*(\S+)\s+([^|;&]+)", cmd):
+        if live(m.start(2)):
+            found.append((m.group(4), m.group(5), m.group(1)))
+    out = []
+    for ph, body, word in found:
+        try:
+            words = shlex.split(word)
+        except ValueError:
+            words = [word]
+        for w in words[:8]:
+            w = w if re.fullmatch(r"[\w@%+=:,./~-]+", w) else shlex.quote(w)
+            out.append(body.replace(ph, w).strip())
+    return list(dict.fromkeys(out))
+
+
+# ---- memory at the gate: what this session was already stopped for, and keys it found ------------ #
+LOSS_RULES = {"OP-001", "OP-002", "OP-003", "OP-011", "OP-012", "OP-014"}
+
+
+# a recursive delete stopped under these is the same delete when it goes piece by piece; a workspace
+# root (OP-001) is different: deleting its children one by one is that rule's own compliant path
+PIECEWISE_RULES = {"OP-002", "OP-003", "OP-012"}
+
+
+KEY_VALUE_RES = (
+    re.compile(r"\b(sk-(?:ant-|proj-)?[A-Za-z0-9_\-]{20,}|sk_live_[A-Za-z0-9]{16,}|rk_live_[A-Za-z0-9]{16,}"
+               r"|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|glpat-[A-Za-z0-9_\-]{20,}"
+               r"|xox[abprs]-[A-Za-z0-9-]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{35}"
+               r"|eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})"),
+    re.compile(r"(?im)^\s*(?:export\s+)?[A-Z0-9_]*(?:TOKEN|API_?KEY|SECRET|PASSWORD|PASSWD|AUTH)[A-Z0-9_]*\s*[:=]\s*['\"]?([A-Za-z0-9_\-./+=]{16,})"),
+)
+
+
+CANDIDATE_RE = re.compile(r"[A-Za-z0-9_\-./+=]{16,}")
+
+
+CLOUD_CLI = {"railway", "fly", "flyctl", "vercel", "heroku", "netlify", "aws", "gcloud", "az", "doctl", "kubectl",
+             "terraform", "pulumi", "supabase", "firebase", "stripe", "render", "wrangler", "neonctl", "turso", "planetscale", "pscale"}
+
+
+REMOTE_CHANGE_RE = re.compile(r"(?i)(?:-X|--request)[= ]?\s*['\"]?(?:DELETE|PUT|PATCH|POST)\b|\bmutation\b"
+                              r"|\b(?:delete|destroy|drop|purge|wipe|remove|terminate|teardown|down|deploy|apply|scale)\b")
+
+
+def key_prints(text):
+    """Short fingerprints of the credential-shaped values in a text. The values are never stored."""
+    prints = set()
+    for rx in KEY_VALUE_RES:
+        for m in rx.finditer(text or ""):
+            v = m.group(1)
+            if v and len(v) >= 16:
+                prints.add(hashlib.sha256(v.encode("utf-8", "replace")).hexdigest()[:16])
+    return prints
+
+
+def file_key_prints(path):
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) <= 262144:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return key_prints(f.read())
+    except Exception:
+        pass
+    return set()
+
+
+def chain_note_stop(sid, effects, meta, rule, receipt):
+    """Remember what a STOP was aimed at, so a different spelling of the same action meets it."""
+    path = _chain_path(sid or "")
+    targets, writes = [], []
+    for e in effects or []:
+        if e.get("kind") == "delete":
+            targets += e.get("targets") or []
+        writes += e.get("writes") or []
+    targets += (meta or {}).get("lite_deletes") or []
+    writes += (meta or {}).get("lite_writes") or []
+    # a write is a target only when it replaces a file that is there: a file the stopped call would have
+    # made fresh (a script it meant to run) loses nothing when it is written again
+    targets += [w for w in writes if isinstance(w, str) and os.path.isfile(w)]
+    targets = [t for t in dict.fromkeys(targets) if isinstance(t, str) and t.startswith("/")][:20]
+    if not path or not targets:
+        return
+    mark = {"kind": "stopped", "targets": targets, "rule": rule, "receipt": (receipt or "")[:16],
+            "preview": redact(" ".join(str((meta or {}).get("normalized") or "").split()))[:140], "t": time.time(),
+            "spelling": str((meta or {}).get("spelling") or ""),
+            "rules": list((meta or {}).get("stop_rules") or [rule])}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(mark, sort_keys=True) + "\n")
+
+
+MACHINE_LEDGER_MAX = 4000                # lines kept in the shared ledger
+
+
+def _machine_path():
+    return pj(OP_HOME, "state", "chain", "_machine.jsonl")
+
+
+def machine_note(mark):
+    """Add a stop to the ledger every session on this machine reads, trimmed to its newest lines."""
+    path = _machine_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(mark, sort_keys=True) + "\n")
+    if os.path.getsize(path) > 2 * 1024 * 1024:
+        with open(path, encoding="utf-8") as f:
+            keep = f.readlines()[-MACHINE_LEDGER_MAX // 2:]
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(keep)
+        os.replace(tmp, path)
+
+
+def machine_stops(sid):
+    """Targets the gate stopped in other sessions on this machine, inside the look-back window."""
+    path, out, now = _machine_path(), [], time.time()
+    if not os.path.isfile(path):
+        return out
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()[-MACHINE_LEDGER_MAX:]
+    except OSError:
+        return out
+    for line in lines:
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(m, dict) and m.get("kind") == "stopped" and m.get("targets") and m.get("sid") != sid \
+                and now - float(m.get("t", 0)) <= CHAIN_WINDOW_S:
+            out.append(m)
+    return out
+
+
+def _home_forms(path):
+    """The ways a command or script names a path under the home folder."""
+    if HOME and path.startswith(HOME + "/"):
+        rest = path[len(HOME):]
+        return {path, "~" + rest, "$HOME" + rest, "${HOME}" + rest}
+    return {path}
+
+
+def _empties(folder, deletes):
+    """True when these deletes take everything visible in folder: a wildcard over it, or every one of its
+    entries named. Clearing a few chosen entries (build output) is not emptying it."""
+    if any(isinstance(d, str) and d.endswith("/*") and same_path(d[:-2], folder) for d in deletes):
+        return True
+    try:
+        entries = [n for n in os.listdir(folder) if not n.startswith(".")]
+    except OSError:
+        return False
+    return bool(entries) and all(any(same_path(d, pj(folder, n)) for d in deletes) for n in entries)
+
+
+def spelling_of(payload, cwd):
+    """The exact call: its tool, working folder and input. Sent again unchanged it is the same action, not
+    a second spelling of it, so it keeps its action id and the owner's permit for that id still applies."""
+    p = payload or {}
+    ti = p.get("tool_input") or p.get("toolInput") or {}
+    tool = str(p.get("tool_name") or p.get("toolName") or "")
+    return hashlib.sha256(json.dumps([tool, cwd, ti], sort_keys=True, ensure_ascii=False, default=str)
+                          .encode("utf-8")).hexdigest()[:16]
+
+
+def second_spelling(payload, cwd, effects, meta, stopped, cross=False):
+    """OP-020: this call reaches a target the gate stopped earlier by another route. `stopped` holds this
+    session's marks, or with cross=True the marks of other sessions on the machine, where only a route
+    that deletes, empties or overwrites the target counts, never merely naming it. In this session, the
+    stopped call itself sent again is not another route: its own rules judge it, as they did the first time."""
+    tool = str(payload.get("tool_name") or payload.get("toolName") or "").lower()
+    if tool in WRITE_TOOLS:
+        return []                                             # editing files is the compliant path, never a respelling
+    same = "" if cross else guarded(spelling_of, "", payload, cwd)
+    prior = [m for m in stopped if same and m.get("spelling") == same]
+    if prior:
+        # this exact call was stopped before: it gets that verdict again, so it keeps its action id
+        if "OP-020" not in (prior[-1].get("rules") or [prior[-1].get("rule")]):
+            return []                                         # its own rule stopped it, and judges it again
+        stopped = [m for m in stopped if m.get("spelling") != same]
+    ti = payload.get("tool_input") or payload.get("toolInput") or {}
+    cmd = str((ti.get("command") or ti.get("cmd") or "") if isinstance(ti, dict) else ti)
+    deletes, overwrites, opaque, texts = set(), set(), False, []
+    for e in effects or []:
+        if e.get("kind") == "delete":
+            deletes.update(e.get("targets") or [])
+        overwrites.update(e.get("writes") or [])
+        if e.get("unresolved") or e.get("kind") == "inline":
+            opaque = True
+    deletes.update((meta or {}).get("lite_deletes") or [])
+    overwrites.update((meta or {}).get("lite_writes") or [])
+    deleting = bool(deletes) or any(e.get("kind") == "delete" for e in effects or []) \
+        or bool(re.search(r"(^|[\s;&|(`])(rm|rmdir|unlink|shred|find|rsync|trash)\b", cmd))
+    for seg in split_segments(cmd) if cmd else []:
+        _, _, _, bare, _ = root_form(tokenize(seg))
+        if not bare:
+            continue
+        if code_prog(os.path.basename(bare[0])) and any(a in CODE_FLAGS for a in bare[1:]):
+            opaque = True
+        for ran in guarded(chain_runs, [], bare, seg, cwd):
+            if os.path.isfile(ran) and os.path.getsize(ran) <= 262144:
+                with open(ran, encoding="utf-8", errors="replace") as f:
+                    texts.append(f.read())
+                opaque = True
+    if opaque and cmd:
+        texts.append(cmd)
+    wild = []
+    if cross:
+        # another session's stop counts only for a route the ordinary rules cannot read (a script, inline code,
+        # an unresolved command): a direct command the rules judged is left to them. Only the paid reader's
+        # deletes and writes count, and Lite's reading only to see a folder emptied; a syntax check runs nothing.
+        if not opaque:
+            return []
+        deletes = {d for e in effects or [] if e.get("kind") == "delete" for d in e.get("targets") or []}
+        overwrites = {w for e in effects or [] for w in e.get("writes") or []}
+        if not re.search(r"(^|[\s;&|(])(?:ba|z|k|da)?sh\s+-n\b", cmd):
+            wild = [d for d in (meta or {}).get("lite_deletes") or [] if isinstance(d, str)]
+    for m in reversed(stopped):
+        for t in m.get("targets") or []:
+            # the project or a folder holding it is named by ordinary work all the time; only a delete
+            # that covers it, or that empties it with a wildcard, is the stopped action again
+            holds_cwd = same_path(t, cwd) or is_inside(cwd, t)
+            forms = {f for f in _home_forms(t) if len(f) > 3}
+            how = None
+            if any(same_path(d, t) or is_inside(t, d) for d in deletes):
+                how = "deletes"
+            elif cross and _empties(t, wild):
+                how = "empties"
+            elif not cross and not holds_cwd and m.get("rule") in PIECEWISE_RULES and any(is_inside(d, t) for d in deletes):
+                how = "deletes what is inside"                # piece by piece is the same delete
+            elif deleting and any(re.search(re.escape(f) + r"/(\*|\.\*|\{)", cmd) for f in forms):
+                how = "empties"
+            elif m.get("rule") in LOSS_RULES and any(same_path(w, t) for w in overwrites) \
+                    and not re.search(r">>\s*['\"]?[^\s;&|]*" + re.escape(posixpath.basename(t)) + r"\b", cmd):
+                how = "overwrites"                            # an append keeps what is there; a truncation does not
+            elif not cross and not holds_cwd and texts and any(f in x for x in texts for f in forms):
+                how = "names"
+            if how:
+                when = time.strftime("%H:%M:%S", time.localtime(float(m.get("t", 0))))
+                where = (" in another session (%s, %s)" % (str(m.get("sid") or "?")[:8], m.get("source") or "unknown host")) if cross else ""
+                return [("OP-020", "%s %s, which the gate stopped at %s%s under %s (receipt %s, `%s`)"
+                         % (how, t, when, where, m.get("rule"), m.get("receipt") or "n/a", str(m.get("preview") or "")[:80]),
+                         "Do what the first stop named, or ask the owner to allow that first action once.")]
+    return []
+
+
+def found_key_use(payload, cwd, keys):
+    """OP-021: a remote write, delete or deploy carrying a key this session found in a file."""
+    ti = payload.get("tool_input") or payload.get("toolInput") or {}
+    cmd = str((ti.get("command") or ti.get("cmd") or "") if isinstance(ti, dict) else ti)
+    if not cmd:
+        return []
+    prints = {hashlib.sha256(c.encode("utf-8", "replace")).hexdigest()[:16] for c in CANDIDATE_RE.findall(cmd)}
+    hit = next((m for m in reversed(keys) if prints & set(m.get("prints") or [])), None)
+    if not hit:
+        return []
+    remote = False
+    for seg in split_segments(cmd):
+        _, _, _, bare, _ = root_form(tokenize(seg))
+        if not bare:
+            continue
+        prog, args = os.path.basename(bare[0]), bare[1:]
+        if _sends_out(prog, args, seg) or (prog in CLOUD_CLI and REMOTE_CHANGE_RE.search(seg)) \
+                or (prog in ("curl", "wget", "http", "https", "xh", "gh") and REMOTE_CHANGE_RE.search(seg)):
+            remote = True
+            break
+    if not remote:
+        return []
+    when = time.strftime("%H:%M:%S", time.localtime(float(hit.get("t", 0))))
+    return [("OP-021", "this call carries a key the session found in %s at %s (receipt %s)"
+             % (hit.get("path"), when, hit.get("receipt") or "n/a"),
+             "Ask the owner which credential this task should use; a key that turned up in a file is not one.")]
+
+
+def memory_reach(payload, cwd, effects, meta):
+    """The rules that need this session's memory: OP-020 and OP-021."""
+    sid = session_of(payload)
+    seen = chain_ledger(sid) if sid else []
+    found = []
+    stopped = [m for m in seen if m.get("kind") == "stopped" and m.get("targets")]
+    if stopped:
+        found += guarded(second_spelling, [], payload, cwd, effects, meta, stopped)
+    # In Lite a stop holds for the rest of its own session. Carrying the owner's no across sessions,
+    # hosts and other agent CLIs is the paid Operator's.
+    keys = [m for m in seen if m.get("kind") == "found_key" and m.get("prints")]
+    if keys:
+        found += guarded(found_key_use, [], payload, cwd, keys)
+    return found
+
+
+# ---- the brake: a session stopped again and again is a runaway, and its changes are held (OP-024) ---- #
+BRAKE_AT = 8                             # stops of one session inside the window that trip the brake
+
+
+BRAKE_WINDOW_S = 300
+
+
+BRAKE_QUIET_S = 15 * 60                  # the brake lets go after this long without a stop
+
+
+GIT_READ_SUBS = {"status", "log", "diff", "show", "blame", "rev-parse", "ls-files", "grep", "describe",
+                 "shortlog", "reflog", "cat-file", "ls-tree", "remote", "branch", "tag", "config",
+                 "diff-tree", "diff-index", "diff-files", "ls-remote", "merge-base", "rev-list", "for-each-ref",
+                 "show-ref", "name-rev", "check-ignore", "check-attr", "count-objects", "cherry", "range-diff",
+                 "whatchanged", "var"}
+
+
+GIT_READ_VERBS = {"worktree": {"list"}, "stash": {"list", "show"}}   # read only with these verbs: a bare `git stash` pushes
+
+
+QUIET_SINKS = {"/dev/null", "/dev/stdout", "/dev/stderr"}           # writing here changes nothing on disk
+
+
+AWK_PROGS = {"awk", "gawk", "mawk", "nawk"}
+
+
+AWK_WRITE_RE = re.compile(r"\bprintf?\b[^;}\n]*?(?:>|\|)|\bsystem\s*\(|\|&|\|\s*getline")
+
+
+# Vestige MCP tools that only read, and the action or mode that makes a mixed tool read
+VESTIGE_READ_TOOLS = {"recall", "forgotten_lesson", "precedent", "memory_status", "session_start", "selftest", "receipt"}
+
+
+VESTIGE_READ_CHOICES = {"memory": ("action", {"get", "get_batch", "state"}),
+                        "codebase": ("action", {"get_context", "verify"}),
+                        "intention": ("action", {"list", "check"}),
+                        "dedup": ("action", {"scan", "policy"}),
+                        "project": ("action", {"preview"}),
+                        "backfill": ("action", {"receipts"}),
+                        "ghostlink": ("mode", {"propose", "bounty", "map", "inspect", "explore", "predict"})}
+
+
+MCP_READ_VERB_RE = re.compile(r"(?:get|list|read|search|describe|view|show|find|lookup)(?:_|$)")
+
+
+def brake_path():
+    return pj(OP_HOME, "state", "brake.json")
+
+
+def _brake_state():
+    try:
+        with open(brake_path(), encoding="utf-8") as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _brake_save(st):
+    path = brake_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    os.replace(tmp, path)
+
+
+def brake_at():
+    """Stops that trip the brake: OPERATOR_BRAKE_AT in the hook's own environment (the owner's, never an
+    agent shell's), default BRAKE_AT; 0 turns the brake off."""
+    try:
+        return max(0, int(os.environ.get("OPERATOR_BRAKE_AT", BRAKE_AT)))
+    except ValueError:
+        return BRAKE_AT
+
+
+def brake_note_stop(sid):
+    """Count a stop for this session. True when this stop is the one that trips the brake."""
+    if not brake_at():
+        return False
+    now, st = time.time(), _brake_state()
+    e = st.get(sid) or {}
+    e["stops"] = [t for t in e.get("stops") or [] if now - float(t) <= BRAKE_WINDOW_S] + [now]
+    e["last_stop"] = now
+    tripped = not e.get("engaged") and len(e["stops"]) >= brake_at()
+    if tripped:
+        e["engaged"] = now
+    st[sid] = e
+    st = {k: v for k, v in st.items() if now - float(v.get("last_stop") or 0) <= max(BRAKE_QUIET_S, BRAKE_WINDOW_S)}
+    _brake_save(st)
+    return tripped
+
+
+def brake_engaged(sid):
+    """The brake record of this session when its brake is on, else None."""
+    e = _brake_state().get(sid) if sid else None
+    if not e or not e.get("engaged") or time.time() - float(e.get("last_stop") or 0) > BRAKE_QUIET_S:
+        return None
+    return e
+
+
+def mcp_reads_only(tool, tool_input):
+    """An MCP call reads when its tool is a known Vestige read (or a mixed tool called with a reading action or
+    mode), or another server's tool whose name starts with a reading verb. Anything else counts as a change."""
+    parts = str(tool or "").lower().split("__")
+    server, name = (parts[1] if len(parts) > 2 else ""), parts[-1]
+    ti = tool_input if isinstance(tool_input, dict) else {}
+    if "vestige" in server:
+        if name in VESTIGE_READ_TOOLS:
+            return True
+        if name == "causal_walk":
+            return ti.get("promote") is not True          # promote records trail edges on the legacy engine
+        if name == "backfill" and ti.get("dry_run") is True:
+            return True
+        key, reads = VESTIGE_READ_CHOICES.get(name, (None, ()))
+        return bool(key) and str(ti.get(key) or "") in reads
+    return bool(MCP_READ_VERB_RE.match(name))
+
+
+def awk_reads_only(e):
+    """An awk program that only prints to standard output reads: no `print > file`, `print | cmd`, system(),
+    `cmd | getline`, program file or in-place edit."""
+    if posixpath.basename(str(e.get("prog") or "")) not in AWK_PROGS:
+        return False
+    if any(str(f).startswith(("-f", "-i", "-l", "-E", "--file", "--include", "--load", "--exec", "--source"))
+           for f in e.get("flags") or []):
+        return False
+    return not any(AWK_WRITE_RE.search(str(a)) or "inplace" in str(a) for a in e.get("args") or [])
+
+
+def git_reads_only(e):
+    """A git call reads when its subcommand only reads, or takes a reading verb (`worktree list`, `stash show`)."""
+    sub = str(e.get("sub") or "")
+    if sub in GIT_READ_SUBS:
+        return True
+    args = [str(a) for a in e.get("args") or []]
+    verbs = [a for a in args[args.index(sub) + 1:] if not a.startswith("-")] if sub in args else []
+    return bool(verbs) and verbs[0] in GIT_READ_VERBS.get(sub, ())
+
+
+def changes_anything(tool, effects, tool_input=None):
+    """False only for a call that reads: no write, delete, move, code that could write, outbound send or
+    changing git. An MCP call is judged by its tool and action (mcp_reads_only)."""
+    t = str(tool or "").lower()
+    if t.startswith("mcp__"):
+        return not mcp_reads_only(t, tool_input)
+    if t in WRITE_TOOLS:
+        return True
+    for e in effects or []:
+        if any(str(w) not in QUIET_SINKS for w in e.get("writes") or []):
+            return True
+        if e.get("targets") or e.get("kind") in ("delete", "move") or e.get("unresolved"):
+            return True
+        if e.get("kind") == "inline" and not awk_reads_only(e):
+            return True
+        if e.get("kind") == "git" and not git_reads_only(e):
+            return True
+        prog = posixpath.basename(str(e.get("prog") or ""))
+        if prog in HTTP_PROGS and _sends_out(prog, [str(a) for a in e.get("args") or []] + [str(f) for f in e.get("flags") or []], str(e.get("seg") or "")):
+            return True
+    return False
+
+
+def brake_hit(payload, tool, effects):
+    """OP-024: this session's brake is on, and the call would change something."""
+    sid = session_of(payload)
+    e = brake_engaged(sid)
+    if not e or not changes_anything(tool, effects, payload.get("tool_input")):
+        return []
+    left = max(1, int((BRAKE_QUIET_S - (time.time() - float(e.get("last_stop") or 0))) // 60))
+    return [("OP-024", "this session was stopped %d times inside %d minutes, so its changes are held until it goes %d minutes "
+             "without a stop (about %d left) or the owner releases it" % (len(e.get("stops") or []), BRAKE_WINDOW_S // 60,
+                                                                         BRAKE_QUIET_S // 60, left),
+             "Stop and tell the owner what you were trying to do. They release it with `%s brake --release %s`." % (self_cmd(), sid))]
+
+
+def cmd_brake(argv):
+    """`brake` lists sessions whose brake is on; `brake --release <session>` lets one go (the owner)."""
+    if argv[:1] == ["--release"]:
+        if any(os.environ.get(k) for k in AGENT_ENV):
+            print("Refusing: releasing the brake is the owner's call, so the owner runs it from their own terminal.")
+            return 3
+        if len(argv) < 2:
+            print("usage: %s brake --release <session>" % self_cmd())
+            return 2
+        st = _brake_state()
+        if st.pop(argv[1], None) is None:
+            print("No brake on %s." % argv[1])
+            return 2
+        _brake_save(st)
+        write_receipt({"decision": "BRAKE_RELEASED", "released": argv[1], "source": "owner-tty"})
+        print("Released the brake on %s." % argv[1])
+        return 0
+    on = [(k, v) for k, v in _brake_state().items() if brake_engaged(k)]
+    if not on:
+        print("No session's brake is on. It trips when one session is stopped %d times inside %d minutes." % (BRAKE_AT, BRAKE_WINDOW_S // 60))
+        return 0
+    for sid, e in on:
+        print("ON  %s  %d stops, last %s; release: %s brake --release %s"
+              % (sid, len(e.get("stops") or []), time.strftime("%H:%M:%S", time.localtime(float(e.get("last_stop") or 0))), self_cmd(), sid))
+    return 0
+
+
+# ---- watchstander turnover: a compacted session takes the watch before it changes anything ------------ #
+# At a compaction the conversation keeps only a summary. The PreCompact hook seals what this session hands
+# over, read from the gate's own receipts; SessionStart (compact) gives it to the session that continues;
+# until that session takes the watch by its id, its changing calls are held.
+TURNOVER_DAYS = 3                        # day files of receipts a turnover reads for the session's record
+
+
+TURNOVER_KEEP_S = 7 * 24 * 3600          # a turnover never taken stops holding the session after a week
+
+
+TURNOVER_LIST = 12                       # stopped actions, allowed actions and kept copies a turnover names
+
+
+TURNOVER_ACK_RE = re.compile(r"\s*(?:python3?\s+)?\S*operator-gate(?:\.py)?\s+turnover\s+--(?:ack|show)\s+[0-9a-f]{16}\s*")
+
+
+HOLD_RULES = {"OP-024", "OP-025"}        # holds on a session, not verdicts on a target: no ledger mark, no drafted law
+
+
+def turnover_on():
+    """OPERATOR_TURNOVER=0 in the hook's own environment turns turnover off."""
+    return os.environ.get("OPERATOR_TURNOVER", "1").strip() != "0"
+
+
+def turnover_path(sid):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", sid or "")[:80]
+    return pj(OP_HOME, "state", "turnover", safe + ".json") if safe else None
+
+
+def _turnover_load(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) and isinstance(st.get("chit"), dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _turnover_save(path, st):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def session_rows(sid):
+    """This session's receipt rows in the last TURNOVER_DAYS day files, oldest first."""
+    rdir, rows = pj(OP_HOME, "receipts"), []
+    try:
+        names = sorted(n for n in os.listdir(rdir) if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.jsonl", n))[-TURNOVER_DAYS:]
+    except OSError:
+        return rows
+    needle = json.dumps(sid, ensure_ascii=False)
+    for n in names:
+        try:
+            with open(pj(rdir, n), encoding="utf-8") as f:
+                for line in f:
+                    if needle not in line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(r, dict) and r.get("session") == sid:
+                        rows.append(r)
+        except OSError:
+            continue
+    return rows
+
+
+def open_permits(sid):
+    """Permits the owner granted to this session that are still unused and unexpired."""
+    out, pdir, now = [], pj(OP_HOME, "permits"), time.time()
+    try:
+        names = sorted(n for n in os.listdir(pdir) if re.fullmatch(r"[0-9a-f]{24}\.json", n))
+    except OSError:
+        return out
+    for n in names:
+        try:
+            with open(pj(pdir, n), encoding="utf-8") as f:
+                pm = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(pm, dict) and pm.get("session") == sid and float(pm.get("expires") or 0) > now:
+            out.append({"action_id": str(pm.get("action_digest") or n[:24]), "expires": int(float(pm["expires"]))})
+    return out
+
+
+def turnover_chit(sid, trigger, cwd):
+    """What this session hands over, from the gate's own record: the actions it was stopped from, what the
+    owner allowed, permits still open, copies Rewind kept, its brake, the laws and protected files in force,
+    and how many stop marks other sessions on this machine left."""
+    stops, allowed, kept = {}, [], []
+    for r in session_rows(sid):
+        d = r.get("decision")
+        if d == "STOP" and r.get("commitment") not in HOLD_RULES:
+            key = r.get("action_digest") or r.get("digest")
+            s = stops.setdefault(key, {"rule": str(r.get("commitment") or ""),
+                                       "name": str(r.get("rule") or ("your law" if r.get("layer") == "taste" else "")),
+                                       "action": str(r.get("action_preview") or "")[:160],
+                                       "action_id": str(r.get("action_digest") or ""), "times": 0})
+            s["times"] += 1
+            s["receipt"], s["ts"] = str(r.get("digest") or "")[:16], str(r.get("ts") or "")
+        elif d == "ALLOW" and r.get("via") == "permit":
+            allowed.append({"rule": ",".join(r.get("commitments") or []) or str(r.get("commitment") or ""),
+                            "action": str(r.get("action_preview") or "")[:160],
+                            "receipt": str(r.get("digest") or "")[:16]})
+        if isinstance(r.get("rewind"), dict) and r["rewind"].get("id"):
+            kept.append(str(r["rewind"]["id"]))
+    law, laws = active_laws()
+    cfg = guarded(load_config, {}) or {}
+    return {"session": sid, "trigger": str(trigger or ""), "gate_version": VERSION,
+            "sealed": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "stops": sorted(stops.values(), key=lambda s: s.get("ts") or "")[-TURNOVER_LIST:],
+            "allowed": allowed[-TURNOVER_LIST:], "permits": open_permits(sid), "rewind": kept[-TURNOVER_LIST:],
+            "brake": bool(brake_engaged(sid)),
+            "laws": [str(c.get("commitment_id")) for c in laws][:24], "law_digest": str(law.get("law_digest") or "")[:12],
+            "protected": ["%s (%s)" % (p, c) for p, c in guarded(file_contracts, [], cfg, cwd)][:TURNOVER_LIST]}
+
+
+def chit_weight(chit):
+    """What a chit hands over that belongs to this session alone. Laws and protected files come back at
+    every session start anyway, so on their own they hold nothing."""
+    return (len(chit.get("stops") or []) + len(chit.get("allowed") or []) + len(chit.get("permits") or [])
+            + len(chit.get("rewind") or []) + (1 if chit.get("brake") else 0))
+
+
+def turnover_seal(payload, source):
+    """PreCompact: seal what this session hands over as a receipt, and keep it for the session that continues."""
+    sid = session_of(payload)
+    path = turnover_path(sid)
+    if not turnover_on() or not path:
+        return None
+    chit = turnover_chit(sid, payload.get("trigger"), canon(payload.get("cwd") or os.getcwd()))
+    cid = hashlib.sha256(json.dumps(chit, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+    holds = chit_weight(chit) > 0
+    rd = write_receipt({"decision": "TURNOVER_SEALED", "session": sid, "chit": cid, "source": source,
+                        "trigger": chit["trigger"], "stops": len(chit["stops"]), "allowed": len(chit["allowed"]),
+                        "permits": len(chit["permits"]), "holds": holds})
+    st = {"id": cid, "chit": chit, "sealed_t": time.time(), "receipt": (rd or "")[:16], "holds": holds, "acked": None}
+    _turnover_save(path, st)
+    return st
+
+
+def turnover_pending(sid):
+    """The turnover this session has not taken yet, when it hands anything over; else None."""
+    st = _turnover_load(turnover_path(sid)) if sid and turnover_on() else None
+    if not st or st.get("acked") or not st.get("holds") or time.time() - float(st.get("sealed_t") or 0) > TURNOVER_KEEP_S:
+        return None
+    return st
+
+
+def turnover_text(st):
+    """The chit as the session that continues reads it."""
+    c = st["chit"]
+    n = lambda k: len(c.get(k) or [])
+    lines = ["Watch turnover %s for session %s, sealed %s at a %s compaction (Vestige Operator %s). This is the "
+             "gate's own record, not the summary:" % (st["id"], str(c.get("session"))[:8], _when(c.get("sealed")),
+                                                      c.get("trigger") or "", c.get("gate_version"))]
+    if n("stops"):
+        lines.append("Stopped in this session (%d action%s). Do not try these again, or another way round:"
+                     % (n("stops"), "" if n("stops") == 1 else "s"))
+        lines += ["  - %s %s: `%s`%s, receipt %s" % (s.get("rule"), s.get("name"), s.get("action"),
+                                                    " (%d times)" % s["times"] if s.get("times", 0) > 1 else "",
+                                                    s.get("receipt") or "?") for s in c["stops"]]
+    if n("allowed"):
+        lines.append("Allowed once by the owner, and already used:")
+        lines += ["  - %s: `%s`, receipt %s" % (a.get("rule"), a.get("action"), a.get("receipt")) for a in c["allowed"]]
+    if n("permits"):
+        lines.append("Permits still open for this session (each lets one exact action through once):")
+        lines += ["  - action %s, expires %s" % (p.get("action_id"), time.strftime("%H:%M", time.localtime(p.get("expires") or 0)))
+                  for p in c["permits"]]
+    if n("rewind"):
+        lines.append("Rewind kept %d cop%s of work before calls destroyed it; `%s rewind` lists them."
+                     % (n("rewind"), "y" if n("rewind") == 1 else "ies", self_cmd()))
+    if c.get("brake"):
+        lines.append("The brake is on for this session: its changes stay held until it goes quiet or the owner releases it.")
+    if n("laws"):
+        lines.append("Owner laws in force (law digest %s): %s." % (c.get("law_digest"), ", ".join(c["laws"])))
+    if n("protected"):
+        lines.append("Protected files: %s." % "; ".join(c["protected"]))
+    if c.get("other_sessions"):
+        lines.append("Other sessions on this machine left %d stop mark%s in the last %d hours; reaching one of those "
+                     "targets from here is stopped too." % (c["other_sessions"], "" if c["other_sessions"] == 1 else "s",
+                                                           CHAIN_WINDOW_S // 3600))
+    return lines
+
+
+def turnover_hit(payload, tool, effects):
+    """OP-025: this session was compacted and has not taken the watch, and the call would change something.
+    Held are the calls the gate judges by their effects, shell commands and file writes; MCP calls keep to
+    their own rules, so the session can still read its memory while it takes the watch."""
+    st = turnover_pending(session_of(payload))
+    if not st or str(tool or "").lower().startswith("mcp__") or not changes_anything(tool, effects):
+        return []
+    ti = payload.get("tool_input") or {}
+    cmd = str(ti.get("command") or "") if isinstance(ti, dict) else ""
+    if cmd and len(split_segments(cmd)) == 1 and TURNOVER_ACK_RE.fullmatch(cmd):
+        return []                                    # taking the watch is the way out of the hold
+    c = st["chit"]
+    k_s, k_a, k_p = len(c.get("stops") or []), len(c.get("allowed") or []), len(c.get("permits") or [])
+    return [("OP-025", "this session was compacted at %s and has not taken the watch yet: turnover %s hands over %d "
+             "stopped action%s, %d the owner allowed and %d open permit%s"
+             % (_when(c.get("sealed")), st["id"], k_s, "" if k_s == 1 else "s", k_a, k_p, "" if k_p == 1 else "s"),
+             "Take the watch first: run `%s turnover --ack %s`. It prints the record; then make this call again."
+             % (self_cmd(), st["id"]))]
+
+
+def turnover_session_start(argv):
+    """SessionStart after a compaction: the session that continues is handed the watch from the gate's own
+    record, in the shape its host reads. It reads only, prints nothing when there is nothing to hand over,
+    and the session starts whatever happens here."""
+    host = argv[argv.index("--host") + 1] if "--host" in argv[:-1] else "claude"
+    try:
+        raw = read_stdin()
+        payload = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    st = guarded(turnover_pending, None, session_of(payload)) if payload.get("source") == "compact" else None
+    if not st:
+        return 0
+    text = "\n".join(guarded(turnover_text, [], st) + [
+        "Before changing anything, take the watch: run `%s turnover --ack %s`. The gate holds this session's "
+        "changes until then; reads go ahead." % (self_cmd(), st["id"])])
+    if host == "cursor":
+        print(json.dumps({"additional_context": text}))
+    else:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}))
+    return 0
+
+
+def cmd_turnover(argv):
+    """`turnover --pre-compact` (the PreCompact hook) seals what this session hands over; `turnover
+    --session-start` (the SessionStart hook) hands it to the session that continues; `turnover --ack <id>`
+    takes the watch and prints it; `turnover --show <id>` prints one; `turnover` lists them."""
+    if "--session-start" in argv:
+        return turnover_session_start(argv)
+    if argv[:1] == ["--pre-compact"]:
+        source = argv[argv.index("--source") + 1] if "--source" in argv[:-1] else "claude"
+        try:
+            raw = read_stdin()
+            payload = json.loads(raw) if raw.strip() else {}
+            if isinstance(payload, dict) and not os.path.exists(pj(OP_HOME, "DISABLED")) and global_mode() != "off":
+                turnover_seal(payload, source)
+        except Exception:
+            pass                                     # a compaction is never blocked or delayed by the gate
+        return 0
+    tdir, found = pj(OP_HOME, "state", "turnover"), []
+    try:
+        names = sorted(n for n in os.listdir(tdir) if n.endswith(".json"))
+    except OSError:
+        names = []
+    for name in names:
+        st = _turnover_load(pj(tdir, name))
+        if st:
+            found.append((pj(tdir, name), st))
+    if argv[:1] in (["--ack"], ["--show"]):
+        if len(argv) < 2 or not re.fullmatch(r"[0-9a-f]{16}", argv[1]):
+            print("usage: %s turnover --ack <16-hex turnover id>" % self_cmd())
+            return 2
+        hit = next(((p, st) for p, st in found if st.get("id") == argv[1]), None)
+        if not hit:
+            print("No turnover %s. `%s turnover` lists them." % (argv[1], self_cmd()))
+            return 2
+        path, st = hit
+        print("\n".join(turnover_text(st)))
+        if argv[0] == "--ack":
+            if not st.get("acked"):
+                st["acked"] = time.time()
+                _turnover_save(path, st)
+                write_receipt({"decision": "TURNOVER_TAKEN", "session": st["chit"].get("session"), "chit": st["id"],
+                               "source": "agent" if any(os.environ.get(k) for k in AGENT_ENV) else "owner-tty"})
+            print("Watch taken. This session's changes go ahead again, each judged as usual.")
+        return 0
+    if not found:
+        print("No turnovers yet. The PreCompact hook seals one for a session at each compaction.")
+        return 0
+    for _, st in sorted(found, key=lambda x: -float(x[1].get("sealed_t") or 0)):
+        c = st["chit"]
+        state = "taken" if st.get("acked") else ("waiting" if st.get("holds") else "nothing to hand over")
+        print("%s  session %s  sealed %s  %d stopped, %d allowed, %d permits  %s"
+              % (st["id"], str(c.get("session"))[:8], _when(c.get("sealed")), len(c.get("stops") or []),
+                 len(c.get("allowed") or []), len(c.get("permits") or []), state))
+    return 0
+
+
+HTTP_PROGS = {"curl", "wget", "http", "https", "xh"}
+
+
+GRAPHQL_DESTROY_RE = re.compile(r"(?i)\b\w*(?:delete|destroy|drop|purge|wipe|terminate)\w*\s*\(")
+
+
+def remote_delete(cmd, cwd):
+    """OP-023: an HTTP DELETE, or a GraphQL mutation that deletes, destroys, drops, purges, wipes or
+    terminates, sent to a remote API (the PocketOS case). This machine and development hosts are not remote."""
+    hint = "Show the owner what this call would remove and let them allow it once; a local or staging endpoint needs no approval."
+    for seg in split_segments(cmd):
+        _, _, _, bare, _ = root_form(tokenize(seg))
+        if not bare or os.path.basename(bare[0]) not in HTTP_PROGS:
+            continue
+        prog, args = os.path.basename(bare[0]), bare[1:]
+        hosts = [h for h in _hosts(seg) if not LOCAL_HOST_RE.match(h)]
+        if not hosts:
+            continue
+        method = None
+        for i, a in enumerate(args):
+            if a in ("-X", "--request", "--method") and i + 1 < len(args):
+                method = args[i + 1]
+            elif re.match(r"^-X[A-Za-z]+$", a):
+                method = a[2:]
+            elif a.startswith(("--request=", "--method=")):
+                method = a.split("=", 1)[1]
+        if prog in ("http", "https", "xh") and args and args[0].upper() in ("DELETE", "PUT", "POST", "PATCH", "GET"):
+            method = args[0]
+        if method and method.strip("'\"").upper() == "DELETE":
+            return [("OP-023", "an HTTP DELETE to %s" % hosts[0], hint)]
+        body = " ".join(args)
+        at = re.search(r"\bmutation\b", body)
+        m = GRAPHQL_DESTROY_RE.search(body[at.end():]) if at else None
+        if m:
+            return [("OP-023", "a GraphQL mutation `%s` sent to %s" % (m.group(0).rstrip("( "), hosts[0]), hint)]
+    return []
+
+
 def classify(payload, cfg):
     tool_raw = str(payload.get("tool_name") or payload.get("toolName") or "")
     tool = tool_raw.lower()
@@ -3760,7 +6353,24 @@ def classify(payload, cfg):
                 hit = hook_settings_hit(w, cmd)
                 if hit:
                     hits.append(hit)
-        if re.search(r"operator-gate(\.py)?['\"]?\s+(approve|mode|install|uninstall|upgrade\s+--install)\b", cmd):
+        # The floor reads a delete with its command substitutions put back: the analyzer judges each
+        # $(...) on its own and leaves a placeholder where its output would land.
+        subs = iter(SUBST_RE.findall(cmd))
+        for eff in effects_out:
+            if eff.get("kind") == "delete" and "__SUBST__" in (eff.get("seg") or ""):
+                seg = re.sub("__SUBST__", lambda m: next(subs, "__SUBST__"), eff["seg"])
+                hits += guarded(floor_hits, [], dict(eff, seg=seg, unresolved=True), eff.get("cwd") or cwd)
+        if tool not in POWERSHELL_TOOLS:
+            hits += guarded(root_reach, [], cmd, ti.get("run_in_background") is True, cwd)
+            hits += guarded(repo_code_run, [], cmd, cwd)
+            hits += guarded(loss_reach, [], cmd, cwd)
+            hits += guarded(remote_delete, [], cmd, cwd)
+        hits += guarded(windows_wreck, [], cmd)               # read on every shell tool, PowerShell included
+        for eff in effects_out:                               # a redirect, cp, tee or sed -i onto an arming file
+            for w in eff.get("writes") or []:
+                hits += guarded(agent_arming, [], w, None)
+        if re.search(r"operator-gate(\.py)?['\"]?\s+(approve|mode|install|uninstall|upgrade\s+--install|protect|"
+                     r"brake\s[^;&|\n]*--release)\b", cmd):
             hits.append(("OP-000", "agent invoked the gate's owner commands",
                          "Approvals and installs are run by the owner in their own terminal."))
         for m in re.finditer(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", cmd, re.M):
@@ -3788,6 +6398,9 @@ def classify(payload, cfg):
             hit = hook_settings_hit(p, body)
             if hit:
                 hits.append(hit)
+        for p in write_paths(tool, ti, cwd):
+            hits += guarded(written_code, [], p, body)
+            hits += guarded(agent_arming, [], p, body)
         if re.search(r"(sk_live|rk_live|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})", body):
             hits.append(("OP-S04", "credential-shaped string in write", ""))
     elif tool in FETCH_TOOLS:                                # a fetch tool reaches the network without a shell
@@ -3874,6 +6487,17 @@ def classify(payload, cfg):
                 hits.append(("OP-S13", "%s reads sensitive path %s" % (tool_raw, m.group(1)),
                              "Ask the owner before tool calls that touch credentials or identity files."))
                 break
+    if not payload.get("_inner"):
+        shell_call = tool in SHELL_TOOLS or ("command" in ti and tool not in WRITE_TOOLS and not tool.startswith("mcp__"))
+        if shell_call:
+            for sub in guarded(xargs_substituted, [], str(ti.get("command") or ti.get("cmd") or "")):
+                _, _, sub_hits, _, _, sub_fx = classify(dict(payload, tool_input={"command": sub}, _inner=True), cfg)
+                if sub_hits:
+                    hits += [(h[0], "xargs -I runs `%s`: %s" % (sub[:80], h[1]), h[2]) for h in sub_hits]
+                    effects_out += sub_fx
+                    if "xargs-substituted" not in meta["transforms"]:
+                        meta["transforms"].append("xargs-substituted")
+    hits = list(dict.fromkeys(hits))                         # the same finding reached by two routes is one hit
     return tool_raw, cwd, hits, " | ".join(previews)[:400], meta, effects_out
 
 
@@ -3967,6 +6591,12 @@ def write_receipt(rec):
                     f.write(rec["digest"])
             except OSError:
                 pass                              # the append is authoritative; a cache failure cannot fork it
+            if rec.get("decision") != "STOP":                # a stopped call did not happen and leaves no mark
+                guarded(chain_commit, None, rec["digest"])
+            else:
+                CHAIN_PENDING["marks"] = []
+                if rec.get("session"):
+                    BRAKE_TRIPPED["sid"] = rec["session"] if guarded(brake_note_stop, False, rec["session"]) else ""
             return rec["digest"]
         finally:
             unlock_file(lock)
@@ -4069,7 +6699,20 @@ def hook_main(argv):
             return 0
         payload = json.loads(raw) if raw.strip() else {}
         cfg = load_config()
+        del PROTECTED_EVIDENCE[:]
         tool, cwd, hits, preview, meta, fx_effects = classify(payload, cfg)
+        # Session rules: a chain of ordinary steps, a second spelling of a stopped action, a key found in a
+        # file, a file the owner gave a contract, a runaway session and a compacted session's watch.
+        meta["source"] = source
+        meta["spelling"] = guarded(spelling_of, "", payload, cwd)
+        hits += guarded(chain_reach, [], payload, cwd, fx_effects)
+        hits += guarded(memory_reach, [], payload, cwd, fx_effects, meta)
+        hits += guarded(protected_hits, [], payload, cwd, fx_effects, cfg)
+        hits += guarded(brake_hit, [], payload, tool, fx_effects)
+        hits += guarded(turnover_hit, [], payload, tool, fx_effects)
+        BRAKE_TRIPPED["sid"] = ""
+        CHAIN_PENDING["sid"] = session_of(payload)
+        CHAIN_PENDING["marks"] = guarded(chain_marks, [], payload, cwd, fx_effects)
         hits = [h for h in hits if h[0] not in cfg["disabled_rules"]]
 
         gmode = global_mode()
@@ -4079,12 +6722,15 @@ def hook_main(argv):
             mode = cfg["mode_overrides"].get(rid, "shadow" if base == "SHADOW" else "enforce")
             if gmode == "shadow":
                 mode = "shadow"
+            if rid in FLOOR_RULES:                           # the floor holds in every mode but off
+                mode = "enforce"
             (enforce_hits if mode == "enforce" else shadow_hits).append((rid, name, why, detail, hint))
 
         action = {"tool": tool, "source": source, "hits": sorted(set(h[0] for h in hits)),
                   "preview": redact(preview)}
         adigest = digest_of({"tool": tool, "cwd": cwd, "hits": action["hits"], "preview": preview})[:24]
         base_rec = {"source": source, "session": str(payload.get("session_id") or payload.get("sessionId") or "")[:64],
+                    "call": call_of(payload),
                     "cwd": cwd, "tool": tool, "action_digest": adigest, "action_preview": action["preview"],
                     "normalized": redact(meta.get("normalized", "")),
                     "transforms": meta.get("transforms", [])}
@@ -4097,9 +6743,10 @@ def hook_main(argv):
 
         # specificity ordering: rule class first (canary > self > memory > workspaces), then the
         # most specific target (deepest path) -- the hit reported to the agent is the one to act on.
-        priority = ["OP-CANARY", "OP-000", "OP-002", "OP-001", "OP-014", "OP-010", "OP-009", "OP-018", "OP-008",
-                    "OP-004", "OP-011", "OP-003", "OP-005", "OP-006", "OP-007",
-                    "OP-S06", "OP-S17", "OP-S12", "OP-S13", "OP-S07", "OP-S08", "OP-S11", "OP-S01",
+        priority = ["OP-CANARY", "OP-000", "OP-022", "OP-002", "OP-001", "OP-012", "OP-013", "OP-014", "OP-015",
+                    "OP-016", "OP-017", "OP-018", "OP-019", "OP-010", "OP-009", "OP-008", "OP-004",
+                    "OP-003", "OP-011", "OP-005", "OP-006", "OP-023", "OP-007", "OP-021", "OP-020", "OP-024",
+                    "OP-025", "OP-S06", "OP-S17", "OP-S12", "OP-S13", "OP-S07", "OP-S08", "OP-S11", "OP-S01",
                     "OP-S02", "OP-S03", "OP-S04", "OP-S05", "OP-S14", "OP-S15", "OP-S16"]
 
         def hit_depth(detail):
@@ -4112,19 +6759,24 @@ def hook_main(argv):
                                          -hit_depth(h[3]), h[0]))
         soft = {h[0] for h in enforce_hits} <= {"OP-003", "OP-005", "OP-006", "OP-007"}
         if enforce_hits:
-            permit = consume_permit(adigest)
+            floor = any(h[0] in FLOOR_RULES for h in enforce_hits)
+            permit = None if floor else consume_permit(adigest)
             if permit:
                 write_receipt(dict(base_rec, decision="ALLOW", via="permit", commitments=[h[0] for h in enforce_hits]))
                 return 0
             top = enforce_hits[0]
             rd = write_receipt(dict(base_rec, decision="STOP", commitment=top[0], rule=top[1],
                                     commitments=[h[0] for h in enforce_hits], detail=redact(top[3])))
+            meta["stop_rules"] = [h[0] for h in enforce_hits]
+            if top[0] not in HOLD_RULES:                  # a hold on the session says nothing about the target
+                guarded(chain_note_stop, None, base_rec["session"], fx_effects, meta, top[0], rd)
             stop(stop_lines(top, meta.get("transforms"), adigest, rd))
         if shadow_hits:
             write_receipt(dict(base_rec, decision="SHADOW_STOP", commitments=[h[0] for h in shadow_hits],
                                detail=redact("; ".join(h[3] for h in shadow_hits))))
         else:
-            write_receipt(dict(base_rec, decision="PASS", commitments=[]))    # no rule matched
+            write_receipt(dict(base_rec, decision="PASS", commitments=[],    # no rule matched
+                               **({"protected": list(PROTECTED_EVIDENCE)} if PROTECTED_EVIDENCE else {})))
 
         return 0
     except SystemExit:
@@ -4944,6 +7596,20 @@ def guarded_python_command(python, dst):
     return '"%s" -I -c "%s"' % (python, code)
 
 
+def claude_side_command(dst, args):
+    """A Claude Code hook that runs one more gate command, `turnover --pre-compact` or `turnover
+    --session-start`, guarded the same way as the PreToolUse hook."""
+    if IS_WINDOWS:
+        return guarded_python_command(canon(sys.executable), dst).replace(
+            "'hook','--source','claude'", ",".join(repr(a) for a in args))
+    q = shlex.quote(dst)
+    return "[ -f %s ] && python3 %s %s" % (q, q, " ".join(args))
+
+
+TURNOVER_HOOKS = (("PreCompact", "manual|auto", ["turnover", "--pre-compact"]),
+                  ("SessionStart", "compact", ["turnover", "--session-start"]))
+
+
 def is_claude_gate_hook(command):
     """A registration of this gate in Claude Code, in this version's form or an older one."""
     return "operator-gate.py" in command and ("hook --source claude" in command or "'--source','claude'" in command)
@@ -5094,6 +7760,17 @@ def cmd_install(argv):
                 groups[:] = [g for g in groups if g.get("hooks")]
             else:
                 groups.append({"matcher": "*", "hooks": [{"type": "command", "command": hook_cmd}]})
+            # OP-025: at a compaction the session seals what the gate recorded for it, and the session that
+            # continues is handed it before it changes anything
+            for event, matcher, args in TURNOVER_HOOKS:
+                want = claude_side_command(dst, args)
+                lst = settings["hooks"].setdefault(event, [])
+                mine = [hh for g in lst for hh in g.get("hooks", [])
+                        if "operator-gate.py" in hh.get("command", "") and args[1] in hh.get("command", "")]
+                if mine:
+                    mine[0]["command"] = want
+                else:
+                    lst.append({"matcher": matcher, "hooks": [{"type": "command", "command": want, "timeout": 10}]})
             text = json.dumps(settings, indent=2)
             if raw is None or json.loads(raw or "{}") != settings:
                 os.makedirs(os.path.dirname(settings_path), exist_ok=True)   # Claude Code not started yet here
@@ -5106,6 +7783,8 @@ def cmd_install(argv):
                     f.write(text)
             registered = True
             print("claude: PreToolUse hook registered in %s" % settings_path)
+            print("claude: PreCompact hook seals what each compacted session was stopped from, and the "
+                  "SessionStart hook hands it over before the session changes anything")
         except Exception as exc:
             print("claude: could not register hook (%s)." % exc)
     if not registered:
@@ -5146,9 +7825,12 @@ def cmd_uninstall(argv):
     try:
         with open(settings_path, encoding="utf-8") as f:
             settings = json.load(f)
-        for pre in settings.get("hooks", {}).get("PreToolUse", []):
-            pre["hooks"] = [h for h in pre.get("hooks", []) if "operator-gate" not in h.get("command", "")]
-        settings["hooks"]["PreToolUse"] = [p for p in settings["hooks"]["PreToolUse"] if p.get("hooks")]
+        for event in ("PreToolUse",) + tuple(e for e, _, _ in TURNOVER_HOOKS):
+            if event not in settings.get("hooks", {}):
+                continue
+            for pre in settings["hooks"][event]:
+                pre["hooks"] = [h for h in pre.get("hooks", []) if "operator-gate" not in h.get("command", "")]
+            settings["hooks"][event] = [p for p in settings["hooks"][event] if p.get("hooks")]
         with open(settings_path, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2)
         print("claude hook removed")
@@ -5174,9 +7856,12 @@ def main():
         sys.exit(hook_main(argv[1:]))
     cmd = {"approve": cmd_approve, "verify": cmd_verify, "status": cmd_status, "corpus": cmd_corpus,
            "test": cmd_corpus, "install": cmd_install, "uninstall": cmd_uninstall,
-           "upgrade": cmd_upgrade, "replay": cmd_replay, "mode": cmd_mode}.get(argv[0])
+           "upgrade": cmd_upgrade, "replay": cmd_replay, "mode": cmd_mode,
+           "append": cmd_append, "protect": cmd_protect, "protected": cmd_protected,
+           "brake": cmd_brake, "turnover": cmd_turnover}.get(argv[0])
     if not cmd:
-        print("usage: operator-gate hook|status|replay|mode|approve|verify|corpus|install|uninstall|upgrade")
+        print("usage: operator-gate hook|status|replay|mode|approve|verify|corpus|install|uninstall|upgrade"
+              "|append|protect|protected|brake|turnover")
         sys.exit(2)
     sys.exit(cmd(argv[1:]))
 
