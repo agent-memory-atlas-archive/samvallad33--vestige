@@ -52,6 +52,8 @@ use vestige_core::{OutputConfig, Storage};
 
 use crate::cognitive::CognitiveEngine;
 
+mod pairing;
+
 /// The dispatch name hooks call.
 pub const NAME: &str = "reflex";
 
@@ -188,6 +190,21 @@ pub fn fold(
     else {
         return;
     };
+    // A failure's memory links to the last memory this session wrote.
+    let written = result
+        .get("nodeId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            result
+                .get("results")
+                .and_then(Value::as_array)
+                .and_then(|r| r.iter().rev().find_map(|x| x.get("nodeId")?.as_str()))
+        })
+        .filter(|id| is_memory_id(id))
+        .map(str::to_string);
+    if let Some(id) = written {
+        s.last_write = Some(id);
+    }
     let turn = s.turn;
     let explicit = named_ids(args);
     let original = result.to_string();
@@ -673,6 +690,12 @@ struct Input {
     source: String,
     format: String,
     since: String,
+    /// PostToolUseFailure: the error the tool reported.
+    error: String,
+    interrupt: bool,
+    /// The file an edit tool wrote.
+    file: String,
+    cwd: String,
 }
 
 /// A substitution the host left unfilled (`${...}`) counts as absent.
@@ -720,6 +743,20 @@ impl Input {
             source: field(a, &["source"]),
             format: field(a, &["format"]),
             since: field(a, &["since"]),
+            error: field(a, &["error"]),
+            interrupt: matches!(
+                a.get("interrupt").or_else(|| a.get("is_interrupt")),
+                Some(Value::Bool(true))
+            ) || field(a, &["interrupt", "is_interrupt"]) == "true",
+            file: {
+                let f = field(a, &["file", "file_path"]);
+                if f.is_empty() {
+                    field(&nested, &["file_path", "path", "notebook_path"])
+                } else {
+                    f
+                }
+            },
+            cwd: field(a, &["cwd"]),
         }
     }
 }
@@ -868,6 +905,9 @@ struct Persisted {
     recent: Vec<Recent>,
     #[serde(default)]
     ledger_tip: Option<String>,
+    /// Fixes Failure Pairing recorded, by failure signature.
+    #[serde(default)]
+    fixes: Vec<(String, pairing::Fix)>,
 }
 
 fn lookup<'a, T>(list: &'a [(String, T)], key: &str) -> Option<&'a T> {
@@ -983,6 +1023,11 @@ struct SessionState {
     turn_chars: usize,
     seen: VecDeque<(String, i64)>,
     touched: i64,
+    /// The last memory this session's agents wrote through Vestige.
+    last_write: Option<String>,
+    open_failures: Vec<pairing::OpenFailure>,
+    /// Findings from background work, told once at the next firing.
+    notes: Vec<String>,
 }
 
 impl SessionState {
@@ -1970,9 +2015,13 @@ fn stop_line(n: &StopNote) -> String {
     line
 }
 
+/// Marks a background note in the told list, apart from stop receipts.
+const NOTE_MARK: &str = "note\u{0}";
+
 /// Compose this firing's context within the event and turn budgets, and mark
-/// what it tells. Returns the text and the receipts told.
-fn compose(g: &mut Global, inp: &Input) -> (String, Vec<String>) {
+/// what it tells. `lead` goes first: what this very firing found. Returns the
+/// text and the receipts told.
+fn compose(g: &mut Global, inp: &Input, lead: &[String]) -> (String, Vec<String>) {
     let budget = event_budget(&inp.event);
     if budget == 0 || inp.session.is_empty() {
         return (String::new(), Vec::new());
@@ -1993,7 +2042,7 @@ fn compose(g: &mut Global, inp: &Input) -> (String, Vec<String>) {
     if cap == 0 {
         return (String::new(), Vec::new());
     }
-    let mut lines: Vec<(String, Option<String>)> = Vec::new();
+    let mut lines: Vec<(String, Option<String>)> = lead.iter().map(|l| (l.clone(), None)).collect();
     match inp.event.as_str() {
         "SessionStart" if inp.source == "compact" => {
             for n in s.stops.iter().filter(|n| s.told.contains(&n.d16)) {
@@ -2074,6 +2123,9 @@ fn compose(g: &mut Global, inp: &Input) -> (String, Vec<String>) {
             }
         }
     }
+    for note in &s.notes {
+        lines.push((note.clone(), Some(format!("{NOTE_MARK}{note}"))));
+    }
     let mut text = String::new();
     let mut told = Vec::new();
     for (line, d16) in lines {
@@ -2094,6 +2146,12 @@ fn compose(g: &mut Global, inp: &Input) -> (String, Vec<String>) {
         }
     }
     s.turn_chars += text.len();
+    let (notes, told): (Vec<String>, Vec<String>) =
+        told.into_iter().partition(|d| d.starts_with(NOTE_MARK));
+    for n in notes {
+        let n = &n[NOTE_MARK.len()..];
+        s.notes.retain(|x| x != n);
+    }
     for d in &told {
         if !s.told.contains(d) {
             s.told.push(d.clone());
@@ -2558,6 +2616,7 @@ pub async fn execute_with(
         }
     }
     spawn_background(&global, storage, cognitive, output_config, background);
+    let paired = pairing::on_event(&global, &ctx, &inp).await;
     let mut g = global.lock().map_err(|e| e.to_string())?;
     let mut wrote = Vec::new();
     for o in outcomes {
@@ -2565,7 +2624,8 @@ pub async fn execute_with(
             wrote.push(entry);
         }
     }
-    let (text, told) = compose(&mut g, &inp);
+    wrote.extend(paired.wrote);
+    let (text, told) = compose(&mut g, &inp, &paired.tell);
     let extra = if inp.session.is_empty() {
         json!({})
     } else {
@@ -3211,6 +3271,128 @@ mod tests {
         let view = fx.fire(json!({"action": "ledger"})).await;
         assert_eq!(view["context"]["duplicateFiringsDropped"], 2, "{view}");
         assert_eq!(view["chain"]["status"], "ok", "{view}");
+    }
+
+    const CARGO_ERR: &str = "Exit code 101\nerror[E0499]: cannot borrow `lines` at src/lib.rs:3107";
+
+    fn failure(session: &str, call: &str) -> Value {
+        json!({"event": "PostToolUseFailure", "session": session, "tool": "Bash", "call": call,
+               "command": "cd /repo && cargo test -p vestige-mcp", "error": CARGO_ERR, "cwd": "/repo"})
+    }
+
+    #[tokio::test]
+    async fn a_first_failure_is_saved_and_tells_the_agent_nothing() {
+        let fx = Fixture::new();
+        let out = fx.fire(failure("s1", "toolu_f1")).await;
+        assert_eq!(
+            out,
+            json!({}),
+            "a first-time failure puts nothing in front of the model"
+        );
+        let sig = pairing::classify("Bash", "cargo test -p vestige-mcp", CARGO_ERR, false)
+            .unwrap()
+            .sig;
+        assert!(fx.tag(&format!("fail-{sig}")).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_next_success_records_the_fix_and_a_repeat_is_told_it_at_once() {
+        let fx = Fixture::new();
+        let sig = pairing::classify("Bash", "cargo test -p vestige-mcp", CARGO_ERR, false)
+            .unwrap()
+            .sig;
+        fx.fire(failure("s1", "toolu_f1")).await;
+        fx.fire(
+            json!({"event": "PostToolUse", "session": "s1", "tool": "Edit", "call": "toolu_e1",
+                       "file": "/repo/src/lib.rs"}),
+        )
+        .await;
+        fx.fire(
+            json!({"event": "PostToolUse", "session": "s1", "tool": "Bash", "call": "toolu_ok",
+                       "command": "cargo test -p vestige-mcp"}),
+        )
+        .await;
+        let fix = fx.tag(&format!("fix-{sig}")).await;
+        assert!(
+            fix.is_some(),
+            "the success after the failure is recorded as its fix"
+        );
+        let failure_node = fx.tag(&format!("fail-{sig}")).await.unwrap();
+        let ctx = Ctx {
+            storage: &fx.storage,
+            cognitive: &fx.cog,
+            output_config: &fx.oc,
+        };
+        let view = super::super::recall::execute(
+            ctx.storage,
+            ctx.cognitive,
+            ctx.output_config,
+            Some(json!({"handle": failure_node, "detail_level": "full_neighbors"})),
+        )
+        .await
+        .unwrap();
+        assert!(view.to_string().contains("closed_by"), "{view}");
+        assert!(
+            view.to_string().contains("/repo/src/lib.rs"),
+            "the fix names the file edited"
+        );
+        // Another session hits the same failure: it hears the fix before guessing.
+        let out = fx.fire(failure("s2", "toolu_f2")).await;
+        let text = context(&out);
+        assert!(text.contains("happened before"), "{out}");
+        assert!(text.contains(fix.as_deref().unwrap()), "{out}");
+        assert!(text.contains("cargo test -p vestige-mcp"), "{out}");
+        assert_eq!(
+            out["hookSpecificOutput"]["hookEventName"],
+            "PostToolUseFailure"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_fails_by_design_writes_nothing() {
+        let fx = Fixture::new();
+        for (call, command, error) in [
+            (
+                "t1",
+                "ls ~/not-yet",
+                "Exit code 1\nls: ~/not-yet: No such file or directory",
+            ),
+            ("t2", "grep -rn needle src", "Exit code 1"),
+            ("t3", "git diff --quiet", "Exit code 1"),
+        ] {
+            fx.fire(
+                json!({"event": "PostToolUseFailure", "session": "s1", "tool": "Bash",
+                           "call": call, "command": command, "error": error}),
+            )
+            .await;
+        }
+        fx.fire(json!({"event": "PostToolUseFailure", "session": "s1", "tool": "Bash",
+                       "call": "t4", "command": "cargo test", "error": CARGO_ERR, "interrupt": "true"}))
+            .await;
+        let view = fx.fire(json!({"action": "ledger"})).await;
+        assert!(!view.to_string().contains("\"kind\":\"failure\""), "{view}");
+    }
+
+    #[tokio::test]
+    async fn a_background_finding_is_told_once_at_the_next_firing() {
+        let fx = Fixture::new();
+        fx.fire(json!({"event": "UserPromptSubmit", "session": "s1"}))
+            .await;
+        {
+            let global = global_for(&fx.storage);
+            let mut g = global.lock().unwrap();
+            g.session("s1")
+                .notes
+                .push("Reflex: a lesson has faded: mem-0000000000000001.".into());
+        }
+        let out = fx
+            .fire(json!({"event": "PreToolUse", "session": "s1", "call": "t1", "tool": "Bash"}))
+            .await;
+        assert!(context(&out).contains("lesson has faded"), "{out}");
+        let again = fx
+            .fire(json!({"event": "PreToolUse", "session": "s1", "call": "t2", "tool": "Bash"}))
+            .await;
+        assert_eq!(again, json!({}));
     }
 
     #[test]

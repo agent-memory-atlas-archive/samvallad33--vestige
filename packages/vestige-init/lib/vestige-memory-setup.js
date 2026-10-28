@@ -35,7 +35,10 @@ function reflexReady(binaryPath, env) {
 // every host without `mcp_tool` hooks, goes through the command shim.
 // `agent` is the subagent's id and empty for the main agent, so every Vestige
 // read lands in the context of the agent that made it.
-const REFLEX_INPUT = { event: '${hook_event_name}', session: '${session_id}', tool: '${tool_name}', call: '${tool_use_id}', agent: '${agent_id}', command: '${tool_input.command}', source: '${source}', host: 'claude' };
+// `error` and `interrupt` let Failure Pairing classify a failed call; `file`
+// names what an edit tool wrote before the fix.
+const REFLEX_INPUT = { event: '${hook_event_name}', session: '${session_id}', tool: '${tool_name}', call: '${tool_use_id}', agent: '${agent_id}', command: '${tool_input.command}', source: '${source}',
+  error: '${error}', interrupt: '${is_interrupt}', file: '${tool_input.file_path}', cwd: '${cwd}', host: 'claude' };
 const REFLEX_EVENTS = {
   claude: [['PreToolUse', '*'], ['PostToolUse', '*'], ['PostToolUseFailure', '*'], ['UserPromptSubmit'], ['SubagentStart'], ['SubagentStop'], ['Stop']],
   codex: [['SessionStart'], ['UserPromptSubmit'], ['PreToolUse', '*'], ['PostToolUse', '*'], ['SubagentStart'], ['Stop']],
