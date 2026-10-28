@@ -116,6 +116,24 @@ Anything shaped like a credential is masked before the command is saved.
 
 A first-time failure puts nothing in front of the agent.
 
+## Stale-belief push
+
+Several agents share one store. When one of them retires a memory, every other agent already holding
+that memory hears about it before its next action. Reflex records each retirement in order from the
+result of the call that made it:
+
+| Call | Recorded as |
+|---|---|
+| `memory(action='edit')` | The old memory retired for its successor, with the successor's first sentence |
+| `smart_ingest` with a `supersedes` link | The old memory superseded by the new one |
+| `memory(action='demote')` | Demoted as wrong or unhelpful |
+| `suppress`, and each target its cascade suppressed | Suppressed |
+
+On the next PreToolUse, PostToolUse, UserPromptSubmit or SubagentStart, Reflex compares the new
+retirements with the agent's context. An agent that held the memory before it was retired is told once,
+with the old id, the successor, when it changed and the receipt, and the old id leaves its context. The
+session that made the change and agents that never held the memory are told nothing.
+
 ## The Hook Ledger
 
 Every firing appends one line to `<data dir>/reflex/ledger.jsonl` with the event, the session, the
