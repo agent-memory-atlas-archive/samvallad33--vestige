@@ -261,7 +261,8 @@ RULES = {
                "stopped from, what the owner allowed and the permits still open, from the gate's own receipts, "
                "not from a summary. Reads go ahead meanwhile."),
     "OP-CANARY": ("canary", "STOP",
-                  "Verification canary: this string exists only to prove the gate is wired."),
+                  "The verification canary string, which proves a host is wired, or a value the owner planted as a "
+                  "canary with `canary plant`: nothing legitimate ever uses one, so a call carrying it is stopped."),
     # shadow-only candidates: recorded, never blocking, promote after reviewing the log
     "OP-S01": ("work-loss", "SHADOW", "git reset --hard / clean / branch -D can discard uncommitted work."),
     "OP-S02": ("outbound-comms", "SHADOW", "Sending a message/email/forward on the owner's behalf."),
@@ -5446,6 +5447,92 @@ def cmd_append(argv):
     return 0
 
 
+CANARY_MIN = 8          # a planted value shorter than this would match ordinary text
+
+
+def planted_canaries():
+    """The values the owner planted with `canary plant`, from <gate home>/canaries.json."""
+    try:
+        with open(pj(OP_HOME, "canaries.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        rows = d.get("canaries") if isinstance(d, dict) else None
+        return [c for c in rows or [] if isinstance(c, dict) and len(str(c.get("value") or "")) >= CANARY_MIN]
+    except (OSError, ValueError):
+        return []
+
+
+def _strings(x, out):
+    if isinstance(x, str):
+        out.append(x)
+    elif isinstance(x, dict):
+        for v in x.values():
+            _strings(v, out)
+    elif isinstance(x, (list, tuple)):
+        for v in x:
+            _strings(v, out)
+    return out
+
+
+def planted_hits(ti):
+    """OP-CANARY for a planted value anywhere in the call: a command, a file's content, a URL, MCP arguments.
+    A decoy no legitimate lookup reaches was read and is now being used."""
+    rows = planted_canaries()
+    if not rows:
+        return []
+    texts = _strings(ti, [])
+    for c in rows:
+        v = str(c["value"])
+        if any(v in t for t in texts):
+            return [("OP-CANARY", "a value the owner planted as a canary (%s) is in this call"
+                     % (c.get("label") or "planted %s" % str(c.get("planted") or "")[:10]),
+                     "Nothing legitimate uses a planted canary: stop, and tell the owner where the value came from.")]
+    return []
+
+
+def cmd_canary(argv):
+    """`canary plant <value> [--label <text>]`, `canary remove <value>`, `canary list`: decoy values the owner
+    plants where only a leak or an injected instruction would find them. The owner runs plant and remove."""
+    sub = argv[0] if argv else "list"
+    path = pj(OP_HOME, "canaries.json")
+    rows = planted_canaries()
+    if sub == "list":
+        if not rows:
+            print("No planted canaries. The owner plants one with `%s canary plant <value> --label <where it sits>`." % self_cmd())
+            return 0
+        for c in rows:
+            v = str(c["value"])
+            print("%s...%s  %-30s planted %s" % (v[:3], v[-2:], c.get("label") or "", str(c.get("planted") or "")[:19]))
+        return 0
+    if sub not in ("plant", "remove") or len(argv) < 2:
+        print("usage: %s canary plant <value> [--label <text>] | canary remove <value> | canary list" % self_cmd())
+        return 2
+    if any(os.environ.get(k) for k in AGENT_ENV):
+        print("Refusing: canaries are the owner's, so the owner runs %s from their own terminal." % sub)
+        return 3
+    value = argv[1]
+    if sub == "plant":
+        if len(value) < CANARY_MIN:
+            print("A canary needs at least %d characters, so ordinary text never matches it." % CANARY_MIN)
+            return 2
+        label = argv[argv.index("--label") + 1] if "--label" in argv[:-1] else ""
+        rows = [c for c in rows if str(c["value"]) != value] + [
+            {"value": value, "label": label[:80], "planted": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}]
+    else:
+        if not any(str(c["value"]) == value for c in rows):
+            print("No such canary.")
+            return 2
+        rows = [c for c in rows if str(c["value"]) != value]
+    os.makedirs(OP_HOME, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"canaries": rows}, f, indent=1)
+    os.replace(tmp, path)
+    write_receipt({"decision": "CANARY_PLANTED" if sub == "plant" else "CANARY_REMOVED",
+                   "canary": hashlib.sha256(value.encode("utf-8")).hexdigest()[:16], "source": "owner-tty"})
+    print("Canary %s. A tool call that carries it is stopped under OP-CANARY." % ("planted" if sub == "plant" else "removed"))
+    return 0
+
+
 def cmd_protected(argv):
     """`protected` lists the owner's file contracts and checks every one against its receipts."""
     contracts = file_contracts(load_config(), os.getcwd())
@@ -6346,6 +6433,7 @@ def classify(payload, cfg):
     # whole: a host that sends a whole file through the gate (Cursor's StrReplace) can still edit it.
     if "OPERATOR_CANARY_" "STOP_7f3a" in blob:
         hits.append(("OP-CANARY", "canary string present", "Nothing to fix: this proves the gate ran."))
+    hits += guarded(planted_hits, [], ti)
 
     if tool in SHELL_TOOLS or "command" in ti and tool not in WRITE_TOOLS and not tool.startswith("mcp__"):
         cmd = ti.get("command") or ti.get("cmd") or ""
@@ -6403,7 +6491,7 @@ def classify(payload, cfg):
             for w in eff.get("writes") or []:
                 hits += guarded(agent_arming, [], w, None)
         if re.search(r"operator-gate(\.py)?['\"]?\s+(approve|mode|install|uninstall|upgrade\s+--install|protect|"
-                     r"brake\s[^;&|\n]*--release)\b", cmd):
+                     r"brake\s[^;&|\n]*--release|canary\s+(?:plant|remove))\b", cmd):
             hits.append(("OP-000", "agent invoked the gate's owner commands",
                          "Approvals and installs are run by the owner in their own terminal."))
         for m in re.finditer(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", cmd, re.M):
@@ -7891,10 +7979,10 @@ def main():
            "test": cmd_corpus, "install": cmd_install, "uninstall": cmd_uninstall,
            "upgrade": cmd_upgrade, "replay": cmd_replay, "mode": cmd_mode,
            "append": cmd_append, "protect": cmd_protect, "protected": cmd_protected,
-           "brake": cmd_brake, "turnover": cmd_turnover}.get(argv[0])
+           "brake": cmd_brake, "turnover": cmd_turnover, "canary": cmd_canary}.get(argv[0])
     if not cmd:
         print("usage: operator-gate hook|status|replay|mode|approve|verify|corpus|install|uninstall|upgrade"
-              "|append|protect|protected|brake|turnover")
+              "|append|protect|protected|brake|turnover|canary")
         sys.exit(2)
     sys.exit(cmd(argv[1:]))
 

@@ -128,6 +128,11 @@ gate sets the standard. Lite now has 42 rules: 27 STOP and 15 SHADOW.
 - **Evidence lock, part of #529.** OP-002 also covers an agent's own record:
   deleting, emptying or rewriting Claude Code, Codex and Gemini CLI transcripts
   or the shell's history is the owner's call. Reading them still passes.
+- **Planted canaries, part of #527.** `operator-gate canary plant <value>` lets the
+  owner plant a decoy value, such as a fake deploy token or hostname; a tool call
+  that carries it in a command, a file's content, a URL or MCP arguments is
+  stopped under OP-CANARY. Planting and removing are owner commands, and the
+  receipt records a digest, never the value.
 - On Windows the floor reads a cmd switch such as the `/s` of `rmdir /s` as a
   switch, not as the Git Bash spelling of a drive.
 - Each rule has its own test suite, run in CI on Linux and macOS.

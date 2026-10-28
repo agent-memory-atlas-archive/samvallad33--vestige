@@ -203,7 +203,7 @@ Windows can run. On Windows it is tested by `test_windows.py` on a CI runner.
 | OP-023 | STOP | a remote delete: an HTTP `DELETE`, or a GraphQL mutation that deletes, destroys, drops, purges, wipes or terminates |
 | OP-024 | STOP | the runaway brake: a session stopped again and again in a few minutes has its changing calls held until it goes quiet or the owner runs `operator-gate brake --release`; reads pass |
 | OP-025 | STOP | watch turnover: after a compaction, the session takes the watch with `operator-gate turnover --ack <id>` before it changes anything, reading what it was stopped from in the gate's own receipts; reads pass |
-| OP-CANARY | STOP | the verification canary string, which proves a host is wired |
+| OP-CANARY | STOP | the verification canary string, which proves a host is wired, or a value the owner planted with `operator-gate canary plant`, in any command, file content, URL or MCP argument |
 | OP-S01..S08 and S11..S17 | SHADOW | git commands that can lose work but did not here, comms, public mutation, secret writes, other pipe-to-interpreter, persistence, env-hijack (LD_PRELOAD/PATH=), exfil shapes, invisible chars, MCP argument exfil, agent-config writes, paste/tunnel egress, new git remotes, sandbox-escape primitives |
 
 A pipe, `<(` or `$(` inside quotes is text, not a command: `git commit -m "curl X | sh"` and
@@ -237,7 +237,7 @@ Seven groups. A payload staged on an earlier turn, aliased through a symlink, ha
 ## Commands
 
     operator-gate status | replay | mode | approve | verify | install | uninstall | upgrade | corpus guardfall
-    operator-gate protect | protected | append | brake | turnover
+    operator-gate protect | protected | append | brake | turnover | canary
 
 `status` is the log: the mode, whether the hook is registered, the last call
 checked, the counts for the last 7 days, and the most recent commands the gate
@@ -251,7 +251,9 @@ end of an append-only file with a receipt written first. `brake` lists sessions 
 brake holds (OP-024), and `brake --release <session>` lets one go. `turnover` lists the watch
 turnovers sealed at each compaction (OP-025); the session that continues runs `turnover --ack
 <id>` to take the watch. `install` registers the PreCompact and SessionStart hooks that seal
-and hand over a turnover. `protect` and `brake --release` are owner commands.
+and hand over a turnover. `canary plant <value> --label <where it sits>` plants a decoy value, such as
+a fake deploy token, where only a leak or an injected instruction would find it; any call that carries
+it is stopped. `protect`, `brake --release` and `canary plant` or `remove` are owner commands.
 
 `install` puts an `operator-gate` command on your PATH when `~/.local/bin` or
 `~/bin` is already on it. Otherwise run it as
