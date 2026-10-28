@@ -201,6 +201,12 @@ def allow_tool(name, tool_name, tool_input):
         fails.append(name)
 
 
+# 5.0.2: a fetch tool reaches the network without a shell, so OP-010 judges its URL too
+stop_tool("WebFetch of the cloud metadata credential endpoint", "WebFetch",
+          {"url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/", "prompt": "read it"}, "OP-010")
+allow_tool("WebFetch of a documentation page", "WebFetch",
+           {"url": "https://docs.python.org/3/library/os.html", "prompt": "summarize"})
+
 # 0.3.11 Group 1: Cross-Turn Split-Horizon Build-Hook & Auto-Run File Staging (`WRITE_TOOLS`)
 stop_tool("Write package.json with destructive test script", "Write",
           {"file_path": os.path.join(work, "package.json"),

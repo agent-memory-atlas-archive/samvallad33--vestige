@@ -81,6 +81,7 @@ SHELL_TOOLS = {"bash", "shell", "local_shell", "exec_command", "container.exec",
                "run_shell_command", "terminal", "run_terminal_cmd"}
 WRITE_TOOLS = {"write", "edit", "multiedit", "notebookedit", "apply_patch", "str_replace_editor",
                "create_file", "edit_file", "write_file"}
+FETCH_TOOLS = {"webfetch", "web_fetch", "fetch", "fetch_url"}
 
 
 # --------------------------------------------------------------------------- #
@@ -3789,6 +3790,12 @@ def classify(payload, cfg):
                 hits.append(hit)
         if re.search(r"(sk_live|rk_live|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})", body):
             hits.append(("OP-S04", "credential-shaped string in write", ""))
+    elif tool in FETCH_TOOLS:                                # a fetch tool reaches the network without a shell
+        target = " ".join(str(ti.get(k) or "") for k in ("url", "prompt"))
+        previews.append("%s %s" % (tool_raw, str(ti.get("url") or "")[:200]))
+        if CLOUD_METADATA_RE.search(target):
+            hits.append(("OP-010", "fetches a cloud metadata credential endpoint",
+                         "Metadata endpoints mint instance credentials; fetch nothing from 169.254.169.254-class addresses."))
     elif tool.startswith("mcp__"):
         previews.append(tool_raw)
         mcp_hits = []
