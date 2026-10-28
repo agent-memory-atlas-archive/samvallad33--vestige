@@ -51,7 +51,7 @@ Install replays your last 30 days of agent history and shows what it would have 
 
 [![Watch Vestige Operator stop what Operator Lite lets through](operator-lite/media/from-lite-to-operator.gif)](operator-lite/media/from-lite-to-operator.mp4)
 
-The owner's version of the guard. Write your own laws, see a Board of today's stops, and get a weekly Letter of what your agents tried. $149 once, every future version included.
+The owner's version of the guard. Write your own laws, see a Board of today's stops, and get a weekly Letter of what your agents tried. $149 once, every future version included, and a 30-day refund if it is not for you.
 
 [Buy Vestige Operator](https://payhip.com/b/d4xvu)
 

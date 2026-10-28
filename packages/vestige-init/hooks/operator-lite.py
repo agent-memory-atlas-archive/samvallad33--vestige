@@ -4401,7 +4401,7 @@ def cmd_mode(argv):
 
 # The offer, in one place: where the paid gate is sold and what it costs.
 OPERATOR_URL = "https://payhip.com/b/d4xvu"
-OPERATOR_PRICE = "$149 once, yours to keep"
+OPERATOR_PRICE = "$149 once, yours to keep, 30-day refund"
 
 
 def at_terminal():

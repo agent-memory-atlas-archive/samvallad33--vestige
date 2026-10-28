@@ -14,7 +14,7 @@ copy one file, wire one hook, and your agent has a deterministic gate.
 
 Click the picture to watch the full film.
 
-Operator Lite is free and stays free. Vestige Operator is the owner's version of the same gate: $149 once, and every later version is yours at no charge, with laws you write, a Board of today's stops, and a weekly Letter of what your agents tried and what stopped them. Operator also judges the chain of steps in a session, so an agent that reads `.env` and later posts a file to an outside host is stopped with the earlier step's time and receipt, and it carries 13 more stop rules than Lite. You download a small archive the moment you pay; from an installed Operator Lite, `upgrade --install <the archive you downloaded>` unpacks it and starts the wizard. [Buy Vestige Operator](https://payhip.com/b/d4xvu).
+Operator Lite is free and stays free. Vestige Operator is the owner's version of the same gate: $149 once with a 30-day refund, and every later version is yours at no charge, with laws you write, a Board of today's stops, and a weekly Letter of what your agents tried and what stopped them. Operator also judges the chain of steps in a session, so an agent that reads `.env` and later posts a file to an outside host is stopped with the earlier step's time and receipt, and it carries 13 more stop rules than Lite. You download a small archive the moment you pay; from an installed Operator Lite, `upgrade --install <the archive you downloaded>` unpacks it and starts the wizard. [Buy Vestige Operator](https://payhip.com/b/d4xvu).
 
 ## Install (one command)
 
@@ -50,6 +50,7 @@ before you trust the gate, and again after any upgrade.
 | A fresh install stops 234 destructive commands and lets 72 normal ones run | `python3 operator-lite/test_destructive.py`, from a clone | `failures: 0 of 306` |
 | An upgrade from 0.3.7 blocks too | `python3 operator-lite/test_upgrade.py`, from a clone | `all upgrade checks passed` |
 | Every decision is on record, in order | `operator-gate verify` | `receipts=<count> chain=OK integrity=reference_digest_not_signature` |
+| It sends nothing off your machine | `grep -nE '^ *(import\|from) ' ~/.operator/gate/operator-gate.py` | standard-library modules only, none that opens a connection: `urllib.parse` only splits text, and `webbrowser` is used only by `upgrade --open`, which opens the buy page when you ask |
 
 `operator-gate` is the command `install` puts on your PATH; without it, run
 `python3 ~/.operator/gate/operator-gate.py` instead. Nothing in these checks runs a
