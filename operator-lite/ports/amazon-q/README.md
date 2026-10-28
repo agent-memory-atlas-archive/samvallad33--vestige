@@ -75,7 +75,7 @@ receipts and promotable per rule via `commitments.json`.
 **GuardFall-proof:** the gate replays a 46-case corpus of GuardFall bypass
 techniques (quote reassembly, `$IFS`, command substitution, ANSI-C escapes,
 base64 bodies, brace/glob enumeration, subshell time-bombs, session variables,
-cd tracking, heredocs, fork bombs, `mv x /dev/null`, …) and must pass 46/46 —
+cd tracking, heredocs, fork bombs, `mv x /dev/null`, …) and must pass 50/50 —
 `test.sh` replays the whole corpus through this adapter, so the pass is
 adapter-inclusive:
 
@@ -181,7 +181,7 @@ with payloads in the exact stdin shape above:
 - an `fs_write` with a credential-shaped `file_text` → OP-S04 shadow receipt
   (proves the body remap)
 - all 46 GuardFall corpus cases replayed through the adapter with Q-shaped
-  payloads (reshape → gate classify), 46/46 expected verdicts
+  payloads (reshape → gate classify), 50/50 expected verdicts
 - receipt `cwd` equals the Q payload's `cwd`; receipt chain verifies;
   no `~/demo-factory` directory is ever created; payloads are never executed
   — the gate is analyzer-only

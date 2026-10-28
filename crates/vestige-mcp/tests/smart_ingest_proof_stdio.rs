@@ -120,7 +120,11 @@ impl StdioServer {
         }
     }
 
-    fn tool(&mut self, name: &str, args: Value) -> Value {
+    fn tool(&mut self, name: &str, mut args: Value) -> Value {
+        // These checks read the full save report, which smart_ingest returns in its standard profile.
+        if name == "smart_ingest" && args.get("outputProfile").is_none() {
+            args["outputProfile"] = json!("standard");
+        }
         let result = self.rpc("tools/call", json!({ "name": name, "arguments": args }));
         assert_eq!(
             result.get("isError").and_then(Value::as_bool),

@@ -32,6 +32,27 @@ test('fresh install previews all files; repeat changes nothing; exact uninstall 
   assert.equal(fs.readFileSync(settings, 'utf8'), original);
   assert.equal(fs.existsSync(first.manifestFile), false);
 });
+test('a client config with comments is left untouched and setup continues for the others (#515)', () => {
+  const f = fixture(); const zed = path.join(f.home, '.config', 'zed', 'settings.json');
+  fs.mkdirSync(path.dirname(zed), { recursive: true });
+  const original = '// Zed settings\n//\n// For information on how to configure Zed, see the Zed docs\n{\n  "theme": "One Dark",\n}\n';
+  fs.writeFileSync(zed, original);
+  const p = setup.plan({ ...f, platform: 'linux' });
+  assert.deepEqual(p.handAdd.map(h => h.id), ['zed']);
+  assert.equal(p.handAdd[0].file, zed);
+  assert(!p.detected.some(c => c.id === 'zed'));
+  assert(!p.changes.some(c => c.file === zed), 'a commented config is never rewritten');
+  assert(p.detected.some(c => c.id === 'claude'), 'the other clients still get set up');
+  setup.apply(p);
+  assert.equal(fs.readFileSync(zed, 'utf8'), original);
+});
+test('an empty client config file is treated as empty JSON, not a crash', () => {
+  const f = fixture(); const hooks = path.join(f.home, '.cursor', 'hooks.json');
+  fs.writeFileSync(hooks, ''); fs.writeFileSync(path.join(f.home, '.cursor', 'mcp.json'), '{}');
+  const p = setup.plan({ ...f, platform: 'linux' });
+  assert(p.detected.some(c => c.id === 'cursor'));
+  assert(p.changes.some(c => c.file === hooks));
+});
 test('uninstall preserves hooks and properties added after installation', () => {
   const f = fixture(); const p = setup.plan({ ...f, platform: 'linux' }); setup.apply(p);
   const file = path.join(f.home, '.cursor', 'hooks.json'); const value = JSON.parse(fs.readFileSync(file));

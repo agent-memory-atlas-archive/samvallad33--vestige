@@ -121,7 +121,7 @@ base64 bodies, brace/glob enumeration, heredocs, session variables and
 subshell time-bombs; every STOP names the transforms it applied.
 
 **GuardFall-proof:** the gate replays a 46-case corpus of bypass techniques
-and must pass 46/46:
+and must pass 50/50:
 
 ```
 python3 ~/.operator/gate/operator-gate.py corpus guardfall
@@ -215,7 +215,7 @@ the exact stdin shapes above:
 - `rm -rf ./src` inside the session cwd → exit 0 (the gate is precise, not
   trigger-happy)
 - the 46-case GuardFall bypass corpus replayed **through the adapter** as real
-  `pre_run_command` payloads — verdicts must survive the reshape (46/46,
+  `pre_run_command` payloads — verdicts must survive the reshape (50/50,
   semantics mirroring the gate's own `corpus guardfall` runner: a shadow
   technique that co-fires a STOP rule blocks in enforce, as it should)
 - merge behavior: existing user hooks and an existing team `.devin/hooks.json`

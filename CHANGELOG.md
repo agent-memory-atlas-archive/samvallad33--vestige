@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.0] - 2026-10-28
+
 ### Reflex: every hook firing reaches Vestige
 
 - Add `reflex`, a tool agent hooks call directly. It is not listed in
@@ -80,6 +82,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memories by handle, decisions first, each as its current version.
 - `@vestige/init` registers PreCompact and PostCompact for Claude Code and the
   pre-compaction events of Codex, Gemini CLI and Cursor.
+
+### Operator Lite: every per-call rule, OP-000 to OP-025
+
+Operator Lite 6.0.0 carries every per-call rule the paid gate had, so the free
+gate sets the standard. Lite now has 42 rules: 27 STOP and 15 SHADOW.
+
+- **OP-012 the-floor.** A recursive delete that reaches a drive or filesystem
+  root, a home folder or a parent of the working directory is refused in every
+  mode, and no permit exists for it.
+- **OP-013 no-root-reach.** A root job started in the background, or a kill aimed
+  at every process or at a process group as root.
+- **OP-015 no-repo-code-run.** Setting a git option that runs a program, or
+  running git where one is set: `core.fsmonitor`, `core.sshCommand`, an external
+  diff or filter, a `!` alias, `GIT_SSH_COMMAND`.
+- **OP-016 no-vulnerable-write.** Code about to be written that carries a known
+  critical flaw.
+- **OP-017 no-agent-arming.** A command written into a file an agent or editor
+  runs on its own at its next start.
+- **OP-019 no-harmful-chain.** Ordinary steps that together run a file the
+  session fetched, carry a secret out, write through a link the session made,
+  launch a process from a build file it wired, or push past a check it
+  switched off.
+- **OP-020 no-second-spelling.** Reaching a target the gate already stopped in
+  this session another way. In Lite a stop holds for its own session; carrying
+  it across sessions, hosts and agent CLIs stays in the paid Operator.
+- **OP-021 no-found-key.** A remote write, delete or deploy carrying a
+  credential the session read from a file.
+- **OP-022 protected-file.** `operator-gate protect <path> --append-only` or
+  `--read-only` gives a file a contract; `protected` checks every contract
+  against its receipts and `append` adds to an append-only file with a receipt
+  written first.
+- **OP-023 no-remote-delete.** An HTTP `DELETE`, or a GraphQL mutation that
+  deletes, destroys, drops, purges, wipes or terminates.
+- **OP-024 runaway-brake.** A session stopped again and again in a few minutes
+  has its changing calls held until it goes quiet or the owner runs
+  `operator-gate brake --release <session>`. Reads still pass.
+- **OP-025 watch-turnover.** At each compaction the PreCompact hook seals what
+  the session was stopped from, what the owner allowed and the permits still
+  open; the SessionStart hook hands it to the session that continues, which
+  takes the watch with `operator-gate turnover --ack <id>` before it changes
+  anything. `install` registers both hooks and `uninstall` removes them.
+- A script that only reads another script with `awk`, `sed`, `rg` and similar
+  readers no longer counts as running it.
+- **Evidence lock, part of #529.** OP-002 also covers an agent's own record:
+  deleting, emptying or rewriting Claude Code, Codex and Gemini CLI transcripts
+  or the shell's history is the owner's call. Reading them still passes.
+- **Planted canaries, part of #527.** `operator-gate canary plant <value>` lets the
+  owner plant a decoy value, such as a fake deploy token or hostname; a tool call
+  that carries it in a command, a file's content, a URL or MCP arguments is
+  stopped under OP-CANARY. Planting and removing are owner commands, and the
+  receipt records a digest, never the value.
+- On Windows the floor reads a cmd switch such as the `/s` of `rmdir /s` as a
+  switch, not as the Git Bash spelling of a drive.
+- Each rule has its own test suite, run in CI on Linux and macOS.
+
+### Operator Lite and the installer, from 5.0.2
+
+- Operator Lite installs without a temp folder and states its rule counts.
+- OP-010 judges the URL a fetch tool asks for, not only a shell command's.
+- The body of a shell trap is judged as code.
+- `status` names the week's undecided actions, and the third permit for the
+  same action offers to make it a law.
+- The upgrade offer states the 30-day refund, and the README shows how to check
+  that Lite sends nothing off the machine.
+- `@vestige/init` reads a client config with comments, and an empty client
+  config file as empty JSON, instead of stopping setup.
+
+### Fixes
+
+- Tag `recall` returns 20 summaries by default, with `totalNodes` and a `next`
+  handle for the following page; `offset` pages through a tag. A single id still
+  returns the whole memory.
+- `smart_ingest` answers in its compact profile unless another is asked for.
+- `causal_walk` scans 25 memories by default.
+- `memory_status(view='provenance')` accepts `memory_id` as well as `memoryId`.
+- `memory(action='get' | 'get_batch' | 'state')` resolves a unique id prefix of
+  eight or more characters.
+- `ghostlink` caps a weave note at 500 characters in its schema.
 
 ## [5.0.1] - 2026-10-23
 

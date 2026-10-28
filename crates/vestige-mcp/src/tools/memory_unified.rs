@@ -27,6 +27,33 @@ pub fn is_memory_id(id: &str) -> bool {
     rest.len() == 16 && rest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// A read may name a memory by a unique id prefix of 8 or more characters,
+/// the same way `recall` resolves one. Writes always need the full id.
+fn resolve_read_id(storage: &Arc<Storage>, id: &str) -> Result<String, String> {
+    if is_memory_id(id) {
+        return Ok(id.to_string());
+    }
+    if id.len() < 8 || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err(format!("Invalid memory ID format: {id}"));
+    }
+    let resolution = storage.resolve_handle(id);
+    match resolution.ids.as_slice() {
+        [one] if is_memory_id(one) => Ok(one.clone()),
+        [] if resolution.candidates.is_empty() => Err(format!("No memory id starts with {id}")),
+        _ => Err(format!(
+            "The prefix {id} matches more than one memory; pass the full id: {}",
+            resolution
+                .ids
+                .iter()
+                .cloned()
+                .chain(resolution.candidates.iter().map(|(id, _)| id.clone()))
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 /// Compute accessibility score from memory strengths
 /// Combines retention, retrieval, and storage strengths
 fn compute_accessibility(retention: f64, retrieval: f64, storage: f64) -> f64 {
@@ -150,16 +177,20 @@ pub async fn execute(
         if ids.len() > 20 {
             return Err("get_batch supports max 20 IDs per call".to_string());
         }
-        for id in &ids {
-            if !is_memory_id(id) {
-                return Err(format!("Invalid memory ID format: {}", id));
-            }
-        }
+        let ids = ids
+            .iter()
+            .map(|id| resolve_read_id(storage, id))
+            .collect::<Result<Vec<_>, _>>()?;
         return execute_get_batch(storage, &ids).await;
     }
 
     // All other actions require 'id'
     let id = args.id.ok_or("This action requires 'id' parameter")?;
+    let id = if matches!(args.action.as_str(), "get" | "state") {
+        resolve_read_id(storage, &id)?
+    } else {
+        id
+    };
     if !is_memory_id(&id) {
         return Err("Invalid memory ID format".to_string());
     }

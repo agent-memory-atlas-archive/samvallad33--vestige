@@ -42,7 +42,7 @@ OUTSIDE = os.path.join(home, "work")
 
 
 def judge(payload, cwd):
-    payload = dict(payload, cwd=cwd, session_id="self-protect", hook_event_name="PreToolUse")
+    payload = dict(payload, cwd=cwd, session_id="self-protect-" + os.urandom(6).hex(), hook_event_name="PreToolUse")
     p = subprocess.run([sys.executable, "-I", GATE, "hook", "--source", "claude"], input=json.dumps(payload),
                        capture_output=True, text=True, env=env, cwd=cwd, timeout=60)
     return p.returncode, p.stdout + p.stderr

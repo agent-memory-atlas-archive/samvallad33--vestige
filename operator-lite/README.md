@@ -14,15 +14,15 @@ copy one file, wire one hook, and your agent has a deterministic gate.
 
 Click the picture to watch the full film.
 
-Operator Lite is free and stays free. Vestige Operator is the owner's version of the same gate: $149 once, and every later version is yours at no charge, with laws you write, a Board of today's stops, and a weekly Letter of what your agents tried and what stopped them. Operator also judges the chain of steps in a session, so an agent that reads `.env` and later posts a file to an outside host is stopped with the earlier step's time and receipt, and it carries six more stop rules than Lite. You download a small archive the moment you pay; from an installed Operator Lite, `upgrade --install <the archive you downloaded>` unpacks it and starts the wizard. [Buy Vestige Operator](https://payhip.com/b/d4xvu).
+Operator Lite is free and stays free, and it carries every per-call rule from OP-000 to OP-025, including the chain of steps in a session: an agent that reads `.env` and later posts a file to an outside host is stopped with the earlier step's time and receipt. Vestige Operator is the owner's version of the same gate: $149 once with a 30-day refund, and every later version is yours at no charge, with laws you write, a Board of today's stops, a weekly Letter of what your agents tried and what stopped them, and one record of stops across every session, host and agent CLI on the machine. You download a small archive the moment you pay; from an installed Operator Lite, `upgrade --install <the archive you downloaded>` unpacks it and starts the wizard. [Buy Vestige Operator](https://payhip.com/b/d4xvu).
 
 ## Install (one command)
 
-    curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/operator-lite/operator-gate.py -o /tmp/operator-gate.py && python3 /tmp/operator-gate.py install
+    mkdir -p ~/.operator/downloads && curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/operator-lite/operator-gate.py -o ~/.operator/downloads/operator-gate.py && python3 ~/.operator/downloads/operator-gate.py install
 
 On Windows, in PowerShell, with Python 3.9 or newer installed:
 
-    curl.exe -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/operator-lite/operator-gate.py -o "$env:TEMP\operator-gate.py"; python "$env:TEMP\operator-gate.py" install
+    $d = "$HOME\.operator\downloads"; New-Item -ItemType Directory -Force $d | Out-Null; curl.exe -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/operator-lite/operator-gate.py -o "$d\operator-gate.py"; python "$d\operator-gate.py" install
 
 From a clone, `python3 operator-gate.py install` does the same. It copies the gate to
 `~/.operator/gate`, registers the Claude Code hook, starts in enforce mode (every
@@ -44,12 +44,13 @@ before you trust the gate, and again after any upgrade.
 
 | Claim | Check it | It prints |
 |---|---|---|
-| It blocks from your agent's first tool call | `operator-gate status` | `Operator Lite 5.0.1   mode: enforce (blocking)   Claude Code hook: registered` |
+| It blocks from your agent's first tool call | `operator-gate status` | `Operator Lite 6.0.0   mode: enforce (blocking)   Claude Code hook: registered` |
 | What it stops is a closed list you can read | `operator-gate status --rules` | all 30 rules: 15 STOP, 15 SHADOW |
-| It sees through 46 adapted GuardFall bypass cases | `npx operator-lite test` | `corpus=guardfall cases=46 passed=46 failed=0` |
-| A fresh install stops 210 destructive commands and lets 62 normal ones run | `python3 operator-lite/test_destructive.py`, from a clone | `failures: 0 of 272` |
+| It sees through 50 adapted GuardFall bypass cases | `npx operator-lite test` | `corpus=guardfall cases=50 passed=50 failed=0` |
+| A fresh install stops 234 destructive commands and lets 72 normal ones run | `python3 operator-lite/test_destructive.py`, from a clone | `failures: 0 of 306` |
 | An upgrade from 0.3.7 blocks too | `python3 operator-lite/test_upgrade.py`, from a clone | `all upgrade checks passed` |
 | Every decision is on record, in order | `operator-gate verify` | `receipts=<count> chain=OK integrity=reference_digest_not_signature` |
+| It sends nothing off your machine | `grep -nE '^ *(import\|from) ' ~/.operator/gate/operator-gate.py` | standard-library modules only, none that opens a connection: `urllib.parse` only splits text, and `webbrowser` is used only by `upgrade --open`, which opens the buy page when you ask |
 
 `operator-gate` is the command `install` puts on your PATH; without it, run
 `python3 ~/.operator/gate/operator-gate.py` instead. Nothing in these checks runs a
@@ -172,13 +173,13 @@ Windows can run. On Windows it is tested by `test_windows.py` on a CI runner.
 
 ## What it stops
 
-30 rules. In enforce mode the 15 STOP rules block; the 15 SHADOW rules only write a receipt.
+42 rules. In enforce mode the 27 STOP rules block; the 15 SHADOW rules only write a receipt.
 
 | Rule | Mode | Catches |
 |---|---|---|
 | OP-000 | STOP | edits to the gate itself, its mode, permits and rules, hook registrations, settings files |
 | OP-001 | STOP | delete/move of a workspace root or a parent of one, including `/` and your home folder |
-| OP-002 | STOP | wiping the Vestige store (its log or database files, sqlite3 writes, `vestige gc`) |
+| OP-002 | STOP | wiping the Vestige store (its log or database files, sqlite3 writes, `vestige gc`), or an agent's own record: deleting, emptying or rewriting Claude Code, Codex and Gemini CLI transcripts or the shell's history |
 | OP-003 | STOP | recursive deletes outside the project and outside scratch/build folders (`rm -r`, `find -delete`, `trash`, inline `shutil.rmtree`/`fs.rmSync`), sweeps from `/` |
 | OP-004 | STOP | force-push to shared branches, remote-main deletion (`--delete`, `:main`), `git reflog expire`/`delete`, deleting `.git` or a whole repository |
 | OP-005 | STOP | unreviewed publishes (npm/pnpm/yarn/cargo/twine/docker push/gh release), deleting a public repo |
@@ -188,9 +189,21 @@ Windows can run. On Windows it is tested by `test_windows.py` on a CI runner.
 | OP-009 | STOP | reverse shells (`/dev/tcp`, `nc -e`, DNS-tunnel tools, inline code that hands a socket a shell) |
 | OP-010 | STOP | cloud metadata endpoints (169.254.169.254, metadata.google.internal) |
 | OP-011 | STOP | loss nothing can undo: `git reset --hard`, `git clean -f`, `git checkout -- <path>`, `git checkout -f` and `git stash drop` when they would discard real work, deleting a project directory with uncommitted git changes, `shred`/`srm`/`rm -P`, deleting, overwriting or emptying a non-empty file outside the project, `crontab -r` |
+| OP-012 | STOP | the floor: a recursive delete that reaches a drive or filesystem root, a home folder or a parent of the working directory, refused in every mode with no permit |
+| OP-013 | STOP | root reach: a root job started in the background, a kill aimed at every process or at a process group as root |
 | OP-014 | STOP | machine wreck: `dd` onto a device, `mkfs`/`fdisk`-class tools, `diskutil erase*`, `shutdown`/`reboot`/`halt`/`poweroff`, `kill -9 -1`, recursive `chmod`/`chown`/`chgrp` on `/`, a system folder or home, fork bombs |
+| OP-015 | STOP | repo code run: setting a git option that runs a program (`core.fsmonitor`, `core.sshCommand`, an external diff or filter, a `!` alias), or running git where one is set, `GIT_SSH_COMMAND` |
+| OP-016 | STOP | a vulnerable write: code that carries a known critical flaw, such as a server key in client code, certificate or signature checks switched off, an unsafe loader, a secret baked into an image |
+| OP-017 | STOP | agent arming: a command written into a file an agent or editor runs on its own at its next start (MCP server lists, hook settings, notify commands, folder-open tasks, `.envrc`) |
 | OP-018 | STOP | a download run unread: `curl X \| sh`, `wget -qO- X \| python3`, `bash <(curl X)`, `sh -c "$(curl X)"`, `eval "$(wget -qO- X)"` |
-| OP-CANARY | STOP | the verification canary string, which proves a host is wired |
+| OP-019 | STOP | a harmful chain: ordinary steps that together run a file this session fetched, carry a secret out, write through a link the session made, launch a process from a build file it wired, or push past a check it switched off |
+| OP-020 | STOP | a second spelling: reaching a target the gate already stopped in this session another way, by a script, inline code, a loop or a different command |
+| OP-021 | STOP | a found key: a remote write, delete or deploy carrying a credential this session read from a file |
+| OP-022 | STOP | a protected file: changing a file the owner marked append-only or read-only with `operator-gate protect` other than its contract allows |
+| OP-023 | STOP | a remote delete: an HTTP `DELETE`, or a GraphQL mutation that deletes, destroys, drops, purges, wipes or terminates |
+| OP-024 | STOP | the runaway brake: a session stopped again and again in a few minutes has its changing calls held until it goes quiet or the owner runs `operator-gate brake --release`; reads pass |
+| OP-025 | STOP | watch turnover: after a compaction, the session takes the watch with `operator-gate turnover --ack <id>` before it changes anything, reading what it was stopped from in the gate's own receipts; reads pass |
+| OP-CANARY | STOP | the verification canary string, which proves a host is wired, or a value the owner planted with `operator-gate canary plant`, in any command, file content, URL or MCP argument |
 | OP-S01..S08 and S11..S17 | SHADOW | git commands that can lose work but did not here, comms, public mutation, secret writes, other pipe-to-interpreter, persistence, env-hijack (LD_PRELOAD/PATH=), exfil shapes, invisible chars, MCP argument exfil, agent-config writes, paste/tunnel egress, new git remotes, sandbox-escape primitives |
 
 A pipe, `<(` or `$(` inside quotes is text, not a command: `git commit -m "curl X | sh"` and
@@ -224,6 +237,7 @@ Seven groups. A payload staged on an earlier turn, aliased through a symlink, ha
 ## Commands
 
     operator-gate status | replay | mode | approve | verify | install | uninstall | upgrade | corpus guardfall
+    operator-gate protect | protected | append | brake | turnover | canary
 
 `status` is the log: the mode, whether the hook is registered, the last call
 checked, the counts for the last 7 days, and the most recent commands the gate
@@ -231,13 +245,23 @@ stopped or would have stopped, each with its project and reason. `status --rules
 prints the rule table. `mode enforce` switches from recording to blocking, and
 `mode shadow` switches back; it is an owner command and needs your own terminal.
 
+`protect <path> --append-only` or `--read-only` gives a file a contract (OP-022), and
+`protected` checks every contract against its receipts; `append <path>` adds stdin to the
+end of an append-only file with a receipt written first. `brake` lists sessions the runaway
+brake holds (OP-024), and `brake --release <session>` lets one go. `turnover` lists the watch
+turnovers sealed at each compaction (OP-025); the session that continues runs `turnover --ack
+<id>` to take the watch. `install` registers the PreCompact and SessionStart hooks that seal
+and hand over a turnover. `canary plant <value> --label <where it sits>` plants a decoy value, such as
+a fake deploy token, where only a leak or an injected instruction would find it; any call that carries
+it is stopped. `protect`, `brake --release` and `canary plant` or `remove` are owner commands.
+
 `install` puts an `operator-gate` command on your PATH when `~/.local/bin` or
 `~/bin` is already on it. Otherwise run it as
 `python3 ~/.operator/gate/operator-gate.py`; every hint the gate prints uses the
 form that works on your machine.
 
-`verify` walks the receipt hash chain. `corpus guardfall` replays 46 adapted
-GuardFall bypass cases (must pass 46/46). `upgrade` describes the paid Operator
+`verify` walks the receipt hash chain. `corpus guardfall` replays 50 adapted
+GuardFall bypass cases (must pass 50/50). `upgrade` describes the paid Operator
 gate and where to get it. `python3 test_parser.py` and `python3 test_replay.py`
 run the tests; CI runs them on Linux and macOS. `corpus` reads the corpus file beside
 the gate: it ships in the repository and in the npm package (`npx operator-lite test`),

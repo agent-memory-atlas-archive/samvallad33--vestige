@@ -231,6 +231,10 @@ pub async fn execute(
 
 /// Max one-hop neighbor edges reported per handle resolution.
 const MAX_NEIGHBOR_EDGES: usize = 20;
+/// Memories a tag returns when the caller sets no limit. An exact id returns
+/// its one memory whole; a tag returns this many at summary detail, with
+/// `totalNodes` and a `next` call for the rest.
+const DEFAULT_TAG_LIMIT: usize = 20;
 
 /// Entry gate for handle mode. Returns `None` when the args carry no `handle`
 /// key (legacy mode dispatch proceeds unchanged); otherwise the complete
@@ -244,8 +248,11 @@ fn handle_flow(storage: &Arc<Storage>, args: &Option<Value>) -> Option<Result<Va
     let detail_level = object
         .get("detail_level")
         .or_else(|| object.get("detailLevel"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("full");
+        .and_then(|v| v.as_str());
+    let offset = object
+        .get("offset")
+        .and_then(|v| v.as_u64())
+        .map_or(0, |n| n as usize);
     if !object.contains_key("handle") {
         // A Strata log has no free-text search, so a `query` there can only be
         // an exact handle. Resolve it as one instead of refusing an id or a tag
@@ -268,6 +275,7 @@ fn handle_flow(storage: &Arc<Storage>, args: &Option<Value>) -> Option<Result<Va
             resolution,
             limit,
             detail_level,
+            offset,
         )));
     }
     let handle = object
@@ -283,6 +291,7 @@ fn handle_flow(storage: &Arc<Storage>, args: &Option<Value>) -> Option<Result<Va
             resolution,
             limit,
             detail_level,
+            offset,
         )));
     }
     // `handle` present but empty/non-string: free text with no handle — the
@@ -300,8 +309,14 @@ fn handle_resolution_payload(
     handle: &str,
     resolution: HandleResolution,
     limit: Option<usize>,
-    detail_level: &str,
+    detail_level: Option<&str>,
+    offset: usize,
 ) -> Value {
+    // One memory asked for by id comes back whole; a tag comes back as a
+    // page of summaries unless the caller asks for more.
+    let single = resolution.ids.len() == 1;
+    let detail_level = detail_level.unwrap_or(if single { "full" } else { "summary" });
+    let limit = limit.or((!single).then_some(DEFAULT_TAG_LIMIT));
     if !resolution.ids.is_empty() {
         let mut indexed_nodes: Vec<(usize, String, KnowledgeNode)> = resolution
             .ids
@@ -321,6 +336,9 @@ fn handle_resolution_payload(
             indexed_nodes
                 .sort_by(|(_, _, a), (_, _, b)| super::memory_packet::compare(a, b, &salience));
         }
+        if offset > 0 {
+            indexed_nodes.drain(..offset.min(indexed_nodes.len()));
+        }
         if let Some(l) = limit {
             indexed_nodes.truncate(l);
         }
@@ -339,6 +357,18 @@ fn handle_resolution_payload(
         });
         if nodes.len() < total_nodes {
             out["totalNodes"] = serde_json::json!(total_nodes);
+            let shown_through = offset + nodes.len();
+            if shown_through < total_nodes {
+                out["next"] = serde_json::json!({
+                    "handle": handle,
+                    "offset": shown_through,
+                    "limit": limit,
+                    "detail_level": detail_level,
+                });
+            }
+        }
+        if !single && detail_level == "summary" {
+            out["detailLevel"] = serde_json::json!("summary");
         }
         return out;
     }

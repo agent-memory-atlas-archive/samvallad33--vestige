@@ -244,6 +244,18 @@ pub fn execute_coverage(storage: &Arc<Storage>) -> Result<Value, String> {
 /// the operator-controlled role/weight policy snapshot and the process actor
 /// identity. Read-only; every list is bounded.
 pub fn execute_provenance(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
+    // The schema's snake_case `memory_id` and `actor_id` name the same thing
+    // as `memoryId` and `actorId`; accept either spelling.
+    let mut args = args;
+    if let Some(Value::Object(map)) = args.as_mut() {
+        for (snake, camel) in [("memory_id", "memoryId"), ("actor_id", "actorId")] {
+            if !map.contains_key(camel)
+                && let Some(v) = map.get(snake).cloned()
+            {
+                map.insert(camel.to_string(), v);
+            }
+        }
+    }
     if crate::strata_memory::is_strata_backend(storage.as_ref()) {
         return crate::strata_memory::execute_node_provenance(storage.as_ref(), args.as_ref());
     }

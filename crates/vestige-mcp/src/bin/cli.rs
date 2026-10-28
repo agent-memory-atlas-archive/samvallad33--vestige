@@ -4021,10 +4021,12 @@ fn run_ingest(
             "unavailable_in_4_0: ingest --ago-days/--created-at is not available on Strata in Vestige 4.0: the Strata store does not expose a creation-time rewrite yet, so the memory would keep the time it was written. Nothing was written; drop the flag to ingest with the current time."
         );
     }
+    // The CLI prints what auto-connect joined, which the standard profile carries.
     let mut args = serde_json::json!({
         "content": content.clone(),
         "node_type": node_type,
         "tags": tag_list,
+        "outputProfile": "standard",
     });
     if let Some(source) = source {
         args["source"] = serde_json::json!(source);

@@ -196,7 +196,7 @@ pub fn schema() -> Value {
     s["properties"]["outputProfile"] = serde_json::json!({
         "type": "string",
         "enum": ["compact", "standard", "full"],
-        "description": "'compact': proof fields only ({decision, nodeId, receiptId, canonicalHash, scope}). 'standard' (default): proof fields plus entities and importance."
+        "description": "'compact' (default): proof fields only ({decision, nodeId, receiptId, canonicalHash, scope}). 'standard': proof fields plus entities and importance."
     });
     for field in ["entities", "attributes"] {
         let description = if field == "entities" {
@@ -655,11 +655,13 @@ pub async fn execute(
     args: Option<Value>,
 ) -> Result<Value, String> {
     let args = personal_metadata(args)?;
+    // Agents get the proof fields by default; `standard` and `full` add the
+    // entities, importance and auto-connect detail on request.
     let compact_profile = args
         .as_ref()
         .and_then(|v| v.get("outputProfile").or_else(|| v.get("output_profile")))
         .and_then(Value::as_str)
-        .is_some_and(|p| p.eq_ignore_ascii_case("compact"));
+        .is_none_or(|p| p.eq_ignore_ascii_case("compact"));
     let (args, links) = take_links(storage, args)?;
     let (args, intents) = take_intent_ids(args)?;
     let mut value = execute_verbose(storage, cognitive, args, &intents).await?;
@@ -2582,7 +2584,8 @@ mod auto_connect_response_tests {
         super::execute(
             storage,
             &Arc::new(Mutex::new(CognitiveEngine::new())),
-            Some(serde_json::json!({ "content": content, "node_type": "fact", "tags": [tag] })),
+            // The pair list is part of the standard profile; compact is the default.
+            Some(serde_json::json!({ "content": content, "node_type": "fact", "tags": [tag], "outputProfile": "standard" })),
         )
         .await
         .unwrap()

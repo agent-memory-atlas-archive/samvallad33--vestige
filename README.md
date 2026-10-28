@@ -42,7 +42,7 @@ When something breaks, `causal_walk` follows the recorded links backward to the 
 **Operator Lite** is a free guard for your agent's tool calls. It stops force pushes, dropped tables, recursive deletes and production deploys before they run, even when the command is disguised. 30 rules: 15 stop the call, 15 record it for you to review.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/operator-lite/operator-gate.py -o /tmp/operator-gate.py && python3 /tmp/operator-gate.py install
+mkdir -p ~/.operator/downloads && curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/operator-lite/operator-gate.py -o ~/.operator/downloads/operator-gate.py && python3 ~/.operator/downloads/operator-gate.py install
 ```
 
 Install replays your last 30 days of agent history and shows what it would have stopped. Nothing in that history is run. [Windows, OpenClaw, and every claim checked on your machine](operator-lite/README.md).
@@ -51,7 +51,7 @@ Install replays your last 30 days of agent history and shows what it would have 
 
 [![Watch Vestige Operator stop what Operator Lite lets through](operator-lite/media/from-lite-to-operator.gif)](operator-lite/media/from-lite-to-operator.mp4)
 
-The owner's version of the guard. Write your own laws, see a Board of today's stops, and get a weekly Letter of what your agents tried. $149 once, every future version included.
+The owner's version of the guard. Write your own laws, see a Board of today's stops, and get a weekly Letter of what your agents tried. $149 once, every future version included, and a 30-day refund if it is not for you.
 
 [Buy Vestige Operator](https://payhip.com/b/d4xvu)
 

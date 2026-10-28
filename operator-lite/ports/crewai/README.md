@@ -100,7 +100,7 @@ bodies, brace/glob enumeration, heredocs, session variables and subshell
 time-bombs.
 
 **GuardFall-proof:** the gate replays a 46-case corpus of bypass techniques and
-must pass 46/46: `python3 ~/.operator/gate/operator-gate.py corpus guardfall`.
+must pass 50/50: `python3 ~/.operator/gate/operator-gate.py corpus guardfall`.
 
 Every decision appends a hash-chained receipt to `~/.operator/receipts/`
 (`operator-gate verify` walks the chain). Receipts are digests, not signatures.

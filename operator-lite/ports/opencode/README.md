@@ -118,7 +118,7 @@ overrides the gate path; `$OPERATOR_PYTHON` overrides the interpreter.
 
 `test.sh` (11/11): gate contract with OpenCode-shaped payloads (plain
 `rm -rf` -> STOP, `r''m` obfuscation -> STOP, benign `ls` -> ALLOW), the 46-case
-GuardFall bypass corpus (46/46), a fresh `install.sh` that starts in enforce,
+GuardFall bypass corpus (50/50), a fresh `install.sh` that starts in enforce,
 adapter hook contract driven directly with node
 (block / canary / benign / gate-unreachable), and — with the `opencode` CLI
 installed — plugin discovery via `opencode debug config` plus a clean

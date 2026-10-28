@@ -114,7 +114,7 @@ per rule via `commitments.json`.
 **GuardFall-proof:** the gate replays a 46-case corpus of bypass techniques
 (quote reassembly, `$IFS`, command substitution, ANSI-C escapes, base64
 bodies, brace/glob enumeration, subshell time-bombs, cd tracking, heredocs,
-fork bombs, `mv x /dev/null`, …) and must pass 46/46:
+fork bombs, `mv x /dev/null`, …) and must pass 50/50:
 
 ```
 python3 ~/.operator/gate/operator-gate.py corpus guardfall

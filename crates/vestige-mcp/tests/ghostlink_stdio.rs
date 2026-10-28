@@ -134,7 +134,11 @@ impl Server {
     }
 
     /// A tool's payload; a tool-level failure comes back as `{isError, text}`.
-    fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
+    fn call_tool(&mut self, name: &str, mut arguments: Value) -> Value {
+        // These checks read the full save report, which smart_ingest returns in its standard profile.
+        if name == "smart_ingest" && arguments.get("outputProfile").is_none() {
+            arguments["outputProfile"] = json!("standard");
+        }
         let result = self.result(
             "tools/call",
             Some(json!({ "name": name, "arguments": arguments })),

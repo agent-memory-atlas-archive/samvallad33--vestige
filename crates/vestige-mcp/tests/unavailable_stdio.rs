@@ -118,7 +118,11 @@ impl Server {
     }
 
     /// The structured result of a call that must succeed.
-    fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
+    fn call_tool(&mut self, name: &str, mut arguments: Value) -> Value {
+        // These checks read the full save report, which smart_ingest returns in its standard profile.
+        if name == "smart_ingest" && arguments.get("outputProfile").is_none() {
+            arguments["outputProfile"] = json!("standard");
+        }
         let result = self.call_raw(name, arguments);
         assert_ne!(result["isError"], true, "{name}: {result}");
         result["structuredContent"].clone()

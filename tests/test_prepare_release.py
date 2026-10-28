@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("prepare_release", ROOT / "scripts/prepare-release.py")
 RELEASE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RELEASE)
+# The product version every tied manifest carries, so a version bump needs no edit here.
+VERSION = json.loads((ROOT / "package.json").read_text())["version"]
 
 
 class ReleasePreparationTests(unittest.TestCase):
@@ -79,7 +81,7 @@ class ReleasePreparationTests(unittest.TestCase):
         self.archive("aarch64-apple-darwin")
         staging = self.root / "npm"
         with self.assertRaises(FileNotFoundError):
-            RELEASE.stage_npm("5.0.1", self.assets, staging)
+            RELEASE.stage_npm(VERSION, self.assets, staging)
         self.assertFalse(staging.exists())
 
     def test_npm_staging_exact_pins_all_companions_and_keeps_source_manifest(self):
@@ -88,11 +90,11 @@ class ReleasePreparationTests(unittest.TestCase):
         manifest = ROOT / "packages/vestige-mcp-npm/package.json"
         before = manifest.read_bytes()
         staging = self.root / "npm"
-        RELEASE.stage_npm("5.0.1", self.assets, staging)
+        RELEASE.stage_npm(VERSION, self.assets, staging)
         for package in ("vestige-mcp-npm", "vestige-init"):
             spec = json.loads((staging / package / "package.json").read_text())
             self.assertEqual(len(spec["optionalDependencies"]), 5)
-            self.assertEqual(set(spec["optionalDependencies"].values()), {"5.0.1"})
+            self.assertEqual(set(spec["optionalDependencies"].values()), {VERSION})
         for platform in RELEASE.TARGETS.values():
             if platform:
                 expected = {f"{name}.exe" if platform == "win32-x64" else name for name in RELEASE.BINARIES}
@@ -100,7 +102,7 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertEqual(manifest.read_bytes(), before)
         self.assertFalse(json.loads((staging / "preparation.json").read_text())["published"])
         with self.assertRaisesRegex(ValueError, "already exists"):
-            RELEASE.stage_npm("5.0.1", self.assets, staging)
+            RELEASE.stage_npm(VERSION, self.assets, staging)
 
 
 if __name__ == "__main__":
