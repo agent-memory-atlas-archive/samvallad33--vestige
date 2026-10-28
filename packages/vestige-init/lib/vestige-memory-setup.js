@@ -238,7 +238,7 @@ function plan({ home = os.homedir(), platform = os.platform(), env = process.env
     const gate = path.join(home, '.operator', 'gate', 'operator-gate.py');
     if (!fs.existsSync(gate)) {
       const source = path.join(__dirname, '..', 'hooks', 'operator-lite.py');
-      const row = change(gate, 'install bundled free Operator Lite 5.0.2 (owner terminal required)'); row.after = fs.readFileSync(source, 'utf8');
+      const row = change(gate, 'install bundled free Operator Lite 6.0.0 (owner terminal required)'); row.after = fs.readFileSync(source, 'utf8');
       const mode = change(path.join(home, '.operator', 'mode'), 'start new guard in enforce mode');
       if (mode.before === null) mode.after = 'enforce\n';
       guardInstall = { source, python };
