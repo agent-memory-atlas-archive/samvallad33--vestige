@@ -154,7 +154,7 @@ pub fn schema() -> Value {
                 "type": "integer",
                 "minimum": 10,
                 "maximum": 5000,
-                "default": 500,
+                "default": 25,
                 "description": "Max records scanned in the scope."
             }
         }
@@ -215,6 +215,10 @@ struct Hop {
     link_type: String,
 }
 
+/// Records a walk scans when the caller sets no `scan_limit`: the strongest
+/// causes come first and a truncated walk says so.
+const DEFAULT_SCAN_LIMIT: i32 = 25;
+
 pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
     if crate::strata_memory::is_strata_backend(storage.as_ref()) {
         return recorded_backward_walk(storage, args);
@@ -230,7 +234,10 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
         .unwrap_or(core_causal_walk::DEFAULT_LOOKBACK_DAYS)
         .clamp(1, 365);
     let promote = args.promote.unwrap_or(false);
-    let scan_limit = args.scan_limit.unwrap_or(500).clamp(10, 5000);
+    let scan_limit = args
+        .scan_limit
+        .unwrap_or(DEFAULT_SCAN_LIMIT)
+        .clamp(10, 5000);
 
     let scope = args.scope.as_deref().unwrap_or("user").trim();
     if scope.is_empty() {
@@ -327,7 +334,10 @@ fn recorded_backward_walk(storage: &Arc<Storage>, args: Option<Value>) -> Result
     if scope.is_empty() {
         return Err("scope must not be empty".into());
     }
-    let node_cap = args.scan_limit.unwrap_or(500).clamp(10, 5000) as usize;
+    let node_cap = args
+        .scan_limit
+        .unwrap_or(DEFAULT_SCAN_LIMIT)
+        .clamp(10, 5000) as usize;
 
     let mut rows = start_rows(&args);
     let starts = classify_starts(storage, scope, &mut rows)?;

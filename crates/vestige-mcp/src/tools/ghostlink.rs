@@ -110,7 +110,7 @@ pub fn schema() -> Value {
                         "url": { "type": "string" },
                         "sha256": { "type": "string" },
                         "retrievedAt": { "type": "string" },
-                        "note": { "type": "string" }
+                        "note": { "type": "string", "maxLength": 500 }
                     },
                     "required": ["url", "sha256", "retrievedAt"]
                 }
