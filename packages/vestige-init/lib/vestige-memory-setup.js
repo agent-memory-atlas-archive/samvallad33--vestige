@@ -96,11 +96,38 @@ function nativeGuardRegistered(value, gate, dialect) {
     });
   });
 }
+// Zed and VS Code allow comments and trailing commas in their JSON. Strings are left alone.
+function withoutComments(text) {
+  let out = ''; let inString = false; let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]; const n = text[i + 1];
+    if (inString) { out += c; if (escaped) escaped = false; else if (c === '\\') escaped = true; else if (c === '"') inString = false; continue; }
+    if (c === '"') { inString = true; out += c; continue; }
+    if (c === '/' && n === '/') { while (i < text.length && text[i] !== '\n') i++; out += '\n'; continue; }
+    if (c === '/' && n === '*') { i += 2; while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++; i++; continue; }
+    out += c;
+  }
+  return out.replace(/,\s*([}\]])/g, '$1');
+}
+// A config with comments is never rewritten, because rewriting would drop the owner's comments;
+// its client is set aside to be added by hand (#515). A config that does not parse even without
+// its comments still refuses setup before any change, as it always has.
+function commented(file) {
+  let raw; try { raw = read(file); } catch { return false; }
+  if (raw === null || !raw.trim()) return false;
+  try { JSON.parse(raw); return false; } catch {}
+  try { JSON.parse(withoutComments(raw)); return true; } catch { return false; }
+}
 function plan({ home = os.homedir(), platform = os.platform(), env = process.env, guard = false, clients, node = process.execPath } = {}) {
   const found = binary(home, platform, env);
-  const detected = catalog(home, platform, env).filter(c => c.detected && (!clients || clients.includes(c.id)));
+  const handAdd = [];
+  const detected = catalog(home, platform, env).filter(c => c.detected && (!clients || clients.includes(c.id))).filter(c => {
+    const kept = [c.id === 'codex' ? null : c.file, c.hookFile].filter(Boolean).find(commented);
+    if (kept) handAdd.push({ id: c.id, name: c.name, file: kept, keys: c.keys });
+    return !kept;
+  });
   const base = path.join(home, '.vestige', 'memory'); const manifestFile = path.join(base, 'manifest.json');
-  if (!found) return { missing: true, detected, changes: [], home, base, manifestFile };
+  if (!found) return { missing: true, detected, handAdd, changes: [], home, base, manifestFile };
   const previous = fs.existsSync(manifestFile) ? object(manifestFile) : { files: [] };
   const changes = new Map();
   const change = (file, description) => {
@@ -198,7 +225,7 @@ function plan({ home = os.homedir(), platform = os.platform(), env = process.env
     }
   }
   const rows = [...changes.values()].filter(r => r.after !== r.before && (r.patches.length || r.block || !detected.some(c => c.file === r.file || c.hookFile === r.file)));
-  return { home, base, manifestFile, previous, binary: found, detected, changes: rows, guard, guardInstall };
+  return { home, base, manifestFile, previous, binary: found, detected, handAdd, changes: rows, guard, guardInstall };
 }
 function atomic(file, contents) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -368,10 +395,14 @@ async function main(args = process.argv.slice(2)) {
     if (c.before !== null) say(`    backup: ${c.file}.vestige-backup-<timestamp>-<nonce>`);
   }
   if (planned.changes.length) say(`  WRITE  ${planned.manifestFile} — exact ownership and rollback record`);
-  if (has('--dry-run')) { if (machine) console.log(json({ status: 'preview', detected: planned.detected.map(c => c.id), files: planned.changes.map(c => ({ file: c.file, description: c.description })) })); return; }
+  for (const h of planned.handAdd) {
+    say(`  SKIP   ${h.file} — it has comments, so it is left exactly as it is.`);
+    if (h.keys) say(`    To connect ${h.name}, add this under ${h.keys.join('.')}: "vestige": ${JSON.stringify({ command: planned.binary, args: [] })}`);
+  }
+  if (has('--dry-run')) { if (machine) console.log(json({ status: 'preview', detected: planned.detected.map(c => c.id), skipped: planned.handAdd.map(h => h.id), files: planned.changes.map(c => ({ file: c.file, description: c.description })) })); return; }
   if (!has('--yes') && !/^y(?:es)?$/i.test(await ask('Apply this preview? [y/N]', true))) { say('Nothing changed.'); return; }
   const result = apply(planned);
-  if (machine) { console.log(json({ status: 'installed', ...result, clients: planned.detected.map(c => c.id) })); return; }
+  if (machine) { console.log(json({ status: 'installed', ...result, clients: planned.detected.map(c => c.id), skipped: planned.handAdd.map(h => h.id) })); return; }
   say(`✓ Memory ready · ${result.written} files · ${result.backups.length} backups`);
   if (guard) say(`  Operator guard configured; owner permits: operator-gate approve <action-id> (or Python + ~/.operator/gate/operator-gate.py approve <action-id>)`);
   say(`  Installed in ${planned.base}`);
