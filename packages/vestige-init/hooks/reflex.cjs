@@ -10,8 +10,8 @@ const { rpc } = require('./memory.cjs');
 
 // Host event name -> the canonical (Claude Code) name reflex speaks.
 const CANONICAL = {
-  gemini: { BeforeTool: 'PreToolUse', AfterTool: 'PostToolUse', BeforeAgent: 'UserPromptSubmit', AfterAgent: 'Stop', SessionStart: 'SessionStart' },
-  cursor: { preToolUse: 'PreToolUse', postToolUse: 'PostToolUse', postToolUseFailure: 'PostToolUseFailure', beforeSubmitPrompt: 'UserPromptSubmit', sessionStart: 'SessionStart', subagentStart: 'SubagentStart', stop: 'Stop' },
+  gemini: { BeforeTool: 'PreToolUse', AfterTool: 'PostToolUse', BeforeAgent: 'UserPromptSubmit', AfterAgent: 'Stop', SessionStart: 'SessionStart', PreCompress: 'PreCompact' },
+  cursor: { preToolUse: 'PreToolUse', postToolUse: 'PostToolUse', postToolUseFailure: 'PostToolUseFailure', beforeSubmitPrompt: 'UserPromptSubmit', sessionStart: 'SessionStart', subagentStart: 'SubagentStart', preCompact: 'PreCompact', stop: 'Stop' },
 };
 const CURSOR_CONTEXT = new Set(['sessionStart', 'postToolUse']);
 
@@ -35,6 +35,8 @@ function argumentsFor(client, event, input) {
     interrupt: input.is_interrupt === true ? 'true' : '',
     file: typeof toolInput.file_path === 'string' ? toolInput.file_path : '',
     cwd: pick('cwd'),
+    summary: pick('compact_summary'),
+    trigger: pick('trigger'),
   };
 }
 

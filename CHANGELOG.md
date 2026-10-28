@@ -62,6 +62,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recorded fix. Walk back from every failure in the background and mention a
   linked lesson that has faded.
 
+### Stale-belief push
+
+- Record every retirement on the store in order: an edit into a successor, a
+  memory superseded at ingest, a demotion, a suppression and its cascade.
+- Before an agent's next action, tell it once about each retirement of a
+  memory it held, with the old id, the successor and the receipt, and drop the
+  old id from its context. The session that made the change is not told.
+
+### Compaction survival
+
+- At PreCompact, save a checkpoint memory listing by exact id every memory
+  the main agent holds.
+- At PostCompact, read the summary for those ids and save an audit memory of
+  what it kept and dropped, derived from the checkpoint.
+- When the session starts again after compaction, give back the dropped
+  memories by handle, decisions first, each as its current version.
+- `@vestige/init` registers PreCompact and PostCompact for Claude Code and the
+  pre-compaction events of Codex, Gemini CLI and Cursor.
+
 ## [5.0.1] - 2026-10-23
 
 ### Retroactive Salience Backfill returns

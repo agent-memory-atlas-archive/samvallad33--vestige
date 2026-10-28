@@ -276,7 +276,7 @@ test('reflex hooks register only for a 6.0.0 or newer server', () => {
 test('claude gets mcp_tool reflex hooks plus a SessionStart shim; nothing is a gate', () => {
   const f = reflexFixture('6.0.0'); setup.apply(setup.plan({ ...f, platform: 'darwin' }));
   const hooks = JSON.parse(fs.readFileSync(path.join(f.home, '.claude', 'settings.json'))).hooks;
-  for (const event of ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'UserPromptSubmit', 'SubagentStart', 'SubagentStop', 'Stop']) {
+  for (const event of ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'UserPromptSubmit', 'SubagentStart', 'SubagentStop', 'PreCompact', 'PostCompact', 'Stop']) {
     const handlers = hooks[event].flatMap(g => g.hooks).filter(h => h.type === 'mcp_tool');
     assert.equal(handlers.length, 1, event);
     assert.equal(handlers[0].server, 'vestige'); assert.equal(handlers[0].tool, 'reflex');
@@ -306,6 +306,9 @@ test('the reflex shim maps host events and answers in each host shape', () => {
   assert.equal(shim.canonical('gemini', 'AfterTool'), 'PostToolUse');
   assert.equal(shim.canonical('cursor', 'beforeSubmitPrompt'), 'UserPromptSubmit');
   assert.equal(shim.canonical('claude', 'SessionStart'), 'SessionStart');
+  assert.equal(shim.canonical('gemini', 'PreCompress'), 'PreCompact');
+  assert.equal(shim.canonical('cursor', 'preCompact'), 'PreCompact');
+  assert.equal(shim.argumentsFor('claude', 'PostCompact', { session_id: 's1', compact_summary: 'kept mem-00000000000000a1', trigger: 'auto' }).summary, 'kept mem-00000000000000a1');
   const args = shim.argumentsFor('codex', 'PreToolUse', { session_id: 's1', tool_name: 'Bash', tool_use_id: 't1', tool_input: { command: 'rm -rf x' } });
   assert.deepEqual([args.event, args.session, args.call, args.command, args.format], ['PreToolUse', 's1', 't1', 'rm -rf x', 'plain']);
   assert.equal(shim.argumentsFor('codex', 'PreToolUse', { session_id: 's1', agent_id: 'ag1' }).agent, 'ag1');

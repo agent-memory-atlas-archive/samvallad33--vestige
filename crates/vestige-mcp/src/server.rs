@@ -1957,6 +1957,7 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
             // records what this read put in front of the agent, folds bodies it
             // already holds word for word, and keeps the memory hook from
             // injecting a memory twice.
+            tools::reflex::record_retirement(&self.reflex, &self.storage, &tool_name, content);
             let hook = saved_args
                 .as_ref()
                 .and_then(|a| a.get("memory_hook"))

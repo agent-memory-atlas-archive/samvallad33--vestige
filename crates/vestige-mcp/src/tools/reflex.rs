@@ -52,7 +52,11 @@ use vestige_core::{OutputConfig, Storage};
 
 use crate::cognitive::CognitiveEngine;
 
+mod compaction;
 mod pairing;
+mod stale;
+
+pub use stale::record as record_retirement;
 
 /// The dispatch name hooks call.
 pub const NAME: &str = "reflex";
@@ -180,6 +184,7 @@ pub fn fold(
     let Ok(mut g) = global.lock() else {
         return;
     };
+    let seq_now = g.p.retire_seq;
     let s = g.session(&session);
     let Some(agent) = s
         .snapshots
@@ -209,6 +214,7 @@ pub fn fold(
     let explicit = named_ids(args);
     let original = result.to_string();
     let ctx = s.context(&agent);
+    ctx.seq_now = seq_now;
     let folded = fold_value(ctx, turn, tool, &explicit, result);
     let manifest = ctx.digest();
     let held = ctx.held.len();
@@ -425,6 +431,7 @@ pub fn admit_injection(storage: &Arc<Storage>, hook: &Value, result: &mut Value)
     let Ok(mut g) = global.lock() else {
         return;
     };
+    let seq_now = g.p.retire_seq;
     let s = g.session(&session);
     let now = Utc::now().timestamp();
     if event == "UserPromptSubmit" {
@@ -439,6 +446,7 @@ pub fn admit_injection(storage: &Arc<Storage>, hook: &Value, result: &mut Value)
     let turn = s.turn;
     let via = format!("hook:{event}");
     let ctx = s.context("");
+    ctx.seq_now = seq_now;
     let (mut injected, mut skipped, mut dropped) = (Vec::new(), Vec::new(), Vec::new());
     let mut spent = 0usize;
     if let Some(rows) = result.get_mut("memories").and_then(Value::as_array_mut) {
@@ -696,6 +704,10 @@ struct Input {
     /// The file an edit tool wrote.
     file: String,
     cwd: String,
+    /// PostCompact: the summary compaction wrote, read for exact ids.
+    summary: String,
+    /// PreCompact and PostCompact: manual or auto.
+    trigger: String,
 }
 
 /// A substitution the host left unfilled (`${...}`) counts as absent.
@@ -757,6 +769,14 @@ impl Input {
                 }
             },
             cwd: field(a, &["cwd"]),
+            summary: a
+                .get("summary")
+                .or_else(|| a.get("compact_summary"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim_start().starts_with("${"))
+                .map(|s| s.chars().take(200_000).collect())
+                .unwrap_or_default(),
+            trigger: field(a, &["trigger"]),
         }
     }
 }
@@ -908,6 +928,11 @@ struct Persisted {
     /// Fixes Failure Pairing recorded, by failure signature.
     #[serde(default)]
     fixes: Vec<(String, pairing::Fix)>,
+    /// Memories any agent retired, in order, for the stale-belief push.
+    #[serde(default)]
+    retired: Vec<stale::Retirement>,
+    #[serde(default)]
+    retire_seq: u64,
 }
 
 fn lookup<'a, T>(list: &'a [(String, T)], key: &str) -> Option<&'a T> {
@@ -954,6 +979,10 @@ struct Held {
     chars: usize,
     /// Fingerprints of every body variant the agent was shown.
     hashes: Vec<String>,
+    /// The store's retirement count when it entered the agent's context; a
+    /// later retirement of it is news to this agent.
+    #[serde(default)]
+    seq: u64,
 }
 
 /// The exact memories one agent holds, oldest first.
@@ -962,6 +991,9 @@ struct Context {
     held: Vec<(String, Held)>,
     #[serde(default)]
     touched: i64,
+    /// The store's retirement count now, stamped on what is held next.
+    #[serde(skip)]
+    seq_now: u64,
 }
 
 impl Context {
@@ -975,6 +1007,7 @@ impl Context {
             None => Held {
                 turn,
                 via: via.to_string(),
+                seq: self.seq_now,
                 ..Held::default()
             },
         };
@@ -1028,6 +1061,8 @@ struct SessionState {
     open_failures: Vec<pairing::OpenFailure>,
     /// Findings from background work, told once at the next firing.
     notes: Vec<String>,
+    /// What the main agent held when compaction started.
+    checkpoint: Option<compaction::Checkpoint>,
 }
 
 impl SessionState {
@@ -1086,6 +1121,8 @@ struct SavedSession {
     turn: u32,
     touched: i64,
     contexts: HashMap<String, Context>,
+    #[serde(default)]
+    checkpoint: Option<compaction::Checkpoint>,
 }
 
 struct Global {
@@ -1120,6 +1157,7 @@ impl Global {
                         contexts: s.contexts,
                         turn: s.turn,
                         touched: s.touched,
+                        checkpoint: s.checkpoint,
                         ..SessionState::default()
                     },
                 )
@@ -1173,7 +1211,7 @@ impl Global {
         let saved: HashMap<&String, SavedSession> = self
             .sessions
             .iter()
-            .filter(|(_, s)| !s.contexts.is_empty())
+            .filter(|(_, s)| !s.contexts.is_empty() || s.checkpoint.is_some())
             .map(|(id, s)| {
                 (
                     id,
@@ -1181,6 +1219,7 @@ impl Global {
                         turn: s.turn,
                         touched: s.touched,
                         contexts: s.contexts.clone(),
+                        checkpoint: s.checkpoint.clone(),
                     },
                 )
             })
@@ -2017,6 +2056,8 @@ fn stop_line(n: &StopNote) -> String {
 
 /// Marks a background note in the told list, apart from stop receipts.
 const NOTE_MARK: &str = "note\u{0}";
+/// Marks a retired belief in the told list.
+const STALE_MARK: &str = "stale\u{0}";
 
 /// Compose this firing's context within the event and turn budgets, and mark
 /// what it tells. `lead` goes first: what this very firing found. Returns the
@@ -2027,6 +2068,8 @@ fn compose(g: &mut Global, inp: &Input, lead: &[String]) -> (String, Vec<String>
         return (String::new(), Vec::new());
     }
     let recent = g.p.recent.clone();
+    let retired = g.p.retired.clone();
+    let seq_now = g.p.retire_seq;
     let commands = if inp.event == "PreToolUse" && !inp.command.is_empty() {
         let h = command_hash(&inp.command);
         lookup(&g.p.commands, &h).and_then(|d16| {
@@ -2123,6 +2166,12 @@ fn compose(g: &mut Global, inp: &Input, lead: &[String]) -> (String, Vec<String>
             }
         }
     }
+    // A belief another session retired goes before background notes.
+    if let Some(ctx) = s.contexts.get(&inp.agent) {
+        for (line, old) in stale::lines(&retired, &inp.session, ctx) {
+            lines.push((line, Some(format!("{STALE_MARK}{old}"))));
+        }
+    }
     for note in &s.notes {
         lines.push((note.clone(), Some(format!("{NOTE_MARK}{note}"))));
     }
@@ -2146,6 +2195,14 @@ fn compose(g: &mut Global, inp: &Input, lead: &[String]) -> (String, Vec<String>
         }
     }
     s.turn_chars += text.len();
+    let (stale_told, told): (Vec<String>, Vec<String>) =
+        told.into_iter().partition(|d| d.starts_with(STALE_MARK));
+    if let Some(ctx) = s.contexts.get_mut(&inp.agent) {
+        for old in &stale_told {
+            let old = &old[STALE_MARK.len()..];
+            ctx.held.retain(|(k, _)| k != old);
+        }
+    }
     let (notes, told): (Vec<String>, Vec<String>) =
         told.into_iter().partition(|d| d.starts_with(NOTE_MARK));
     for n in notes {
@@ -2165,6 +2222,7 @@ fn compose(g: &mut Global, inp: &Input, lead: &[String]) -> (String, Vec<String>
         .collect();
     let turn = s.turn;
     let ctx = s.context(&inp.agent);
+    ctx.seq_now = seq_now;
     for id in told_nodes {
         ctx.hold(&id, turn, "reflex", None);
     }
@@ -2542,6 +2600,7 @@ pub async fn execute_with(
                     | "SubagentStart"
                     | "SubagentStop"
                     | "PreCompact"
+                    | "PostCompact"
             );
             if (!inp.call.is_empty() || once_per_turn)
                 && s.seen_before(key, !inp.call.is_empty(), now)
@@ -2617,6 +2676,7 @@ pub async fn execute_with(
     }
     spawn_background(&global, storage, cognitive, output_config, background);
     let paired = pairing::on_event(&global, &ctx, &inp).await;
+    let (compacted, restored) = compaction::on_event(&global, &ctx, &inp).await;
     let mut g = global.lock().map_err(|e| e.to_string())?;
     let mut wrote = Vec::new();
     for o in outcomes {
@@ -2625,7 +2685,9 @@ pub async fn execute_with(
         }
     }
     wrote.extend(paired.wrote);
-    let (text, told) = compose(&mut g, &inp, &paired.tell);
+    wrote.extend(compacted);
+    let lead: Vec<String> = restored.into_iter().chain(paired.tell).collect();
+    let (text, told) = compose(&mut g, &inp, &lead);
     let extra = if inp.session.is_empty() {
         json!({})
     } else {
@@ -2643,9 +2705,15 @@ pub async fn execute_with(
         started.elapsed().as_millis(),
         extra,
     );
+    // A turn's end and every compaction step are written down at once: the
+    // next firing may come from a new server process.
     let force = wrote
         .iter()
-        .any(|w| w.get("new").and_then(Value::as_bool) == Some(true));
+        .any(|w| w.get("new").and_then(Value::as_bool) == Some(true))
+        || matches!(
+            inp.event.as_str(),
+            "Stop" | "SubagentStop" | "PreCompact" | "PostCompact" | "SessionStart" | "SessionEnd"
+        );
     g.dirty = g.dirty || !wrote.is_empty();
     g.persist(force);
     g.heartbeat();
@@ -3393,6 +3461,220 @@ mod tests {
             .fire(json!({"event": "PreToolUse", "session": "s1", "call": "t2", "tool": "Bash"}))
             .await;
         assert_eq!(again, json!({}));
+    }
+
+    fn other_connection(session: &str) -> ConnectionState {
+        let conn = new_connection();
+        conn.lock().unwrap().session = Some(session.to_string());
+        conn
+    }
+
+    #[tokio::test]
+    async fn a_retired_belief_reaches_every_other_session_holding_it_once() {
+        let fx = Fixture::new();
+        fx.read(
+            "s1",
+            "toolu_r1",
+            "",
+            "recall",
+            json!({"handle": "topic"}),
+            recall_result(A, &body("a")),
+        )
+        .await;
+        fx.read(
+            "s2",
+            "toolu_r2",
+            "",
+            "recall",
+            json!({"handle": "topic"}),
+            recall_result(A, &body("a")),
+        )
+        .await;
+        // Session s2 corrects the memory; s1 still holds the old version.
+        stale::record(
+            &other_connection("s2"),
+            &fx.storage,
+            "memory",
+            &json!({"action": "edit", "nodeId": B, "supersedes": A,
+                    "newContentPreview": "The service listens on port 4000. The old note said 3000.",
+                    "receiptId": "eff-0000000000000009"}),
+        );
+        let out = fx
+            .fire(
+                json!({"event": "PreToolUse", "session": "s1", "call": "toolu_n1", "tool": "Bash"}),
+            )
+            .await;
+        let text = context(&out);
+        assert!(text.contains(A) && text.contains(B), "{out}");
+        assert!(text.contains("eff-0000000000000009"), "{out}");
+        assert!(text.contains("port 4000"), "{out}");
+        let again = fx
+            .fire(
+                json!({"event": "PreToolUse", "session": "s1", "call": "toolu_n2", "tool": "Bash"}),
+            )
+            .await;
+        assert_eq!(again, json!({}), "told once");
+        let editor = fx
+            .fire(
+                json!({"event": "PreToolUse", "session": "s2", "call": "toolu_n3", "tool": "Bash"}),
+            )
+            .await;
+        assert_eq!(
+            editor,
+            json!({}),
+            "the session that made the change is not told"
+        );
+        let stranger = fx
+            .fire(
+                json!({"event": "PreToolUse", "session": "s3", "call": "toolu_n4", "tool": "Bash"}),
+            )
+            .await;
+        assert_eq!(
+            stranger,
+            json!({}),
+            "a session that never held it is not told"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_memory_read_after_its_retirement_is_not_news() {
+        let fx = Fixture::new();
+        stale::record(
+            &other_connection("s2"),
+            &fx.storage,
+            "memory",
+            &json!({"action": "demoted", "nodeId": A}),
+        );
+        fx.read(
+            "s1",
+            "toolu_r1",
+            "",
+            "recall",
+            json!({"handle": "topic"}),
+            recall_result(A, &body("a")),
+        )
+        .await;
+        let out = fx
+            .fire(
+                json!({"event": "PreToolUse", "session": "s1", "call": "toolu_n1", "tool": "Bash"}),
+            )
+            .await;
+        assert_eq!(out, json!({}), "{out}");
+    }
+
+    /// Two real memories, a decision and a fact, read by session s1.
+    async fn held_pair(fx: &Fixture) -> (String, String) {
+        let ctx = Ctx {
+            storage: &fx.storage,
+            cognitive: &fx.cog,
+            output_config: &fx.oc,
+        };
+        let d = ingest(
+            &ctx,
+            json!({"content": "DECISION: deploys go out only from main, never from a feature branch.",
+                   "node_type": "decision", "tags": ["deploys"]}),
+        )
+        .await
+        .unwrap();
+        let f = ingest(
+            &ctx,
+            json!({"content": "FACT: the staging API listens on port 4000.", "node_type": "fact", "tags": ["deploys"]}),
+        )
+        .await
+        .unwrap();
+        fx.read(
+            "s1",
+            "toolu_r1",
+            "",
+            "recall",
+            json!({"handle": "deploys"}),
+            json!({"nodes": [{"id": f, "content": "FACT: the staging API listens on port 4000."},
+                             {"id": d, "content": "DECISION: deploys go out only from main."}]}),
+        )
+        .await;
+        (d, f)
+    }
+
+    #[tokio::test]
+    async fn compaction_gives_back_exactly_what_the_summary_dropped() {
+        let fx = Fixture::new();
+        let (d, f) = held_pair(&fx).await;
+        // Claude Code's order: PreCompact, SessionStart(compact), PostCompact.
+        fx.fire(json!({"event": "PreCompact", "session": "s1", "trigger": "auto"}))
+            .await;
+        assert!(fx.tag("compaction-checkpoint").await.is_some());
+        let start = fx
+            .fire(json!({"event": "SessionStart", "session": "s1", "source": "compact"}))
+            .await;
+        assert_eq!(start, json!({}), "the restore waits for the audit");
+        fx.fire(
+            json!({"event": "PostCompact", "session": "s1", "trigger": "auto",
+                       "summary": format!("We tuned staging. The port fact {f} still holds.")}),
+        )
+        .await;
+        assert!(fx.tag("compaction-audit").await.is_some());
+        let out = fx
+            .fire(json!({"event": "UserPromptSubmit", "session": "s1"}))
+            .await;
+        let text = context(&out);
+        assert!(text.contains(&d) && text.contains("[decision]"), "{out}");
+        assert!(
+            !text.contains(&format!("- {f}")),
+            "the kept memory is not repeated: {out}"
+        );
+        assert!(text.contains("audit mem-"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn without_an_audit_every_held_memory_comes_back_decisions_first() {
+        let fx = Fixture::new();
+        let (d, f) = held_pair(&fx).await;
+        fx.fire(json!({"event": "PreCompact", "session": "s1", "trigger": "manual"}))
+            .await;
+        fx.fire(json!({"event": "SessionStart", "session": "s1", "source": "compact"}))
+            .await;
+        let out = fx
+            .fire(json!({"event": "PreToolUse", "session": "s1", "call": "toolu_after", "tool": "Bash"}))
+            .await;
+        let text = context(&out);
+        let (di, fi) = (text.find(&d).unwrap(), text.find(&f).unwrap());
+        assert!(di < fi, "the decision comes first: {out}");
+        assert!(text.contains("may have dropped"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn an_edited_memory_comes_back_as_its_current_version() {
+        let fx = Fixture::new();
+        let (d, _f) = held_pair(&fx).await;
+        let ctx = Ctx {
+            storage: &fx.storage,
+            cognitive: &fx.cog,
+            output_config: &fx.oc,
+        };
+        let d2 = ingest(
+            &ctx,
+            json!({"content": "DECISION: deploys go out from main or a release branch.", "node_type": "decision", "tags": ["deploys"]}),
+        )
+        .await
+        .unwrap();
+        fx.fire(json!({"event": "PreCompact", "session": "s1"}))
+            .await;
+        stale::record(
+            &other_connection("s2"),
+            &fx.storage,
+            "memory",
+            &json!({"action": "edit", "nodeId": d2, "supersedes": d}),
+        );
+        fx.fire(json!({"event": "SessionStart", "session": "s1", "source": "compact"}))
+            .await;
+        let out = fx
+            .fire(json!({"event": "UserPromptSubmit", "session": "s1"}))
+            .await;
+        let text = context(&out);
+        assert!(
+            text.contains(&format!("{d2} [decision] (current version of {d})")),
+            "{out}"
+        );
     }
 
     #[test]

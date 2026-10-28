@@ -116,6 +116,39 @@ Anything shaped like a credential is masked before the command is saved.
 
 A first-time failure puts nothing in front of the agent.
 
+## Stale-belief push
+
+Several agents share one store. When one of them retires a memory, every other agent already holding
+that memory hears about it before its next action. Reflex records each retirement in order from the
+result of the call that made it:
+
+| Call | Recorded as |
+|---|---|
+| `memory(action='edit')` | The old memory retired for its successor, with the successor's first sentence |
+| `smart_ingest` with a `supersedes` link | The old memory superseded by the new one |
+| `memory(action='demote')` | Demoted as wrong or unhelpful |
+| `suppress`, and each target its cascade suppressed | Suppressed |
+
+On the next PreToolUse, PostToolUse, UserPromptSubmit or SubagentStart, Reflex compares the new
+retirements with the agent's context. An agent that held the memory before it was retired is told once,
+with the old id, the successor, when it changed and the receipt, and the old id leaves its context. The
+session that made the change and agents that never held the memory are told nothing.
+
+## Compaction survival
+
+Compaction rewrites a conversation into a summary, and whatever the summary drops is gone for the rest of
+the session. Reflex checks it and repairs it by handle.
+
+| Event | What Reflex does |
+|---|---|
+| `PreCompact` | Saves a checkpoint memory, tagged `compaction-checkpoint`, listing by exact id every memory the main agent holds |
+| `PostCompact` | Reads the summary for those exact ids and saves an audit memory, tagged `compaction-audit` and derived from the checkpoint, naming what was kept and what was dropped |
+| `SessionStart` after compaction | Gives back the dropped memories by handle, decisions first, each as its current version, with its type and opening, inside the 2,000 character budget |
+
+An id the summary paraphrased or cut counts as dropped. A memory retired since the checkpoint comes back
+as its successor, and a suppressed one does not come back. Hosts without `PostCompact` get every
+checkpointed memory back. The checkpoint survives a server restart in `sessions.json`.
+
 ## The Hook Ledger
 
 Every firing appends one line to `<data dir>/reflex/ledger.jsonl` with the event, the session, the
