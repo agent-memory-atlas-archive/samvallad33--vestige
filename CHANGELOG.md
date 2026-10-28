@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Reflex: every hook firing reaches Vestige
+
+- Add `reflex`, a tool agent hooks call directly. It is not listed in
+  `tools/list`, so it adds nothing to the tool schema budget. Claude Code
+  calls it from `mcp_tool` hooks; Codex, Gemini CLI and Cursor reach it through
+  a command shim installed by `@vestige/init`.
+- Move the stop-to-Strata reflex into the server. Each Operator gate receipt
+  is checked against the gate's digest chain before it is read, and a line that
+  breaks the chain never becomes a memory. Stop memories keep the same tags and
+  text as `operator-stop-memory.py`.
+- Link a permit, or a law's own compliant path, to the stop it answers with a
+  `closes` edge, and name that answer the next time the same rule stops a call.
+- Tell the stopped session once, at its next tool call, inside a per-event and
+  per-turn character budget. Warn before the exact same command is tried again.
+- Record the memories an agent held at the tool call that was stopped.
+- Write only the calling session's stops on the hook path; drain the rest in
+  one background task per store.
+- Append every firing to a hash-chained Hook Ledger and add
+  `vestige reflex --since <window>` to read and check it while a server runs.
+- `operator-stop-memory.py` steps aside while a Reflex server is active.
+- See [docs/REFLEX.md](docs/REFLEX.md).
+
+### Context manifest: what each agent holds
+
+- Keep, per session and per agent, the exact memories each agent holds: the
+  ones its own Vestige reads returned, the ones the memory hook injected, and
+  the stops Reflex told it. Each read is tied to its agent by the call's
+  `tool_use_id`, so a subagent never inherits what only its parent read.
+  Compaction and `/clear` empty every context.
+- Fold a memory body the agent already holds word for word out of later
+  results, down to its opening and the call that returns it whole. Tags, edge
+  paths and receipt ids stay whole, a memory the call names itself is never
+  folded, and a folded result carries a `reflexFold` block with both sizes and
+  the SHA-256 of the result before folding.
+- The memory hook never injects a memory twice, and every Vestige hook shares
+  one budget of 8,000 characters per turn.
+- Answer a second copy of the same hook firing empty and only ledger it.
+- Stop memories and Hook Ledger lines carry the agent's context manifest, the
+  SHA-256 over the sorted ids it holds.
+- Add `vestige reflex --replay <transcripts>` to measure the fold offline on
+  recorded Claude Code sessions.
+
+### Failure Pairing
+
+- Classify every failed call by a fixed table. Probes that answer by failing,
+  interrupts, refusals and Operator stops are never recorded.
+- Save each failure once, tagged with a signature of the tool, the command's
+  first words and its masked first error line, with a `derived_from` edge to
+  the session's last write and credentials masked.
+- When the same command next succeeds, save the fix with a `closes` edge to
+  the failure, naming the files edited in between.
+- Tell the agent at once when an earlier failure with the same signature has a
+  recorded fix. Walk back from every failure in the background and mention a
+  linked lesson that has faded.
+
 ## [5.0.1] - 2026-10-23
 
 ### Retroactive Salience Backfill returns

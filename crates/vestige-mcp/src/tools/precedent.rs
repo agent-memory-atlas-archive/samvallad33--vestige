@@ -136,7 +136,7 @@ fn parse_query_capped(args: Option<Value>, max_limit: usize) -> Result<Query, St
     })
 }
 
-fn operator_home() -> PathBuf {
+pub(crate) fn operator_home() -> PathBuf {
     if let Ok(h) = std::env::var("OPERATOR_HOME") {
         let p = PathBuf::from(h);
         if !p.as_os_str().is_empty() {
@@ -163,7 +163,7 @@ fn ts_unix(ts: &str) -> Option<i64> {
 /// as Python's `json.dumps(sort_keys=True, separators=(",", ":"),
 /// ensure_ascii=False)`. None when the record holds a non-integer number, whose
 /// Python spelling this cannot reproduce byte for byte.
-fn gate_digest(rec: &Value) -> Option<String> {
+pub(crate) fn gate_digest(rec: &Value) -> Option<String> {
     fn canonical(v: &Value, out: &mut String, top: bool) -> bool {
         match v {
             Value::Null => out.push_str("null"),
@@ -252,7 +252,7 @@ fn file_name(p: &Path) -> String {
 }
 
 /// The stored digest on the last non-empty line of a day file, if it parses.
-fn last_digest(path: &Path) -> Option<String> {
+pub(crate) fn last_digest(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let line = text.lines().rev().find(|l| !l.trim().is_empty())?;
     serde_json::from_str::<Value>(line.trim())

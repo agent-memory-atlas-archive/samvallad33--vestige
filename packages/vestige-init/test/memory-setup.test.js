@@ -236,3 +236,91 @@ for (const responds of [true, false]) {
     }
   });
 }
+test('the memory hook names its session so the server never injects a memory twice', () => {
+  const f = fixture(); const server = path.join(f.home, 'recording.cjs'); const seen = path.join(f.home, 'calls.jsonl');
+  fs.writeFileSync(server, `
+    const fs = require('node:fs'); const readline = require('node:readline');
+    readline.createInterface({ input: process.stdin }).on('line', line => {
+      const msg = JSON.parse(line); if (!msg.id) return;
+      if (msg.method === 'tools/call') fs.appendFileSync(${JSON.stringify(seen)}, JSON.stringify(msg.params) + '\\n');
+      const result = msg.method === 'initialize'
+        ? { protocolVersion: '2025-06-18', capabilities: {}, serverInfo: { name: 'fixture', version: '6.0.0' } }
+        : { structuredContent: { memories: [], entities: [], backfill_receipts: [] } };
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }) + '\\n');
+    });
+  `);
+  const triggers = path.join(f.home, 'triggers.json'); fs.writeFileSync(triggers, JSON.stringify(defaults));
+  const config = path.join(f.home, 'config.json');
+  fs.writeFileSync(config, JSON.stringify({ binary: process.execPath, binaryArgs: [server], triggers }));
+  const result = spawnSync(process.execPath, [path.join(__dirname, '../hooks/memory.cjs'), '--config', config, '--client', 'claude', '--event', 'session'],
+    { input: JSON.stringify({ session_id: 's-518', source: 'compact' }), encoding: 'utf8', timeout: 4000 });
+  assert.equal(result.status, 0, result.stderr);
+  const call = fs.readFileSync(seen, 'utf8').trim().split('\n').map(JSON.parse).find(p => p.name === 'session_start');
+  assert.deepEqual([call.arguments.memory_hook.session, call.arguments.memory_hook.host, call.arguments.memory_hook.event, call.arguments.memory_hook.source],
+    ['s-518', 'claude', 'session', 'compact']);
+});
+function reflexFixture(version) {
+  const f = fixture();
+  fs.writeFileSync(f.bin, `#!/bin/sh\nprintf "vestige-mcp ${version}\\n"\n`, { mode: 0o755 });
+  return f;
+}
+test('reflex hooks register only for a 6.0.0 or newer server', () => {
+  assert.equal(setup.reflexReady(fixture().bin, { PATH: '/usr/bin:/bin' }), false);
+  assert.equal(setup.reflexReady(reflexFixture('6.0.0').bin, { PATH: '/usr/bin:/bin' }), true);
+  assert.equal(setup.reflexReady(reflexFixture('6.1.2').bin, { PATH: '/usr/bin:/bin' }), true);
+  assert.equal(setup.reflexReady(reflexFixture('5.9.9').bin, { PATH: '/usr/bin:/bin' }), false);
+  const old = fixture(); setup.apply(setup.plan({ ...old, platform: 'darwin' }));
+  const oldSettings = JSON.parse(fs.readFileSync(path.join(old.home, '.claude', 'settings.json')));
+  assert.equal(JSON.stringify(oldSettings).includes('"reflex"'), false, 'a 5.x server gets no reflex hooks');
+});
+test('claude gets mcp_tool reflex hooks plus a SessionStart shim; nothing is a gate', () => {
+  const f = reflexFixture('6.0.0'); setup.apply(setup.plan({ ...f, platform: 'darwin' }));
+  const hooks = JSON.parse(fs.readFileSync(path.join(f.home, '.claude', 'settings.json'))).hooks;
+  for (const event of ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'UserPromptSubmit', 'SubagentStart', 'SubagentStop', 'Stop']) {
+    const handlers = hooks[event].flatMap(g => g.hooks).filter(h => h.type === 'mcp_tool');
+    assert.equal(handlers.length, 1, event);
+    assert.equal(handlers[0].server, 'vestige'); assert.equal(handlers[0].tool, 'reflex');
+    assert.equal(handlers[0].input.session, '${session_id}'); assert.equal(handlers[0].input.call, '${tool_use_id}');
+    assert.equal(handlers[0].input.agent, '${agent_id}', 'each read lands in the context of the agent that made it');
+    assert.equal(handlers[0].input.error, '${error}', 'Failure Pairing reads the error the tool reported');
+  }
+  assert(hooks.PreToolUse.every(g => g.hooks.every(h => h.type === 'mcp_tool')), 'memory plus reflex adds no command gate');
+  const shim = hooks.SessionStart.flatMap(g => g.hooks).find(h => h.command && h.command.includes('reflex.cjs'));
+  assert(shim && shim.command.includes("'--client' 'claude'"));
+  assert(fs.existsSync(path.join(f.home, '.vestige', 'memory', 'hooks', 'reflex.cjs')));
+  const again = setup.plan({ ...f, platform: 'darwin' }); assert.equal(again.changes.length, 0, 'repeat install changes nothing');
+  setup.uninstall(f.home);
+  assert.equal(fs.existsSync(path.join(f.home, '.claude', 'settings.json')) && fs.readFileSync(path.join(f.home, '.claude', 'settings.json'), 'utf8').includes('reflex'), false);
+});
+test('codex, gemini and cursor reach reflex through the command shim', () => {
+  const f = reflexFixture('6.0.0'); setup.apply(setup.plan({ ...f, platform: 'linux' }));
+  const codex = JSON.parse(fs.readFileSync(path.join(f.home, '.codex', 'hooks.json'))).hooks;
+  assert(codex.PreToolUse.some(g => g.matcher === '*' && g.hooks.some(h => h.command.includes('reflex.cjs'))));
+  const gemini = JSON.parse(fs.readFileSync(path.join(f.home, '.gemini', 'settings.json'))).hooks;
+  assert(gemini.AfterTool.some(g => g.hooks.some(h => h.command.includes("'--client' 'gemini'"))));
+  const cursor = JSON.parse(fs.readFileSync(path.join(f.home, '.cursor', 'hooks.json'))).hooks;
+  assert(cursor.postToolUse.some(h => h.command.includes('reflex.cjs') && h.failClosed === false));
+});
+test('the reflex shim maps host events and answers in each host shape', () => {
+  const shim = require('../hooks/reflex.cjs');
+  assert.equal(shim.canonical('gemini', 'AfterTool'), 'PostToolUse');
+  assert.equal(shim.canonical('cursor', 'beforeSubmitPrompt'), 'UserPromptSubmit');
+  assert.equal(shim.canonical('claude', 'SessionStart'), 'SessionStart');
+  const args = shim.argumentsFor('codex', 'PreToolUse', { session_id: 's1', tool_name: 'Bash', tool_use_id: 't1', tool_input: { command: 'rm -rf x' } });
+  assert.deepEqual([args.event, args.session, args.call, args.command, args.format], ['PreToolUse', 's1', 't1', 'rm -rf x', 'plain']);
+  assert.equal(shim.argumentsFor('codex', 'PreToolUse', { session_id: 's1', agent_id: 'ag1' }).agent, 'ag1');
+  const failed = shim.argumentsFor('codex', 'PostToolUseFailure', { session_id: 's1', error: 'Exit code 1\nboom', is_interrupt: true, cwd: '/repo', tool_input: { file_path: '/repo/a.rs' } });
+  assert.deepEqual([failed.error, failed.interrupt, failed.file, failed.cwd], ['Exit code 1\nboom', 'true', '/repo/a.rs', '/repo']);
+  assert.equal(shim.argumentsFor('codex', 'PreToolUse', { session_id: 's1' }).agent, '');
+  assert.deepEqual(shim.hostOutput('claude', 'SessionStart', 'hi'), { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: 'hi' } });
+  assert.deepEqual(shim.hostOutput('cursor', 'postToolUse', 'hi'), { additional_context: 'hi' });
+  assert.deepEqual(shim.hostOutput('cursor', 'stop', 'hi'), {});
+  assert.deepEqual(shim.hostOutput('gemini', 'AfterTool', ''), {});
+});
+test('the reflex shim fails open when the server is missing', async () => {
+  const shim = require('../hooks/reflex.cjs');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'vestige-reflex-shim-'));
+  const config = path.join(home, 'config.json'); fs.writeFileSync(config, JSON.stringify({ binary: path.join(home, 'missing-binary') }));
+  const out = await shim.run({ client: 'claude', configFile: config, input: { hook_event_name: 'PostToolUse', session_id: 's1' }, deadlineMs: 200 });
+  assert.deepEqual(out, {});
+});

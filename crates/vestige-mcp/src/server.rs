@@ -660,6 +660,9 @@ pub struct McpServer {
     /// The connected client's name from `initialize` (clientInfo.name), so the
     /// dashboard can say which agent is showing a memory.
     client_name: std::sync::OnceLock<String>,
+    /// The host session this connection's hooks report to `reflex`, so the
+    /// memories this agent reads can be named at a later Operator stop.
+    reflex: tools::reflex::ConnectionState,
 }
 
 /// Load `vestige.toml` from the storage's data directory and resolve it to an
@@ -719,6 +722,7 @@ impl McpServer {
             event_tx: None,
             output_config,
             client_name: std::sync::OnceLock::new(),
+            reflex: tools::reflex::new_connection(),
         }
     }
 
@@ -741,6 +745,7 @@ impl McpServer {
             event_tx: Some(event_tx),
             output_config,
             client_name: std::sync::OnceLock::new(),
+            reflex: tools::reflex::new_connection(),
         }
     }
 
@@ -1598,6 +1603,13 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
         &self,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, JsonRpcError> {
+        // Claude Code names each call's tool_use_id in `_meta`; reflex ties the
+        // call to the agent whose PreToolUse firing recorded the same id.
+        let call_id = params
+            .as_ref()
+            .and_then(|p| p.pointer("/_meta/claudecode~1toolUseId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         let mut request: CallToolRequest = match params {
             Some(p) => serde_json::from_value(p)
                 .map_err(|e| JsonRpcError::invalid_params(&e.to_string()))?,
@@ -1614,6 +1626,34 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
         // `source`; the handlers read them at the top level.
         if let Some(arguments) = request.arguments.as_mut() {
             tools::compact::unfold_arguments(&request.name, arguments);
+        }
+
+        // Hook-only: `reflex` answers hooks in hook JSON. It skips the trace
+        // recorder, the review gate, the consolidation counter and dashboard
+        // events, so hook firings never count as agent activity.
+        if request.name == tools::reflex::NAME {
+            let value = tools::reflex::execute(
+                &self.storage,
+                &self.cognitive,
+                &self.output_config,
+                &self.reflex,
+                request.arguments,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                warn!(%error, "reflex answered empty");
+                serde_json::json!({})
+            });
+            let call_result = CallToolResult {
+                content: vec![crate::protocol::messages::ToolResultContent {
+                    content_type: "text".to_string(),
+                    text: value.to_string(),
+                }],
+                structured_content: Some(value),
+                is_error: Some(false),
+            };
+            return serde_json::to_value(call_result)
+                .map_err(|e| JsonRpcError::internal_error(&e.to_string()));
         }
 
         // 4.0: erasure-class calls are withheld on a Strata log. Refuse before
@@ -1913,6 +1953,27 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
             // Emit after receipt attachment and gating so the dashboard sees the
             // same final evidence and review state returned to the calling agent.
             self.emit_tool_event(&tool_name, &saved_args, content);
+            // Last, so receipts and the dashboard keep the whole result: reflex
+            // records what this read put in front of the agent, folds bodies it
+            // already holds word for word, and keeps the memory hook from
+            // injecting a memory twice.
+            let hook = saved_args
+                .as_ref()
+                .and_then(|a| a.get("memory_hook"))
+                .filter(|h| h.get("session").is_some());
+            match hook {
+                Some(hook) if tool_name == "session_start" => {
+                    tools::reflex::admit_injection(&self.storage, hook, content)
+                }
+                _ => tools::reflex::fold(
+                    &self.reflex,
+                    &self.storage,
+                    &tool_name,
+                    saved_args.as_ref(),
+                    call_id.as_deref(),
+                    content,
+                ),
+            }
         }
 
         let response = match result {
