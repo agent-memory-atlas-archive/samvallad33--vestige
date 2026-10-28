@@ -144,7 +144,10 @@ async function run({ event, client, configFile, input, deadlineMs = 190 }) {
     let context = ''; let packet = {};
     let cause = trigger(prompt, phrases);
     if (['session', 'prompt', 'tool'].includes(event)) {
-      packet = await transport.tool('session_start', { memory_hook: { prompt, limit: event === 'session' ? 8 : cause.limit, trigger: cause } });
+      // The session lets a 6.0.0 server skip memories this agent already holds
+      // and keep every hook inside one budget per turn; older servers ignore it.
+      packet = await transport.tool('session_start', { memory_hook: { prompt, limit: event === 'session' ? 8 : cause.limit, trigger: cause,
+        session, host: client, event, source: typeof input.source === 'string' ? input.source : '' } });
       if (!Array.isArray(packet.memories)) throw new Error('binary lacks v5.0.1 memory hooks');
       cause = trigger(prompt, phrases, packet.entities || []);
       context = formatContext(packet);

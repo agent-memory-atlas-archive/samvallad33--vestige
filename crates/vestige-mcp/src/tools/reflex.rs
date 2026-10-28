@@ -22,6 +22,14 @@
 //! - tells the stopped session once, inside a per-event and per-turn budget,
 //!   and warns before the exact same command is tried again.
 //!
+//! Its second handler is the context manifest. Reflex keeps, per session and per
+//! agent, the exact memories each agent holds: the ones its own Vestige reads
+//! returned and the ones a hook injected. Ids are read from JSON keys, never
+//! matched in text. A Vestige read that returns a body the agent already holds
+//! word for word gets that body folded to a stub naming the call that unfolds
+//! it, the memory hook never injects a memory twice, and every hook shares one
+//! budget per turn. Compaction and `/clear` empty what an agent holds.
+//!
 //! Every firing appends one hash-chained line to `<data_dir>/reflex/ledger.jsonl`,
 //! the Hook Ledger, which `reflex(action='ledger')` summarizes and verifies.
 //!
@@ -61,12 +69,28 @@ const MAX_COMMANDS: usize = 2000;
 const RECENT_KEEP: usize = 20;
 const RECENT_SHOWN: usize = 5;
 const RECENT_DAYS: i64 = 7;
-/// Characters reflex may add to one turn across every event.
-const TURN_BUDGET: usize = 4000;
+/// Characters every Vestige hook together may add to one turn: reflex's own
+/// notices and the memory hook's injections share it.
+const TURN_BUDGET: usize = 8000;
+/// What the memory hook leaves of the turn budget for reflex's notices.
+const NOTICE_RESERVE: usize = 1500;
 const MANIFEST_KEEP: usize = 400;
 const MANIFEST_IN_STOP: usize = 40;
 const SNAPSHOT_KEEP: usize = 128;
 const SESSIONS_KEEP: usize = 64;
+/// Agent contexts kept per session: the main agent and its subagents.
+const CONTEXTS_KEEP: usize = 16;
+/// Fingerprints kept per held memory, one for each body variant shown.
+const HASHES_KEEP: usize = 4;
+/// A body shorter than this is never folded; its stub would save too little.
+const FOLD_MIN: usize = 400;
+/// Characters of a folded body kept as its opening.
+const FOLD_OPENING: usize = 120;
+/// Firings remembered per session to drop a second copy of the same one.
+const SEEN_KEEP: usize = 256;
+/// A turn start or a call-less event repeated within this many seconds is
+/// the same firing reported twice.
+const SAME_FIRING_SECS: i64 = 5;
 const PERSIST_EVERY_SECS: i64 = 30;
 const HEARTBEAT_EVERY_SECS: i64 = 30;
 const LEDGER_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
@@ -95,6 +119,7 @@ pub fn schema() -> Value {
             "host": {"type": "string", "description": "claude, codex, cursor, gemini, opencode."},
             "tool": {"type": "string", "description": "The tool the event is about."},
             "call": {"type": "string", "description": "The tool_use_id."},
+            "agent": {"type": "string", "description": "The subagent's agent_id; empty for the main agent."},
             "command": {"type": "string", "description": "The shell command, on PreToolUse of a shell tool."},
             "source": {"type": "string", "description": "SessionStart source: startup, resume, clear or compact."},
             "format": {"type": "string", "description": "claude (default) for hook JSON, plain for {context}."},
@@ -120,55 +145,486 @@ pub fn new_connection() -> ConnectionState {
     Arc::new(std::sync::Mutex::new(Connection::default()))
 }
 
-/// Record the memory ids a Vestige read put in front of the agent on this
-/// connection, so a later stop can say what the agent held. Ids are read from
-/// the result's JSON keys, never matched in text.
-pub fn observe(conn: &ConnectionState, storage: &Arc<Storage>, tool: &str, result: &Value) {
-    if !matches!(tool, "recall" | "memory" | "session_start" | "codebase") {
+/// What one Vestige read put in front of the agent. Claude Code sends the call's
+/// tool_use_id in `_meta`, and the PreToolUse firing just before it recorded
+/// that id with the agent that made the call, so the read lands in exactly
+/// that agent's context. A call reflex cannot tie to an agent is left as it was.
+///
+/// Every memory the result names joins that agent's context. A body the agent
+/// already holds word for word is folded to its opening and the exact call that
+/// unfolds it, unless this call named that memory itself. Tags, types, dates,
+/// edge paths and receipt ids are never touched. A folded result carries a
+/// `reflexFold` block with both sizes, the ids folded and the SHA-256 of the
+/// result as it was before folding.
+pub fn fold(
+    conn: &ConnectionState,
+    storage: &Arc<Storage>,
+    tool: &str,
+    args: Option<&Value>,
+    call: Option<&str>,
+    result: &mut Value,
+) {
+    if tool == NAME || !result.is_object() {
         return;
     }
+    let Some(call) = call.filter(|c| !c.is_empty()) else {
+        return;
+    };
     let Some(session) = conn.lock().ok().and_then(|c| c.session.clone()) else {
         return;
     };
-    let mut ids = Vec::new();
-    collect_ids(result, &mut ids, 0);
-    if ids.is_empty() {
-        return;
-    }
+    let started = Instant::now();
     let global = global_for(storage);
     let Ok(mut g) = global.lock() else {
         return;
     };
-    let state = g.session(&session);
-    for id in ids {
-        state.remember(id);
+    let s = g.session(&session);
+    let Some(agent) = s
+        .snapshots
+        .iter()
+        .rev()
+        .find(|x| x.call == call)
+        .map(|x| x.agent.clone())
+    else {
+        return;
+    };
+    let turn = s.turn;
+    let explicit = named_ids(args);
+    let original = result.to_string();
+    let ctx = s.context(&agent);
+    let folded = fold_value(ctx, turn, tool, &explicit, result);
+    let manifest = ctx.digest();
+    let held = ctx.held.len();
+    g.dirty = true;
+    if folded.is_empty() {
+        return;
     }
+    let block = attach_fold_block(&original, &folded, result);
+    let sent = result.to_string().len();
+    let inp = Input {
+        event: "Fold".into(),
+        session,
+        host: "claude".into(),
+        tool: tool.to_string(),
+        call: call.to_string(),
+        agent,
+        ..Input::default()
+    };
+    append_ledger(
+        &mut g,
+        &inp,
+        0,
+        &[],
+        &[],
+        started.elapsed().as_millis(),
+        json!({"fold": block, "sentChars": sent, "manifest": manifest, "held": held}),
+    );
 }
 
-fn collect_ids(v: &Value, out: &mut Vec<String>, depth: usize) {
-    if depth > 8 || out.len() >= MANIFEST_KEEP {
+/// Add the `reflexFold` block to a folded result and return it. `foldedChars`
+/// is the result's size before the block; the ledger keeps the size sent.
+fn attach_fold_block(original: &str, folded: &[String], result: &mut Value) -> Value {
+    let block = json!({
+        "folded": folded,
+        "originalChars": original.len(),
+        "foldedChars": result.to_string().len(),
+        "originalSha256": sha256_hex(original),
+        "note": "These memories are already in your context word for word, so their bodies are folded. memory(action='get', id=...) returns any of them whole.",
+    });
+    if let Some(o) = result.as_object_mut() {
+        o.insert("reflexFold".into(), block.clone());
+    }
+    block
+}
+
+/// Replay recorded Claude Code transcripts through the fold, offline. Every
+/// Vestige tool result is taken in order, with one context for the main agent
+/// and one per subagent sidechain, emptied at each compaction. For each tool it
+/// reports the characters the agent was sent and the characters it would have
+/// been sent with the fold, block included. Nothing is written anywhere.
+pub fn replay(paths: &[PathBuf]) -> Value {
+    #[derive(Default)]
+    struct Tally {
+        calls: u64,
+        folded_calls: u64,
+        folds: u64,
+        before: u64,
+        after: u64,
+    }
+    let mut by_tool: std::collections::BTreeMap<String, Tally> = std::collections::BTreeMap::new();
+    let (mut files, mut unreadable, mut compactions, mut not_json) = (0u64, 0u64, 0u64, 0u64);
+    for path in paths {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            unreadable += 1;
+            continue;
+        };
+        files += 1;
+        let mut contexts: HashMap<String, Context> = HashMap::new();
+        let mut uses: HashMap<String, (String, Value)> = HashMap::new();
+        let mut turn = 0u32;
+        for line in text.lines() {
+            let Ok(r) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if r["type"] == "system" && r["subtype"] == "compact_boundary" {
+                contexts.clear();
+                compactions += 1;
+                continue;
+            }
+            let agent = if r["isSidechain"] == true {
+                r["agentId"].as_str().unwrap_or("sidechain").to_string()
+            } else {
+                String::new()
+            };
+            let blocks = r["message"]["content"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let prompt = r["type"] == "user"
+                && agent.is_empty()
+                && r["isCompactSummary"] != true
+                && (r["message"]["content"].is_string()
+                    || !blocks.iter().any(|b| b["type"] == "tool_result"));
+            if prompt {
+                turn += 1;
+            }
+            for b in blocks {
+                if b["type"] == "tool_use" {
+                    if let Some(tool) = b["name"]
+                        .as_str()
+                        .and_then(|n| n.strip_prefix("mcp__vestige__"))
+                        && let Some(id) = b["id"].as_str()
+                    {
+                        uses.insert(id.to_string(), (tool.to_string(), b["input"].clone()));
+                    }
+                    continue;
+                }
+                if b["type"] != "tool_result" {
+                    continue;
+                }
+                let Some((tool, input)) = b["tool_use_id"].as_str().and_then(|id| uses.get(id))
+                else {
+                    continue;
+                };
+                let body = match &b["content"] {
+                    Value::String(s) => s.clone(),
+                    Value::Array(parts) => parts
+                        .iter()
+                        .filter_map(|p| p["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(""),
+                    _ => continue,
+                };
+                let Ok(mut v) = serde_json::from_str::<Value>(&body) else {
+                    not_json += 1;
+                    continue;
+                };
+                if !v.is_object() {
+                    not_json += 1;
+                    continue;
+                }
+                let original = v.to_string();
+                let explicit = named_ids(Some(input));
+                let ctx = contexts.entry(agent.clone()).or_default();
+                let folded = fold_value(ctx, turn, tool, &explicit, &mut v);
+                if !folded.is_empty() {
+                    attach_fold_block(&original, &folded, &mut v);
+                }
+                let t = by_tool.entry(tool.clone()).or_default();
+                t.calls += 1;
+                t.before += original.len() as u64;
+                t.after += v.to_string().len() as u64;
+                if !folded.is_empty() {
+                    t.folded_calls += 1;
+                    t.folds += folded.len() as u64;
+                }
+            }
+        }
+    }
+    let pct = |before: u64, after: u64| {
+        if before == 0 {
+            0.0
+        } else {
+            ((before.saturating_sub(after)) as f64 * 1000.0 / before as f64).round() / 10.0
+        }
+    };
+    let (mut before, mut after, mut calls, mut folds) = (0u64, 0u64, 0u64, 0u64);
+    let tools: serde_json::Map<String, Value> = by_tool
+        .iter()
+        .map(|(tool, t)| {
+            before += t.before;
+            after += t.after;
+            calls += t.calls;
+            folds += t.folds;
+            (
+                tool.clone(),
+                json!({
+                    "calls": t.calls,
+                    "foldedCalls": t.folded_calls,
+                    "memoriesFolded": t.folds,
+                    "charsSent": t.before,
+                    "charsWithFold": t.after,
+                    "charsSaved": t.before.saturating_sub(t.after),
+                    "savedPct": pct(t.before, t.after),
+                }),
+            )
+        })
+        .collect();
+    json!({
+        "transcripts": files,
+        "unreadable": unreadable,
+        "compactions": compactions,
+        "resultsNotJson": not_json,
+        "vestigeCalls": calls,
+        "memoriesFolded": folds,
+        "charsSent": before,
+        "charsWithFold": after,
+        "charsSaved": before.saturating_sub(after),
+        "savedPct": pct(before, after),
+        "byTool": tools,
+        "method": "Each recorded Vestige result, in order, folded against what that agent already held word for word; one context per transcript and per subagent sidechain, emptied at each compaction; calls that named a memory by id never fold it.",
+    })
+}
+
+/// What the memory hook is about to inject at a session start or a prompt. A
+/// memory the agent already holds at least this much of is skipped, the rest
+/// stays inside what is left of the turn budget, and what is kept joins the
+/// main agent's context. The packet says what it skipped and why.
+pub fn admit_injection(storage: &Arc<Storage>, hook: &Value, result: &mut Value) {
+    let session = field(hook, &["session", "session_id"]);
+    if session.is_empty() {
+        return;
+    }
+    let event = match field(hook, &["event"]).as_str() {
+        "session" | "SessionStart" => "SessionStart",
+        "prompt" | "UserPromptSubmit" => "UserPromptSubmit",
+        "tool" | "PostToolUse" => "PostToolUse",
+        _ => "MemoryHook",
+    }
+    .to_string();
+    let source = field(hook, &["source"]);
+    let started = Instant::now();
+    let global = global_for(storage);
+    let Ok(mut g) = global.lock() else {
+        return;
+    };
+    let s = g.session(&session);
+    let now = Utc::now().timestamp();
+    if event == "UserPromptSubmit" {
+        s.start_turn(now);
+    }
+    if event == "SessionStart" && matches!(source.as_str(), "clear" | "compact") {
+        s.forget_all();
+    }
+    let mut room = TURN_BUDGET
+        .saturating_sub(s.turn_chars)
+        .saturating_sub(NOTICE_RESERVE);
+    let turn = s.turn;
+    let via = format!("hook:{event}");
+    let ctx = s.context("");
+    let (mut injected, mut skipped, mut dropped) = (Vec::new(), Vec::new(), Vec::new());
+    let mut spent = 0usize;
+    if let Some(rows) = result.get_mut("memories").and_then(Value::as_array_mut) {
+        rows.retain(|row| {
+            let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
+                return true;
+            };
+            let body = row.get("content").and_then(Value::as_str).unwrap_or("");
+            if ctx.get(&id).is_some_and(|h| h.chars >= body.len()) {
+                skipped.push(id);
+                return false;
+            }
+            // The memory hook writes one JSON line per memory; count that line.
+            let line = json!({"id": id, "text": body, "entities": row.get("tags")})
+                .to_string()
+                .len()
+                + 1;
+            if line > room {
+                dropped.push(id);
+                return false;
+            }
+            room -= line;
+            spent += line;
+            ctx.hold(&id, turn, &via, Some(body));
+            injected.push(id);
+            true
+        });
+    }
+    let manifest = ctx.digest();
+    let held = ctx.held.len();
+    s.turn_chars += spent;
+    if let Some(o) = result.as_object_mut() {
+        o.insert(
+            "reflex".into(),
+            json!({
+                "injected": injected,
+                "skippedAlreadyHeld": skipped,
+                "droppedForTurnBudget": dropped,
+                "turnBudgetLeft": room,
+            }),
+        );
+    }
+    g.dirty = true;
+    let inp = Input {
+        event: "MemoryHook".into(),
+        session,
+        host: field(hook, &["host", "client"]),
+        source,
+        ..Input::default()
+    };
+    append_ledger(
+        &mut g,
+        &inp,
+        spent,
+        &[],
+        &[],
+        started.elapsed().as_millis(),
+        json!({
+            "hook": event,
+            "injected": injected,
+            "skipped": skipped,
+            "dropped": dropped,
+            "manifest": manifest,
+            "held": held,
+        }),
+    );
+}
+
+/// The memory ids a call names itself. A memory the agent asked for by id is
+/// never folded in that call's own result.
+fn named_ids(args: Option<&Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(a) = args else {
+        return out;
+    };
+    for key in [
+        "id",
+        "ids",
+        "handle",
+        "memoryId",
+        "memory_id",
+        "nodeId",
+        "node_id",
+        "center_id",
+    ] {
+        let mut push = |s: &str| {
+            if is_memory_id(s) && !out.iter().any(|o| o == s) {
+                out.push(s.to_string());
+            }
+        };
+        match a.get(key) {
+            Some(Value::String(s)) => push(s),
+            Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).for_each(push),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Fold, in place, every memory body in `v` the context already holds word for
+/// word, and add every other memory `v` names to the context. Ids are read from
+/// JSON keys in serialization order, so a body shown earlier in the same result
+/// counts as held for a later copy. Returns the ids folded.
+fn fold_value(
+    ctx: &mut Context,
+    turn: u32,
+    via: &str,
+    explicit: &[String],
+    v: &mut Value,
+) -> Vec<String> {
+    let mut folded = Vec::new();
+    walk(ctx, turn, via, explicit, v, &mut folded, 0);
+    folded
+}
+
+fn walk(
+    ctx: &mut Context,
+    turn: u32,
+    via: &str,
+    explicit: &[String],
+    v: &mut Value,
+    folded: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > 16 {
         return;
     }
     match v {
         Value::Object(map) => {
-            for (k, x) in map {
-                if matches!(k.as_str(), "id" | "nodeId" | "memoryId" | "node_id")
-                    && let Some(s) = x.as_str()
-                    && is_memory_id(s)
-                    && !out.iter().any(|o| o == s)
-                {
-                    out.push(s.to_string());
+            let id = ["id", "nodeId", "memoryId", "node_id"]
+                .iter()
+                .find_map(|k| {
+                    map.get(*k)
+                        .and_then(Value::as_str)
+                        .filter(|s| is_memory_id(s))
+                        .map(str::to_string)
+                });
+            if let Some(id) = &id {
+                let body = map
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                match body {
+                    Some(body) => {
+                        let held = ctx
+                            .get(id)
+                            .filter(|h| h.hashes.contains(&fingerprint(&body)))
+                            .cloned();
+                        let short = held.map(|h| stub(&body, id, &h));
+                        match short {
+                            Some(short)
+                                if body.len() >= FOLD_MIN
+                                    && short.len() < body.len()
+                                    && !explicit.contains(id) =>
+                            {
+                                map.insert("content".into(), Value::String(short));
+                                if !folded.contains(id) {
+                                    folded.push(id.clone());
+                                }
+                            }
+                            _ => ctx.hold(id, turn, via, Some(&body)),
+                        }
+                    }
+                    None => ctx.hold(id, turn, via, None),
                 }
-                collect_ids(x, out, depth + 1);
+            }
+            for (k, x) in map.iter_mut() {
+                if k == "content" && x.is_string() {
+                    continue;
+                }
+                walk(ctx, turn, via, explicit, x, folded, depth + 1);
             }
         }
         Value::Array(items) => {
             for x in items {
-                collect_ids(x, out, depth + 1);
+                walk(ctx, turn, via, explicit, x, folded, depth + 1);
             }
         }
         _ => {}
     }
+}
+
+fn stub(body: &str, id: &str, held: &Held) -> String {
+    let opening: String = body.chars().take(FOLD_OPENING).collect();
+    format!(
+        "{}… [held since turn {} via {}; memory(action='get', id='{id}') unfolds it]",
+        opening.trim_end(),
+        held.turn,
+        held.via
+    )
+}
+
+fn sha256_hex(s: &str) -> String {
+    sha2::Sha256::digest(s.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The first 16 hex characters of a body's SHA-256: enough to tell the body
+/// variants of one memory apart, never matched across memories.
+fn fingerprint(body: &str) -> String {
+    sha256_hex(body)[..16].to_string()
 }
 
 fn is_hex(s: &str) -> bool {
@@ -212,6 +668,7 @@ struct Input {
     host: String,
     tool: String,
     call: String,
+    agent: String,
     command: String,
     source: String,
     format: String,
@@ -258,6 +715,7 @@ impl Input {
             },
             tool: field(a, &["tool", "tool_name", "toolName"]),
             call: field(a, &["call", "tool_use_id", "toolUseId"]),
+            agent: field(a, &["agent", "agent_id", "agentId"]),
             command,
             source: field(a, &["source"]),
             format: field(a, &["format"]),
@@ -440,30 +898,149 @@ struct StopNote {
 #[derive(Clone, Debug, Default)]
 struct Snapshot {
     call: String,
+    agent: String,
     command: Option<String>,
     manifest: Vec<String>,
 }
 
+/// One memory an agent holds.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Held {
+    /// The turn it entered the agent's context.
+    turn: u32,
+    /// What put it there: a Vestige tool, a hook, or a reflex notice.
+    via: String,
+    /// The longest body of it the agent was shown; 0 when only its id was.
+    chars: usize,
+    /// Fingerprints of every body variant the agent was shown.
+    hashes: Vec<String>,
+}
+
+/// The exact memories one agent holds, oldest first.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Context {
+    held: Vec<(String, Held)>,
+    #[serde(default)]
+    touched: i64,
+}
+
+impl Context {
+    fn get(&self, id: &str) -> Option<&Held> {
+        self.held.iter().find(|(k, _)| k == id).map(|(_, h)| h)
+    }
+
+    fn hold(&mut self, id: &str, turn: u32, via: &str, body: Option<&str>) {
+        let mut h = match self.held.iter().position(|(k, _)| k == id) {
+            Some(pos) => self.held.remove(pos).1,
+            None => Held {
+                turn,
+                via: via.to_string(),
+                ..Held::default()
+            },
+        };
+        if let Some(body) = body {
+            h.chars = h.chars.max(body.len());
+            let fp = fingerprint(body);
+            if !h.hashes.contains(&fp) {
+                h.hashes.push(fp);
+                if h.hashes.len() > HASHES_KEEP {
+                    h.hashes.remove(0);
+                }
+            }
+        }
+        self.held.push((id.to_string(), h));
+        if self.held.len() > MANIFEST_KEEP {
+            let drop = self.held.len() - MANIFEST_KEEP;
+            self.held.drain(..drop);
+        }
+    }
+
+    fn ids(&self) -> Vec<String> {
+        self.held.iter().map(|(k, _)| k.clone()).collect()
+    }
+
+    /// The manifest: SHA-256 over the sorted ids, first 16 hex characters.
+    fn digest(&self) -> String {
+        manifest_digest(&self.ids())
+    }
+}
+
+fn manifest_digest(ids: &[String]) -> String {
+    let mut sorted: Vec<&str> = ids.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sha256_hex(&sorted.join("\n"))[..16].to_string()
+}
+
 #[derive(Debug, Default)]
 struct SessionState {
-    manifest: VecDeque<String>,
+    /// What each agent holds; "" is the main agent, others are subagent ids.
+    contexts: HashMap<String, Context>,
     snapshots: VecDeque<Snapshot>,
     stops: Vec<StopNote>,
     told: Vec<String>,
+    turn: u32,
+    turn_started: i64,
     turn_chars: usize,
+    seen: VecDeque<(String, i64)>,
     touched: i64,
 }
 
 impl SessionState {
-    fn remember(&mut self, id: String) {
-        if let Some(pos) = self.manifest.iter().position(|x| *x == id) {
-            self.manifest.remove(pos);
+    fn context(&mut self, agent: &str) -> &mut Context {
+        let now = Utc::now().timestamp();
+        if !self.contexts.contains_key(agent)
+            && self.contexts.len() >= CONTEXTS_KEEP
+            && let Some(oldest) = self
+                .contexts
+                .iter()
+                .filter(|(k, _)| !k.is_empty())
+                .min_by_key(|(_, c)| c.touched)
+                .map(|(k, _)| k.clone())
+        {
+            self.contexts.remove(&oldest);
         }
-        self.manifest.push_back(id);
-        while self.manifest.len() > MANIFEST_KEEP {
-            self.manifest.pop_front();
+        let c = self.contexts.entry(agent.to_string()).or_default();
+        c.touched = now;
+        c
+    }
+
+    /// A new turn starts once, however many hooks report the same prompt.
+    fn start_turn(&mut self, now: i64) {
+        if now - self.turn_started > SAME_FIRING_SECS {
+            self.turn += 1;
+            self.turn_chars = 0;
+            self.turn_started = now;
         }
     }
+
+    /// Compaction and /clear leave no memory in any agent's context.
+    fn forget_all(&mut self) {
+        self.contexts.clear();
+    }
+
+    /// True when this exact firing was already answered: the same event for
+    /// the same call, or a call-less event repeated within a few seconds.
+    fn seen_before(&mut self, key: String, has_call: bool, now: i64) -> bool {
+        let dup = self
+            .seen
+            .iter()
+            .any(|(k, at)| *k == key && (has_call || now - at <= SAME_FIRING_SECS));
+        if !dup {
+            self.seen.push_back((key, now));
+            while self.seen.len() > SEEN_KEEP {
+                self.seen.pop_front();
+            }
+        }
+        dup
+    }
+}
+
+/// What reflex keeps of one session across restarts, in `sessions.json`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SavedSession {
+    turn: u32,
+    touched: i64,
+    contexts: HashMap<String, Context>,
 }
 
 struct Global {
@@ -484,10 +1061,29 @@ impl Global {
             .ok()
             .and_then(|t| serde_json::from_str::<Persisted>(&t).ok())
             .unwrap_or_default();
+        let saved: HashMap<String, SavedSession> =
+            std::fs::read_to_string(dir.join("sessions.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default();
+        let sessions = saved
+            .into_iter()
+            .map(|(id, s)| {
+                (
+                    id,
+                    SessionState {
+                        contexts: s.contexts,
+                        turn: s.turn,
+                        touched: s.touched,
+                        ..SessionState::default()
+                    },
+                )
+            })
+            .collect();
         let mut g = Global {
             dir,
             p,
-            sessions: HashMap::new(),
+            sessions,
             in_flight: Vec::new(),
             dirty: false,
             last_persist: 0,
@@ -529,6 +1125,27 @@ impl Global {
         let Ok(text) = serde_json::to_string(&self.p) else {
             return;
         };
+        let saved: HashMap<&String, SavedSession> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| !s.contexts.is_empty())
+            .map(|(id, s)| {
+                (
+                    id,
+                    SavedSession {
+                        turn: s.turn,
+                        touched: s.touched,
+                        contexts: s.contexts.clone(),
+                    },
+                )
+            })
+            .collect();
+        let sessions_tmp = self.dir.join("sessions.json.tmp");
+        if let Ok(t) = serde_json::to_string(&saved)
+            && std::fs::write(&sessions_tmp, t).is_ok()
+        {
+            let _ = std::fs::rename(&sessions_tmp, self.dir.join("sessions.json"));
+        }
         if std::fs::write(&tmp, text).is_ok()
             && std::fs::rename(&tmp, self.dir.join("state.json")).is_ok()
         {
@@ -986,9 +1603,11 @@ fn stop_item(row: &GateRow, rule_node: &str, manifest: &[String], command: Optio
             .map(String::as_str)
             .collect();
         content.push_str(&format!(
-            " Memories in this agent's context at that tool call, newest first, {} of {}: {}.",
-            shown.len(),
+            " Context manifest {} over the {} memories in this agent's context at that tool call; \
+             newest first, {} of them: {}.",
+            manifest_digest(manifest),
             manifest.len(),
+            shown.len(),
             shown.join(", ")
         ));
     }
@@ -1185,7 +1804,15 @@ fn spawn_background(
                 host: "reflex".into(),
                 ..Input::default()
             };
-            append_ledger(&mut g, &inp, 0, &[], &wrote, started.elapsed().as_millis());
+            append_ledger(
+                &mut g,
+                &inp,
+                0,
+                &[],
+                &wrote,
+                started.elapsed().as_millis(),
+                json!({}),
+            );
             g.persist(true);
         }
         g.bg_running = false;
@@ -1478,8 +2105,10 @@ fn compose(g: &mut Global, inp: &Input) -> (String, Vec<String>) {
         .filter(|n| told.contains(&n.d16))
         .map(|n| n.node.clone())
         .collect();
+    let turn = s.turn;
+    let ctx = s.context(&inp.agent);
     for id in told_nodes {
-        s.remember(id);
+        ctx.hold(&id, turn, "reflex", None);
     }
     (text, told)
 }
@@ -1516,6 +2145,7 @@ fn append_ledger(
     told: &[String],
     wrote: &[Value],
     ms: u128,
+    extra: Value,
 ) {
     if std::fs::create_dir_all(&g.dir).is_err() {
         return;
@@ -1540,6 +2170,14 @@ fn append_ledger(
         "ms": ms as u64,
         "prev": g.p.ledger_tip.clone().unwrap_or_else(|| "0".repeat(64)),
     });
+    if !inp.agent.is_empty() {
+        row["agent"] = json!(inp.agent);
+    }
+    if let (Some(o), Value::Object(more)) = (row.as_object_mut(), extra) {
+        for (k, v) in more {
+            o.insert(k, v);
+        }
+    }
     let digest = ledger_digest(&row);
     row["digest"] = json!(digest);
     let line = format!("{row}\n");
@@ -1628,6 +2266,14 @@ fn ledger_at(dir: &Path, since: &str) -> Value {
     let mut stops = 0u64;
     let mut resolutions = 0u64;
     let mut told = 0u64;
+    let mut folds = 0u64;
+    let mut saved = 0u64;
+    let mut saved_by_tool: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let mut injected = 0u64;
+    let mut skipped = 0u64;
+    let mut dropped = 0u64;
+    let mut duplicates = 0u64;
     let mut sessions: Vec<String> = Vec::new();
     let mut last: VecDeque<Value> = VecDeque::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -1686,6 +2332,35 @@ fn ledger_at(dir: &Path, since: &str) -> Value {
                 }
             }
         }
+        if let Some(f) = row.get("fold") {
+            folds += 1;
+            let before = f.get("originalChars").and_then(Value::as_u64).unwrap_or(0);
+            let after = row
+                .get("sentChars")
+                .and_then(Value::as_u64)
+                .unwrap_or(before);
+            let cut = before.saturating_sub(after);
+            saved += cut;
+            *saved_by_tool
+                .entry(
+                    row.get("tool")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                )
+                .or_default() += cut;
+        }
+        let count = |k: &str| {
+            row.get(k)
+                .and_then(Value::as_array)
+                .map_or(0, |a| a.len() as u64)
+        };
+        injected += count("injected");
+        skipped += count("skipped");
+        dropped += count("dropped");
+        if row.get("duplicate").and_then(Value::as_bool) == Some(true) {
+            duplicates += 1;
+        }
         if let Some(s) = row.get("session").and_then(Value::as_str)
             && !s.is_empty()
             && !sessions.iter().any(|x| x == s)
@@ -1706,6 +2381,15 @@ fn ledger_at(dir: &Path, since: &str) -> Value {
         "stopsTold": told,
         "stopsRecorded": stops,
         "resolutionsRecorded": resolutions,
+        "context": {
+            "folds": folds,
+            "charsSaved": saved,
+            "charsSavedByTool": saved_by_tool,
+            "injected": injected,
+            "skippedAlreadyHeld": skipped,
+            "droppedForTurnBudget": dropped,
+            "duplicateFiringsDropped": duplicates,
+        },
         "sessions": sessions.len(),
         "chain": {
             "status": if checked == 0 { "empty" } else if breaks == 0 { "ok" } else { "broken" },
@@ -1787,20 +2471,60 @@ pub async fn execute_with(
     let jobs = {
         let mut g = global.lock().map_err(|e| e.to_string())?;
         if !inp.session.is_empty() {
+            let now = Utc::now().timestamp();
             let s = g.session(&inp.session);
-            if inp.event == "UserPromptSubmit" {
-                s.turn_chars = 0;
+            // One firing per event: a host that reads the same settings twice
+            // reports it twice, and the second copy is only ledgered.
+            let key = format!("{}|{}|{}|{}", inp.event, inp.call, inp.agent, inp.source);
+            let once_per_turn = matches!(
+                inp.event.as_str(),
+                "UserPromptSubmit"
+                    | "SessionStart"
+                    | "Stop"
+                    | "SubagentStart"
+                    | "SubagentStop"
+                    | "PreCompact"
+            );
+            if (!inp.call.is_empty() || once_per_turn)
+                && s.seen_before(key, !inp.call.is_empty(), now)
+            {
+                append_ledger(
+                    &mut g,
+                    &inp,
+                    0,
+                    &[],
+                    &[],
+                    started.elapsed().as_millis(),
+                    json!({"duplicate": true}),
+                );
+                return Ok(json!({}));
             }
-            if inp.event == "PreToolUse" && !inp.call.is_empty() {
-                let snap = Snapshot {
-                    call: inp.call.clone(),
-                    command: (!inp.command.is_empty()).then(|| command_hash(&inp.command)),
-                    manifest: s.manifest.iter().cloned().collect(),
-                };
-                s.snapshots.push_back(snap);
-                while s.snapshots.len() > SNAPSHOT_KEEP {
-                    s.snapshots.pop_front();
+            match inp.event.as_str() {
+                "UserPromptSubmit" => s.start_turn(now),
+                "SessionStart" if matches!(inp.source.as_str(), "clear" | "compact") => {
+                    s.forget_all()
                 }
+                // A subagent starts blank and its context ends with it.
+                "SubagentStart" if !inp.agent.is_empty() => {
+                    s.contexts.remove(&inp.agent);
+                }
+                "SubagentStop" if !inp.agent.is_empty() => {
+                    s.contexts.remove(&inp.agent);
+                }
+                "PreToolUse" if !inp.call.is_empty() => {
+                    let manifest = s.context(&inp.agent).ids();
+                    let snap = Snapshot {
+                        call: inp.call.clone(),
+                        agent: inp.agent.clone(),
+                        command: (!inp.command.is_empty()).then(|| command_hash(&inp.command)),
+                        manifest,
+                    };
+                    s.snapshots.push_back(snap);
+                    while s.snapshots.len() > SNAPSHOT_KEEP {
+                        s.snapshots.pop_front();
+                    }
+                }
+                _ => {}
             }
         }
         scan(&mut g, home);
@@ -1842,6 +2566,14 @@ pub async fn execute_with(
         }
     }
     let (text, told) = compose(&mut g, &inp);
+    let extra = if inp.session.is_empty() {
+        json!({})
+    } else {
+        let s = g.session(&inp.session);
+        let turn = s.turn;
+        let ctx = s.context(&inp.agent);
+        json!({"turn": turn, "manifest": ctx.digest(), "held": ctx.held.len()})
+    };
     append_ledger(
         &mut g,
         &inp,
@@ -1849,6 +2581,7 @@ pub async fn execute_with(
         &told,
         &wrote,
         started.elapsed().as_millis(),
+        extra,
     );
     let force = wrote
         .iter()
@@ -1960,6 +2693,33 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
             panic!("background drain did not finish");
+        }
+
+        /// One Vestige read the way Claude Code makes it: the PreToolUse firing
+        /// with the call's id and agent, then the call itself carrying that id.
+        async fn read(
+            &self,
+            session: &str,
+            call: &str,
+            agent: &str,
+            tool: &str,
+            args: Value,
+            mut result: Value,
+        ) -> Value {
+            self.fire(
+                json!({"event": "PreToolUse", "session": session, "call": call,
+                             "agent": agent, "tool": format!("mcp__vestige__{tool}")}),
+            )
+            .await;
+            fold(
+                &self.conn,
+                &self.storage,
+                tool,
+                Some(&args),
+                Some(call),
+                &mut result,
+            );
+            result
         }
 
         async fn tag(&self, tag: &str) -> Option<String> {
@@ -2140,12 +2900,15 @@ mod tests {
         let mut fx = Fixture::new();
         fx.fire(json!({"event": "SessionStart", "session": "s1", "source": "startup"}))
             .await;
-        observe(
-            &fx.conn,
-            &fx.storage,
+        fx.read(
+            "s1",
+            "toolu_r",
+            "",
             "recall",
-            &json!({"nodes": [{"id": "mem-00000000000000aa"}]}),
-        );
+            json!({"handle": "some-tag"}),
+            json!({"nodes": [{"id": "mem-00000000000000aa"}]}),
+        )
+        .await;
         fx.fire(json!({"event": "PreToolUse", "session": "s1", "call": "toolu_1", "command": "rm -rf ~/work"})).await;
         let digest = fx.receipt(stop("s1", "OP-003", "toolu_1", "rm -rf ~/work"));
         fx.fire(json!({"event": "PostToolUse", "session": "s1"}))
@@ -2168,6 +2931,312 @@ mod tests {
         .await
         .unwrap();
         assert!(got.to_string().contains("mem-00000000000000aa"), "{got}");
+        let manifest = manifest_digest(&["mem-00000000000000aa".to_string()]);
+        assert!(
+            got.to_string()
+                .contains(&format!("Context manifest {manifest}")),
+            "{got}"
+        );
+    }
+
+    const A: &str = "mem-00000000000000a1";
+    const B: &str = "mem-00000000000000b2";
+
+    fn body(tag: &str) -> String {
+        format!(
+            "DECISION {tag}: {}",
+            "the long body of a memory. ".repeat(30)
+        )
+    }
+
+    fn recall_result(id: &str, content: &str) -> Value {
+        json!({
+            "nodes": [{"id": id, "content": content, "tags": ["topic"], "type": "decision"}],
+            "edges": [{"from": id, "to": B, "link_type": "derived_from", "receiptId": "eff-0000000000000001"}],
+        })
+    }
+
+    #[tokio::test]
+    async fn a_body_the_agent_already_holds_is_folded_and_unfolds_whole() {
+        let fx = Fixture::new();
+        let full = body("a");
+        let first = fx
+            .read(
+                "s1",
+                "toolu_1",
+                "",
+                "recall",
+                json!({"handle": "topic"}),
+                recall_result(A, &full),
+            )
+            .await;
+        assert!(first.get("reflexFold").is_none(), "{first}");
+        assert_eq!(first["nodes"][0]["content"], full.as_str());
+        let original = recall_result(A, &full);
+        let second = fx
+            .read(
+                "s1",
+                "toolu_2",
+                "",
+                "recall",
+                json!({"handle": "topic"}),
+                original.clone(),
+            )
+            .await;
+        let stub = second["nodes"][0]["content"].as_str().unwrap();
+        assert!(
+            stub.contains(&format!("memory(action='get', id='{A}')")),
+            "{stub}"
+        );
+        assert!(stub.len() < full.len());
+        assert_eq!(second["nodes"][0]["tags"], json!(["topic"]));
+        assert_eq!(second["nodes"][0]["type"], "decision");
+        assert_eq!(
+            second["edges"], original["edges"],
+            "edge paths and receipts stay whole"
+        );
+        let block = &second["reflexFold"];
+        assert_eq!(block["folded"], json!([A]));
+        assert_eq!(block["originalSha256"], sha256_hex(&original.to_string()));
+        assert_eq!(block["originalChars"], original.to_string().len());
+        assert!(block["foldedChars"].as_u64().unwrap() < block["originalChars"].as_u64().unwrap());
+        // Asking for the memory by id returns it byte for byte.
+        let unfolded = fx
+            .read(
+                "s1",
+                "toolu_3",
+                "",
+                "memory",
+                json!({"action": "get", "id": A}),
+                json!({"id": A, "content": full}),
+            )
+            .await;
+        assert_eq!(unfolded["content"], full.as_str());
+        assert!(unfolded.get("reflexFold").is_none());
+        let view = fx.fire(json!({"action": "ledger"})).await;
+        assert_eq!(view["context"]["folds"], 1, "{view}");
+        assert!(
+            view["context"]["charsSaved"].as_u64().unwrap() > 0,
+            "{view}"
+        );
+        assert!(
+            view["context"]["charsSavedByTool"]["recall"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(view["chain"]["status"], "ok", "{view}");
+    }
+
+    #[tokio::test]
+    async fn a_subagent_is_never_handed_a_stub_for_what_only_its_parent_read() {
+        let fx = Fixture::new();
+        let full = body("a");
+        fx.read(
+            "s1",
+            "toolu_1",
+            "",
+            "recall",
+            json!({"handle": "topic"}),
+            recall_result(A, &full),
+        )
+        .await;
+        fx.fire(json!({"event": "SubagentStart", "session": "s1", "agent": "ag1"}))
+            .await;
+        let sub = fx
+            .read(
+                "s1",
+                "toolu_2",
+                "ag1",
+                "recall",
+                json!({"handle": "topic"}),
+                recall_result(A, &full),
+            )
+            .await;
+        assert_eq!(sub["nodes"][0]["content"], full.as_str(), "{sub}");
+        let again = fx
+            .read(
+                "s1",
+                "toolu_3",
+                "ag1",
+                "recall",
+                json!({"handle": "topic"}),
+                recall_result(A, &full),
+            )
+            .await;
+        assert_eq!(
+            again["reflexFold"]["folded"],
+            json!([A]),
+            "the subagent now holds it"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_and_clear_empty_what_the_agent_holds() {
+        let fx = Fixture::new();
+        let full = body("a");
+        for (i, source) in ["compact", "clear"].iter().enumerate() {
+            fx.read(
+                "s1",
+                &format!("toolu_{i}a"),
+                "",
+                "recall",
+                json!({"handle": "topic"}),
+                recall_result(A, &full),
+            )
+            .await;
+            fx.fire(json!({"event": "SessionStart", "session": "s1", "source": source}))
+                .await;
+            let after = fx
+                .read(
+                    "s1",
+                    &format!("toolu_{i}b"),
+                    "",
+                    "recall",
+                    json!({"handle": "topic"}),
+                    recall_result(A, &full),
+                )
+                .await;
+            assert_eq!(
+                after["nodes"][0]["content"],
+                full.as_str(),
+                "after {source}: {after}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_reflex_cannot_tie_to_an_agent_is_left_as_it_was() {
+        let fx = Fixture::new();
+        let full = body("a");
+        fx.read(
+            "s1",
+            "toolu_1",
+            "",
+            "recall",
+            json!({}),
+            recall_result(A, &full),
+        )
+        .await;
+        for call in [Some("toolu_unseen"), None] {
+            let mut result = recall_result(A, &full);
+            fold(&fx.conn, &fx.storage, "recall", None, call, &mut result);
+            assert_eq!(result, recall_result(A, &full), "{call:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_changed_body_or_a_named_memory_is_shown_in_full() {
+        let fx = Fixture::new();
+        fx.read(
+            "s1",
+            "toolu_1",
+            "",
+            "recall",
+            json!({}),
+            recall_result(A, &body("a")),
+        )
+        .await;
+        let changed = fx
+            .read(
+                "s1",
+                "toolu_2",
+                "",
+                "recall",
+                json!({}),
+                recall_result(A, &body("b")),
+            )
+            .await;
+        assert_eq!(changed["nodes"][0]["content"], body("b").as_str());
+        let named = fx
+            .read(
+                "s1",
+                "toolu_3",
+                "",
+                "recall",
+                json!({"handle": A}),
+                recall_result(A, &body("b")),
+            )
+            .await;
+        assert_eq!(named["nodes"][0]["content"], body("b").as_str());
+    }
+
+    fn packet(first: u64, n: u64, chars: usize) -> Value {
+        json!({"memories": (0..n).map(|i| json!({
+            "id": format!("mem-{:016x}", first + i), "content": "m".repeat(chars), "tags": ["x"]
+        })).collect::<Vec<_>>()})
+    }
+
+    #[tokio::test]
+    async fn the_memory_hook_never_injects_a_memory_twice_and_shares_the_turn_budget() {
+        let fx = Fixture::new();
+        let hook = json!({"session": "s1", "event": "prompt", "host": "claude"});
+        let mut p1 = packet(0xa0, 3, 700);
+        admit_injection(&fx.storage, &hook, &mut p1);
+        assert_eq!(p1["memories"].as_array().unwrap().len(), 3, "{p1}");
+        let mut p2 = packet(0xa0, 3, 700);
+        admit_injection(&fx.storage, &hook, &mut p2);
+        assert_eq!(p2["memories"], json!([]), "{p2}");
+        assert_eq!(
+            p2["reflex"]["skippedAlreadyHeld"].as_array().unwrap().len(),
+            3
+        );
+        let mut p3 = packet(0xb0, 12, 700);
+        admit_injection(&fx.storage, &hook, &mut p3);
+        let kept = p3["memories"].as_array().unwrap().len();
+        let dropped = p3["reflex"]["droppedForTurnBudget"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert!(kept > 0 && dropped > 0 && kept + dropped == 12, "{p3}");
+        let view = fx.fire(json!({"action": "ledger"})).await;
+        assert_eq!(view["context"]["injected"], 3 + kept as u64, "{view}");
+        assert_eq!(view["context"]["skippedAlreadyHeld"], 3, "{view}");
+        let s = global_for(&fx.storage);
+        let g = s.lock().unwrap();
+        assert!(g.sessions["s1"].turn_chars <= TURN_BUDGET - NOTICE_RESERVE);
+    }
+
+    #[tokio::test]
+    async fn a_second_copy_of_the_same_firing_is_only_ledgered() {
+        let fx = Fixture::new();
+        let pre =
+            json!({"event": "PreToolUse", "session": "s1", "call": "toolu_1", "tool": "Bash"});
+        fx.fire(pre.clone()).await;
+        assert_eq!(fx.fire(pre).await, json!({}));
+        fx.fire(json!({"event": "UserPromptSubmit", "session": "s1"}))
+            .await;
+        fx.fire(json!({"event": "UserPromptSubmit", "session": "s1"}))
+            .await;
+        let view = fx.fire(json!({"action": "ledger"})).await;
+        assert_eq!(view["context"]["duplicateFiringsDropped"], 2, "{view}");
+        assert_eq!(view["chain"]["status"], "ok", "{view}");
+    }
+
+    #[test]
+    fn a_replay_folds_recorded_repeats_and_restarts_after_compaction() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let text = serde_json::to_string(&recall_result(A, &body("a"))).unwrap();
+        fn call(lines: &mut Vec<Value>, id: &str, text: &str) {
+            lines.push(json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": id, "name": "mcp__vestige__recall", "input": {"handle": "topic"}}]}}));
+            lines.push(json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": id, "content": [{"type": "text", "text": text}]}]}}));
+        }
+        let mut lines = vec![json!({"type": "user", "message": {"content": "go"}})];
+        call(&mut lines, "t1", &text);
+        call(&mut lines, "t2", &text);
+        lines.push(json!({"type": "system", "subtype": "compact_boundary"}));
+        call(&mut lines, "t3", &text);
+        let out: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&path, out).unwrap();
+        let report = replay(&[path]);
+        let recall = &report["byTool"]["recall"];
+        assert_eq!(recall["calls"], 3, "{report}");
+        assert_eq!(recall["foldedCalls"], 1, "{report}");
+        assert!(recall["charsSaved"].as_u64().unwrap() > 0, "{report}");
+        assert_eq!(report["compactions"], 1);
     }
 
     #[tokio::test]

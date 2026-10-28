@@ -8,6 +8,10 @@ decided, saves each stop as a memory linked to its rule, tells the stopped agent
 each stop was answered. The gate stays the only thing that can block a call, and Reflex never allows,
 retries or routes around a stop.
 
+Its second job is the context manifest: the exact memories each agent holds at every call. A memory the
+agent already holds word for word is folded out of later results, a hook never injects it twice, and
+every Vestige hook shares one budget per turn.
+
 ## What happens on a hook firing
 
 On every firing Reflex reads the gate's day files under `~/.operator/receipts` from where it last
@@ -38,7 +42,8 @@ slows a tool call.
 | `SessionStart` | The newest stops on this machine from the last seven days, each with the handle to recall it; after compaction, the stops this session was already told | 2,000 characters |
 | `Stop` and every other event | Nothing; Reflex records only | 0 |
 
-Each stop is told once per session. Across every event, Reflex adds at most 4,000 characters to a turn.
+Each stop is told once per session. Every Vestige hook together adds at most 8,000 characters to a turn,
+and the memory hook leaves 1,500 of those for Reflex's notices.
 
 When a later stop hits a rule that was answered before, the notice names that answer and its memory. A
 command's fingerprint is the first 16 hex characters of the SHA-256 of the command with its whitespace
@@ -49,6 +54,42 @@ collapsed, so the exact command is recognized without storing it again.
 Besides the gate's own fields, a stop memory names the memories that were in the agent's context at that
 exact tool call. Reflex learns them from the agent's own Vestige reads on the same MCP connection, and
 takes the snapshot at `PreToolUse`. The gate's receipt names that call by its `tool_use_id`.
+
+## What each agent holds
+
+Reflex keeps a context for every session: one for the main agent and one for each subagent. A memory joins
+an agent's context when one of that agent's own Vestige reads returns it, when the memory hook injects
+it, or when Reflex tells the agent about a stop saved as it. Ids are read from the JSON keys of the
+result, never matched in text, and a body is remembered by the SHA-256 of its exact text.
+
+Claude Code sends each tool call's `tool_use_id` in the call's `_meta`. The PreToolUse firing just
+before the call records the same id with the agent that made it, so every read lands in exactly that
+agent's context. A subagent starts with nothing and its context ends with it. Compaction and `/clear`
+empty every context of the session. A read Reflex cannot tie to an agent this way is left as it was.
+
+| What happens | When |
+|---|---|
+| A memory body is folded to its opening and `memory(action='get', id=...)`, the call that returns it whole | The same agent already holds that exact body and the call did not name that memory itself |
+| The result carries a `reflexFold` block with the ids folded, both sizes and the SHA-256 of the result before folding | Any body was folded |
+| The memory hook skips a memory | The agent already holds at least that much of it |
+| The memory hook drops a memory | It would take the turn past its budget |
+| A firing is answered empty and only ledgered | The host reported the same firing twice: the same event for the same call, or the same once-per-turn event within five seconds |
+
+Tags, types, dates, edge paths and receipt ids are never folded. Receipts and the dashboard see every
+result whole, because the fold runs last.
+
+Every PreToolUse snapshot records the agent's manifest: the SHA-256 over the sorted ids it holds. A stop
+memory names that manifest and the ids, and every Hook Ledger line carries the manifest of the agent it
+fired for.
+
+To measure the fold on your own sessions, replay recorded Claude Code transcripts through it offline:
+
+```bash
+vestige reflex --replay ~/.claude/projects/*/*.jsonl
+```
+
+It reports, per tool, the characters each Vestige result sent and what it would have sent with the fold,
+with one context per transcript and per subagent sidechain, emptied at each compaction. It writes nothing.
 
 ## The Hook Ledger
 
@@ -65,16 +106,20 @@ vestige reflex --since 24h
 ```
 
 It reads only `<data dir>/reflex/`, never the log, so it works while a server owns the store. It reports
-firings by event, characters told, stops and resolutions recorded, whether the ledger chain is intact, and
-the receipt reader's own counters.
+firings by event, characters told, stops and resolutions recorded, folds and the characters they saved by
+tool, memories the memory hook injected, skipped and dropped, duplicate firings, whether the ledger chain
+is intact, and the receipt reader's own counters.
 
 ## Installing
 
 `npx @vestige/init` registers Reflex when the installed `vestige-mcp` is 6.0.0 or newer.
 
 - **Claude Code** calls Reflex from `mcp_tool` hooks on `PreToolUse`, `PostToolUse`,
-  `PostToolUseFailure`, `UserPromptSubmit`, `SubagentStart` and `Stop`. `SessionStart` at launch fires
-  before MCP servers connect, so it uses the command shim `~/.vestige/memory/hooks/reflex.cjs`.
+  `PostToolUseFailure`, `UserPromptSubmit`, `SubagentStart`, `SubagentStop` and `Stop`, each passing
+  the session, the call and the agent id. `SessionStart` at launch fires before MCP servers connect, so it
+  uses the command shim `~/.vestige/memory/hooks/reflex.cjs`.
+- **The memory hook** names its session when it asks the server what to inject, so the server can skip
+  what the agent already holds. Older servers ignore the field.
 - **Codex, Gemini CLI and Cursor** use the same command shim on their matching events.
 
 None of these hooks can block a call. The Operator gate stays a separate command hook that fails closed.
@@ -88,5 +133,6 @@ none, that hook works exactly as before.
 | Path | Holds |
 |---|---|
 | `<data dir>/reflex/state.json` | Read positions in the gate's day files, the last digest read, recorded stops, rules, open stops and the background queue |
+| `<data dir>/reflex/sessions.json` | What each agent of each recent session holds, so a resumed session gets no repeats after a server restart |
 | `<data dir>/reflex/ledger.jsonl` | The Hook Ledger; it rotates to `ledger.jsonl.1` past 8 MB |
 | `<data dir>/reflex/heartbeat` | The time of the last firing |

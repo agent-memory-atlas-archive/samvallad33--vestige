@@ -29,6 +29,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `operator-stop-memory.py` steps aside while a Reflex server is active.
 - See [docs/REFLEX.md](docs/REFLEX.md).
 
+### Context manifest: what each agent holds
+
+- Keep, per session and per agent, the exact memories each agent holds: the
+  ones its own Vestige reads returned, the ones the memory hook injected, and
+  the stops Reflex told it. Each read is tied to its agent by the call's
+  `tool_use_id`, so a subagent never inherits what only its parent read.
+  Compaction and `/clear` empty every context.
+- Fold a memory body the agent already holds word for word out of later
+  results, down to its opening and the call that returns it whole. Tags, edge
+  paths and receipt ids stay whole, a memory the call names itself is never
+  folded, and a folded result carries a `reflexFold` block with both sizes and
+  the SHA-256 of the result before folding.
+- The memory hook never injects a memory twice, and every Vestige hook shares
+  one budget of 8,000 characters per turn.
+- Answer a second copy of the same hook firing empty and only ledger it.
+- Stop memories and Hook Ledger lines carry the agent's context manifest, the
+  SHA-256 over the sorted ids it holds.
+- Add `vestige reflex --replay <transcripts>` to measure the fold offline on
+  recorded Claude Code sessions.
+
 ## [5.0.1] - 2026-10-23
 
 ### Retroactive Salience Backfill returns
