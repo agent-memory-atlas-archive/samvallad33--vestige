@@ -18,7 +18,7 @@ function supportedVersion(text) {
 }
 const read = file => fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
 function object(file) {
-  const raw = read(file); const value = raw === null ? {} : JSON.parse(raw);
+  const raw = read(file); const value = raw === null || !raw.trim() ? {} : JSON.parse(raw);
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${file} must contain a JSON object; nothing changed`);
   return value;
 }
@@ -138,7 +138,7 @@ function plan({ home = os.homedir(), platform = os.platform(), env = process.env
     return changes.get(file);
   };
   const add = (file, keys, value, description, append = false) => {
-    const row = change(file, description); const value_ = row.after === null ? {} : JSON.parse(row.after);
+    const row = change(file, description); const value_ = row.after === null || !row.after.trim() ? {} : JSON.parse(row.after);
     let cursor = value_;
     for (const key of keys.slice(0, -1)) {
       if (cursor[key] === undefined) cursor[key] = {};
