@@ -125,6 +125,11 @@ gate sets the standard. Lite now has 42 rules: 27 STOP and 15 SHADOW.
   anything. `install` registers both hooks and `uninstall` removes them.
 - A script that only reads another script with `awk`, `sed`, `rg` and similar
   readers no longer counts as running it.
+- **Evidence lock, part of #529.** OP-002 also covers an agent's own record:
+  deleting, emptying or rewriting Claude Code, Codex and Gemini CLI transcripts
+  or the shell's history is the owner's call. Reading them still passes.
+- On Windows the floor reads a cmd switch such as the `/s` of `rmdir /s` as a
+  switch, not as the Git Bash spelling of a drive.
 - Each rule has its own test suite, run in CI on Linux and macOS.
 
 ### Operator Lite and the installer, from 5.0.2

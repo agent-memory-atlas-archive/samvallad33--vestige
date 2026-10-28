@@ -179,7 +179,7 @@ Windows can run. On Windows it is tested by `test_windows.py` on a CI runner.
 |---|---|---|
 | OP-000 | STOP | edits to the gate itself, its mode, permits and rules, hook registrations, settings files |
 | OP-001 | STOP | delete/move of a workspace root or a parent of one, including `/` and your home folder |
-| OP-002 | STOP | wiping the Vestige store (its log or database files, sqlite3 writes, `vestige gc`) |
+| OP-002 | STOP | wiping the Vestige store (its log or database files, sqlite3 writes, `vestige gc`), or an agent's own record: deleting, emptying or rewriting Claude Code, Codex and Gemini CLI transcripts or the shell's history |
 | OP-003 | STOP | recursive deletes outside the project and outside scratch/build folders (`rm -r`, `find -delete`, `trash`, inline `shutil.rmtree`/`fs.rmSync`), sweeps from `/` |
 | OP-004 | STOP | force-push to shared branches, remote-main deletion (`--delete`, `:main`), `git reflog expire`/`delete`, deleting `.git` or a whole repository |
 | OP-005 | STOP | unreviewed publishes (npm/pnpm/yarn/cargo/twine/docker push/gh release), deleting a public repo |

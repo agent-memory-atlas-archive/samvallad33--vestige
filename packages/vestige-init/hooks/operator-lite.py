@@ -194,7 +194,8 @@ RULES = {
     "OP-001": ("protect-workspaces", "STOP",
                "Deleting or moving a registered workspace root (or a parent of one) is owner-only."),
     "OP-002": ("protect-memory", "STOP",
-               "Wiping, deleting or rewriting the Vestige memory store is owner-only."),
+               "Wiping, deleting or rewriting the Vestige memory store, or an agent's own record (its "
+               "transcripts and shell history), is owner-only."),
     "OP-003": ("no-blind-recursive-delete", "STOP",
                "Recursive delete outside scratch/build directories needs the owner's approval."),
     "OP-004": ("no-history-destruction", "STOP",
@@ -645,6 +646,17 @@ def vestige_data_dirs(env, home, platform):
 STRATA_DIRS = [canon(d) for d in vestige_data_dirs(os.environ, HOME, sys.platform)]
 MEMORY_DIRS = [pj(HOME, ".vestige")] + STRATA_DIRS
 MEMORY_FILE_RE = re.compile(r"vestige\.db|\.wal$|\.shm$|\.sqlite3?$", re.I)
+# An agent's own record: the transcripts of what it was told and did, and the shell's history of what
+# it ran. Reading them is fine; erasing, emptying or rewriting them is the owner's call (#529).
+RECORD_DIRS = [pj(HOME, ".claude", "projects"), pj(HOME, ".codex", "sessions"), pj(HOME, ".codex", "archived_sessions"),
+               pj(HOME, ".gemini", "tmp")]
+if os.environ.get("CLAUDE_CONFIG_DIR", "").startswith("/"):
+    RECORD_DIRS.append(pj(canon(os.environ["CLAUDE_CONFIG_DIR"]), "projects"))
+RECORD_FILES = [pj(HOME, n) for n in (".zsh_history", ".zhistory", ".bash_history", ".sh_history", ".history")] + [
+    pj(HOME, ".local", "share", "fish", "fish_history"), pj(HOME, ".codex", "history.jsonl")]
+if os.environ.get("HISTFILE", "").startswith("/"):
+    RECORD_FILES.append(canon(os.environ["HISTFILE"]))
+RECORD_HINT = "The record outlives the task: the owner decides what is erased and when, with a one-time permit."
 # Inside a Strata data dir: the hash-chained log (segments, head.state, strata.key), the keys that sign
 # its receipts and identify its actor, the store marker, and the backups. Exports and logs stay writable.
 STRATA_CRITICAL_RE = re.compile(r"^(?:log|backups)(?:/.*)?$|^(?:actor\.key|receipt-signing\.key|store\.meta)$")
@@ -2776,6 +2788,12 @@ def memory_store_hit(w, verb, extra_strata=()):
             return "%s Vestige store path %s" % (verb, w)
     if any(is_inside(w, d) for d in MEMORY_DIRS) and MEMORY_FILE_RE.search(w):
         return "%s memory store path %s" % (verb, w)
+    for d in RECORD_DIRS:
+        if is_inside(w, d) or (verb in ("delete", "move") and is_same_or_ancestor(w, d)
+                               and not is_same_or_ancestor(w, HOME)):
+            return "%s an agent's own record %s" % (verb, w)
+    if any(same_path(w, f) for f in RECORD_FILES):
+        return "%s shell history %s" % (verb, w)
     return None
 
 
@@ -2786,7 +2804,8 @@ def write_hits(w, gate_files, verb="write to", extra_strata=()):
                      "Ask the owner to make this change, or to grant a one-time permit."))
     store = memory_store_hit(w, verb, extra_strata=extra_strata)
     if store:
-        hits.append(("OP-002", store, "Use `vestige backup` first; erasure is not something an agent decides."))
+        hits.append(("OP-002", store, RECORD_HINT if ("own record" in store or "shell history" in store) else
+                     "Use `vestige backup` first; erasure is not something an agent decides."))
     base = w.rstrip("/").rsplit("/", 1)[-1]
     parent = w.rstrip("/").rsplit("/", 1)[-2] if w.rstrip("/").count("/") >= 1 else ""
     is_init = (base in SHELL_INIT_FILES or (base == "config.fish" and parent.endswith("fish"))
@@ -2989,6 +3008,10 @@ def classify_effect(e, cfg, cwd):
                          "Download to a file, read it, then run it deliberately; the owner reviews the script."))
     if kind == "truncate":
         for t in e["targets"]:
+            store = memory_store_hit(t, "empty")          # `> ~/.zsh_history` names no program, only the file
+            if store:
+                hits.append(("OP-002", store, RECORD_HINT if ("own record" in store or "shell history" in store)
+                             else "Use `vestige backup` first; erasure is not something an agent decides."))
             if is_precious_outside_file(t) and not is_scratch(t) and not (ecwd and is_inside(t, ecwd)):
                 hits.append(("OP-011", "empties %s, which is outside the project" % t,
                              "Copy it to a dated backup first, or ask the owner."))
