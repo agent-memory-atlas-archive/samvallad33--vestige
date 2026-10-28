@@ -3897,6 +3897,40 @@ def unlock_file(f):
         msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def receipt_tail_digest(rdir):
+    """Last complete append, checked under the writer lock. HEAD is only a cache.
+
+    A malformed/incomplete tail is preserved and prevents another append; never skip evidence.
+    Historical chain links are left untouched, including previously recorded forks.
+    """
+    files = sorted(f for f in os.listdir(rdir) if f.endswith(".jsonl"))
+    for name in reversed(files):
+        with open(pj(rdir, name), "rb") as f:
+            end = f.seek(0, os.SEEK_END)
+            if not end:
+                continue
+            f.seek(end - 1)
+            if f.read(1) != b"\n":
+                raise ValueError("incomplete receipt tail")
+            pos, chunks = end - 1, []
+            while pos:
+                start = max(0, pos - 4096)
+                f.seek(start)
+                chunk = f.read(pos - start)
+                split = chunk.rfind(b"\n")
+                chunks.append(chunk[split + 1:] if split >= 0 else chunk)
+                if split >= 0:
+                    break
+                pos = start
+            rec = json.loads(b"".join(reversed(chunks)).decode("utf-8"))
+        receipt_digest = rec.pop("digest")
+        if (not re.fullmatch(r"[0-9a-f]{64}", str(receipt_digest))
+                or digest_of(rec) != receipt_digest):
+            raise ValueError("invalid receipt tail digest")
+        return receipt_digest
+    return "0" * 64
+
+
 def write_receipt(rec):
     """Append a hash-chained receipt. Never raises into the caller."""
     try:
@@ -3906,11 +3940,7 @@ def write_receipt(rec):
         lock = open(pj(rdir, ".lock"), "a+", encoding="utf-8")
         lock_file(lock)
         try:
-            try:
-                with open(head_path, encoding="utf-8") as f:
-                    prev = f.read().strip() or ("0" * 64)
-            except Exception:
-                prev = "0" * 64
+            prev = receipt_tail_digest(rdir)
             rec = dict(rec)
             rec.update({"v": 1, "integrity": INTEGRITY, "gate_version": VERSION, "prev": prev,
                         "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"})
@@ -3918,8 +3948,11 @@ def write_receipt(rec):
             day = time.strftime("%Y-%m-%d", time.gmtime())
             with open(pj(rdir, day + ".jsonl"), "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, sort_keys=True, ensure_ascii=False) + "\n")
-            with open(head_path, "w", encoding="utf-8") as f:
-                f.write(rec["digest"])
+            try:
+                with open(head_path, "w", encoding="utf-8") as f:
+                    f.write(rec["digest"])
+            except OSError:
+                pass                              # the append is authoritative; a cache failure cannot fork it
             return rec["digest"]
         finally:
             unlock_file(lock)
