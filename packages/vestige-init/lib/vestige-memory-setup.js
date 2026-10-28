@@ -38,12 +38,13 @@ function reflexReady(binaryPath, env) {
 // `error` and `interrupt` let Failure Pairing classify a failed call; `file`
 // names what an edit tool wrote before the fix.
 const REFLEX_INPUT = { event: '${hook_event_name}', session: '${session_id}', tool: '${tool_name}', call: '${tool_use_id}', agent: '${agent_id}', command: '${tool_input.command}', source: '${source}',
-  error: '${error}', interrupt: '${is_interrupt}', file: '${tool_input.file_path}', cwd: '${cwd}', host: 'claude' };
+  error: '${error}', interrupt: '${is_interrupt}', file: '${tool_input.file_path}', cwd: '${cwd}',
+  summary: '${compact_summary}', trigger: '${trigger}', host: 'claude' };
 const REFLEX_EVENTS = {
-  claude: [['PreToolUse', '*'], ['PostToolUse', '*'], ['PostToolUseFailure', '*'], ['UserPromptSubmit'], ['SubagentStart'], ['SubagentStop'], ['Stop']],
-  codex: [['SessionStart'], ['UserPromptSubmit'], ['PreToolUse', '*'], ['PostToolUse', '*'], ['SubagentStart'], ['Stop']],
-  gemini: [['SessionStart'], ['BeforeAgent'], ['BeforeTool', '*'], ['AfterTool', '*'], ['AfterAgent']],
-  cursor: [['sessionStart'], ['beforeSubmitPrompt'], ['preToolUse'], ['postToolUse'], ['subagentStart'], ['stop']],
+  claude: [['PreToolUse', '*'], ['PostToolUse', '*'], ['PostToolUseFailure', '*'], ['UserPromptSubmit'], ['SubagentStart'], ['SubagentStop'], ['PreCompact'], ['PostCompact'], ['Stop']],
+  codex: [['SessionStart'], ['UserPromptSubmit'], ['PreToolUse', '*'], ['PostToolUse', '*'], ['SubagentStart'], ['PreCompact'], ['Stop']],
+  gemini: [['SessionStart'], ['BeforeAgent'], ['BeforeTool', '*'], ['AfterTool', '*'], ['PreCompress'], ['AfterAgent']],
+  cursor: [['sessionStart'], ['beforeSubmitPrompt'], ['preToolUse'], ['postToolUse'], ['subagentStart'], ['preCompact'], ['stop']],
 };
 function reflexHooks(dialect, shimCommand) {
   const shim = matcher => dialect === 'cursor' ? { command: shimCommand, timeout: 2, failClosed: false }

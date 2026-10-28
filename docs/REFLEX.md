@@ -134,6 +134,21 @@ retirements with the agent's context. An agent that held the memory before it wa
 with the old id, the successor, when it changed and the receipt, and the old id leaves its context. The
 session that made the change and agents that never held the memory are told nothing.
 
+## Compaction survival
+
+Compaction rewrites a conversation into a summary, and whatever the summary drops is gone for the rest of
+the session. Reflex checks it and repairs it by handle.
+
+| Event | What Reflex does |
+|---|---|
+| `PreCompact` | Saves a checkpoint memory, tagged `compaction-checkpoint`, listing by exact id every memory the main agent holds |
+| `PostCompact` | Reads the summary for those exact ids and saves an audit memory, tagged `compaction-audit` and derived from the checkpoint, naming what was kept and what was dropped |
+| `SessionStart` after compaction | Gives back the dropped memories by handle, decisions first, each as its current version, with its type and opening, inside the 2,000 character budget |
+
+An id the summary paraphrased or cut counts as dropped. A memory retired since the checkpoint comes back
+as its successor, and a suppressed one does not come back. Hosts without `PostCompact` get every
+checkpointed memory back. The checkpoint survives a server restart in `sessions.json`.
+
 ## The Hook Ledger
 
 Every firing appends one line to `<data dir>/reflex/ledger.jsonl` with the event, the session, the
