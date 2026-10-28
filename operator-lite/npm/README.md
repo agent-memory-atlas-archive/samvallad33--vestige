@@ -14,7 +14,7 @@ To record without blocking:
 
 To check it on your own machine before you trust it:
 
-    npx operator-lite test       # prints: corpus=guardfall cases=46 passed=46 failed=0
+    npx operator-lite test       # prints: corpus=guardfall cases=50 passed=50 failed=0
     npx operator-lite status     # the mode, whether the hook is registered, what it stopped
     npx operator-lite verify     # the receipt chain, in order
 

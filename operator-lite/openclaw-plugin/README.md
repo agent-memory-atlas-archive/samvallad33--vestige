@@ -18,7 +18,7 @@ it inspects):
   GuardFall research: `$IFS` splitting, ANSI-C quoting, quote reassembly
   (`r''m -rf`), command substitution as the program name, `base64 -d | sh`,
   brace and glob expansion against the live filesystem, subshell time-bombs,
-  fork bombs. 46/46 on the adapted bypass corpus.
+  fork bombs. 50/50 on the adapted bypass corpus.
 - **Hash-chained receipts** — every verdict (allow, block, shadow) is
   appended to `~/.operator/receipts/<date>.jsonl` as a tamper-evident chain.
   `operator-gate verify` walks the chain.

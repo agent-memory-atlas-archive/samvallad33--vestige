@@ -97,7 +97,7 @@ base64 bodies, brace/glob enumeration, heredocs, session variables and
 subshell time-bombs; every STOP names the transforms it applied.
 
 **GuardFall-proof:** the gate replays a 46-case corpus of bypass techniques
-and must pass 46/46:
+and must pass 50/50:
 
 ```
 python3 ~/.operator/gate/operator-gate.py corpus guardfall

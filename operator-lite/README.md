@@ -14,15 +14,15 @@ copy one file, wire one hook, and your agent has a deterministic gate.
 
 Click the picture to watch the full film.
 
-Operator Lite is free and stays free. Vestige Operator is the owner's version of the same gate: $149 once, and every later version is yours at no charge, with laws you write, a Board of today's stops, and a weekly Letter of what your agents tried and what stopped them. Operator also judges the chain of steps in a session, so an agent that reads `.env` and later posts a file to an outside host is stopped with the earlier step's time and receipt, and it carries six more stop rules than Lite. You download a small archive the moment you pay; from an installed Operator Lite, `upgrade --install <the archive you downloaded>` unpacks it and starts the wizard. [Buy Vestige Operator](https://payhip.com/b/d4xvu).
+Operator Lite is free and stays free. Vestige Operator is the owner's version of the same gate: $149 once, and every later version is yours at no charge, with laws you write, a Board of today's stops, and a weekly Letter of what your agents tried and what stopped them. Operator also judges the chain of steps in a session, so an agent that reads `.env` and later posts a file to an outside host is stopped with the earlier step's time and receipt, and it carries 13 more stop rules than Lite. You download a small archive the moment you pay; from an installed Operator Lite, `upgrade --install <the archive you downloaded>` unpacks it and starts the wizard. [Buy Vestige Operator](https://payhip.com/b/d4xvu).
 
 ## Install (one command)
 
-    curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/operator-lite/operator-gate.py -o /tmp/operator-gate.py && python3 /tmp/operator-gate.py install
+    mkdir -p ~/.operator/downloads && curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/operator-lite/operator-gate.py -o ~/.operator/downloads/operator-gate.py && python3 ~/.operator/downloads/operator-gate.py install
 
 On Windows, in PowerShell, with Python 3.9 or newer installed:
 
-    curl.exe -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/operator-lite/operator-gate.py -o "$env:TEMP\operator-gate.py"; python "$env:TEMP\operator-gate.py" install
+    $d = "$HOME\.operator\downloads"; New-Item -ItemType Directory -Force $d | Out-Null; curl.exe -fsSL https://raw.githubusercontent.com/samvallad33/vestige/main/operator-lite/operator-gate.py -o "$d\operator-gate.py"; python "$d\operator-gate.py" install
 
 From a clone, `python3 operator-gate.py install` does the same. It copies the gate to
 `~/.operator/gate`, registers the Claude Code hook, starts in enforce mode (every
@@ -44,10 +44,10 @@ before you trust the gate, and again after any upgrade.
 
 | Claim | Check it | It prints |
 |---|---|---|
-| It blocks from your agent's first tool call | `operator-gate status` | `Operator Lite 5.0.1   mode: enforce (blocking)   Claude Code hook: registered` |
+| It blocks from your agent's first tool call | `operator-gate status` | `Operator Lite 5.0.2   mode: enforce (blocking)   Claude Code hook: registered` |
 | What it stops is a closed list you can read | `operator-gate status --rules` | all 30 rules: 15 STOP, 15 SHADOW |
-| It sees through 46 adapted GuardFall bypass cases | `npx operator-lite test` | `corpus=guardfall cases=46 passed=46 failed=0` |
-| A fresh install stops 210 destructive commands and lets 62 normal ones run | `python3 operator-lite/test_destructive.py`, from a clone | `failures: 0 of 272` |
+| It sees through 50 adapted GuardFall bypass cases | `npx operator-lite test` | `corpus=guardfall cases=50 passed=50 failed=0` |
+| A fresh install stops 233 destructive commands and lets 71 normal ones run | `python3 operator-lite/test_destructive.py`, from a clone | `failures: 0 of 304` |
 | An upgrade from 0.3.7 blocks too | `python3 operator-lite/test_upgrade.py`, from a clone | `all upgrade checks passed` |
 | Every decision is on record, in order | `operator-gate verify` | `receipts=<count> chain=OK integrity=reference_digest_not_signature` |
 
@@ -236,8 +236,8 @@ prints the rule table. `mode enforce` switches from recording to blocking, and
 `python3 ~/.operator/gate/operator-gate.py`; every hint the gate prints uses the
 form that works on your machine.
 
-`verify` walks the receipt hash chain. `corpus guardfall` replays 46 adapted
-GuardFall bypass cases (must pass 46/46). `upgrade` describes the paid Operator
+`verify` walks the receipt hash chain. `corpus guardfall` replays 50 adapted
+GuardFall bypass cases (must pass 50/50). `upgrade` describes the paid Operator
 gate and where to get it. `python3 test_parser.py` and `python3 test_replay.py`
 run the tests; CI runs them on Linux and macOS. `corpus` reads the corpus file beside
 the gate: it ships in the repository and in the npm package (`npx operator-lite test`),

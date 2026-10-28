@@ -1,6 +1,6 @@
 {
   "name": "@vestige/init",
-  "version": "5.0.1",
+  "version": "5.0.2",
   "description": "Local memory setup for AI agents: merge MCP connections and memory hooks, with optional free Operator Lite",
   "bin": {
     "vestige-init": "bin/init.js"
