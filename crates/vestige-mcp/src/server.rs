@@ -660,6 +660,9 @@ pub struct McpServer {
     /// The connected client's name from `initialize` (clientInfo.name), so the
     /// dashboard can say which agent is showing a memory.
     client_name: std::sync::OnceLock<String>,
+    /// The host session this connection's hooks report to `reflex`, so the
+    /// memories this agent reads can be named at a later Operator stop.
+    reflex: tools::reflex::ConnectionState,
 }
 
 /// Load `vestige.toml` from the storage's data directory and resolve it to an
@@ -719,6 +722,7 @@ impl McpServer {
             event_tx: None,
             output_config,
             client_name: std::sync::OnceLock::new(),
+            reflex: tools::reflex::new_connection(),
         }
     }
 
@@ -741,6 +745,7 @@ impl McpServer {
             event_tx: Some(event_tx),
             output_config,
             client_name: std::sync::OnceLock::new(),
+            reflex: tools::reflex::new_connection(),
         }
     }
 
@@ -1616,6 +1621,34 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
             tools::compact::unfold_arguments(&request.name, arguments);
         }
 
+        // Hook-only: `reflex` answers hooks in hook JSON. It skips the trace
+        // recorder, the review gate, the consolidation counter and dashboard
+        // events, so hook firings never count as agent activity.
+        if request.name == tools::reflex::NAME {
+            let value = tools::reflex::execute(
+                &self.storage,
+                &self.cognitive,
+                &self.output_config,
+                &self.reflex,
+                request.arguments,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                warn!(%error, "reflex answered empty");
+                serde_json::json!({})
+            });
+            let call_result = CallToolResult {
+                content: vec![crate::protocol::messages::ToolResultContent {
+                    content_type: "text".to_string(),
+                    text: value.to_string(),
+                }],
+                structured_content: Some(value),
+                is_error: Some(false),
+            };
+            return serde_json::to_value(call_result)
+                .map_err(|e| JsonRpcError::internal_error(&e.to_string()));
+        }
+
         // 4.0: erasure-class calls are withheld on a Strata log. Refuse before
         // tracing and before the Memory-PR review gate, so a withheld call
         // cannot open a pending purge or suppress review either.
@@ -1752,6 +1785,8 @@ description: Some("Earlier memories on recorded causal edges from a failure, low
         // Emit real-time events to WebSocket clients after successful tool calls.
         // ================================================================
         if let Ok(ref mut content) = result {
+            // The memories this read put in front of the agent, for reflex.
+            tools::reflex::observe(&self.reflex, &self.storage, &tool_name, content);
             // Agent Black Box: inspect the successful result and record the
             // downstream memory events (retrieve/suppress/veto/dream) under the
             // same run_id as the opening mcp.call, so /api/traces, /api/receipts
