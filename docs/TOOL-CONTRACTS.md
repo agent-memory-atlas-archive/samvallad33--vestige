@@ -1,17 +1,19 @@
 # Tool contracts
 
-> The 18 tools a Vestige 5.0.0 server advertises, what each action takes, returns and writes
+> The 19 tools a Vestige 5.0.1 server advertises, what each action takes, returns and writes
 
-Vestige advertises eighteen MCP tools, sorted by name. Most are action multiplexers:
-`memory`, `codebase`, `maintain` and `dedup` take an `action`, `memory_status` takes a
-`view`, and `ghostlink` takes a `mode`. An agent should choose the action its task needs.
-There is no requirement to call every tool in every session.
+Vestige advertises nineteen MCP tools, sorted by name. Most are action multiplexers:
+`memory`, `codebase`, `maintain`, `dedup` and `backfill` take an `action`,
+`memory_status` takes a `view`, and `ghostlink` takes a `mode`. An agent should choose
+the action its task needs. There is no requirement to call every tool in every session.
 
-Statements here come from the 5.0.0 code under `crates/` and its tests. The parts that
+Statements here come from the 5.0.1 code under `crates/` and its tests. The parts that
 did not change since 4.2.0 were also checked by running the 4.2.0 binaries against a
 scratch store; the 5.0.0 additions (`gather`, `precedent`, `ghostlink` `heal`, `memory`
-`get` with `reason`, the per-record `changelog`) were read from the code. Where an older
-doc and the code differ, the code wins.
+`get` with `reason`, the per-record `changelog`) and the 5.0.1 additions (`backfill`,
+salience-ranked tag recall, `smart_ingest` `entities` and `attributes`, the
+`session_start` `memory_hook` packet) were read from the code. Where an older doc and
+the code differ, the code wins.
 
 ## Discover the installed contract
 
@@ -42,7 +44,8 @@ records by lookalike text.
 admitted. `receipt` `get` shows what the write did, and `receipt` `replay` re-derives it
 from the log. Writes that return one directly: `smart_ingest` (and one per declared link),
 `memory` `promote`, `demote` and `edit`, `suppress`, `intention`, `ghostlink` `weave` and
-`harden`.
+`harden`. A `backfill` change returns its own salience receipt, which `backfill`
+`receipts` lists and `backfill` `undo` takes.
 
 **Scope.** Records default to scope `user`. Walks, GhostLink proposals, `dream` and
 `codebase` read one scope unless you pass `includeCrossScope` or `allScopes`. An id,
@@ -81,11 +84,16 @@ runs `gh` or a local test suite, but `ghostlink` is not marked open-world.
 Find records by exact handle: `handle` is a record id, a unique id prefix (8+ characters)
 or an exact tag. Lookup order is exact id, then unique prefix, then exact tag.
 
-- A tag returns live records carrying it newest first, from every scope, with `nodes` (`id`,
-  `type`, `content`, `tags`, `createdAt`) and the one-hop recorded `neighbors` (direction,
+- A tag returns live records carrying it, from every scope, with `nodes` (`id`, `type`,
+  `content`, `tags`, `createdAt`) and the one-hop recorded `neighbors` (direction,
   `link_type`, strength, and a 200-character preview, 80 when repeated; at most 20 edges;
   pass `detail_level: "full_neighbors"` or call `memory(action="get")` for full neighbor text).
-  Honors `limit` (cutting after sorting newest first and reporting `totalNodes` when truncated)
+  Typed tags such as `person:Maya` are tags like any other.
+- **Order (5.0.1).** Records are ranked by the net salience change their `backfill`
+  receipts recorded (largest first), then FSRS stability (higher first), then newest
+  first, then id. Before 5.0.1 a tag returned newest first. The order is the same on
+  every read of the same log.
+- Honors `limit` (cutting after that ranking and reporting `totalNodes` when truncated)
   and `detail_level` (`brief`, `summary`, `full`, `full_neighbors`).
 - An ambiguous prefix is refused as `ambiguous`, with its `candidates`.
 - A miss is `handle_required` (with `candidates: []`), not an empty list. Free text is
@@ -100,7 +108,20 @@ CLI: `vestige recall --handle <handle>`.
 
 Save one record (`content`) or up to 20 (`items`), never both. Fields: `node_type` (free
 text: `fact`, `concept`, `event`, `person`, `place`, `note`, `pattern`, `decision`),
-`tags`, `source`, `scope`, `validFrom`, `validUntil`, `links`, `allowSecrets`.
+`tags`, `entities`, `attributes`, `source`, `scope`, `validFrom`, `validUntil`, `links`,
+`allowSecrets`.
+
+- **`entities` and `attributes` (5.0.1).** Up to 64 typed strings each, stored as exact
+  tags on the record. `entities` names who or what the record is about, as
+  `<kind>:<name>` with kind `person`, `place`, `food`, `file`, `service`, `symbol`,
+  `path`, `commit`, `issue` or `url` (`person:Maya`, `place:Bangkok Garden`).
+  `attributes` states facts such as `allergy:peanut` or
+  `preference:ambience=quiet`. Nothing is inferred from the content. Every batch item is
+  checked before the first write.
+- **Backfill on every save (5.0.1).** After the save is admitted, the server runs one
+  `backfill` pass with the new record as its trigger, unless `VESTIGE_BACKFILL_AUTOFIRE`
+  is `0`, `false`, `off` or `no`. A pass that fails is logged and never turns an admitted
+  save into a failure; a manual `backfill` run can repeat it.
 
 - **Every create carries its proof (4.2.0).** The response holds `receiptId` (the `eff-`
   effect that wrote it), `canonicalHash` (blake3 of the content after NFC,
@@ -228,6 +249,18 @@ token budget (default 1000, counted as UTF-8 bytes divided by four). It writes n
   change records, `codeContext.elsewhere` lists those scopes with counts (4.1.1).
 - Intentions show their id, their due date with the year, and an `OVERDUE` mark.
   `needsBackup` and `needsDream` come from the last backup and dream that completed.
+- **`memory_hook` (5.0.1)** returns a context packet for a local lifecycle hook instead
+  of the session summary. It takes `prompt` (up to 64 KiB), `limit` (1 to 8, default 3)
+  and `trigger`, and reads one `scope`. Live records only: retired, expired and
+  not-yet-valid records are left out. When the prompt names a recorded typed entity
+  (`person:`, `place:`, `food:`, `file:`, `service:`, `symbol:`), as the whole tag or
+  its name, matched case-insensitively on word boundaries, only records carrying those
+  entities are kept, and `selection` is `exact_recorded_entities`; otherwise it is
+  `top_salience`. Prompt words select entities and never rank. The packet ranks by
+  Backfill salience, then stability, then recency (`ranking_signal`), and returns
+  `memories` (content cut to 700 characters, with `salience_delta_q`), up to 8 of their
+  `backfill_receipts`, and `backfill_autofire`. With entities matched and
+  `trigger.mode` `light`, the limit is 8. It writes nothing.
 
 ### `receipt`
 
@@ -305,6 +338,49 @@ lesson records whose FSRS retrievability was below 0.5, lowest first, each with 
 inferred edge is used. Read-only.
 
 CLI: `vestige forgotten-lesson <failure-id>`.
+
+### `backfill`
+
+Retroactive Salience Backfill (5.0.1): a new record raises or lowers older records that
+share an exact typed identity with it. Actions: `run` (default), `receipts`, `undo`.
+`scope` defaults to `user`. Every `smart_ingest` save already runs one pass (see
+[`smart_ingest`](#smart_ingest)); call this tool to preview, repeat, review or undo.
+
+- **`run`** takes `trigger_id` (required; `failure_id` is a legacy alias, and the two
+  must agree when both are sent), `manual`, `dry_run`, `lookback_days` (1 to 365,
+  default 30) and `scan_limit` (1 to 500, default 500). The trigger must be a live record
+  in the scope. Backfill never guesses a trigger.
+  - A pass does work only when the trigger carries a personal attribute tag
+    (`allergy:`, `preference:<key>=<value>`, `health:`, `condition:`, `medication:`,
+    `diet:`), reads like a failure (a fixed whole-word list such as `error`, `crash`,
+    `timeout`), or `manual` is true. Otherwise it returns no changes with that reason.
+  - Candidates are older records in the scope, inside the lookback, that carry one of
+    the trigger's `person:`, `place:`, `food:`, `file:`, `service:` or `symbol:` tags
+    exactly. Records the causal walk reaches from the trigger come first, then newer
+    before older, then id. A record already changed for this trigger is skipped, so a
+    repeated pass changes nothing.
+  - A personal attribute links through exactly one `person:` tag. A raise multiplies
+    stability by 1.5 (at most +365 days). A lower divides it by 1.5 (never below 0.01)
+    and needs an explicit signal: a newer `preference:` value for the same person and
+    key, or, with `manual`, a `contradicts:<id>` or `supersedes:<id>` tag on the trigger.
+  - At most 16 changes per pass. Each is applied only if the stored stability still
+    equals the planned value; otherwise the call is refused and can be run again.
+  - Returns `changes`: in a preview, each planned change with `memory_id`,
+    `trigger_id`, `shared_entity`, `reason`, `old_score`, `new_score` and `direction`;
+    when applied, each change's receipt. Then `changed`, `would_change`,
+    `scanned`, `truncated`, `change_budget_reached`, `causality_verified: false` and
+    `ranking_signal`. `dry_run` (or the legacy `promote: false`) previews and appends
+    nothing, not even a tool trace.
+- **`receipts`** lists the salience receipts whose record is in the scope.
+- **`undo`** takes `receipt_id` and restores that record's exact earlier stability.
+  With `dry_run` it shows the receipt it would undo. A receipt for a record outside the
+  scope is refused.
+
+A change is a statement of relevance, not of cause. Reads never change a score; tag
+`recall` and the `session_start` `memory_hook` packet rank by the receipts.
+
+CLI: `vestige backfill <trigger-id>` with `--manual`, `--dry-run`, `--lookback-days`,
+`--scope` and `--json`; `vestige backfill receipts`; `vestige backfill undo <receipt-id>`.
 
 ### `selftest`
 
@@ -642,7 +718,7 @@ it verifies the receipts' digest chain over the day files it reads (5.0.1, see b
 ## Withheld in 4.x
 
 Each of these is absent from the advertised schema and refused with the reason. All are
-still withheld in 5.0.0.
+still withheld in 5.0.1.
 
 | Call | Why |
 |------|-----|
@@ -672,10 +748,12 @@ cannot honor.
 ## v3 contracts (not used by the 4.x default build)
 
 Earlier versions of this page described the v3 engine: `recall` modes `reason` and
-`contradictions`, `backfill` with `promote`, embedding-backed duplicate scan and merge
-planning, suppression reversal windows and cascades, `maintain consolidate` phases,
-portable restore, context packets and Memory PR review modes. Each depended on
-embeddings, keyword scoring, inferred links or SQLite, and none is part of a Strata log.
+`contradictions`, the v3 `backfill` that joined records by words they shared,
+embedding-backed duplicate scan and merge planning, suppression reversal windows and
+cascades, `maintain consolidate` phases, portable restore, the v3 context packets and
+Memory PR review modes. Each depended on embeddings, keyword scoring, inferred links or
+SQLite, and none is part of a Strata log. The 5.0.1 `backfill` tool and `memory_hook`
+packet above are new Strata mechanisms that share those names, not the v3 code.
 The code stays behind the `legacy-sqlite` and `v3-engine` features for the harnesses
 that test it. For how a v3 store arrives in 4.x, see
 [Migrating to Vestige 4.0](MIGRATING-v4.md).

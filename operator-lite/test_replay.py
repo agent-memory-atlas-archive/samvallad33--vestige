@@ -374,7 +374,7 @@ check("hook still allows a plain push silently", p.returncode == 0 and not p.std
 # the corpus needs a home outside scratch (a home under the temp dir makes deletes of ~ look like scratch)
 p = subprocess.run([sys.executable, GATE, "corpus", "guardfall"], capture_output=True, text=True,
                    env=dict(REAL_ENV, OPERATOR_HOME=tempfile.mkdtemp(prefix="oplite-corpus-")))
-check("corpus 46/46", "cases=46 passed=46 failed=0" in p.stdout, p.stdout[-300:])
+check("corpus 50/50", "cases=50 passed=50 failed=0" in p.stdout, p.stdout[-300:])
 body = open(GATE, "rb").read()
 for c in ("operator-lite/openclaw-plugin/gate/operator-gate.py", "operator-lite/ports/opencode/operator-gate.py"):
     check("copy identical: " + c, open(os.path.join(W, c), "rb").read() == body)

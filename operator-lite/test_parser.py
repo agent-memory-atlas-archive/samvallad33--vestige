@@ -141,6 +141,23 @@ stop("2020s CVE-2026-72718 git -c core.fsmonitor", 'git -c core.fsmonitor="rm -r
 allow("benign git -c core.fsmonitor=false status", "git -c core.fsmonitor=false status")
 allow("benign tar -I zstd archive", "tar -I zstd -cf /tmp/opgate-archive.tar.zst README.md")
 
+# a here-string is xargs' input: `xargs -I {} cmd <<< WORD` runs cmd with WORD in place of {}
+stop("xargs -I {} fed a here-string", "xargs -I {} rm -rf {} <<< ~/Documents", "OP-003")
+stop("xargs -I{} fed a double-quoted here-string", 'xargs -I{} rm -rf {} <<< "$HOME/Documents"', "OP-003")
+stop("xargs -0 -I {} fed a here-string", "xargs -0 -I {} rm -rf {} <<< ~/Documents", "OP-003")
+stop("xargs -I {} sh -c fed a here-string", "xargs -I {} sh -c 'rm -rf {}' <<< ~/Documents", "OP-003")
+stop("xargs here-string, then another command", "xargs -I {} rm -rf {} <<< ~/Documents; echo done", "OP-003")
+allow("xargs here-string that only echoes", "xargs -I {} echo {} <<< ~/Documents")
+allow("xargs here-string written inside a commit message", 'git commit -m "xargs -I {} rm -rf {} <<< ~/Documents"')
+allow("xargs here-string written in a heredoc", "cat <<'EOF'\nxargs -I {} rm -rf {} <<< ~/Documents\nEOF")
+
+# `sh -n` reads a script's syntax and runs none of it; the script is judged when something runs it
+allow("bash -n syntax check of a script that deletes", "bash -n %s" % sh)
+allow("sh -n syntax check, then an echo", "sh -n %s && echo syntax-ok" % sh)
+allow("bash -nv syntax check", "bash -nv %s" % sh)
+stop("syntax check, then the script runs", "bash -n %s && bash %s" % (sh, sh), "OP-003")
+stop("syntax check, then the script runs as a program", "bash -n %s; %s" % (sh, sh), "OP-003")
+
 # the stop message an agent reads right after a stop: three lines, the rule and the receipt,
 # what to do next (no retry, ask precedent), and who can allow it once
 p = subprocess.run([sys.executable, GATE, "hook", "--source", "claude"],

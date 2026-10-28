@@ -1911,6 +1911,76 @@ KNOWN_EXEC_BINS = {"rm", "rmdir", "shred", "unlink", "dd", "mkfs", "sh", "bash",
                    "python", "python3", "perl", "ruby", "node", "curl", "wget", "git", "find", "sed", "awk",
                    "sqlite3", "psql", "mysql", "mv", "cp", "chmod", "chown"}
 
+# ---- xargs fed a here-string: the command it runs is the command that runs ---- #
+_XARGS_OPTS = r"((?:\s+-(?!I\b)[A-Za-z0-9-]+(?:[= ](?!-)\S+)?)*)"
+XARGS_HERESTRING_RE = re.compile(r"\bxargs\b" + _XARGS_OPTS +
+                                 r"\s+-I\s*(\S+)\s+([^|;&]+?)\s*<<<\s*('[^']*'|\"[^\"]*\"|[^\s;&|]+)")
+
+
+def xargs_herestring_runs(cmd):
+    """The commands `xargs -I R cmd <<< WORD` runs, with the here-string in place of R. The quoting of
+    WORD is kept, so `"$HOME/x"` still expands and `'~/x'` stays literal. Heredoc bodies were extracted
+    before this runs, and an xargs inside quotes is text, not the one that runs."""
+    masked = mask_quotes(cmd)
+    out = []
+    for m in XARGS_HERESTRING_RE.finditer(cmd):
+        if masked[m.start():m.start() + 5] != "xargs":
+            continue
+        ph, body, word = m.group(2), m.group(3), m.group(4)
+        if word[0] in "'\"":
+            words = [word]                                  # -I takes the whole line as one argument
+        else:
+            try:
+                words = shlex.split(word)
+            except ValueError:
+                words = [word]
+            words = [w if re.fullmatch(r"[\w@%+=:,./~${}-]+", w) else shlex.quote(w) for w in words[:8]]
+        for w in words:
+            out.append(body.replace(ph, w).strip())
+    return list(dict.fromkeys(out))
+
+
+def shell_noexec(rest):
+    """`sh -n x.sh`, `bash -nv x.sh`: the shell reads the script's syntax and runs none of it."""
+    for t in rest:
+        if not t.startswith("-") or t == "--":
+            return False
+        if not t.startswith("--") and "n" in t[1:]:
+            return True
+    return False
+
+
+SCRIPT_QUIET_PROGS = {"cat", "less", "more", "head", "tail", "grep", "wc", "ls", "stat", "file", "shasum",
+                      "sha256sum", "md5", "diff", "cmp", "cp", "git", "chmod", "shellcheck", "echo", "printf"}
+
+
+def script_may_run(cmd, name, bodies=()):
+    """False only when the command checks the script's syntax with `sh -n` and every other mention of it
+    is a read: nothing in the command can run it. Any mention this cannot place counts as a run."""
+    if any(name in b for b in bodies):
+        return True
+    checked = False
+    for seg in split_segments(cmd or ""):
+        if name not in seg:
+            continue
+        try:
+            toks = tokenize(seg)
+        except Exception:
+            return True
+        at = [i for i, t in enumerate(toks) if posixpath.basename(t) == name]
+        if not at:
+            return True                                     # named inside a string or a substitution
+        prog = os.path.basename(toks[0])
+        if prog in ("bash", "sh", "zsh", "dash", "ksh", "fish"):
+            if shell_noexec(toks[1:]):
+                checked = True
+                continue
+            return True
+        if prog in SCRIPT_QUIET_PROGS and 0 not in at:
+            continue
+        return True
+    return not checked
+
 
 def analyze(cmd, cwd, depth=0, vars_=None):
     """Walk a shell command tracking cd and simple VAR=value, yielding effects (never executes anything)."""
@@ -1993,6 +2063,8 @@ def analyze(cmd, cwd, depth=0, vars_=None):
         effects.append({"prog": ":()", "seg": cmd[:200], "targets": [], "recursive": False, "kind": "fork-bomb",
                         "filtered": False, "unresolved": False, "flags": [], "args": [], "cwd": UNKNOWN_CWD,
                         "writes": [], "text": cmd[:200]})
+    for run in xargs_herestring_runs(cmd):                 # `xargs -I {} rm -rf {} <<< ~/Documents`
+        effects += analyze(run, state["cwd"], depth + 1, vars_)
     raw_segs = split_segments(cmd)
     cmd = replace_command_substs(cmd, substs, vars_)
     for seg in split_segments(cmd):                     # `: > f`, `> f`, `truncate -s 0 f`, `cp /dev/null f`
@@ -2184,9 +2256,10 @@ def analyze(cmd, cwd, depth=0, vars_=None):
                 fed_sh = decode_ansi_c(" ".join(w for w in fed[1] if not (w.startswith("-") and len(w) <= 3)))
                 if fed_sh.strip():
                     effects += analyze(fed_sh, ecwd, depth + 1, vars_)
-            # opaque-script resolution: `bash totally_harmless.sh` executes the FILE body as shell
+            # opaque-script resolution: `bash totally_harmless.sh` executes the FILE body as shell;
+            # `bash -n x.sh` only checks its syntax, and the script is judged when something runs it
             sp = resolve_script_arg(rest, ecwd)
-            if sp:
+            if sp and (not shell_noexec(rest) or script_may_run(cmd, os.path.basename(sp), bodies)):
                 effects += script_body_effects(sp, ecwd, depth, vars_, mode="shell")
             continue
         if prog == "eval":
@@ -3824,6 +3897,40 @@ def unlock_file(f):
         msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def receipt_tail_digest(rdir):
+    """Last complete append, checked under the writer lock. HEAD is only a cache.
+
+    A malformed/incomplete tail is preserved and prevents another append; never skip evidence.
+    Historical chain links are left untouched, including previously recorded forks.
+    """
+    files = sorted(f for f in os.listdir(rdir) if f.endswith(".jsonl"))
+    for name in reversed(files):
+        with open(pj(rdir, name), "rb") as f:
+            end = f.seek(0, os.SEEK_END)
+            if not end:
+                continue
+            f.seek(end - 1)
+            if f.read(1) != b"\n":
+                raise ValueError("incomplete receipt tail")
+            pos, chunks = end - 1, []
+            while pos:
+                start = max(0, pos - 4096)
+                f.seek(start)
+                chunk = f.read(pos - start)
+                split = chunk.rfind(b"\n")
+                chunks.append(chunk[split + 1:] if split >= 0 else chunk)
+                if split >= 0:
+                    break
+                pos = start
+            rec = json.loads(b"".join(reversed(chunks)).decode("utf-8"))
+        receipt_digest = rec.pop("digest")
+        if (not re.fullmatch(r"[0-9a-f]{64}", str(receipt_digest))
+                or digest_of(rec) != receipt_digest):
+            raise ValueError("invalid receipt tail digest")
+        return receipt_digest
+    return "0" * 64
+
+
 def write_receipt(rec):
     """Append a hash-chained receipt. Never raises into the caller."""
     try:
@@ -3833,11 +3940,7 @@ def write_receipt(rec):
         lock = open(pj(rdir, ".lock"), "a+", encoding="utf-8")
         lock_file(lock)
         try:
-            try:
-                with open(head_path, encoding="utf-8") as f:
-                    prev = f.read().strip() or ("0" * 64)
-            except Exception:
-                prev = "0" * 64
+            prev = receipt_tail_digest(rdir)
             rec = dict(rec)
             rec.update({"v": 1, "integrity": INTEGRITY, "gate_version": VERSION, "prev": prev,
                         "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"})
@@ -3845,8 +3948,11 @@ def write_receipt(rec):
             day = time.strftime("%Y-%m-%d", time.gmtime())
             with open(pj(rdir, day + ".jsonl"), "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, sort_keys=True, ensure_ascii=False) + "\n")
-            with open(head_path, "w", encoding="utf-8") as f:
-                f.write(rec["digest"])
+            try:
+                with open(head_path, "w", encoding="utf-8") as f:
+                    f.write(rec["digest"])
+            except OSError:
+                pass                              # the append is authoritative; a cache failure cannot fork it
             return rec["digest"]
         finally:
             unlock_file(lock)
