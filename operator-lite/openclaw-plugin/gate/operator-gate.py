@@ -4074,6 +4074,12 @@ def hook_main(argv):
                     "cwd": cwd, "tool": tool, "action_digest": adigest, "action_preview": action["preview"],
                     "normalized": redact(meta.get("normalized", "")),
                     "transforms": meta.get("transforms", [])}
+        try:
+            own = sorted(own_law_classes(fx_effects))
+        except Exception:
+            own = []
+        if own:                     # what no built-in rule decides; `status` counts these for the owner
+            base_rec["own"] = own
 
         # specificity ordering: rule class first (canary > self > memory > workspaces), then the
         # most specific target (deepest path) -- the hit reported to the agent is the one to act on.
@@ -4129,20 +4135,21 @@ def cmd_approve(argv):
         print("Refusing: approvals need an interactive terminal run by the owner.")
         return 3
     ensure_dirs()
-    recent = ""
-    try:
-        day = time.strftime("%Y-%m-%d", time.gmtime())
-        with open(pj(OP_HOME, "receipts", day + ".jsonl"), encoding="utf-8") as f:
-            for line in f:
-                if argv[0] in line:
-                    recent = line
-    except Exception:
-        pass
-    if recent:
-        r = json.loads(recent)
+    r = {}                          # the STOP this permit answers, from today's or yesterday's receipts (UTC days)
+    for day in (time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400)), time.strftime("%Y-%m-%d", time.gmtime())):
+        try:
+            with open(pj(OP_HOME, "receipts", day + ".jsonl"), encoding="utf-8") as f:
+                for line in f:
+                    if argv[0] in line:
+                        rec = json.loads(line)
+                        if rec.get("decision") == "STOP":
+                            r = rec
+        except Exception:
+            pass
+    if r:
         print("Blocked action: %s\n  rule: %s\n  preview: %s" % (r.get("tool"), r.get("rule"), r.get("action_preview")))
     else:
-        print("No matching STOP receipt today for %s." % argv[0])
+        print("No matching STOP receipt since yesterday for %s." % argv[0])
     if input("Type ALLOW ONCE to grant a single-use permit (%d min): " % (PERMIT_TTL_S // 60)).strip() != "ALLOW ONCE":
         print("Cancelled.")
         return 1
@@ -4151,8 +4158,12 @@ def cmd_approve(argv):
         json.dump({"action_digest": argv[0], "granted": time.time(), "expires": time.time() + PERMIT_TTL_S,
                    "single_use": True, "by": "owner-tty"}, f)
     os.chmod(p, 0o600)
-    write_receipt({"decision": "PERMIT_GRANTED", "action_digest": argv[0], "source": "owner-tty"})
+    grant = {"decision": "PERMIT_GRANTED", "action_digest": argv[0], "source": "owner-tty"}
+    if r.get("commitment"):
+        grant["commitment"] = r["commitment"]
+    write_receipt(grant)
     print("Permit granted for one use.")
+    permit_offer(r.get("commitment"))
     return 0
 
 
@@ -4336,7 +4347,13 @@ def cmd_status(argv):
     if mode == "shadow":
         print("\nShadow mode records and never blocks. To have the gate block from now on: %s mode enforce" % me)
     print("\nYour last 30 days, replayed: %s replay\nAll rules: %s status --rules" % (me, me))
-    upgrade_hint()
+    undecided = {}
+    for r in calls:                 # calls no built-in rule decided: they ran with nothing to say about them
+        if r.get("decision") == "PASS" or (r.get("decision") == "SHADOW_STOP" and not hard(r)):
+            for c in r.get("own") or []:
+                undecided[c] = undecided.get(c, 0) + 1
+    if not weekly_offer(undecided):
+        upgrade_hint()
     return 0
 
 
@@ -4401,6 +4418,52 @@ def upgrade_hint():
     else:
         print("\nSee what your agents already ran: %s replay\n"
               "Your own laws, a Board and a Letter: %s upgrade" % (self_cmd(), self_cmd()))
+
+
+# How the week's undecided actions are counted out loud, one noun per OWN_LAW class.
+OWN_NOUNS = {"push": ("push", "pushes"), "no-verify": ("commit that skipped git hooks", "commits that skipped git hooks"),
+             "packages": ("package install", "package installs"), "deploy": ("deploy", "deploys"),
+             "database": ("database run", "database runs"), "ci-config": ("CI config write", "CI config writes"),
+             "env-file": ("env file write", "env file writes")}
+# A law an owner might write in Operator after allowing the same rule again and again.
+PERMIT_LAWS = {"OP-003": "Deleting build folders inside my projects is fine.",
+               "OP-004": "Force pushes to my own feature branches are fine; never to main.",
+               "OP-005": "Publishing a release from main is fine after the tests pass.",
+               "OP-006": "Preview deploys are fine; production is mine.",
+               "OP-007": "Dropping tables in my local test databases is fine."}
+
+
+def weekly_offer(undecided):
+    """At a terminal: the last 7 days' actions no built-in rule decided, and a law the owner could write
+    for the commonest. True when printed. Never shown to an agent, a pipe or a script."""
+    if not undecided or not at_terminal():
+        return False
+    order = sorted(undecided, key=lambda c: (-undecided[c], [k for k, _, _ in OWN_LAW].index(c)))
+    said = ", ".join("%d %s" % (undecided[c], OWN_NOUNS[c][0 if undecided[c] == 1 else 1]) for c in order)
+    law = next(w for k, _, w in OWN_LAW if k == order[0])
+    print("\nLast 7 days, no built-in rule decided: %s." % said)
+    print("Operator makes these your laws, in your words, such as \"%s\" (%s): %s upgrade"
+          % (law, OPERATOR_PRICE, self_cmd()))
+    return True
+
+
+def ordinal(n):
+    return {3: "third", 6: "sixth", 9: "ninth", 12: "twelfth"}.get(n, "%dth" % n)
+
+
+def permit_offer(rid):
+    """At a terminal, on every third permit for the same rule in 30 days: the owner keeps saying yes to
+    the same thing, which is a law waiting to be written. Never shown to an agent or a pipe."""
+    if not rid or not at_terminal():
+        return
+    n = sum(1 for r in recent_receipts(30) if r.get("decision") == "PERMIT_GRANTED" and r.get("commitment") == rid)
+    if n < 3 or n % 3:
+        return
+    name = RULES.get(rid, ("", "", ""))[0]
+    law = PERMIT_LAWS.get(rid, "Say once when %s is fine and when it is not." % (name or rid))
+    print("\nThat is the %s time in 30 days you allowed %s %s. In Operator you write that rule once, in your "
+          "words, such as \"%s\", instead of approving it each time (%s): %s upgrade"
+          % (ordinal(n), rid, name, law, OPERATOR_PRICE, self_cmd()))
 
 
 def upgrade_install(argv):

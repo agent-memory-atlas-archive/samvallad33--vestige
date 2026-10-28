@@ -68,6 +68,9 @@ jobs:
       - name: an upgrade from 0.3.7 blocks
         run: python operator-lite/test_upgrade.py
       - if: runner.os != 'Windows'
+        name: the upgrade offer reaches the owner at a terminal, never an agent or a pipe
+        run: python3 operator-lite/test_upgrade_moments.py
+      - if: runner.os != 'Windows'
         name: the npm package carries this gate at its own version
         run: node operator-lite/npm/test.js
       - if: runner.os != 'Windows'
