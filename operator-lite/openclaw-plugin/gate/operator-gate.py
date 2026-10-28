@@ -2267,6 +2267,13 @@ def analyze(cmd, cwd, depth=0, vars_=None):
                 effects.append(eff)
             effects += analyze(" ".join(rest), ecwd, depth + 1, vars_)
             continue
+        if prog == "trap":                                   # `trap 'body' EXIT` runs the body when the shell exits
+            if eff["writes"]:
+                effects.append(eff)
+            ops = [a for a in rest if a != "--"]
+            if ops and ops[0] not in ("-", "-p", "-l") and ops[0].strip():
+                effects += analyze(ops[0], ecwd, depth + 1, vars_)
+            continue
 
         if prog in ("source", "."):                          # `source x.sh` executes the file body
             if eff["writes"]:
