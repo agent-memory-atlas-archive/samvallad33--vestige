@@ -33,9 +33,11 @@ function reflexReady(binaryPath, env) {
 // Claude Code calls reflex straight from `mcp_tool` hooks on the agent's own MCP
 // connection. SessionStart at launch fires before MCP servers connect, so it, and
 // every host without `mcp_tool` hooks, goes through the command shim.
-const REFLEX_INPUT = { event: '${hook_event_name}', session: '${session_id}', tool: '${tool_name}', call: '${tool_use_id}', command: '${tool_input.command}', host: 'claude' };
+// `agent` is the subagent's id and empty for the main agent, so every Vestige
+// read lands in the context of the agent that made it.
+const REFLEX_INPUT = { event: '${hook_event_name}', session: '${session_id}', tool: '${tool_name}', call: '${tool_use_id}', agent: '${agent_id}', command: '${tool_input.command}', source: '${source}', host: 'claude' };
 const REFLEX_EVENTS = {
-  claude: [['PreToolUse', '*'], ['PostToolUse', '*'], ['PostToolUseFailure', '*'], ['UserPromptSubmit'], ['SubagentStart'], ['Stop']],
+  claude: [['PreToolUse', '*'], ['PostToolUse', '*'], ['PostToolUseFailure', '*'], ['UserPromptSubmit'], ['SubagentStart'], ['SubagentStop'], ['Stop']],
   codex: [['SessionStart'], ['UserPromptSubmit'], ['PreToolUse', '*'], ['PostToolUse', '*'], ['SubagentStart'], ['Stop']],
   gemini: [['SessionStart'], ['BeforeAgent'], ['BeforeTool', '*'], ['AfterTool', '*'], ['AfterAgent']],
   cursor: [['sessionStart'], ['beforeSubmitPrompt'], ['preToolUse'], ['postToolUse'], ['subagentStart'], ['stop']],

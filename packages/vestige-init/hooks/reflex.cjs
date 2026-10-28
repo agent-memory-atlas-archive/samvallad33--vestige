@@ -28,6 +28,7 @@ function argumentsFor(client, event, input) {
     session: pick('session_id', 'sessionId', 'conversation_id'),
     tool: pick('tool_name', 'toolName'),
     call: pick('tool_use_id', 'toolUseId', 'call_id'),
+    agent: pick('agent_id', 'agentId'),
     command: typeof toolInput.command === 'string' ? toolInput.command : pick('command'),
     source: pick('source'),
   };

@@ -215,6 +215,29 @@ for (const responds of [true, false]) {
     }
   });
 }
+test('the memory hook names its session so the server never injects a memory twice', () => {
+  const f = fixture(); const server = path.join(f.home, 'recording.cjs'); const seen = path.join(f.home, 'calls.jsonl');
+  fs.writeFileSync(server, `
+    const fs = require('node:fs'); const readline = require('node:readline');
+    readline.createInterface({ input: process.stdin }).on('line', line => {
+      const msg = JSON.parse(line); if (!msg.id) return;
+      if (msg.method === 'tools/call') fs.appendFileSync(${JSON.stringify(seen)}, JSON.stringify(msg.params) + '\\n');
+      const result = msg.method === 'initialize'
+        ? { protocolVersion: '2025-06-18', capabilities: {}, serverInfo: { name: 'fixture', version: '6.0.0' } }
+        : { structuredContent: { memories: [], entities: [], backfill_receipts: [] } };
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }) + '\\n');
+    });
+  `);
+  const triggers = path.join(f.home, 'triggers.json'); fs.writeFileSync(triggers, JSON.stringify(defaults));
+  const config = path.join(f.home, 'config.json');
+  fs.writeFileSync(config, JSON.stringify({ binary: process.execPath, binaryArgs: [server], triggers }));
+  const result = spawnSync(process.execPath, [path.join(__dirname, '../hooks/memory.cjs'), '--config', config, '--client', 'claude', '--event', 'session'],
+    { input: JSON.stringify({ session_id: 's-518', source: 'compact' }), encoding: 'utf8', timeout: 4000 });
+  assert.equal(result.status, 0, result.stderr);
+  const call = fs.readFileSync(seen, 'utf8').trim().split('\n').map(JSON.parse).find(p => p.name === 'session_start');
+  assert.deepEqual([call.arguments.memory_hook.session, call.arguments.memory_hook.host, call.arguments.memory_hook.event, call.arguments.memory_hook.source],
+    ['s-518', 'claude', 'session', 'compact']);
+});
 function reflexFixture(version) {
   const f = fixture();
   fs.writeFileSync(f.bin, `#!/bin/sh\nprintf "vestige-mcp ${version}\\n"\n`, { mode: 0o755 });
@@ -232,11 +255,12 @@ test('reflex hooks register only for a 6.0.0 or newer server', () => {
 test('claude gets mcp_tool reflex hooks plus a SessionStart shim; nothing is a gate', () => {
   const f = reflexFixture('6.0.0'); setup.apply(setup.plan({ ...f, platform: 'darwin' }));
   const hooks = JSON.parse(fs.readFileSync(path.join(f.home, '.claude', 'settings.json'))).hooks;
-  for (const event of ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'UserPromptSubmit', 'SubagentStart', 'Stop']) {
+  for (const event of ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'UserPromptSubmit', 'SubagentStart', 'SubagentStop', 'Stop']) {
     const handlers = hooks[event].flatMap(g => g.hooks).filter(h => h.type === 'mcp_tool');
     assert.equal(handlers.length, 1, event);
     assert.equal(handlers[0].server, 'vestige'); assert.equal(handlers[0].tool, 'reflex');
     assert.equal(handlers[0].input.session, '${session_id}'); assert.equal(handlers[0].input.call, '${tool_use_id}');
+    assert.equal(handlers[0].input.agent, '${agent_id}', 'each read lands in the context of the agent that made it');
   }
   assert(hooks.PreToolUse.every(g => g.hooks.every(h => h.type === 'mcp_tool')), 'memory plus reflex adds no command gate');
   const shim = hooks.SessionStart.flatMap(g => g.hooks).find(h => h.command && h.command.includes('reflex.cjs'));
@@ -262,6 +286,8 @@ test('the reflex shim maps host events and answers in each host shape', () => {
   assert.equal(shim.canonical('claude', 'SessionStart'), 'SessionStart');
   const args = shim.argumentsFor('codex', 'PreToolUse', { session_id: 's1', tool_name: 'Bash', tool_use_id: 't1', tool_input: { command: 'rm -rf x' } });
   assert.deepEqual([args.event, args.session, args.call, args.command, args.format], ['PreToolUse', 's1', 't1', 'rm -rf x', 'plain']);
+  assert.equal(shim.argumentsFor('codex', 'PreToolUse', { session_id: 's1', agent_id: 'ag1' }).agent, 'ag1');
+  assert.equal(shim.argumentsFor('codex', 'PreToolUse', { session_id: 's1' }).agent, '');
   assert.deepEqual(shim.hostOutput('claude', 'SessionStart', 'hi'), { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: 'hi' } });
   assert.deepEqual(shim.hostOutput('cursor', 'postToolUse', 'hi'), { additional_context: 'hi' });
   assert.deepEqual(shim.hostOutput('cursor', 'stop', 'hi'), {});
